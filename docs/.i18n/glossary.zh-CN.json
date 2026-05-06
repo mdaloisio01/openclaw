@@ -742,5 +742,9 @@
   {
     "source": "/cli/config",
     "target": "/cli/config"
+  },
+  {
+    "source": "fs-safe Cleanup Plan",
+    "target": "fs-safe Cleanup Plan"
   }
 ]
