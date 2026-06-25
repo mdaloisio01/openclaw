@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { accessSync, closeSync, constants, openSync, readSync, statSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { buildCmdExeCommandLine } from "./windows-cmd-helpers.mjs";
 
@@ -54,6 +55,39 @@ function isFile(value) {
   }
 }
 
+function splitPathEntries(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    return [];
+  }
+  return value.split(path.delimiter).filter((entry) => entry.length > 0);
+}
+
+function listPnpmFallbackDirs(params = {}) {
+  const env = params.env ?? process.env;
+  const home = params.home ?? env.HOME ?? os.homedir();
+  const dirs = [...splitPathEntries(env.PATH)];
+  if (typeof env.PNPM_HOME === "string" && env.PNPM_HOME.length > 0) {
+    dirs.push(env.PNPM_HOME);
+  }
+  if (typeof home === "string" && home.length > 0) {
+    dirs.push(path.join(home, ".npm-global", "bin"));
+    dirs.push(path.join(home, ".local", "share", "pnpm"));
+    dirs.push(path.join(home, ".local", "bin"));
+    dirs.push(path.join(home, "bin"));
+  }
+  return [...new Set(dirs)];
+}
+
+function resolveExecutableFromDirs(command, dirs) {
+  for (const dir of dirs) {
+    const candidate = path.join(dir, command);
+    if (isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
 function isNodeRunnablePnpmExecPath(value) {
   if (!isPnpmExecPath(value)) {
     return false;
@@ -75,6 +109,8 @@ export function resolvePnpmRunner(params = {}) {
   const nodeExecPath = params.nodeExecPath ?? process.execPath;
   const platform = params.platform ?? process.platform;
   const comSpec = params.comSpec ?? process.env.ComSpec ?? "cmd.exe";
+  const env = params.env ?? process.env;
+  const home = params.home ?? env.HOME;
 
   if (typeof npmExecPath === "string" && npmExecPath.length > 0 && isPnpmExecPath(npmExecPath)) {
     if (isNodeRunnablePnpmExecPath(npmExecPath)) {
@@ -116,6 +152,21 @@ export function resolvePnpmRunner(params = {}) {
       args: ["/d", "/s", "/c", buildCmdExeCommandLine("pnpm.cmd", pnpmArgs)],
       shell: false,
       windowsVerbatimArguments: true,
+    };
+  }
+
+  const resolvedPnpm = resolveExecutableFromDirs(
+    "pnpm",
+    listPnpmFallbackDirs({
+      env,
+      home,
+    }),
+  );
+  if (resolvedPnpm) {
+    return {
+      command: resolvedPnpm,
+      args: pnpmArgs,
+      shell: false,
     };
   }
 

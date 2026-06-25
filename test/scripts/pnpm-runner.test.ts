@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -112,6 +112,8 @@ describe("resolvePnpmRunner", () => {
           npmExecPath,
           pnpmArgs: ["exec", "vitest", "run"],
           platform: "linux",
+          env: { PATH: "" },
+          home: tempDir,
         }),
       ).toEqual({
         command: "pnpm",
@@ -205,8 +207,58 @@ describe("resolvePnpmRunner", () => {
   });
 
   it("falls back to bare pnpm on non-Windows when npm_execpath is missing", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "pnpm-runner-"));
+    try {
+      expect(
+        resolvePnpmRunner({
+          env: { PATH: "" },
+          home: tempDir,
+          npmExecPath: "",
+          pnpmArgs: ["exec", "vitest", "run"],
+          platform: "linux",
+        }),
+      ).toEqual({
+        command: "pnpm",
+        args: ["exec", "vitest", "run"],
+        shell: false,
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("uses npm-global pnpm when inherited PATH omits it", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "pnpm-runner-"));
+    const pnpmPath = path.join(tempDir, ".npm-global", "bin", "pnpm");
+    mkdirSync(path.dirname(pnpmPath), { recursive: true });
+    writeFileSync(pnpmPath, "#!/usr/bin/env node\nconsole.log('pnpm');\n");
+    chmodSync(pnpmPath, 0o755);
+
+    try {
+      expect(
+        resolvePnpmRunner({
+          env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+          home: tempDir,
+          npmExecPath: "",
+          pnpmArgs: ["exec", "vitest", "run"],
+          platform: "linux",
+        }),
+      ).toEqual({
+        command: pnpmPath,
+        args: ["exec", "vitest", "run"],
+        shell: false,
+      });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to bare pnpm on non-Windows when no stable pnpm exists", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "pnpm-runner-"));
     expect(
       resolvePnpmRunner({
+        env: { PATH: "" },
+        home: tempDir,
         npmExecPath: "",
         pnpmArgs: ["exec", "vitest", "run"],
         platform: "linux",
@@ -216,6 +268,7 @@ describe("resolvePnpmRunner", () => {
       args: ["exec", "vitest", "run"],
       shell: false,
     });
+    rmSync(tempDir, { recursive: true, force: true });
   });
 
   it("wraps pnpm.cmd via cmd.exe on Windows when npm_execpath is unavailable", () => {
@@ -259,6 +312,7 @@ describe("resolvePnpmRunner", () => {
         npmExecPath: "",
         pnpmArgs: ["exec", "vitest", "run"],
         platform: "linux",
+        home: "/missing-home",
         env,
       }),
     ).toEqual({
