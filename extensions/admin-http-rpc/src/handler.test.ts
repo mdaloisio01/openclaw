@@ -105,6 +105,38 @@ describe("admin-http-rpc plugin handler", () => {
     });
   });
 
+  it("allows the active-production watchdog lifecycle proof probe", async () => {
+    dispatchGatewayMethod.mockResolvedValueOnce({
+      ok: true,
+      payload: {
+        ok: true,
+        afterOpenEnabled: true,
+        afterCloseEnabled: false,
+      },
+    });
+
+    const result = await invoke({
+      id: "watchdog-probe",
+      method: "tasks.probeProductionWatchdogLifecycle",
+      params: {},
+    });
+
+    expect(dispatchGatewayMethod).toHaveBeenCalledWith(
+      "tasks.probeProductionWatchdogLifecycle",
+      {},
+    );
+    expect(result.captured.statusCode).toBe(200);
+    expect(result.json).toEqual({
+      id: "watchdog-probe",
+      ok: true,
+      payload: {
+        ok: true,
+        afterOpenEnabled: true,
+        afterCloseEnabled: false,
+      },
+    });
+  });
+
   it.each([
     ["web.login.start", { force: true, timeoutMs: 1000 }],
     ["web.login.wait", { timeoutMs: 1000 }],
