@@ -49,8 +49,17 @@ export type CodexAppServerThreadBinding = {
   pluginAppPolicyContext?: PluginAppPolicyContext;
   contextEngine?: CodexAppServerContextEngineBinding;
   environmentSelectionFingerprint?: string;
+  confirmationGate?: CodexAppServerConfirmationGateBinding;
   createdAt: string;
   updatedAt: string;
+};
+
+export type CodexAppServerConfirmationGateBinding = {
+  schemaVersion: 1;
+  status: "pending";
+  mission: string;
+  createdAt: string;
+  runId?: string;
 };
 
 export type CodexAppServerContextEngineBinding = {
@@ -139,6 +148,7 @@ export async function readCodexAppServerBinding(
         typeof parsed.environmentSelectionFingerprint === "string"
           ? parsed.environmentSelectionFingerprint
           : undefined,
+      confirmationGate: readConfirmationGateBinding(parsed.confirmationGate),
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : new Date().toISOString(),
       updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString(),
     };
@@ -184,6 +194,7 @@ export async function writeCodexAppServerBinding(
     pluginAppPolicyContext: binding.pluginAppPolicyContext,
     contextEngine: binding.contextEngine,
     environmentSelectionFingerprint: binding.environmentSelectionFingerprint,
+    confirmationGate: binding.confirmationGate,
     createdAt: binding.createdAt ?? now,
     updatedAt: now,
   };
@@ -191,6 +202,31 @@ export async function writeCodexAppServerBinding(
     resolveCodexAppServerBindingPath(sessionFile),
     `${JSON.stringify(payload, null, 2)}\n`,
   );
+}
+
+function readConfirmationGateBinding(
+  value: unknown,
+): CodexAppServerConfirmationGateBinding | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.schemaVersion !== 1 ||
+    record.status !== "pending" ||
+    typeof record.mission !== "string" ||
+    !record.mission.trim() ||
+    typeof record.createdAt !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 1,
+    status: "pending",
+    mission: record.mission,
+    createdAt: record.createdAt,
+    ...(typeof record.runId === "string" && record.runId.trim() ? { runId: record.runId } : {}),
+  };
 }
 
 function readContextEngineBinding(value: unknown): CodexAppServerContextEngineBinding | undefined {

@@ -158,6 +158,31 @@ describe("codex app-server session binding", () => {
     });
   });
 
+  it("round-trips confirmation gate pending state", async () => {
+    const sessionFile = path.join(tempDir, "session.json");
+    await writeCodexAppServerBinding(sessionFile, {
+      threadId: "thread-123",
+      cwd: tempDir,
+      confirmationGate: {
+        schemaVersion: 1,
+        status: "pending",
+        mission: "fix the server-side confirmation gate",
+        createdAt: "2026-06-25T04:00:00.000Z",
+        runId: "run-123",
+      },
+    });
+
+    const binding = await readCodexAppServerBinding(sessionFile);
+
+    expect(binding?.confirmationGate).toEqual({
+      schemaVersion: 1,
+      status: "pending",
+      mission: "fix the server-side confirmation gate",
+      createdAt: "2026-06-25T04:00:00.000Z",
+      runId: "run-123",
+    });
+  });
+
   it("rejects old plugin app policy entries that duplicate the app id", async () => {
     const sessionFile = path.join(tempDir, "session.json");
     await fs.writeFile(

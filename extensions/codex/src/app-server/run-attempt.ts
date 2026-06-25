@@ -127,6 +127,12 @@ import {
   type CodexAppServerRuntimeOptions,
 } from "./config.js";
 import {
+  readCodexConfirmationGatePending,
+  resolveCodexConfirmationGateDecision,
+  withCodexConfirmationGatePending,
+  type CodexConfirmationGatePending,
+} from "./confirmation-gate.js";
+import {
   projectContextEngineAssemblyForCodex,
   resolveCodexContextEngineProjectionMaxChars,
   resolveCodexContextEngineProjectionReserveTokens,
@@ -256,6 +262,39 @@ function estimateCodexAppServerProjectedTurnTokens(params: {
 }): number {
   const inputChars = params.prompt.length + (params.developerInstructions?.length ?? 0);
   return Math.max(1, Math.ceil(inputChars / CODEX_APP_SERVER_PROJECTED_CHARS_PER_TOKEN));
+}
+
+async function writeCodexConfirmationGatePendingState(params: {
+  sessionFile: string;
+  pending: CodexConfirmationGatePending | undefined;
+  authProfileStore?: EmbeddedRunAttemptParams["authProfileStore"];
+  agentDir?: string;
+  config?: EmbeddedRunAttemptParams["config"];
+}): Promise<void> {
+  const binding = await readCodexAppServerBinding(params.sessionFile, {
+    authProfileStore: params.authProfileStore,
+    agentDir: params.agentDir,
+    config: params.config,
+  });
+  if (!binding) {
+    embeddedAgentLog.warn("codex confirmation gate could not persist state without binding", {
+      sessionFile: params.sessionFile,
+      pending: Boolean(params.pending),
+    });
+    return;
+  }
+  const nextBinding = withCodexConfirmationGatePending(binding, params.pending);
+  const {
+    schemaVersion: _schemaVersion,
+    sessionFile: _sessionFile,
+    updatedAt: _updatedAt,
+    ...writeable
+  } = nextBinding;
+  await writeCodexAppServerBinding(params.sessionFile, writeable, {
+    authProfileStore: params.authProfileStore,
+    agentDir: params.agentDir,
+    config: params.config,
+  });
 }
 
 async function ensureCodexWorkspaceDirOnce(workspaceDir: string): Promise<void> {
@@ -670,12 +709,6 @@ export async function runCodexAppServerAttempt(
     sessionAgentId,
     memoryToolNames,
   });
-  const baseDeveloperInstructions = joinPresentSections(
-    buildDeveloperInstructions(params, {
-      dynamicTools: toolBridge.availableSpecs,
-    }),
-    workspaceBootstrapContext.developerInstructions,
-  );
   const openClawPromptContext = buildCodexOpenClawPromptContext({
     params,
     workspacePromptContext: workspaceBootstrapContext.promptContext,
@@ -684,7 +717,54 @@ export async function runCodexAppServerAttempt(
     attempt: params,
     skillsPrompt: params.skillsSnapshot?.prompt,
   });
+  const confirmationGateDecision = resolveCodexConfirmationGateDecision({
+    prompt: params.prompt,
+    trigger: params.trigger,
+    workspaceBootstrapContext,
+    startupBinding,
+    historyMessages,
+    runId: params.runId,
+  });
+  const confirmationGateNoToolTurn =
+    confirmationGateDecision.action === "request_confirmation" ||
+    confirmationGateDecision.action === "keep_pending_mission" ||
+    confirmationGateDecision.action === "reject_pending_mission";
+  const confirmationGatePendingAfterTurn: CodexConfirmationGatePending | undefined =
+    confirmationGateDecision.action === "request_confirmation" ||
+    confirmationGateDecision.action === "keep_pending_mission"
+      ? confirmationGateDecision.pending
+      : undefined;
+  const confirmationGateShouldPersist =
+    confirmationGateDecision.action === "request_confirmation" ||
+    confirmationGateDecision.action === "keep_pending_mission" ||
+    confirmationGateDecision.action === "reject_pending_mission" ||
+    confirmationGateDecision.action === "release_confirmed_mission";
   let promptText = params.prompt;
+  if (confirmationGateDecision.action === "request_confirmation") {
+    promptText = confirmationGateDecision.prompt;
+  } else if (confirmationGateDecision.action === "keep_pending_mission") {
+    promptText = confirmationGateDecision.prompt;
+  } else if (confirmationGateDecision.action === "reject_pending_mission") {
+    promptText = confirmationGateDecision.prompt;
+  } else if (confirmationGateDecision.action === "release_confirmed_mission") {
+    promptText = confirmationGateDecision.mission;
+  }
+  const activeDynamicToolSpecs = confirmationGateNoToolTurn ? [] : toolBridge.availableSpecs;
+  const activeThreadDynamicToolSpecs = confirmationGateNoToolTurn ? [] : toolBridge.specs;
+  if (confirmationGateNoToolTurn) {
+    embeddedAgentLog.info("codex confirmation gate forced no-tool turn", {
+      sessionId: params.sessionId,
+      sessionKey: contextSessionKey,
+      action: confirmationGateDecision.action,
+      hadPending: Boolean(readCodexConfirmationGatePending(startupBinding)),
+    });
+  }
+  const baseDeveloperInstructions = joinPresentSections(
+    buildDeveloperInstructions(params, {
+      dynamicTools: activeDynamicToolSpecs,
+    }),
+    workspaceBootstrapContext.developerInstructions,
+  );
   let developerInstructions = baseDeveloperInstructions;
   let prePromptMessageCount = historyMessages.length;
   let contextEngineProjection: CodexContextEngineThreadBootstrapProjection | undefined;
@@ -696,7 +776,7 @@ export async function runCodexAppServerAttempt(
     const projection = projectContextEngineAssemblyForCodex({
       assembledMessages: historyMessages,
       originalHistoryMessages: historyMessages,
-      prompt: params.prompt,
+      prompt: promptText,
     });
     promptText = projection.promptText;
     prePromptMessageCount = projection.prePromptMessageCount;
@@ -714,11 +794,11 @@ export async function runCodexAppServerAttempt(
       messages: historyMessages,
       tokenBudget: params.contextTokenBudget,
       availableTools: new Set(
-        toolBridge.availableSpecs.map((tool) => tool.name).filter(isNonEmptyString),
+        activeDynamicToolSpecs.map((tool) => tool.name).filter(isNonEmptyString),
       ),
       citationsMode: params.config?.memory?.citations,
       modelId: params.modelId,
-      prompt: params.prompt,
+      prompt: promptText,
     });
     if (!assembled) {
       throw new Error("context engine assemble returned no result");
@@ -729,7 +809,7 @@ export async function runCodexAppServerAttempt(
     const projection = projectContextEngineAssemblyForCodex({
       assembledMessages: assembled.messages,
       originalHistoryMessages: historyMessages,
-      prompt: params.prompt,
+      prompt: promptText,
       systemPromptAddition: assembled.systemPromptAddition,
       maxRenderedContextChars: resolveCodexContextEngineProjectionMaxChars({
         contextTokenBudget: params.contextTokenBudget,
@@ -747,7 +827,7 @@ export async function runCodexAppServerAttempt(
             contextEngineProjection,
           ),
           projection: contextEngineProjection,
-          dynamicToolsFingerprint: codexDynamicToolsFingerprint(toolBridge.specs),
+          dynamicToolsFingerprint: codexDynamicToolsFingerprint(activeThreadDynamicToolSpecs),
         })
       : { project: true, reason: "per-turn-projection" };
     embeddedAgentLog.info("codex app-server context-engine projection decision", {
@@ -1073,11 +1153,13 @@ export async function runCodexAppServerAttempt(
       sessionAgentId,
       effectiveWorkspace,
       effectiveCwd,
-      dynamicTools: toolBridge.specs,
+      dynamicTools: activeThreadDynamicToolSpecs,
       developerInstructions: promptBuild.developerInstructions,
       buildFinalConfigPatch: buildNativeHookRelayFinalConfigPatch,
-      bundleMcpThreadConfig,
-      nativeToolSurfaceEnabled,
+      bundleMcpThreadConfig: confirmationGateNoToolTurn
+        ? { diagnostics: [], evaluated: true }
+        : bundleMcpThreadConfig,
+      nativeToolSurfaceEnabled: confirmationGateNoToolTurn ? false : nativeToolSurfaceEnabled,
       sandboxExecServerEnabled,
       sandbox,
       contextEngineProjection,
@@ -1110,19 +1192,28 @@ export async function runCodexAppServerAttempt(
   if (applyNoContextEngineContinuityProjection(thread.lifecycle.action, thread)) {
     await rebuildCodexTurnPromptTextFromCurrentProjection();
   }
+  if (confirmationGateShouldPersist) {
+    await writeCodexConfirmationGatePendingState({
+      sessionFile: params.sessionFile,
+      pending: confirmationGatePendingAfterTurn,
+      authProfileStore: params.authProfileStore,
+      agentDir: params.agentDir,
+      config: params.config,
+    });
+  }
   trajectoryRecorder?.recordEvent("session.started", {
     sessionFile: params.sessionFile,
     threadId: thread.threadId,
     authProfileId: startupAuthProfileId,
     workspaceDir: effectiveWorkspace,
-    toolCount: toolBridge.specs.length,
+    toolCount: activeThreadDynamicToolSpecs.length,
   });
   recordCodexTrajectoryContext(trajectoryRecorder, {
     attempt: params,
     cwd: effectiveCwd,
     developerInstructions: buildRenderedCodexDeveloperInstructions(),
     prompt: codexTurnPromptText,
-    tools: toolBridge.availableSpecs,
+    tools: activeDynamicToolSpecs,
   });
   const pendingNotifications: CodexServerNotification[] = [];
   let completed = false;
