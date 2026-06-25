@@ -433,6 +433,15 @@ function isExplicitTestFileArg(arg) {
   );
 }
 
+function isExplicitPathShapeArg(arg) {
+  if (GLOB_PATTERN_CHARS_RE.test(arg)) {
+    return false;
+  }
+  return (
+    path.isAbsolute(arg) || arg.startsWith("./") || arg.startsWith("../") || /[/\\]/u.test(arg)
+  );
+}
+
 function collectExplicitTestFileArgs(argv) {
   const files = [];
   for (let index = 0; index < argv.length; index += 1) {
@@ -452,6 +461,34 @@ function collectExplicitTestFileArgs(argv) {
     }
   }
   return files;
+}
+
+function collectExplicitPathShapeArgs(argv) {
+  const targets = [];
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--") {
+      break;
+    }
+    if (optionConsumesNextArg(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      continue;
+    }
+    if (isExplicitPathShapeArg(arg)) {
+      targets.push(arg);
+    }
+  }
+  return targets;
+}
+
+function collectExplicitPathTargetArgs(argv, cwd = process.cwd(), fsImpl = fs) {
+  return collectExplicitPathShapeArgs(argv).filter((arg) => {
+    const targetPath = path.isAbsolute(arg) ? arg : path.resolve(cwd, arg);
+    return fsImpl.existsSync(targetPath);
+  });
 }
 
 export function resolveExplicitTestFileNoPassArgs(argv) {
@@ -547,7 +584,7 @@ function stripRunSubcommand(argv) {
   return stripped;
 }
 
-export function resolveTestProjectsDelegationArgs(argv) {
+export function resolveTestProjectsDelegationArgs(argv, cwd = process.cwd(), fsImpl = fs) {
   if (
     hasExplicitVitestConfigArg(argv) ||
     hasAlternateVitestRootArg(argv) ||
@@ -555,7 +592,7 @@ export function resolveTestProjectsDelegationArgs(argv) {
     resolveExplicitVitestMode(argv) === "watch" ||
     hasExplicitDisabledRunFlag(argv) ||
     hasSeparateVitestOptionValueArg(argv) ||
-    collectExplicitTestFileArgs(argv).length === 0
+    collectExplicitPathTargetArgs(argv, cwd, fsImpl).length === 0
   ) {
     return null;
   }
@@ -566,7 +603,7 @@ export function resolveMissingExplicitTestFiles(argv, cwd = process.cwd(), fsImp
   if (hasExplicitVitestConfigArg(argv) || hasAlternateVitestRootArg(argv)) {
     return [];
   }
-  return collectExplicitTestFileArgs(argv)
+  return [...new Set(collectExplicitPathShapeArgs(argv))]
     .filter((arg) => {
       const filePath = path.isAbsolute(arg) ? arg : path.resolve(cwd, arg);
       return !fsImpl.existsSync(filePath);

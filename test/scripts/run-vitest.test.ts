@@ -243,6 +243,51 @@ describe("scripts/run-vitest", () => {
     }
   });
 
+  it("delegates valid directory targets to the project router", () => {
+    const fsImpl = {
+      existsSync: (filePath: string) =>
+        [
+          "/repo/src/auto-reply",
+          "/repo/src/commands",
+          "/home/will/openclaw-source/src/auto-reply",
+          "/home/will/openclaw-source/src/commands",
+        ].includes(filePath.replaceAll("\\", "/")),
+    };
+
+    expect(resolveTestProjectsDelegationArgs(["run", "src/auto-reply"], "/repo", fsImpl)).toEqual([
+      "src/auto-reply",
+    ]);
+    expect(resolveTestProjectsDelegationArgs(["run", "src/commands"], "/repo", fsImpl)).toEqual([
+      "src/commands",
+    ]);
+    expect(
+      resolveTestProjectsDelegationArgs(
+        ["run", "/home/will/openclaw-source/src/auto-reply"],
+        "/repo",
+        fsImpl,
+      ),
+    ).toEqual(["/home/will/openclaw-source/src/auto-reply"]);
+    expect(
+      resolveTestProjectsDelegationArgs(
+        ["run", "/home/will/openclaw-source/src/commands"],
+        "/repo",
+        fsImpl,
+      ),
+    ).toEqual(["/home/will/openclaw-source/src/commands"]);
+    expect(
+      resolveTestProjectsDelegationArgs(
+        ["run", "test/scripts/run-vitest.test.ts", "src/commands"],
+        "/repo",
+        {
+          existsSync: (filePath: string) =>
+            ["/repo/src/commands", "/repo/test/scripts/run-vitest.test.ts"].includes(
+              filePath.replaceAll("\\", "/"),
+            ),
+        },
+      ),
+    ).toEqual(["test/scripts/run-vitest.test.ts", "src/commands"]);
+  });
+
   it("keeps direct Vitest runs when project routing could change option semantics", () => {
     const directArgvCases = [
       [
@@ -265,6 +310,26 @@ describe("scripts/run-vitest", () => {
     for (const argv of directArgvCases) {
       expect(resolveTestProjectsDelegationArgs(argv)).toBeNull();
     }
+  });
+
+  it("does not delegate missing directory targets and reports them before raw Vitest fallback", () => {
+    const fsImpl = {
+      existsSync: () => false,
+    };
+
+    expect(
+      resolveTestProjectsDelegationArgs(["run", "src/auto-reply"], "/repo", fsImpl),
+    ).toBeNull();
+    expect(resolveMissingExplicitTestFiles(["run", "src/auto-reply"], "/repo", fsImpl)).toEqual([
+      "src/auto-reply",
+    ]);
+    expect(
+      resolveMissingExplicitTestFiles(
+        ["run", "/home/will/openclaw-source/src/auto-reply"],
+        "/repo",
+        fsImpl,
+      ),
+    ).toEqual(["../home/will/openclaw-source/src/auto-reply"]);
   });
 
   it("reports missing explicit test files before Vitest can silently ignore them", () => {

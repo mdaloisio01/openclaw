@@ -851,6 +851,47 @@ describe("scripts/test-projects changed-target routing", () => {
     ]);
   });
 
+  it("routes bare auto-reply directory targets to the auto-reply suite", () => {
+    expect(buildVitestRunPlans(["src/auto-reply"], process.cwd())).toEqual([
+      {
+        config: "test/vitest/vitest.auto-reply.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/auto-reply/**/*.test.ts"],
+        watchMode: false,
+      },
+    ]);
+  });
+
+  it("routes bare commands directory targets to the commands suite consistently", () => {
+    const cwd = process.cwd();
+    const absoluteTarget = path.join(cwd, "src", "commands");
+
+    expect(buildVitestRunPlans(["src/commands"], cwd)).toEqual([
+      {
+        config: "test/vitest/vitest.commands.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/commands/**/*.test.ts"],
+        watchMode: false,
+      },
+    ]);
+    expect(buildVitestRunPlans([absoluteTarget], cwd)).toEqual([
+      {
+        config: "test/vitest/vitest.commands.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/commands/**/*.test.ts"],
+        watchMode: false,
+      },
+    ]);
+    expect(buildVitestRunPlans(["src/commands/channels.add.test.ts"], cwd)).toEqual([
+      {
+        config: "test/vitest/vitest.commands.config.ts",
+        forwardedArgs: [],
+        includePatterns: ["src/commands/channels.add.test.ts"],
+        watchMode: false,
+      },
+    ]);
+  });
+
   it("preserves post-separator Vitest args without parsing them as targets", () => {
     for (const [arg, watchMode] of [
       ["--reporter=verbose", false],

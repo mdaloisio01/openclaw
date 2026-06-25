@@ -1509,6 +1509,10 @@ function resolveVitestConfigTargetKind(relative) {
   return VITEST_CONFIG_TARGET_KIND_BY_PATH.get(relative) ?? null;
 }
 
+function isTargetWithin(relative, root) {
+  return relative === root || relative.startsWith(`${root}/`);
+}
+
 function isVitestConfigPathLikeTarget(relative) {
   return (
     relative === "vitest.config.ts" || /^test\/vitest\/vitest\..+\.config\.ts$/u.test(relative)
@@ -1811,7 +1815,7 @@ function classifyTarget(arg, cwd) {
   if (isControlUiE2eTarget(relative)) {
     return "uiE2e";
   }
-  if (relative.startsWith("ui/src/")) {
+  if (isTargetWithin(relative, "ui/src")) {
     if (isUnitUiTestTarget(relative)) {
       return "unitUi";
     }
@@ -1834,7 +1838,7 @@ function classifyTarget(arg, cwd) {
   if (channelContractKind) {
     return channelContractKind;
   }
-  if (relative.startsWith("src/plugins/contracts/")) {
+  if (isTargetWithin(relative, "src/plugins/contracts")) {
     return "contractsPlugin";
   }
   if (resolveUnitFastTimerTestIncludePattern(relative)) {
@@ -1927,8 +1931,8 @@ function classifyTarget(arg, cwd) {
     return "toolingIsolated";
   }
   if (
-    relative.startsWith("test/") ||
-    relative.startsWith("src/scripts/") ||
+    isTargetWithin(relative, "test") ||
+    isTargetWithin(relative, "src/scripts") ||
     relative === "src/config/doc-baseline.integration.test.ts" ||
     relative === "src/config/schema.base.generated.test.ts" ||
     relative === "src/config/schema.help.quality.test.ts"
@@ -1938,76 +1942,76 @@ function classifyTarget(arg, cwd) {
   if (isBundledPluginDependentUnitTestFile(relative)) {
     return "bundled";
   }
-  if (relative.startsWith("src/channels/")) {
+  if (isTargetWithin(relative, "src/channels")) {
     return "channel";
   }
-  if (relative.startsWith("src/gateway/")) {
+  if (isTargetWithin(relative, "src/gateway")) {
     return "gateway";
   }
-  if (relative.startsWith("src/hooks/")) {
+  if (isTargetWithin(relative, "src/hooks")) {
     return "hooks";
   }
-  if (relative.startsWith("src/infra/")) {
+  if (isTargetWithin(relative, "src/infra")) {
     return "infra";
   }
-  if (relative.startsWith("src/config/")) {
+  if (isTargetWithin(relative, "src/config")) {
     return "runtimeConfig";
   }
-  if (relative.startsWith("src/cron/")) {
+  if (isTargetWithin(relative, "src/cron")) {
     return "cron";
   }
-  if (relative.startsWith("src/daemon/")) {
+  if (isTargetWithin(relative, "src/daemon")) {
     return "daemon";
   }
-  if (relative.startsWith("src/media-understanding/")) {
+  if (isTargetWithin(relative, "src/media-understanding")) {
     return "mediaUnderstanding";
   }
-  if (relative.startsWith("src/media/")) {
+  if (isTargetWithin(relative, "src/media")) {
     return "media";
   }
-  if (relative.startsWith("src/logging/")) {
+  if (isTargetWithin(relative, "src/logging")) {
     return "logging";
   }
-  if (relative.startsWith("src/plugin-sdk/")) {
+  if (isTargetWithin(relative, "src/plugin-sdk")) {
     return isPluginSdkLightTarget(relative) ? "pluginSdkLight" : "pluginSdk";
   }
-  if (relative.startsWith("src/process/")) {
+  if (isTargetWithin(relative, "src/process")) {
     return "process";
   }
-  if (relative.startsWith("src/secrets/")) {
+  if (isTargetWithin(relative, "src/secrets")) {
     return "secrets";
   }
-  if (relative.startsWith("src/shared/")) {
+  if (isTargetWithin(relative, "src/shared")) {
     return "sharedCore";
   }
-  if (relative.startsWith("src/tasks/")) {
+  if (isTargetWithin(relative, "src/tasks")) {
     return "tasks";
   }
-  if (relative.startsWith("src/tui/")) {
+  if (isTargetWithin(relative, "src/tui")) {
     return "tui";
   }
-  if (relative.startsWith("src/acp/")) {
+  if (isTargetWithin(relative, "src/acp")) {
     return "acp";
   }
-  if (relative.startsWith("src/cli/")) {
+  if (isTargetWithin(relative, "src/cli")) {
     return "cli";
   }
-  if (relative.startsWith("src/commands/")) {
+  if (isTargetWithin(relative, "src/commands")) {
     return isCommandsLightTarget(relative) ? "commandLight" : "command";
   }
-  if (relative.startsWith("src/auto-reply/")) {
+  if (isTargetWithin(relative, "src/auto-reply")) {
     return "autoReply";
   }
-  if (relative.startsWith("src/agents/")) {
+  if (isTargetWithin(relative, "src/agents")) {
     return "agent";
   }
-  if (relative.startsWith("src/plugins/")) {
+  if (isTargetWithin(relative, "src/plugins")) {
     return "plugin";
   }
-  if (relative.startsWith("src/utils/")) {
+  if (isTargetWithin(relative, "src/utils")) {
     return "utils";
   }
-  if (relative.startsWith("src/wizard/")) {
+  if (isTargetWithin(relative, "src/wizard")) {
     return "wizard";
   }
   return "default";
@@ -2046,7 +2050,7 @@ function shouldUseWholeConfigTarget(kind, targetArg, cwd) {
     return false;
   }
   const relative = toRepoRelativeTarget(targetArg, cwd);
-  return relative.startsWith("ui/src/") && !relative.startsWith("ui/src/ui/");
+  return isTargetWithin(relative, "ui/src") && !isTargetWithin(relative, "ui/src/ui");
 }
 
 function createVitestArgs(params) {
