@@ -1,3 +1,4 @@
+import { resolveTaskBuildExecutionTruth } from "./task-build-execution-truth.js";
 import type { TaskEventRecord, TaskRecord, TaskStatus } from "./task-registry.types.js";
 import { formatTaskStatusTitleText, sanitizeTaskStatusText } from "./task-status.js";
 
@@ -26,6 +27,31 @@ function resolveTaskRunLabel(task: TaskRecord): string {
   return task.runId ? ` (run ${task.runId.slice(0, 8)})` : "";
 }
 
+function formatScopeConstrainedCompletionMessage(params: {
+  title: string;
+  runLabel: string;
+  summary: string;
+}): string {
+  const { title, runLabel, summary } = params;
+  const broaderMissionOpen = "Broader build execution is paused pending parent review.";
+  return summary
+    ? `Background task local result ready for review: ${title}${runLabel}. ${summary} ${broaderMissionOpen}`
+    : `Background task local result ready for review: ${title}${runLabel}. ${broaderMissionOpen}`;
+}
+
+function formatContinuationRequiredCompletionMessage(params: {
+  title: string;
+  runLabel: string;
+  summary: string;
+}): string {
+  const { title, runLabel, summary } = params;
+  const continuationRequired =
+    "Next executable unit must launch before this slice can truthfully pause or close. Broader build execution remains open.";
+  return summary
+    ? `Background task local result ready for follow-through: ${title}${runLabel}. ${summary} ${continuationRequired}`
+    : `Background task local result ready for follow-through: ${title}${runLabel}. ${continuationRequired}`;
+}
+
 export function formatTaskTerminalMessage(
   task: TaskRecord,
   options: { surface?: "direct" | "parent_session" } = {},
@@ -35,14 +61,33 @@ export function formatTaskTerminalMessage(
   const summary = sanitizeTaskStatusText(task.terminalSummary, {
     errorContext: task.status !== "succeeded" || task.terminalOutcome === "blocked",
   });
+  const buildExecutionTruth = resolveTaskBuildExecutionTruth(task);
+  const scopeConstrainedCompletion = buildExecutionTruth.state === "paused_pending_parent_review";
+  const continuationRequired =
+    buildExecutionTruth.state === "continuation_required_after_local_success";
   if (task.status === "succeeded") {
     if (task.terminalOutcome === "blocked") {
       return summary
         ? `Background task blocked: ${title}${runLabel}. ${summary}`
         : `Background task blocked: ${title}${runLabel}.`;
     }
+    if (scopeConstrainedCompletion) {
+      return formatScopeConstrainedCompletionMessage({
+        title,
+        runLabel,
+        summary,
+      });
+    }
+    if (continuationRequired) {
+      return formatContinuationRequiredCompletionMessage({
+        title,
+        runLabel,
+        summary,
+      });
+    }
     if (options.surface === "parent_session") {
-      const reviewNext = "Next: parent will review/verify before calling it done.";
+      const reviewNext =
+        "Next: parent will review/verify before calling it done. Broader build execution is paused pending parent review.";
       return summary
         ? `Background task ready for review: ${title}${runLabel}. ${summary} ${reviewNext}`
         : `Background task ready for review: ${title}${runLabel}. ${reviewNext}`;

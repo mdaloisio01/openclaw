@@ -23,6 +23,15 @@ export type TaskNotifyPolicy = "done_only" | "state_changes" | "silent";
 
 export type TaskTerminalOutcome = "succeeded" | "blocked";
 export type TaskScopeKind = "session" | "system";
+export type TaskMissionState = "active" | "subordinate" | "abandoned";
+export type TaskBuildExecutionState =
+  | "identified"
+  | "accepted"
+  | "active_confirmed"
+  | "continuation_required_after_local_success"
+  | "paused_pending_parent_review"
+  | "blocked"
+  | "completed";
 
 export type TaskStatusCounts = Record<TaskStatus, number>;
 export type TaskRuntimeCounts = Record<TaskRuntime, number>;
@@ -48,6 +57,7 @@ const TASK_DELIVERY_STATUSES = new Set<TaskDeliveryStatus>([
 const TASK_NOTIFY_POLICIES = new Set<TaskNotifyPolicy>(["done_only", "state_changes", "silent"]);
 const TASK_TERMINAL_OUTCOMES = new Set<TaskTerminalOutcome>(["succeeded", "blocked"]);
 const TASK_SCOPE_KINDS = new Set<TaskScopeKind>(["session", "system"]);
+const TASK_MISSION_STATES = new Set<TaskMissionState>(["active", "subordinate", "abandoned"]);
 
 function parsePersistedTaskValue<T extends string>(
   value: unknown,
@@ -87,6 +97,13 @@ export function parseOptionalTaskTerminalOutcome(value: unknown): TaskTerminalOu
   return parsePersistedTaskValue(value, TASK_TERMINAL_OUTCOMES, "terminal outcome");
 }
 
+export function parseOptionalTaskMissionState(value: unknown): TaskMissionState | undefined {
+  if (value == null || value === "") {
+    return undefined;
+  }
+  return parsePersistedTaskValue(value, TASK_MISSION_STATES, "mission state");
+}
+
 export type TaskRegistrySummary = {
   total: number;
   active: number;
@@ -94,6 +111,12 @@ export type TaskRegistrySummary = {
   failures: number;
   byStatus: TaskStatusCounts;
   byRuntime: TaskRuntimeCounts;
+};
+
+export type TaskBuildExecutionTruth = {
+  state: TaskBuildExecutionState;
+  broaderBuildOpen: boolean;
+  proofSummary: string;
 };
 
 export type TaskEventKind = TaskStatus | "progress";
@@ -137,6 +160,10 @@ export type TaskRecord = {
   progressSummary?: string;
   terminalSummary?: string;
   terminalOutcome?: TaskTerminalOutcome;
+  missionId?: string;
+  missionSummary?: string;
+  missionState?: TaskMissionState;
+  missionUpdatedAt?: number;
 };
 
 export type TaskRegistrySnapshot = {

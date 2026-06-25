@@ -1,3 +1,5 @@
+import { resolveTaskBuildExecutionTruth } from "./task-build-execution-truth.js";
+import { getTaskFlowById } from "./task-flow-runtime-internal.js";
 import {
   compareTaskAuditFindingSortKeys,
   createEmptyTaskAuditSummary,
@@ -95,6 +97,49 @@ function compareFindings(left: TaskAuditFinding, right: TaskAuditFinding): numbe
   );
 }
 
+function taskMissionReferenceAt(task: TaskRecord): number {
+  return (
+    task.missionUpdatedAt ?? task.lastEventAt ?? task.endedAt ?? task.startedAt ?? task.createdAt
+  );
+}
+
+function taskClaimsActiveExecutionWithoutProof(task: TaskRecord): boolean {
+  const haystack = [
+    task.task,
+    task.label,
+    task.progressSummary,
+    task.terminalSummary,
+    task.missionSummary,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n")
+    .toLowerCase();
+  if (!haystack) {
+    return false;
+  }
+  return (
+    haystack.includes("owner execution in progress") ||
+    haystack.includes("active owner execution is underway") ||
+    haystack.includes("active execution is underway")
+  );
+}
+
+function taskHasQueuedSameSliceReworkWithoutLaunchProof(task: TaskRecord): boolean {
+  if (task.status !== "queued" || !task.parentFlowId?.trim()) {
+    return false;
+  }
+  const flow = getTaskFlowById(task.parentFlowId.trim());
+  const rework =
+    (flow?.stateJson as { rework?: { handbackStatus?: string; transferOwner?: string } } | null)
+      ?.rework ?? null;
+  return (
+    rework?.handbackStatus === "required" &&
+    rework.transferOwner !== "Will" &&
+    typeof task.progressSummary === "string" &&
+    task.progressSummary.includes("REWORK_EXECUTOR_LAUNCH_REQUIRED")
+  );
+}
+
 export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAuditFinding[] {
   const tasks = options.tasks ?? taskAuditTaskProvider();
   const now = options.now ?? Date.now();
@@ -179,6 +224,152 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
     const inconsistency = findTimestampInconsistency(task);
     if (inconsistency) {
       findings.push(inconsistency);
+    }
+  }
+
+  const tasksByMissionId = new Map<string, TaskRecord[]>();
+  for (const task of tasks) {
+    const missionId = task.missionId?.trim();
+    if (!missionId) {
+      continue;
+    }
+    const current = tasksByMissionId.get(missionId);
+    if (current) {
+      current.push(task);
+    } else {
+      tasksByMissionId.set(missionId, [task]);
+    }
+  }
+
+  for (const missionTasks of tasksByMissionId.values()) {
+    const latestTask = [...missionTasks].sort((left, right) => {
+      const diff = taskMissionReferenceAt(right) - taskMissionReferenceAt(left);
+      if (diff !== 0) {
+        return diff;
+      }
+      return right.createdAt - left.createdAt;
+    })[0];
+    if (!latestTask) {
+      continue;
+    }
+    const truth = resolveTaskBuildExecutionTruth(latestTask);
+    const latestAgeMs = Math.max(0, now - taskMissionReferenceAt(latestTask));
+    const hasActiveExecutor = missionTasks.some((task) => task.status === "running");
+    const allRelatedTasksTerminal = missionTasks.every(
+      (task) => task.status !== "queued" && task.status !== "running",
+    );
+
+    if (taskHasQueuedSameSliceReworkWithoutLaunchProof(latestTask) && !hasActiveExecutor) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "rework_follow_through_violation",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "same-slice rework packet is queued, but no launched/running executor proof exists for the next lawful rework run",
+        }),
+      );
+    }
+
+    if (latestTask.status === "queued" && latestAgeMs >= staleQueuedMs) {
+      findings.push(
+        createFinding({
+          severity: "warn",
+          code: "accepted_not_yet_proven_active_too_long",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail: "accepted task has stayed queued too long without proving active execution",
+        }),
+      );
+      findings.push(
+        createFinding({
+          severity: "warn",
+          code: "routed_to_owner_not_proven_active",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail: "work appears routed or accepted, but active owner execution is still not proven",
+        }),
+      );
+    }
+
+    if (truth.state === "continuation_required_after_local_success" && !hasActiveExecutor) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "parent_continuity_violation",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "active production continuation requires the next executable unit to launch, but no active executor is currently running",
+        }),
+      );
+    }
+
+    if (
+      truth.state === "paused_pending_parent_review" &&
+      !hasActiveExecutor &&
+      latestAgeMs >= staleQueuedMs
+    ) {
+      findings.push(
+        createFinding({
+          severity: "warn",
+          code: "parent_review_state_without_active_executor",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "latest mission state is paused pending parent review, but no active executor is currently running",
+        }),
+      );
+      findings.push(
+        createFinding({
+          severity: "warn",
+          code: "owner_readout_finished_no_followthrough",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "local readout or review-ready work finished, but no next-owner execution followthrough is currently running",
+        }),
+      );
+    }
+
+    if (truth.broaderBuildOpen && !hasActiveExecutor && latestAgeMs >= staleQueuedMs) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "open_build_no_active_owner",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "latest mission state says the broader build is still open, but no task in that mission is actively running now",
+        }),
+      );
+    }
+
+    if (truth.broaderBuildOpen && allRelatedTasksTerminal && latestAgeMs >= staleQueuedMs) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "build_open_all_related_sessions_terminal",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "broader build is still open, but every related task in the mission is already terminal",
+        }),
+      );
+    }
+
+    if (truth.state !== "active_confirmed" && taskClaimsActiveExecutionWithoutProof(latestTask)) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "execution_truth_conflicts_with_status_text",
+          task: latestTask,
+          ageMs: latestAgeMs,
+          detail:
+            "task text claims active execution, but runtime execution truth does not prove an active executor",
+        }),
+      );
     }
   }
 

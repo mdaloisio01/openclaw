@@ -5,6 +5,7 @@ import type {
   TaskRunDetail,
   TaskRunView,
 } from "../plugins/runtime/task-domain-types.js";
+import { resolveTaskBuildExecutionTruth } from "./task-build-execution-truth.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import { summarizeTaskRecords } from "./task-registry.summary.js";
 import type { TaskRecord, TaskRegistrySummary } from "./task-registry.types.js";
@@ -21,6 +22,7 @@ export function mapTaskRunAggregateSummary(summary: TaskRegistrySummary): TaskRu
 }
 
 export function mapTaskRunView(task: TaskRecord): TaskRunView {
+  const buildExecutionTruth = resolveTaskBuildExecutionTruth(task);
   return {
     id: task.taskId,
     runtime: task.runtime,
@@ -47,6 +49,11 @@ export function mapTaskRunView(task: TaskRecord): TaskRunView {
     ...(task.progressSummary ? { progressSummary: task.progressSummary } : {}),
     ...(task.terminalSummary ? { terminalSummary: task.terminalSummary } : {}),
     ...(task.terminalOutcome ? { terminalOutcome: task.terminalOutcome } : {}),
+    ...(task.missionId ? { missionId: task.missionId } : {}),
+    ...(task.missionSummary ? { missionSummary: task.missionSummary } : {}),
+    ...(task.missionState ? { missionState: task.missionState } : {}),
+    ...(task.missionUpdatedAt !== undefined ? { missionUpdatedAt: task.missionUpdatedAt } : {}),
+    buildExecutionTruth,
   };
 }
 

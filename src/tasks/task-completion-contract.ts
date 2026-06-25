@@ -1,7 +1,7 @@
 import type { TaskTerminalOutcome } from "./task-registry.types.js";
 
 export type RequiredCompletionTerminalResult = {
-  terminalOutcome?: Extract<TaskTerminalOutcome, "blocked">;
+  terminalOutcome?: TaskTerminalOutcome;
   terminalSummary?: string;
 };
 
@@ -84,7 +84,7 @@ export function resolveRequiredCompletionDeliveryFailureTerminalResult(
 ): RequiredCompletionTerminalResult {
   const normalizedReason = normalizeCompletionFailureReason(reason);
   return {
-    terminalOutcome: "blocked",
+    terminalOutcome: "succeeded",
     terminalSummary: normalizedReason
       ? `Required completion delivery failed before reaching the requester: ${normalizedReason}.`
       : "Required completion delivery failed before reaching the requester.",

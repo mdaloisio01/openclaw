@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   formatTaskBlockedFollowupMessage,
   formatTaskStateChangeMessage,
@@ -9,6 +9,12 @@ import {
   shouldSuppressDuplicateTerminalDelivery,
   shouldUseParentReviewTaskTerminalMessage,
 } from "./task-executor-policy.js";
+import {
+  createBlindTestSliceFlow,
+  recordBlindTestDraftReview,
+  recordBlindTestImplementationReview,
+  resetTaskFlowRegistryForTests,
+} from "./task-flow-runtime-internal.js";
 import type { TaskEventRecord, TaskRecord } from "./task-registry.types.js";
 
 function createTask(partial: Partial<TaskRecord>): TaskRecord {
@@ -28,6 +34,10 @@ function createTask(partial: Partial<TaskRecord>): TaskRecord {
 }
 
 describe("task-executor-policy", () => {
+  afterEach(() => {
+    resetTaskFlowRegistryForTests({ persist: false });
+  });
+
   it("identifies terminal statuses", () => {
     expect(isTerminalTaskStatus("queued")).toBe(false);
     expect(isTerminalTaskStatus("running")).toBe(false);
@@ -59,7 +69,7 @@ describe("task-executor-policy", () => {
     };
 
     expect(formatTaskTerminalMessage(succeededTask, { surface: "parent_session" })).toBe(
-      "Background task ready for review: ACP import (run run-0234). Imported 12 rows. Next: parent will review/verify before calling it done.",
+      "Background task ready for review: ACP import (run run-0234). Imported 12 rows. Next: parent will review/verify before calling it done. Broader build execution is paused pending parent review.",
     );
     expect(formatTaskTerminalMessage(succeededTask)).toBe(
       "Background task done: ACP import (run run-0234). Imported 12 rows.",
@@ -72,6 +82,79 @@ describe("task-executor-policy", () => {
     );
     expect(formatTaskStateChangeMessage(blockedTask, progressEvent)).toBe(
       "Background task update: ACP import. No output for 60s.",
+    );
+  });
+
+  it("forces scope-explicit wording for subordinate slice completions", () => {
+    const subordinateTask = createTask({
+      status: "succeeded",
+      missionState: "subordinate",
+      missionId: "mission-grant-blind-test",
+      parentTaskId: "task-parent-1",
+      terminalSummary: "Phase 4 landed and passed tests.",
+      runId: "run-3333567890",
+      label: "Blind-test phase",
+    });
+
+    expect(formatTaskTerminalMessage(subordinateTask)).toBe(
+      "Background task local result ready for review: Blind-test phase (run run-3333). Phase 4 landed and passed tests. Broader build execution is paused pending parent review.",
+    );
+    expect(formatTaskTerminalMessage(subordinateTask, { surface: "parent_session" })).toBe(
+      "Background task local result ready for review: Blind-test phase (run run-3333). Phase 4 landed and passed tests. Broader build execution is paused pending parent review.",
+    );
+  });
+
+  it("forces continuation-required wording when active production follow-through is still owed", () => {
+    resetTaskFlowRegistryForTests({ persist: false });
+    const flow = createBlindTestSliceFlow({
+      ownerKey: "agent:main:main",
+      goal: "Grant production blind-test slice 1",
+      sliceKey: "prod-slice-1",
+      subjectAgent: "Grant",
+      createdAt: 1,
+      updatedAt: 1,
+      continuation: {
+        activeProductionRun: true,
+        parentRunOpen: true,
+      },
+    });
+    if (!flow) {
+      throw new Error("Expected blind-test flow creation");
+    }
+    const draftPassed = recordBlindTestDraftReview({
+      flowId: flow.flowId,
+      expectedRevision: flow.revision,
+      verdict: "passed",
+      reviewedAt: 2,
+      updatedAt: 2,
+    });
+    if (!draftPassed.applied) {
+      throw new Error("Expected draft pass");
+    }
+    const implementationPassed = recordBlindTestImplementationReview({
+      flowId: flow.flowId,
+      expectedRevision: draftPassed.flow.revision,
+      verdict: "passed",
+      reviewedAt: 3,
+      updatedAt: 3,
+    });
+    if (!implementationPassed.applied) {
+      throw new Error("Expected implementation pass");
+    }
+
+    const subordinateTask = createTask({
+      status: "succeeded",
+      missionState: "subordinate",
+      missionId: "mission-grant-blind-test",
+      parentTaskId: "task-parent-1",
+      parentFlowId: implementationPassed.flow.flowId,
+      terminalSummary: "Phase 4 landed and passed tests.",
+      runId: "run-3333567890",
+      label: "Blind-test phase",
+    });
+
+    expect(formatTaskTerminalMessage(subordinateTask)).toBe(
+      "Background task local result ready for follow-through: Blind-test phase (run run-3333). Phase 4 landed and passed tests. Next executable unit must launch before this slice can truthfully pause or close. Broader build execution remains open.",
     );
   });
 

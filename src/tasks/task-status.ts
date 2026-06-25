@@ -153,8 +153,12 @@ export type TaskStatusSnapshot = {
   focus?: TaskRecord;
   visible: TaskRecord[];
   active: TaskRecord[];
+  running: TaskRecord[];
+  accepted: TaskRecord[];
   recentTerminal: TaskRecord[];
   activeCount: number;
+  runningCount: number;
+  acceptedCount: number;
   totalCount: number;
   recentFailureCount: number;
 };
@@ -166,6 +170,8 @@ export function buildTaskStatusSnapshot(
   const now = opts?.now ?? Date.now();
   const visibleCandidates = tasks.filter((task) => !isExpiredTask(task, now));
   const active = visibleCandidates.filter(isActiveTask);
+  const running = active.filter((task) => task.status === "running");
+  const accepted = active.filter((task) => task.status === "queued");
   const recentTerminal = visibleCandidates.filter((task) => isRecentTerminalTask(task, now));
   const visible = active.length > 0 ? [...active, ...recentTerminal] : recentTerminal;
   const focus =
@@ -175,8 +181,12 @@ export function buildTaskStatusSnapshot(
     focus,
     visible,
     active,
+    running,
+    accepted,
     recentTerminal,
     activeCount: active.length,
+    runningCount: running.length,
+    acceptedCount: accepted.length,
     totalCount: visible.length,
     recentFailureCount: recentTerminal.filter(isFailureTask).length,
   };

@@ -6,7 +6,15 @@ import {
   failTaskRunByRunId,
   startTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
-import { resolveRequiredCompletionTerminalResult } from "../../tasks/task-completion-contract.js";
+import {
+  resolveRequiredCompletionTerminalResult,
+  type RequiredCompletionTerminalResult,
+} from "../../tasks/task-completion-contract.js";
+import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "../../tasks/task-flow-runtime-internal.js";
+import { findLatestActiveMissionForOwnerKey } from "../../tasks/task-registry.js";
 import type { DeliveryContext } from "../../utils/delivery-context.js";
 import { AcpRuntimeError } from "../runtime/errors.js";
 import type { AcpSessionManagerDeps } from "./manager.types.js";
@@ -22,6 +30,8 @@ export type BackgroundTaskContext = {
   runId: string;
   label?: string;
   task: string;
+  parentFlowId?: string;
+  parentTaskId?: string;
 };
 
 export function summarizeBackgroundTaskText(text: string): string {
@@ -52,10 +62,9 @@ export function resolveBackgroundTaskFailureStatus(error: AcpRuntimeError): "fai
   return /\btimed out\b/i.test(error.message) ? "timed_out" : "failed";
 }
 
-export function resolveBackgroundTaskTerminalResult(progressSummary: string): {
-  terminalOutcome?: "blocked";
-  terminalSummary?: string;
-} {
+export function resolveBackgroundTaskTerminalResult(
+  progressSummary: string,
+): RequiredCompletionTerminalResult {
   const requiredCompletionResult = resolveRequiredCompletionTerminalResult(progressSummary);
   if (requiredCompletionResult.terminalOutcome) {
     return requiredCompletionResult;
@@ -107,6 +116,10 @@ export function resolveBackgroundTaskContext(params: {
     cfg: params.cfg,
     sessionKey: requesterSessionKey,
   })?.entry;
+  const activeMission = findLatestActiveMissionForOwnerKey(requesterSessionKey);
+  const parentFlowId = activeMission?.parentFlowId?.trim();
+  const linkedFlow = parentFlowId ? getTaskFlowById(parentFlowId) : undefined;
+  const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;
   return {
     requesterSessionKey,
     requesterOrigin: parentEntry?.deliveryContext ?? childEntry?.deliveryContext,
@@ -114,6 +127,10 @@ export function resolveBackgroundTaskContext(params: {
     runId: params.requestId,
     label: normalizeText(childEntry?.label),
     task: summarizeBackgroundTaskText(params.text),
+    ...(linkedContinuation?.activeProductionRun && parentFlowId ? { parentFlowId } : {}),
+    ...(linkedContinuation?.activeProductionRun && activeMission?.taskId?.trim()
+      ? { parentTaskId: activeMission.taskId.trim() }
+      : {}),
   };
 }
 
@@ -130,6 +147,8 @@ export function createBackgroundTaskRecord(
       requesterOrigin: context.requesterOrigin,
       childSessionKey: context.childSessionKey,
       runId: context.runId,
+      ...(context.parentFlowId ? { parentFlowId: context.parentFlowId } : {}),
+      ...(context.parentTaskId ? { parentTaskId: context.parentTaskId } : {}),
       label: context.label,
       task: context.task,
       startedAt,

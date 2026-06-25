@@ -38,9 +38,25 @@ describe("task status snapshot", () => {
     const snapshot = buildTaskStatusSnapshot([staleButActive], { now: NOW });
 
     expect(snapshot.activeCount).toBe(1);
+    expect(snapshot.runningCount).toBe(1);
+    expect(snapshot.acceptedCount).toBe(0);
     expect(snapshot.recentFailureCount).toBe(0);
     expect(snapshot.focus?.status).toBe("running");
     expect(snapshot.focus?.taskId).toBe("task-1");
+  });
+
+  it("separates queued accepted work from actively running work", () => {
+    const queued = makeTask({
+      status: "queued",
+      createdAt: NOW - 60_000,
+    });
+
+    const snapshot = buildTaskStatusSnapshot([queued], { now: NOW });
+
+    expect(snapshot.activeCount).toBe(1);
+    expect(snapshot.runningCount).toBe(0);
+    expect(snapshot.acceptedCount).toBe(1);
+    expect(snapshot.focus?.status).toBe("queued");
   });
 
   it("filters tasks whose cleanupAfter has expired", () => {

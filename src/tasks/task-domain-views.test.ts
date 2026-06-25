@@ -1,8 +1,4 @@
-import { describe, expect, it } from "vitest";
-
-import type { TaskFlowRecord } from "./task-flow-registry.types.js";
-import type { TaskRecord, TaskRegistrySummary } from "./task-registry.types.js";
-
+import { afterEach, describe, expect, it } from "vitest";
 import {
   mapTaskFlowDetail,
   mapTaskFlowView,
@@ -10,6 +6,12 @@ import {
   mapTaskRunDetail,
   mapTaskRunView,
 } from "./task-domain-views.js";
+import type { TaskFlowRecord } from "./task-flow-registry.types.js";
+import {
+  createManagedTaskFlow,
+  resetTaskFlowRegistryForTests,
+} from "./task-flow-runtime-internal.js";
+import type { TaskRecord, TaskRegistrySummary } from "./task-registry.types.js";
 
 function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {
@@ -68,6 +70,10 @@ function makeSummary(overrides: Partial<TaskRegistrySummary> = {}): TaskRegistry
 }
 
 describe("task domain view mappers", () => {
+  afterEach(() => {
+    resetTaskFlowRegistryForTests({ persist: false });
+  });
+
   it("maps task registry summaries without sharing mutable count objects", () => {
     const summary = makeSummary();
 
@@ -133,6 +139,66 @@ describe("task domain view mappers", () => {
       progressSummary: "Checking logs",
       terminalSummary: "Diagnostics failed",
       terminalOutcome: "blocked",
+      buildExecutionTruth: {
+        state: "blocked",
+        broaderBuildOpen: true,
+        proofSummary:
+          "Task reported a blocked terminal outcome, so the broader build remains open.",
+      },
+    });
+  });
+
+  it("surfaces shared build-execution truth on mapped task views", () => {
+    const running = mapTaskRunView(makeTask({ status: "running" }));
+    expect(running.buildExecutionTruth).toEqual({
+      state: "active_confirmed",
+      broaderBuildOpen: true,
+      proofSummary: "Task status is running, so this execution slice is actively running now.",
+    });
+
+    const reviewReady = mapTaskRunView(
+      makeTask({
+        status: "succeeded",
+        runtime: "acp",
+        childSessionKey: "agent:main:acp:child-2",
+      }),
+    );
+    expect(reviewReady.buildExecutionTruth).toEqual({
+      state: "paused_pending_parent_review",
+      broaderBuildOpen: true,
+      proofSummary:
+        "This task completed a local execution slice, but broader build execution remains open pending parent review.",
+    });
+  });
+
+  it("surfaces continuation-required truth for cli task views linked to an active production parent flow", () => {
+    const flow = createManagedTaskFlow({
+      ownerKey: "agent:main:main",
+      controllerId: "tests/gateway-cli-parent",
+      goal: "Continue the next bounded unit before idle",
+      status: "running",
+      continuation: {
+        activeProductionRun: true,
+        currentUnitStatus: "passed",
+        parentRunOpen: true,
+        continuationRequiredAfterLocalSuccess: true,
+      },
+    });
+
+    const linkedCliTask = mapTaskRunView(
+      makeTask({
+        runtime: "cli",
+        status: "succeeded",
+        parentFlowId: flow.flowId,
+        parentTaskId: "task-parent",
+      }),
+    );
+
+    expect(linkedCliTask.buildExecutionTruth).toEqual({
+      state: "continuation_required_after_local_success",
+      broaderBuildOpen: true,
+      proofSummary:
+        "This local execution slice passed, but active production continuation still requires the next executable unit to launch before pause or closeout.",
     });
   });
 
