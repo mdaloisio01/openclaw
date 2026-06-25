@@ -11,6 +11,12 @@ import {
   isSourceCheckoutRoot,
   pruneBundledPluginSourceNodeModules,
 } from "./postinstall-bundled-plugins.mjs";
+import {
+  restoreControlUiFromSnapshotIfMissing,
+  restoreRuntimeAssets,
+  snapshotRuntimeAssets,
+  validateRuntimeAssets,
+} from "./runtime-asset-guard.mjs";
 
 const logLevel = process.env.OPENCLAW_BUILD_VERBOSE ? "info" : "warn";
 const INEFFECTIVE_DYNAMIC_IMPORT_MARKER = "[INEFFECTIVE_DYNAMIC_IMPORT]";
@@ -20,6 +26,7 @@ const DEPENDENCY_PATH_MARKERS = ["node_modules/", "openclaw-pnpm-node-modules/"]
 const HASHED_ROOT_JS_RE = /^(?<base>.+)-[A-Za-z0-9_-]+\.js$/u;
 const DEFAULT_CAPTURE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_HEARTBEAT_MS = 30_000;
+const DEFAULT_TSDOWN_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_TSDOWN_MAX_OLD_SPACE_MB = 12288;
 const DEFAULT_WINDOWS_TSDOWN_MAX_OLD_SPACE_MB = 8192;
 const MIN_TSDOWN_MAX_OLD_SPACE_MB = 2048;
@@ -553,6 +560,7 @@ export function resolveTsdownBuildInvocation(params = {}) {
       options: {
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
+        detached: params.detached ?? (params.platform ?? process.platform) !== "win32",
         windowsVerbatimArguments: undefined,
         env,
       },
@@ -571,10 +579,84 @@ export function resolveTsdownBuildInvocation(params = {}) {
     options: {
       stdio: ["ignore", "pipe", "pipe"],
       shell: runner.shell,
+      detached: params.detached ?? (params.platform ?? process.platform) !== "win32",
       windowsVerbatimArguments: runner.windowsVerbatimArguments,
       env,
     },
   };
+}
+
+export function parseTsdownBuildProcessRows(text, params = {}) {
+  const currentPid = params.currentPid ?? process.pid;
+  const rows = [];
+  for (const line of String(text).split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const match = /^(?<pid>\d+)\s+(?<ppid>\d+)\s+(?<stat>\S+)\s+(?<command>.+)$/u.exec(trimmed);
+    if (!match?.groups) {
+      continue;
+    }
+    const pid = Number.parseInt(match.groups.pid, 10);
+    if (!Number.isFinite(pid) || pid === currentPid) {
+      continue;
+    }
+    const command = match.groups.command;
+    const startsWithNode = /^(?:\S*\/)?node(?:\s|$)/u.test(command);
+    const isWrapper = startsWithNode && command.includes("scripts/tsdown-build.mjs");
+    const isPnpmTsdown = startsWithNode && command.includes("pnpm exec tsdown");
+    const isDirectTsdown = startsWithNode && command.includes("node_modules/tsdown");
+    if (!isWrapper && !isPnpmTsdown && !isDirectTsdown) {
+      continue;
+    }
+    rows.push({
+      pid,
+      ppid: Number.parseInt(match.groups.ppid, 10),
+      stat: match.groups.stat,
+      command,
+      stopped: match.groups.stat.includes("T"),
+    });
+  }
+  return rows;
+}
+
+export function findTsdownBuildProcesses(params = {}) {
+  if ((params.platform ?? process.platform) === "win32") {
+    return [];
+  }
+  const result = spawnSync("ps", ["-eo", "pid=,ppid=,stat=,command="], {
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    return [];
+  }
+  return parseTsdownBuildProcessRows(result.stdout, params);
+}
+
+function formatTsdownBuildProcesses(processes) {
+  return processes
+    .map((entry) => `pid=${entry.pid} ppid=${entry.ppid} stat=${entry.stat} cmd=${entry.command}`)
+    .join("; ");
+}
+
+function terminateChildProcessTree(child, signal) {
+  if (!child.pid) {
+    return;
+  }
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-child.pid, signal);
+      return;
+    }
+  } catch {
+    // Fall back to killing the direct child below.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // The child may already be gone.
+  }
 }
 
 export async function runTsdownBuildInvocation(invocation, params = {}) {
@@ -582,7 +664,8 @@ export async function runTsdownBuildInvocation(invocation, params = {}) {
   const stderr = params.stderr ?? process.stderr;
   const env = params.env ?? process.env;
   const scanner = params.scanner ?? createTsdownOutputScanner();
-  const timeoutMs = parsePositiveInteger(env.OPENCLAW_TSDOWN_TIMEOUT_MS);
+  const timeoutMs =
+    parsePositiveInteger(env.OPENCLAW_TSDOWN_TIMEOUT_MS) ?? DEFAULT_TSDOWN_TIMEOUT_MS;
   const heartbeatMs =
     parseNonNegativeInteger(env.OPENCLAW_TSDOWN_HEARTBEAT_MS) ?? DEFAULT_HEARTBEAT_MS;
   let timedOut = false;
@@ -630,12 +713,14 @@ export async function runTsdownBuildInvocation(invocation, params = {}) {
     timeoutMs !== null
       ? setTimeout(() => {
           timedOut = true;
-          stderr.write(`[tsdown-build] timeout after ${timeoutMs}ms${pidText}; sending SIGTERM\n`);
-          child.kill("SIGTERM");
+          stderr.write(
+            `[tsdown-build] timeout after ${timeoutMs}ms${pidText}; sending SIGTERM to process tree\n`,
+          );
+          terminateChildProcessTree(child, "SIGTERM");
           setTimeout(() => {
             if (!settled) {
-              stderr.write(`[tsdown-build] forcing SIGKILL${pidText}\n`);
-              child.kill("SIGKILL");
+              stderr.write(`[tsdown-build] forcing SIGKILL for process tree${pidText}\n`);
+              terminateChildProcessTree(child, "SIGKILL");
             }
           }, TERMINATION_GRACE_MS).unref();
         }, timeoutMs).unref()
@@ -678,11 +763,69 @@ function isMainModule() {
   return import.meta.url === pathToFileURL(argv1).href;
 }
 
+function formatRuntimeAssetGuardFailure(result) {
+  const lines = [];
+  if (result.blocker) {
+    lines.push(`blocker=${result.blocker}`);
+  }
+  if (Array.isArray(result.missing) && result.missing.length > 0) {
+    lines.push(`missing=${result.missing.join(", ")}`);
+  }
+  if (result.rootMismatch) {
+    lines.push(
+      `operation=${result.rootMismatch.operation} root=${result.rootMismatch.rootDir} expected=${result.rootMismatch.expectedRoot}`,
+    );
+  }
+  const internalMissing = result.internalImports?.missing;
+  if (Array.isArray(internalMissing) && internalMissing.length > 0) {
+    for (const item of internalMissing) {
+      lines.push(
+        [
+          `operation=${item.operation}`,
+          `importer=${item.importerFile}`,
+          `specifier=${item.importSpecifier}`,
+          `missing=${item.missingTargetFile}`,
+        ].join(" "),
+      );
+    }
+  }
+  return lines.length > 0 ? lines.join("; ") : "unknown runtime asset guard failure";
+}
+
+function restoreRuntimeAfterRejectedBuild(reason) {
+  const restore = restoreRuntimeAssets({ requireUi: false, operation: "restore" });
+  if (!restore.ok) {
+    console.error(
+      `[tsdown-build] failed to restore last-known-good runtime after ${reason}: ${formatRuntimeAssetGuardFailure(
+        restore,
+      )}`,
+    );
+  }
+  return restore;
+}
+
 if (isMainModule()) {
   const args = parseTsdownBuildArgs(process.argv.slice(2));
   if (args.help) {
     console.log(tsdownBuildUsage());
     process.exit(0);
+  }
+  const staleBuildProcesses = findTsdownBuildProcesses();
+  if (staleBuildProcesses.length > 0) {
+    console.error(
+      `[tsdown-build] build_stale_process_detected: ${formatTsdownBuildProcesses(
+        staleBuildProcesses,
+      )}`,
+    );
+    process.exit(1);
+  }
+  const runtimeSnapshot = snapshotRuntimeAssets({ requireUi: false, operation: "snapshot" });
+  if (!runtimeSnapshot.ok) {
+    console.warn(
+      `[tsdown-build] active runtime snapshot skipped: ${formatRuntimeAssetGuardFailure(
+        runtimeSnapshot,
+      )}`,
+    );
   }
   pruneSourceCheckoutBundledPluginNodeModules();
   pruneUntrackedGeneratedSourceDeclarations();
@@ -692,6 +835,7 @@ if (isMainModule()) {
   const result = await runTsdownBuildInvocation(invocation);
 
   if (result.status === 0 && result.hasIneffectiveDynamicImport) {
+    restoreRuntimeAfterRejectedBuild("rejected build");
     console.error(
       "Build emitted [INEFFECTIVE_DYNAMIC_IMPORT]. Replace transparent runtime re-export facades with real runtime boundaries.",
     );
@@ -699,6 +843,7 @@ if (isMainModule()) {
   }
 
   if (result.status === 0 && result.fatalUnresolvedImport) {
+    restoreRuntimeAfterRejectedBuild("unresolved import");
     console.error(
       `Build emitted [UNRESOLVED_IMPORT] outside extensions: ${result.fatalUnresolvedImport}`,
     );
@@ -706,12 +851,49 @@ if (isMainModule()) {
   }
 
   if (result.timedOut) {
+    restoreRuntimeAfterRejectedBuild("timeout");
     process.exit(124);
   }
 
   if (typeof result.status === "number") {
+    if (result.status === 0) {
+      const uiRestore = restoreControlUiFromSnapshotIfMissing();
+      if (!uiRestore.ok) {
+        console.warn(
+          `[tsdown-build] control UI was not restored from last-known-good snapshot: ${
+            uiRestore.blocker ?? "unknown"
+          }`,
+        );
+      }
+      const postBuildValidation = validateRuntimeAssets({
+        requireUi: false,
+        operation: "build",
+      });
+      if (!postBuildValidation.ok) {
+        restoreRuntimeAfterRejectedBuild("runtime_internal_import_missing");
+        console.error(
+          `[tsdown-build] build output rejected by runtime asset guard: ${formatRuntimeAssetGuardFailure(
+            postBuildValidation,
+          )}`,
+        );
+        process.exit(1);
+      }
+      const snapshot = snapshotRuntimeAssets({ requireUi: false, operation: "snapshot" });
+      if (!snapshot.ok) {
+        restoreRuntimeAfterRejectedBuild("broken runtime snapshot");
+        console.error(
+          `[tsdown-build] runtime snapshot rejected by runtime asset guard: ${formatRuntimeAssetGuardFailure(
+            snapshot,
+          )}`,
+        );
+        process.exit(1);
+      }
+    } else {
+      restoreRuntimeAfterRejectedBuild("failed build");
+    }
     process.exit(result.status);
   }
 
+  restoreRuntimeAfterRejectedBuild("abnormal build exit");
   process.exit(1);
 }

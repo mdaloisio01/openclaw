@@ -8,6 +8,7 @@ import {
   createTsdownOutputScanner,
   listTsdownOutputRoots,
   parseTsdownBuildArgs,
+  parseTsdownBuildProcessRows,
   pruneSourceCheckoutBundledPluginNodeModules,
   pruneStaleRootChunkFiles,
   pruneUntrackedGeneratedSourceDeclarations,
@@ -58,6 +59,36 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(result.stdout).not.toContain("pnpm");
   });
 
+  it("detects stale tsdown build processes from ps output", () => {
+    const rows = parseTsdownBuildProcessRows(
+      [
+        "100 1 Tl /usr/bin/node scripts/tsdown-build.mjs",
+        "101 100 Tl /usr/bin/node /home/will/.local/share/pnpm/.tools/pnpm/11.2.2/bin/pnpm exec tsdown --config-loader unrun --logLevel warn --no-clean",
+        "102 1 S node unrelated.js",
+        "103 1 S rg tsdown-build.mjs",
+      ].join("\n"),
+      { currentPid: 999 },
+    );
+
+    expect(rows).toEqual([
+      {
+        pid: 100,
+        ppid: 1,
+        stat: "Tl",
+        command: "/usr/bin/node scripts/tsdown-build.mjs",
+        stopped: true,
+      },
+      {
+        pid: 101,
+        ppid: 100,
+        stat: "Tl",
+        command:
+          "/usr/bin/node /home/will/.local/share/pnpm/.tools/pnpm/11.2.2/bin/pnpm exec tsdown --config-loader unrun --logLevel warn --no-clean",
+        stopped: true,
+      },
+    ]);
+  });
+
   it("forwards explicit tsdown args after wrapper args are parsed", () => {
     const result = resolveTsdownBuildInvocation({
       args: ["--format", "esm"],
@@ -101,6 +132,7 @@ describe("resolveTsdownBuildInvocation", () => {
       options: {
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
+        detached: false,
         windowsVerbatimArguments: undefined,
         env: { NODE_OPTIONS: "--max-old-space-size=8192" },
       },
@@ -234,6 +266,7 @@ describe("resolveTsdownBuildInvocation", () => {
       options: {
         stdio: ["ignore", "pipe", "pipe"],
         shell: false,
+        detached: true,
         windowsVerbatimArguments: undefined,
         env: {
           NODE_OPTIONS: "--max-old-space-size=12288",
