@@ -1241,6 +1241,38 @@ describe("runCli exit behavior", () => {
     ]);
   });
 
+  it("loads and parses the real system primary command before Grant retirement execution", async () => {
+    const argv = [
+      "node",
+      "openclaw",
+      "system",
+      "grant",
+      "retirement-request",
+      "--workspace",
+      "/tmp/grant-proof",
+      "--outcome-code",
+      "rejected_proof_missing",
+      "--reason",
+      "capability_materially_fixed",
+      "--evidence",
+      "run-main proof",
+    ];
+    const parseAsync = vi.fn().mockResolvedValueOnce(undefined);
+    const program = {
+      commands: [{ name: () => "system", aliases: () => [] }],
+      parseAsync,
+    };
+    buildProgramMock.mockReturnValueOnce(program);
+    const ctx = { programVersion: "0.0.0-test" };
+    getProgramContextMock.mockReturnValueOnce(ctx as never);
+
+    await runCli(argv);
+
+    expect(registerCoreCliByNameMock.mock.calls).toEqual([[program, ctx, "system", argv]]);
+    expect(registerSubCliByNameMock.mock.calls).toEqual([[program, "system", argv]]);
+    expect(parseAsync).toHaveBeenCalledWith(argv);
+  });
+
   it("restores terminal state before uncaught CLI exits", async () => {
     buildProgramMock.mockReturnValueOnce({
       commands: [{ name: () => "status" }],

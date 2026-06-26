@@ -7,6 +7,7 @@ import { defaultRuntime } from "../runtime.js";
 import { formatCliCommand } from "./command-format.js";
 import type { GatewayRpcOpts } from "./gateway-rpc.js";
 import { addGatewayClientOptions, callGatewayFromCli } from "./gateway-rpc.js";
+import { createGrantRetirementRequest } from "./grant-retirement-request.js";
 
 type SystemEventOpts = GatewayRpcOpts & {
   text?: string;
@@ -15,6 +16,18 @@ type SystemEventOpts = GatewayRpcOpts & {
   json?: boolean;
 };
 type SystemGatewayOpts = GatewayRpcOpts & { json?: boolean };
+type SystemGrantRetirementRequestOpts = {
+  workspace?: string;
+  outcomeCode?: string;
+  reason?: string;
+  evidence?: string;
+  proofPath?: string[];
+  notes?: string;
+  requestedAt?: string;
+  approvedAt?: string;
+  dryRun?: boolean;
+  json?: boolean;
+};
 
 const normalizeWakeMode = (raw: unknown) => {
   const mode = normalizeOptionalString(raw) ?? "";
@@ -148,4 +161,50 @@ export function registerSystemCli(program: Command) {
       });
     });
   });
+
+  const grant = system.command("grant").description("Grant hardening tools");
+
+  grant
+    .command("retirement-request")
+    .description("Create and enqueue a Grant correction retirement request")
+    .requiredOption("--workspace <path>", "Workspace that owns the Grant retirement files")
+    .requiredOption("--outcome-code <code>", "Generated Grant correction outcome code to retire")
+    .requiredOption(
+      "--reason <reason>",
+      "Retirement reason (obsolete_rule|superseded_by_higher_quality_rule|false_positive_pattern|capability_materially_fixed)",
+    )
+    .option("--evidence <text>", "Plain-English retirement evidence")
+    .option("--proof-path <path...>", "Optional supporting proof path(s)")
+    .option("--notes <text>", "Optional operator note")
+    .option("--requested-at <iso>", "Optional request timestamp override")
+    .option("--approved-at <iso>", "Optional approval timestamp override")
+    .option("--dry-run", "Preview without writing files", false)
+    .option("--json", "Output JSON", false)
+    .action(async (opts: SystemGrantRetirementRequestOpts) => {
+      try {
+        const result = await createGrantRetirementRequest({
+          workspace: normalizeOptionalString(opts.workspace) ?? "",
+          outcomeCode: normalizeOptionalString(opts.outcomeCode) ?? "",
+          reason: normalizeOptionalString(opts.reason) ?? "",
+          evidence: opts.evidence,
+          proofPaths: opts.proofPath ?? [],
+          notes: opts.notes,
+          requestedAt: opts.requestedAt,
+          approvedAt: opts.approvedAt,
+          dryRun: opts.dryRun === true,
+        });
+        if (opts.json) {
+          defaultRuntime.writeJson(result);
+        } else {
+          defaultRuntime.log(`request: ${result.requestPath}`);
+          defaultRuntime.log(`queue: ${result.queuePath}`);
+          if (result.dryRun) {
+            defaultRuntime.log("dry-run");
+          }
+        }
+      } catch (err) {
+        defaultRuntime.error(danger(String(err)));
+        defaultRuntime.exit(1);
+      }
+    });
 }
