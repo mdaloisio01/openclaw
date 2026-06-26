@@ -9,6 +9,7 @@ import {
   getCompactionProvider,
   type CompactionProvider,
 } from "../../plugins/compaction-provider.js";
+import { buildActiveMissionContextBlockForOwnerKey } from "../../tasks/task-registry.js";
 import {
   buildHistoryPrunePlanWithWorker,
   computeAdaptiveChunkRatioWithWorker,
@@ -815,6 +816,19 @@ function extractLatestUserAsk(messages: AgentMessage[]): string | null {
   return null;
 }
 
+function buildActiveMissionSummaryLine(sessionKey?: string): string | null {
+  return sessionKey ? buildActiveMissionContextBlockForOwnerKey(sessionKey) : null;
+}
+
+function buildMissionAwareInstructions(params: {
+  structuredInstructions: string;
+  activeMissionSummary: string | null;
+}): string {
+  return params.activeMissionSummary
+    ? `${params.structuredInstructions}\n\nFor ## Active mission, restate this live mission exactly unless the target has changed:\n${params.activeMissionSummary}`
+    : `${params.structuredInstructions}\n\nFor ## Active mission, write None if no active mission is known.`;
+}
+
 /**
  * Read and format critical workspace context for compaction summary.
  * Uses explicitly configured AGENTS.md section names only.
@@ -879,6 +893,18 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
   api.on("session_before_compact", async (event, ctx) => {
     const { preparation, customInstructions: eventInstructions, signal } = event;
     const rawTurnPrefixMessages = preparation.turnPrefixMessages ?? [];
+    const runtime = getCompactionSafeguardRuntime(ctx.sessionManager);
+    const activeMissionSummary = buildActiveMissionSummaryLine(runtime?.sessionKey);
+    const customInstructions = resolveCompactionInstructions(
+      eventInstructions,
+      runtime?.customInstructions,
+    );
+    const summarizationInstructions = {
+      identifierPolicy: runtime?.identifierPolicy,
+      identifierInstructions: runtime?.identifierInstructions,
+    };
+    const identifierPolicy = runtime?.identifierPolicy ?? "strict";
+    const providerId = runtime?.provider;
     let baseMessagesToSummarize = stripRuntimeContextCustomMessages(
       preparation.messagesToSummarize,
     );
@@ -916,7 +942,11 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       log.info(
         "Compaction safeguard: no real conversation messages to summarize; writing compaction boundary to suppress re-trigger loop.",
       );
-      const fallbackSummary = buildStructuredFallbackSummary(preparation.previousSummary);
+      const fallbackSummary = buildStructuredFallbackSummary(
+        preparation.previousSummary,
+        summarizationInstructions,
+        activeMissionSummary,
+      );
       return {
         compaction: {
           summary: fallbackSummary,
@@ -935,17 +965,6 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
 
     // Model resolution: ctx.model is undefined in compact.ts workflow (extensionRunner.initialize() is never called).
     // Fall back to runtime.model which is explicitly passed when building extension paths.
-    const runtime = getCompactionSafeguardRuntime(ctx.sessionManager);
-    const customInstructions = resolveCompactionInstructions(
-      eventInstructions,
-      runtime?.customInstructions,
-    );
-    const summarizationInstructions = {
-      identifierPolicy: runtime?.identifierPolicy,
-      identifierInstructions: runtime?.identifierInstructions,
-    };
-    const identifierPolicy = runtime?.identifierPolicy ?? "strict";
-    const providerId = runtime?.provider;
     const turnPrefixMessages = baseTurnPrefixMessages;
     const recentTurnsPreserve = resolveRecentTurnsPreserve(runtime?.recentTurnsPreserve);
     const { preservedMessages: providerPreservedMessages } = splitPreservedRecentTurns({
@@ -960,6 +979,18 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       customInstructions,
       summarizationInstructions,
     );
+    const missionAwareInstructions = buildMissionAwareInstructions({
+      structuredInstructions,
+      activeMissionSummary,
+    });
+    const providerAllMessages = [...baseMessagesToSummarize, ...turnPrefixMessages];
+    const providerLatestUserAsk = extractLatestUserAsk(providerAllMessages);
+    const providerIdentifierSeedText = providerAllMessages
+      .slice(-10)
+      .map((message) => extractMessageText(message))
+      .filter(Boolean)
+      .join("\n");
+    const providerIdentifiers = extractOpaqueIdentifiers(providerIdentifierSeedText);
 
     // -----------------------------------------------------------------------
     // Provider path — one call with all messages, no LLM-specific prep.
@@ -975,37 +1006,50 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
           const providerResult = await tryProviderSummarize(compactionProvider, {
             messages: allMessages,
             signal,
-            customInstructions: structuredInstructions,
+            customInstructions: missionAwareInstructions,
             summarizationInstructions,
             previousSummary: preparation.previousSummary,
           });
 
           if (providerResult !== undefined) {
-            // Provider succeeded — assemble suffix metadata and return.
-            // No quality guard: the provider is trusted.
-            const workspaceContext = await readWorkspaceContextForSummary(
-              runtime?.postCompactionSections,
-              runtime?.workspaceDir,
-            );
-            const suffix = assembleSuffix({
-              splitTurnSection,
-              preservedTurnsSection,
-              toolFailureSection,
-              fileOpsSummary,
-              workspaceContext,
+            const providerQuality = auditSummaryQuality({
+              summary: providerResult,
+              identifiers: providerIdentifiers,
+              latestAsk: providerLatestUserAsk,
+              activeMission: activeMissionSummary,
+              identifierPolicy,
             });
-            const summary = capCompactionSummaryPreservingSuffix(providerResult, suffix);
-            return {
-              compaction: {
-                summary,
-                firstKeptEntryId: preparation.firstKeptEntryId,
-                tokensBefore: preparation.tokensBefore,
-                details: { readFiles, modifiedFiles },
-              },
-            };
+            if (!providerQuality.ok) {
+              log.warn(
+                `Compaction provider "${providerId}" failed summary quality checks (${providerQuality.reasons.join(", ")}); falling back to LLM.`,
+              );
+            } else {
+              // Provider succeeded — assemble suffix metadata and return.
+              const workspaceContext = await readWorkspaceContextForSummary(
+                runtime?.postCompactionSections,
+                runtime?.workspaceDir,
+              );
+              const suffix = assembleSuffix({
+                splitTurnSection,
+                preservedTurnsSection,
+                toolFailureSection,
+                fileOpsSummary,
+                workspaceContext,
+              });
+              const summary = capCompactionSummaryPreservingSuffix(providerResult, suffix);
+              return {
+                compaction: {
+                  summary,
+                  firstKeptEntryId: preparation.firstKeptEntryId,
+                  tokensBefore: preparation.tokensBefore,
+                  details: { readFiles, modifiedFiles },
+                },
+              };
+            }
+          } else {
+            // Provider returned empty — fall through to LLM path.
+            log.info("Compaction provider did not produce a result; falling back to LLM path.");
           }
-          // Provider returned empty — fall through to LLM path.
-          log.info("Compaction provider did not produce a result; falling back to LLM path.");
         } catch (err) {
           // tryProviderSummarize rethrows abort/timeout — if we reach here it is
           // an unexpected error from the assembly step. Fall through to LLM path.
@@ -1120,7 +1164,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   ),
                   maxChunkTokens: droppedMaxChunkTokens,
                   contextWindow: contextWindowTokens,
-                  customInstructions: structuredInstructions,
+                  customInstructions: missionAwareInstructions,
                   summarizationInstructions,
                   previousSummary: preparation.previousSummary,
                 });
@@ -1175,7 +1219,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
       let summary = "";
       let lastHistorySummary = "";
       let lastSplitTurnSection = "";
-      let currentInstructions = structuredInstructions;
+      let currentInstructions = missionAwareInstructions;
       const totalAttempts = qualityGuardEnabled ? qualityGuardMaxRetries + 1 : 1;
       let lastSuccessfulSummary: string | null = null;
 
@@ -1200,7 +1244,11 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
                   summarizationInstructions,
                   previousSummary: effectivePreviousSummary,
                 })
-              : buildStructuredFallbackSummary(effectivePreviousSummary, summarizationInstructions);
+              : buildStructuredFallbackSummary(
+                  effectivePreviousSummary,
+                  summarizationInstructions,
+                  activeMissionSummary,
+                );
 
           summaryWithoutPreservedTurns = historySummary;
           if (preparation.isSplitTurn && turnPrefixMessages.length > 0) {
@@ -1255,6 +1303,7 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
           summary: summaryWithoutPreservedTurns,
           identifiers,
           latestAsk: latestUserAsk,
+          activeMission: activeMissionSummary,
           identifierPolicy,
         });
         summary = summaryWithPreservedTurns;
@@ -1270,9 +1319,13 @@ export default function compactionSafeguardExtension(api: ExtensionAPI): void {
           "Quality check feedback",
           `Previous summary failed quality checks (${reasons}).`,
         );
-        currentInstructions = qualityFeedbackReasons
+        const retryStructuredInstructions = qualityFeedbackReasons
           ? `${structuredInstructions}\n\n${qualityFeedbackInstruction}\n\n${qualityFeedbackReasons}`
           : `${structuredInstructions}\n\n${qualityFeedbackInstruction}`;
+        currentInstructions = buildMissionAwareInstructions({
+          structuredInstructions: retryStructuredInstructions,
+          activeMissionSummary,
+        });
       }
 
       // Cap the main history body first, then append split-turn context, preserved

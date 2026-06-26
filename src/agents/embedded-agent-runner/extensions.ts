@@ -144,6 +144,7 @@ function buildContextPruningFactory(params: {
 export function buildEmbeddedExtensionFactories(params: {
   cfg: OpenClawConfig | undefined;
   sessionManager: SessionManager;
+  sessionKey?: string;
   workspaceDir?: string;
   provider: string;
   modelId: string;
@@ -162,6 +163,7 @@ export function buildEmbeddedExtensionFactories(params: {
       defaultTokens: DEFAULT_CONTEXT_TOKENS,
     });
     setCompactionSafeguardRuntime(params.sessionManager, {
+      sessionKey: params.sessionKey,
       maxHistoryShare: compactionCfg?.maxHistoryShare,
       contextWindowTokens: contextWindowInfo.tokens,
       identifierPolicy: compactionCfg?.identifierPolicy,

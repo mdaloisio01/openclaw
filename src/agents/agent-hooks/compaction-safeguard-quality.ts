@@ -12,6 +12,7 @@ const REQUIRED_SUMMARY_SECTIONS = [
   "## Decisions",
   "## Open TODOs",
   "## Constraints/Rules",
+  "## Active mission",
   "## Pending user asks",
   "## Exact identifiers",
 ] as const;
@@ -81,6 +82,23 @@ function normalizedSummaryLines(summary: string): string[] {
     .filter((line) => line.length > 0);
 }
 
+function extractSectionBody(summary: string, heading: string): string {
+  const lines = summary.split(/\r?\n/u);
+  const start = lines.findIndex((line) => line.trim() === heading);
+  if (start === -1) {
+    return "";
+  }
+  const body: string[] = [];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]?.trim() ?? "";
+    if (line.startsWith("## ")) {
+      break;
+    }
+    body.push(lines[index] ?? "");
+  }
+  return body.join("\n").trim();
+}
+
 function hasRequiredSummarySections(summary: string): boolean {
   const lines = normalizedSummaryLines(summary);
   let cursor = 0;
@@ -97,6 +115,7 @@ function hasRequiredSummarySections(summary: string): boolean {
 export function buildStructuredFallbackSummary(
   previousSummary: string | undefined,
   _summarizationInstructions?: CompactionSummarizationInstructions,
+  activeMission?: string | null,
 ): string {
   const trimmedPreviousSummary = previousSummary?.trim() ?? "";
   if (trimmedPreviousSummary && hasRequiredSummarySections(trimmedPreviousSummary)) {
@@ -112,6 +131,9 @@ export function buildStructuredFallbackSummary(
     "",
     "## Constraints/Rules",
     "None.",
+    "",
+    "## Active mission",
+    activeMission?.trim() || "None.",
     "",
     "## Pending user asks",
     "None.",
@@ -222,6 +244,7 @@ export function auditSummaryQuality(params: {
   summary: string;
   identifiers: string[];
   latestAsk: string | null;
+  activeMission?: string | null;
   identifierPolicy?: CompactionSummarizationInstructions["identifierPolicy"];
 }): { ok: boolean; reasons: string[] } {
   const reasons: string[] = [];
@@ -242,6 +265,10 @@ export function auditSummaryQuality(params: {
   }
   if (!hasAskOverlap(params.summary, params.latestAsk)) {
     reasons.push("latest_user_ask_not_reflected");
+  }
+  const activeMissionSection = extractSectionBody(params.summary, "## Active mission");
+  if (!hasAskOverlap(activeMissionSection, params.activeMission ?? null)) {
+    reasons.push("active_mission_not_reflected");
   }
   return { ok: reasons.length === 0, reasons };
 }

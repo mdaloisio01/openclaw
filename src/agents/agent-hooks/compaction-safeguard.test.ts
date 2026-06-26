@@ -10,6 +10,7 @@ import {
   clearCompactionProviders,
   registerCompactionProvider,
 } from "../../plugins/compaction-provider.js";
+import { createTaskRecord, resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import * as compactionModule from "../compaction.js";
 import { buildEmbeddedExtensionFactories } from "../embedded-agent-runner/extensions.js";
 import { castAgentMessage } from "../test-helpers/agent-message-fixtures.js";
@@ -60,11 +61,13 @@ const {
 
 beforeEach(() => {
   testing.setSummarizeInStagesForTest(mockSummarizeInStages);
+  resetTaskRegistryForTests({ persist: false });
 });
 
 afterEach(() => {
   testing.setSummarizeInStagesForTest();
   clearCompactionProviders();
+  resetTaskRegistryForTests({ persist: false });
 });
 
 function stubSessionManager(): ExtensionContext["sessionManager"] {
@@ -132,6 +135,8 @@ const createCompactionEvent = (params: { messageText: string; tokensBefore: numb
       edited: [],
       written: [],
     },
+    settings: { reserveTokens: 4_000 },
+    isSplitTurn: false,
   },
   customInstructions: "",
   signal: new AbortController().signal,
@@ -646,6 +651,35 @@ describe("compaction-safeguard runtime registry", () => {
     expect(resolveQualityGuardMaxRetries(runtime?.qualityGuardMaxRetries)).toBe(3);
     expect(resolveRecentTurnsPreserve(runtime?.recentTurnsPreserve)).toBe(12);
   });
+
+  it("threads sessionKey into safeguard runtime so compaction can recover the active mission", () => {
+    const sessionManager = {} as unknown as Parameters<
+      typeof buildEmbeddedExtensionFactories
+    >[0]["sessionManager"];
+    const cfg = {
+      agents: {
+        defaults: {
+          compaction: {
+            mode: "safeguard",
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    buildEmbeddedExtensionFactories({
+      cfg,
+      sessionManager,
+      sessionKey: "agent:main:webchat:self-repair",
+      provider: "anthropic",
+      modelId: "claude-3-opus",
+      model: {
+        contextWindow: 200_000,
+      } as Parameters<typeof buildEmbeddedExtensionFactories>[0]["model"],
+    });
+
+    const runtime = getCompactionSafeguardRuntime(sessionManager);
+    expect(runtime?.sessionKey).toBe("agent:main:webchat:self-repair");
+  });
 });
 
 describe("compaction-safeguard recent-turn preservation", () => {
@@ -918,6 +952,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
       "None.",
       "## Constraints/Rules",
       "Preserve identifiers.",
+      "## Active mission",
+      "None.",
       "## Pending user asks",
       "Explain post-compaction behavior.",
       "## Exact identifiers",
@@ -981,6 +1017,7 @@ describe("compaction-safeguard recent-turn preservation", () => {
       "missing_section:## Decisions",
       "missing_section:## Open TODOs",
       "missing_section:## Constraints/Rules",
+      "missing_section:## Active mission",
       "missing_section:## Pending user asks",
       "missing_section:## Exact identifiers",
       "missing_identifiers:abc12345",
@@ -996,6 +1033,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Keep policy.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "Need status.",
         "## Exact identifiers",
@@ -1018,6 +1057,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "No sensitive identifiers.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "Provide status.",
         "## Exact identifiers",
@@ -1040,6 +1081,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Follow custom policy.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "Share summary.",
         "## Exact identifiers",
@@ -1062,6 +1105,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Preserve hex IDs.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "Provide status.",
         "## Exact identifiers",
@@ -1084,6 +1129,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Preserve safety checks.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "No pending asks.",
         "## Exact identifiers",
@@ -1106,6 +1153,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Preserve safety checks.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "状态更新 pending.",
         "## Exact identifiers",
@@ -1127,6 +1176,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Follow policy.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "This is to track active asks.",
         "## Exact identifiers",
@@ -1149,6 +1200,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Follow policy.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "Password issue tracked.",
         "## Exact identifiers",
@@ -1162,6 +1215,38 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(quality.reasons).toContain("latest_user_ask_not_reflected");
   });
 
+  it("flags missing active mission reflection when mission truth is provided", () => {
+    const quality = auditSummaryQuality({
+      summary: [
+        "## Decisions",
+        "Keep current flow.",
+        "## Open TODOs",
+        "None.",
+        "## Constraints/Rules",
+        "Follow policy.",
+        "## Active mission",
+        "None.",
+        "## Pending user asks",
+        "Provide status.",
+        "## Exact identifiers",
+        "None.",
+      ].join("\n"),
+      identifiers: [],
+      latestAsk: "Provide status.",
+      activeMission: [
+        "<active_mission>",
+        "<mission_id>mission-self-repair</mission_id>",
+        "<mission_summary>Fix my own drift behavior</mission_summary>",
+        "<authority>task-registry</authority>",
+        "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+        "</active_mission>",
+      ].join("\n"),
+    });
+
+    expect(quality.ok).toBe(false);
+    expect(quality.reasons).toContain("active_mission_not_reflected");
+  });
+
   it("clamps quality-guard retries into a safe range", () => {
     expect(resolveQualityGuardMaxRetries(undefined)).toBe(1);
     expect(resolveQualityGuardMaxRetries(-1)).toBe(0);
@@ -1173,6 +1258,7 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(instructions).toContain("## Decisions");
     expect(instructions).toContain("## Open TODOs");
     expect(instructions).toContain("## Constraints/Rules");
+    expect(instructions).toContain("## Active mission");
     expect(instructions).toContain("## Pending user asks");
     expect(instructions).toContain("## Exact identifiers");
     expect(instructions).toContain("Keep security caveats.");
@@ -1222,9 +1308,31 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(summary).toContain("## Decisions");
     expect(summary).toContain("## Open TODOs");
     expect(summary).toContain("## Constraints/Rules");
+    expect(summary).toContain("## Active mission");
     expect(summary).toContain("## Pending user asks");
     expect(summary).toContain("## Exact identifiers");
     expect(summary).toContain("legacy summary without headings");
+  });
+
+  it("threads live active mission truth into fallback summaries", () => {
+    const summary = buildStructuredFallbackSummary(
+      "legacy summary without headings",
+      undefined,
+      [
+        "<active_mission>",
+        "<mission_id>mission-self-repair</mission_id>",
+        "<mission_summary>Fix my own drift behavior</mission_summary>",
+        "<authority>task-registry</authority>",
+        "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+        "</active_mission>",
+      ].join("\n"),
+    );
+    expect(summary).toContain("## Active mission");
+    expect(summary).toContain("<active_mission>");
+    expect(summary).toContain(
+      "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+    );
+    expect(summary).not.toContain("## Active mission\nNone.");
   });
 
   it("preserves an already-structured previous summary as-is", () => {
@@ -1237,6 +1345,9 @@ describe("compaction-safeguard recent-turn preservation", () => {
       "",
       "## Constraints/Rules",
       "rules",
+      "",
+      "## Active mission",
+      "None.",
       "",
       "## Pending user asks",
       "asks",
@@ -1271,6 +1382,9 @@ describe("compaction-safeguard recent-turn preservation", () => {
       "",
       "## Constraints/Rules",
       "rules",
+      "",
+      "## Active mission",
+      "None.",
       "",
       "## Pending user asks",
       "asks",
@@ -1494,6 +1608,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
           "None.",
           "## Constraints/Rules",
           "Follow rules.",
+          "## Active mission",
+          "None.",
           "## Pending user asks",
           "latest ask status",
           "## Exact identifiers",
@@ -1540,6 +1656,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
                   "## Open TODOs",
                   "from preserved turns",
                   "## Constraints/Rules",
+                  "from preserved turns",
+                  "## Active mission",
                   "from preserved turns",
                   "## Pending user asks",
                   "from preserved turns",
@@ -1592,6 +1710,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
           "None.",
           "## Constraints/Rules",
           "Follow rules.",
+          "## Active mission",
+          "None.",
           "## Pending user asks",
           "latest ask status",
           "## Exact identifiers",
@@ -1793,6 +1913,7 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(summary).toContain("## Decisions");
     expect(summary).toContain("## Open TODOs");
     expect(summary).toContain("## Constraints/Rules");
+    expect(summary).toContain("## Active mission");
     expect(summary).toContain("## Pending user asks");
     expect(summary).toContain("## Exact identifiers");
     expect(summary).toContain("legacy summary without headings");
@@ -1808,6 +1929,8 @@ describe("compaction-safeguard recent-turn preservation", () => {
         "None.",
         "## Constraints/Rules",
         "Preserve identifiers.",
+        "## Active mission",
+        "None.",
         "## Pending user asks",
         "latest ask status",
         "## Exact identifiers",
@@ -1865,7 +1988,29 @@ describe("compaction-safeguard recent-turn preservation", () => {
 
   it("passes compaction instructions to providers and preserves suffix context", async () => {
     mockSummarizeInStages.mockReset();
-    const providerSummarize = vi.fn().mockResolvedValue("provider summary body");
+    const providerSummarize = vi
+      .fn()
+      .mockResolvedValue(
+        [
+          "## Decisions",
+          "provider summary body",
+          "",
+          "## Open TODOs",
+          "None.",
+          "",
+          "## Constraints/Rules",
+          "Keep milestone names.",
+          "",
+          "## Active mission",
+          "None.",
+          "",
+          "## Pending user asks",
+          "latest ask status; prefix request that was split out",
+          "",
+          "## Exact identifiers",
+          "None captured.",
+        ].join("\n"),
+      );
     registerCompactionProvider({
       id: "test-provider",
       label: "Test Provider",
@@ -1936,6 +2081,87 @@ describe("compaction-safeguard recent-turn preservation", () => {
     expect(compaction.summary).toContain("## Recent turns preserved verbatim");
     expect(compaction.summary).toContain("latest ask status");
     expect(compaction.summary).toContain("latest assistant reply");
+  });
+
+  it("falls back to the LLM path when provider compaction fails mission-aware quality checks", async () => {
+    mockSummarizeInStages.mockReset();
+    mockSummarizeInStages.mockResolvedValue(
+      [
+        "## Decisions",
+        "llm summary body",
+        "",
+        "## Open TODOs",
+        "None.",
+        "",
+        "## Constraints/Rules",
+        "Follow policy.",
+        "",
+        "## Active mission",
+        "<active_mission>",
+        "<mission_id>mission-self-repair</mission_id>",
+        "<mission_summary>Fix my own drift behavior</mission_summary>",
+        "<authority>task-registry</authority>",
+        "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+        "</active_mission>",
+        "",
+        "## Pending user asks",
+        "latest ask status",
+        "",
+        "## Exact identifiers",
+        "None captured.",
+      ].join("\n"),
+    );
+    const providerSummarize = vi.fn().mockResolvedValue("provider summary body");
+    registerCompactionProvider({
+      id: "test-provider-invalid",
+      label: "Test Provider Invalid",
+      summarize: providerSummarize,
+    });
+
+    createTaskRecord({
+      runtime: "subagent",
+      ownerKey: "agent:main:webchat:self-repair",
+      requesterSessionKey: "agent:main:webchat:self-repair",
+      scopeKind: "session",
+      childSessionKey: "agent:main:webchat:self-repair",
+      runId: "run-self-repair-provider-fallback",
+      task: "Fix my own drift behavior",
+      missionId: "mission-self-repair",
+      missionSummary: "Fix my own drift behavior",
+      missionState: "active",
+      status: "running",
+      deliveryStatus: "pending",
+    });
+
+    const sessionManager = stubSessionManager();
+    setCompactionSafeguardRuntime(sessionManager, {
+      provider: "test-provider-invalid",
+      sessionKey: "agent:main:webchat:self-repair",
+      model: createAnthropicModelFixture(),
+    });
+
+    const event = createCompactionEvent({
+      messageText: "latest ask status",
+      tokensBefore: 1_500,
+    });
+
+    const { result, getApiKeyAndHeadersMock } = await runCompactionScenario({
+      sessionManager,
+      event,
+      apiKey: "sk-test",
+    });
+
+    const compaction = expectCompactionResult(result);
+    expect(providerSummarize).toHaveBeenCalledTimes(1);
+    expect(getApiKeyAndHeadersMock).toHaveBeenCalledTimes(1);
+    expect(compaction.summary).not.toContain("provider summary body");
+    expect(compaction.summary).toContain("## Active mission");
+    expect(compaction.summary).toContain("<active_mission>");
+    expect(compaction.summary).toContain(
+      "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+    );
+    expect(compaction.summary).toContain("## Recent turns preserved verbatim");
+    expect(compaction.summary).toContain("latest ask status");
   });
 });
 
@@ -2025,6 +2251,53 @@ describe("compaction-safeguard double-compaction guard", () => {
     expect(compaction.firstKeptEntryId).toBe("entry-1");
     expect(compaction.tokensBefore).toBe(1500);
     expect(getApiKeyAndHeadersMock).not.toHaveBeenCalled();
+  });
+
+  it("uses live mission truth in no-real-conversation fallback summaries", async () => {
+    createTaskRecord({
+      runtime: "subagent",
+      ownerKey: "agent:main:webchat:self-repair",
+      requesterSessionKey: "agent:main:webchat:self-repair",
+      scopeKind: "session",
+      childSessionKey: "agent:main:webchat:self-repair",
+      runId: "run-self-repair-fallback",
+      task: "Fix my own drift behavior",
+      missionId: "mission-self-repair",
+      missionSummary: "Fix my own drift behavior",
+      missionState: "active",
+      status: "running",
+      deliveryStatus: "pending",
+    });
+
+    const sessionManager = stubSessionManager();
+    const model = createAnthropicModelFixture();
+    setCompactionSafeguardRuntime(sessionManager, {
+      model,
+      sessionKey: "agent:main:webchat:self-repair",
+    });
+
+    const mockEvent = {
+      preparation: {
+        messagesToSummarize: [] as AgentMessage[],
+        turnPrefixMessages: [] as AgentMessage[],
+        firstKeptEntryId: "entry-1",
+        tokensBefore: 1500,
+        fileOps: { read: [], edited: [], written: [] },
+      },
+      customInstructions: "",
+      signal: new AbortController().signal,
+    };
+    const { result } = await runCompactionScenario({
+      sessionManager,
+      event: mockEvent,
+      apiKey: "sk-test",
+    });
+    const compaction = expectCompactionResult(result);
+    expect(compaction.summary).toContain("## Active mission");
+    expect(compaction.summary).toContain("<active_mission>");
+    expect(compaction.summary).toContain(
+      "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+    );
   });
 
   it("returns compaction result with structured fallback summary sections", async () => {
