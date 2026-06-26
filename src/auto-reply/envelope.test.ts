@@ -215,4 +215,20 @@ describe("formatInboundEnvelope", () => {
       userTimezone: "Europe/Vienna",
     });
   });
+
+  it("defaults envelope options to user timezone delivery when unset", () => {
+    const options = resolveEnvelopeFormatOptions({
+      agents: {
+        defaults: {
+          userTimezone: "America/Chicago",
+        },
+      },
+    });
+    expect(options).toEqual({
+      timezone: "user",
+      includeTimestamp: true,
+      includeElapsed: true,
+      userTimezone: "America/Chicago",
+    });
+  });
 });

@@ -69,7 +69,7 @@ function sanitizeEnvelopeHeaderPart(value: string): string {
 export function resolveEnvelopeFormatOptions(cfg?: OpenClawConfig): EnvelopeFormatOptions {
   const defaults = cfg?.agents?.defaults;
   return {
-    timezone: defaults?.envelopeTimezone,
+    timezone: defaults?.envelopeTimezone ?? "user",
     includeTimestamp: defaults?.envelopeTimestamp !== "off",
     includeElapsed: defaults?.envelopeElapsed !== "off",
     userTimezone: defaults?.userTimezone,
