@@ -172,6 +172,19 @@ type WatchdogReceiptRecord = {
   chat_delivery?: WatchdogChatDeliveryRecord;
 };
 
+type WatchdogChatDeliveryStateRecord = {
+  last_attempted_at: string;
+  last_delivered_at: string;
+  last_delivered_fingerprint?: string;
+  last_label?: unknown;
+  last_suspicious_count?: unknown;
+  last_recommendation_code?: unknown;
+  last_scan_source?: unknown;
+  last_receipt_path: string;
+  last_message_id?: string;
+  last_session_entry_id?: string;
+};
+
 type WatchdogDeliveryRecoveryResult =
   | { ok: true; status: "delivered" | "suppressed" | "already-delivered" | "not-needed" }
   | { ok: false; error: string };
@@ -532,7 +545,7 @@ function finalizeWatchdogChatDeliveryState(params: {
     (typeof params.delivery.attempted_at === "string" && params.delivery.attempted_at) ||
     (typeof params.receipt.checked_at === "string" && params.receipt.checked_at) ||
     new Date().toISOString();
-  const state = {
+  const state: WatchdogChatDeliveryStateRecord = {
     last_attempted_at: attemptedAt,
     last_delivered_at: attemptedAt,
     last_delivered_fingerprint: params.delivery.fingerprint,
