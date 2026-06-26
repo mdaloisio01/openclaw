@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { getTaskFlowById } from "../../tasks/task-flow-registry.js";
+import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "../../tasks/task-flow-registry.js";
 import { getTaskById } from "../../tasks/task-registry.js";
 import {
   installRuntimeTaskDeliveryMock,
@@ -135,5 +138,134 @@ describe("runtime TaskFlow", () => {
     }
     expect(summary.total).toBe(1);
     expect(summary.active).toBe(1);
+  });
+
+  it("returns guard_blocked when a blind-test slice tries to finish before implementation review passes", () => {
+    const runtime = createRuntimeTaskFlow();
+    const taskFlow = runtime.bindSession({
+      sessionKey: "agent:main:main",
+    });
+
+    const created = requireCreatedFlow(
+      taskFlow.createManaged({
+        controllerId: "governance/blind-test-slice",
+        goal: "Blind test Grant slice 1",
+        currentStep: "implementation_review_required",
+        stateJson: {
+          kind: "blind_test_slice",
+          sliceKey: "slice-1",
+          subjectAgent: "Grant",
+          draft: { verdict: "passed", reviewedAt: 100 },
+          implementation: { verdict: "pending" },
+        },
+      }),
+    );
+
+    const result = taskFlow.finish({
+      flowId: created.flowId,
+      expectedRevision: created.revision,
+      endedAt: 200,
+    });
+
+    expect(result).toMatchObject({
+      applied: false,
+      code: "guard_blocked",
+      current: {
+        flowId: created.flowId,
+        status: "queued",
+      },
+    });
+  });
+
+  it("blocks managed flow finish until the next executable unit launches in an active production run", () => {
+    const runtime = createRuntimeTaskFlow();
+    const taskFlow = runtime.bindSession({
+      sessionKey: "agent:main:main",
+    });
+
+    const created = requireCreatedFlow(
+      taskFlow.createManaged({
+        controllerId: "tests/runtime-taskflow",
+        goal: "Run bounded managed controller",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      }),
+    );
+
+    const blockedClose = taskFlow.finish({
+      flowId: created.flowId,
+      expectedRevision: created.revision,
+      endedAt: 200,
+    });
+    expect(blockedClose).toMatchObject({
+      applied: false,
+      code: "guard_blocked",
+      current: {
+        flowId: created.flowId,
+        status: "blocked",
+        currentStep: "continuation_launch_required",
+      },
+    });
+    if (blockedClose.applied || !blockedClose.current) {
+      throw new Error("Expected blocked managed finish snapshot");
+    }
+
+    const launched = taskFlow.recordNextExecutableLaunch({
+      flowId: created.flowId,
+      expectedRevision: blockedClose.current.revision,
+      detail: "Launch bounded unit 2",
+      currentStep: "bounded_unit_2_running",
+      updatedAt: 210,
+    });
+    expect(launched.applied).toBe(true);
+    if (!launched.applied) {
+      throw new Error("Expected next-launch mutation to apply");
+    }
+    expect(getTaskFlowProductionContinuation(launched.flow)?.nextExecutableUnitLaunched).toBe(true);
+
+    const closed = taskFlow.finish({
+      flowId: created.flowId,
+      expectedRevision: launched.flow.revision,
+      endedAt: 220,
+    });
+    expect(closed.applied).toBe(true);
+  });
+
+  it("allows runtime-managed lawful blocker state without pretending the flow can close", () => {
+    const runtime = createRuntimeTaskFlow();
+    const taskFlow = runtime.bindSession({
+      sessionKey: "agent:main:main",
+    });
+
+    const created = requireCreatedFlow(
+      taskFlow.createManaged({
+        controllerId: "tests/runtime-taskflow",
+        goal: "Wait on real blocker",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      }),
+    );
+
+    const blocked = taskFlow.recordLawfulStop({
+      flowId: created.flowId,
+      expectedRevision: created.revision,
+      reason: "blocker",
+      detail: "Approval token missing.",
+      currentStep: "approval_blocked",
+      updatedAt: 230,
+    });
+    expect(blocked.applied).toBe(true);
+    if (!blocked.applied) {
+      throw new Error("Expected lawful blocker mutation to apply");
+    }
+    expect(blocked.flow.status).toBe("blocked");
+    expect(getTaskFlowProductionContinuation(blocked.flow)?.lawfulStopReason).toBe("blocker");
+    expect(getTaskFlowById(created.flowId)?.currentStep).toBe("approval_blocked");
   });
 });

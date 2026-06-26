@@ -6,13 +6,18 @@ import {
 } from "./task-flow-registry.audit.js";
 import {
   deleteTaskFlowRecordById,
+  getTaskFlowProductionContinuation,
   getTaskFlowById,
   listTaskFlowRecords,
+  recordFlowLawfulStop,
   updateFlowRecordByIdExpectedRevision,
 } from "./task-flow-registry.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 
 const TASK_FLOW_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const ORPHAN_QUEUED_FLOW_STALE_MS = 30 * 60 * 1000;
+const ORPHAN_QUEUED_FLOW_SUMMARY =
+  "Managed queued TaskFlow aged past stale threshold without executor proof, linked task rows, or wait state.";
 
 export type TaskFlowRegistryMaintenanceSummary = {
   reconciled: number;
@@ -59,22 +64,78 @@ function shouldFinalizeCancelledFlow(flow: TaskFlowRecord): boolean {
   return !hasActiveLinkedTasks(flow.flowId);
 }
 
-function finalizeCancelledFlow(flow: TaskFlowRecord, now: number): boolean {
+function shouldFinalizeOrphanedQueuedFlow(flow: TaskFlowRecord, now: number): boolean {
+  if (flow.syncMode !== "managed" || flow.status !== "queued") {
+    return false;
+  }
+  if (flow.waitJson != null || flow.blockedTaskId?.trim() || flow.blockedSummary?.trim()) {
+    return false;
+  }
+  if (getTaskFlowProductionContinuation(flow)?.activeProductionRun === true) {
+    return false;
+  }
+  if (listTasksForFlowId(flow.flowId).length > 0) {
+    return false;
+  }
+  return now - resolveTerminalAt(flow) >= ORPHAN_QUEUED_FLOW_STALE_MS;
+}
+
+function finalizeOrphanedQueuedFlow(flow: TaskFlowRecord, now: number): boolean {
   let current = flow;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const endedAt = Math.max(now, current.updatedAt, current.cancelRequestedAt ?? now);
+    if (!shouldFinalizeOrphanedQueuedFlow(current, now)) {
+      return false;
+    }
+    const endedAt = Math.max(now, current.updatedAt, current.createdAt);
     const result = updateFlowRecordByIdExpectedRevision({
       flowId: current.flowId,
       expectedRevision: current.revision,
       patch: {
-        status: "cancelled",
+        status: "lost",
         blockedTaskId: null,
-        blockedSummary: null,
+        blockedSummary: ORPHAN_QUEUED_FLOW_SUMMARY,
         waitJson: null,
         endedAt,
         updatedAt: endedAt,
       },
     });
+    if (result.applied) {
+      return true;
+    }
+    if (result.reason === "not_found" || !result.current) {
+      return false;
+    }
+    current = result.current;
+  }
+  return false;
+}
+
+function finalizeCancelledFlow(flow: TaskFlowRecord, now: number): boolean {
+  let current = flow;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const endedAt = Math.max(now, current.updatedAt, current.cancelRequestedAt ?? now);
+    const result =
+      getTaskFlowProductionContinuation(current)?.activeProductionRun === true
+        ? recordFlowLawfulStop({
+            flowId: current.flowId,
+            expectedRevision: current.revision,
+            reason: "hard_stop",
+            status: "cancelled",
+            detail: "Managed flow cancellation completed after all child tasks settled.",
+            updatedAt: endedAt,
+          })
+        : updateFlowRecordByIdExpectedRevision({
+            flowId: current.flowId,
+            expectedRevision: current.revision,
+            patch: {
+              status: "cancelled",
+              blockedTaskId: null,
+              blockedSummary: null,
+              waitJson: null,
+              endedAt,
+              updatedAt: endedAt,
+            },
+          });
     if (result.applied) {
       return true;
     }
@@ -136,6 +197,10 @@ export function previewTaskFlowRegistryMaintenance(): TaskFlowRegistryMaintenanc
       reconciled += 1;
       continue;
     }
+    if (shouldFinalizeOrphanedQueuedFlow(flow, now)) {
+      reconciled += 1;
+      continue;
+    }
     if (shouldFinalizeCancelledFlow(flow)) {
       reconciled += 1;
       continue;
@@ -158,6 +223,12 @@ export async function runTaskFlowRegistryMaintenance(): Promise<TaskFlowRegistry
     }
     if (shouldRepairTerminalMirroredFlowTimestamp(current)) {
       if (repairTerminalMirroredFlowTimestamp(current)) {
+        reconciled += 1;
+      }
+      continue;
+    }
+    if (shouldFinalizeOrphanedQueuedFlow(current, now)) {
+      if (finalizeOrphanedQueuedFlow(current, now)) {
         reconciled += 1;
       }
       continue;

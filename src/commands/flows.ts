@@ -5,15 +5,22 @@ import { isRich, theme } from "../../packages/terminal-core/src/theme.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { info } from "../globals.js";
+import { runRuntimeAssetGuardPreflight } from "../infra/runtime-asset-guard-preflight.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
+import { evaluateProductionOwnerLaneGuard } from "../tasks/production-owner-lane-guard.js";
 import { listTasksForFlowId } from "../tasks/runtime-internal.js";
 import { cancelFlowById, getFlowTaskSummary } from "../tasks/task-executor.js";
+import type { ProductionContinuationStopReason } from "../tasks/task-flow-registry.js";
 import type { TaskFlowRecord, TaskFlowStatus } from "../tasks/task-flow-registry.types.js";
 import {
+  createManagedTaskFlow,
+  getTaskFlowProductionContinuation,
   getTaskFlowById,
   listTaskFlowRecords,
+  recordFlowLawfulStop,
   resolveTaskFlowForLookupToken,
+  resumeFlow,
 } from "../tasks/task-flow-runtime-internal.js";
 
 const ID_PAD = 10;
@@ -24,6 +31,11 @@ const CTRL_PAD = 20;
 
 function formatFlowLookupMiss(lookup: string): string {
   return `TaskFlow not found: ${lookup}. Run ${formatCliCommand("openclaw tasks flow list")} to see recent flow ids.`;
+}
+
+function failCommand(runtime: RuntimeEnv, message: string): void {
+  runtime.error(message);
+  runtime.exit(1);
 }
 
 function truncate(value: string, maxChars: number) {
@@ -42,6 +54,19 @@ function safeFlowDisplayText(value: string | undefined, maxChars?: number): stri
     return "n/a";
   }
   return typeof maxChars === "number" ? truncate(sanitized, maxChars) : sanitized;
+}
+
+function requireCliString(
+  value: string | undefined,
+  flag: string,
+  runtime: RuntimeEnv,
+): string | null {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    failCommand(runtime, `${flag} is required.`);
+    return null;
+  }
+  return normalized;
 }
 
 function shortToken(value: string | undefined, maxChars = ID_PAD): string {
@@ -266,4 +291,232 @@ export async function flowsCancelCommand(opts: { lookup: string }, runtime: Runt
   }
   const updated = getTaskFlowById(flow.flowId) ?? result.flow ?? flow;
   runtime.log(`Cancelled ${updated.flowId} (${updated.syncMode}) with status ${updated.status}.`);
+}
+
+export async function flowsStartProductionCommand(
+  opts: {
+    ownerKey?: string;
+    controllerId?: string;
+    goal?: string;
+    sliceId?: string;
+    sliceOwner?: string;
+    authorityPath?: string;
+    authorityBasis?: string;
+    buildItem?: string;
+    requiredOwnerLane?: string;
+    attemptedOwnerLane?: string;
+    attemptedExecutor?: string;
+    executorRole?: string;
+    lawfulRouteRequired?: string;
+    currentStep?: string;
+    blocker?: string[];
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const ownerKey = requireCliString(opts.ownerKey, "--owner-key", runtime);
+  const controllerId = requireCliString(opts.controllerId, "--controller-id", runtime);
+  const goal = requireCliString(opts.goal, "--goal", runtime);
+  const sliceId = requireCliString(opts.sliceId, "--slice-id", runtime);
+  const sliceOwner = requireCliString(opts.sliceOwner, "--slice-owner", runtime);
+  const authorityPath = requireCliString(opts.authorityPath, "--authority-path", runtime);
+  const authorityBasis = requireCliString(opts.authorityBasis, "--authority-basis", runtime);
+  const buildItem = requireCliString(opts.buildItem, "--build-item", runtime);
+  const requiredOwnerLane = requireCliString(
+    opts.requiredOwnerLane,
+    "--required-owner-lane",
+    runtime,
+  );
+  const attemptedOwnerLane = requireCliString(
+    opts.attemptedOwnerLane,
+    "--attempted-owner-lane",
+    runtime,
+  );
+  const attemptedExecutor = requireCliString(
+    opts.attemptedExecutor,
+    "--attempted-executor",
+    runtime,
+  );
+  const executorRole = requireCliString(opts.executorRole, "--executor-role", runtime);
+  const lawfulRouteRequired = requireCliString(
+    opts.lawfulRouteRequired,
+    "--lawful-route-required",
+    runtime,
+  );
+  if (
+    !ownerKey ||
+    !controllerId ||
+    !goal ||
+    !sliceId ||
+    !sliceOwner ||
+    !authorityPath ||
+    !authorityBasis ||
+    !buildItem ||
+    !requiredOwnerLane ||
+    !attemptedOwnerLane ||
+    !attemptedExecutor ||
+    !executorRole ||
+    !lawfulRouteRequired
+  ) {
+    return;
+  }
+  const ownerLaneGuard = evaluateProductionOwnerLaneGuard({
+    buildPlanRef: authorityPath,
+    buildItem,
+    requiredOwnerLane,
+    attemptedOwnerLane,
+    attemptedExecutor,
+    executorRole,
+    lawfulRouteRequired,
+  });
+  if (!ownerLaneGuard.allowed) {
+    failCommand(runtime, ownerLaneGuard.message);
+    return;
+  }
+
+  const now = Date.now();
+  const blockers = (opts.blocker ?? []).map((value) => value.trim()).filter(Boolean);
+  const flow = createManagedTaskFlow({
+    ownerKey,
+    controllerId,
+    goal,
+    status: "running",
+    notifyPolicy: "done_only",
+    currentStep: normalizeOptionalString(opts.currentStep) ?? "production_slice_started",
+    continuation: {
+      activeProductionRun: true,
+      parentRunOpen: true,
+    },
+    stateJson: {
+      kind: "production_taskflow_slice",
+      sliceId,
+      sliceOwner,
+      authorityPath,
+      authorityBasis,
+      buildItem,
+      requiredOwnerLane,
+      attemptedOwnerLane,
+      attemptedExecutor,
+      executorRole,
+      lawfulRouteRequired,
+      ownerLaneGuard: ownerLaneGuard.details,
+      blockers,
+    },
+    createdAt: now,
+    updatedAt: now,
+  });
+  if (!flow) {
+    failCommand(runtime, "Failed to create production TaskFlow.");
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, { flow });
+    return;
+  }
+  runtime.log(`Started production TaskFlow ${flow.flowId} (${sliceId}).`);
+}
+
+export async function flowsResumeProductionCommand(
+  opts: { lookup: string; currentStep?: string; json?: boolean },
+  runtime: RuntimeEnv,
+) {
+  const flow = resolveTaskFlowForLookupToken(opts.lookup);
+  if (!flow) {
+    failCommand(runtime, formatFlowLookupMiss(opts.lookup));
+    return;
+  }
+  if (flow.syncMode !== "managed") {
+    failCommand(runtime, `TaskFlow is not managed: ${flow.flowId}.`);
+    return;
+  }
+  const continuation = getTaskFlowProductionContinuation(flow);
+  if (!continuation?.activeProductionRun) {
+    failCommand(runtime, `TaskFlow is not an active-production flow: ${flow.flowId}.`);
+    return;
+  }
+  const runtimeGuard = runRuntimeAssetGuardPreflight({ operation: "production preflight" });
+  if (!runtimeGuard.ok) {
+    failCommand(
+      runtime,
+      `Production resume blocked by runtime asset guard: ${runtimeGuard.message}.`,
+    );
+    return;
+  }
+  const resumed = resumeFlow({
+    flowId: flow.flowId,
+    expectedRevision: flow.revision,
+    status: "running",
+    currentStep: normalizeOptionalString(opts.currentStep) ?? flow.currentStep,
+  });
+  if (!resumed.applied) {
+    failCommand(runtime, `Failed to resume production TaskFlow: ${resumed.reason}.`);
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, { flow: resumed.flow });
+    return;
+  }
+  runtime.log(`Resumed production TaskFlow ${resumed.flow.flowId}.`);
+}
+
+export async function flowsLawfulStopCommand(
+  opts: {
+    lookup: string;
+    reason?: ProductionContinuationStopReason;
+    detail?: string;
+    currentStep?: string;
+    finish?: boolean;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const flow = resolveTaskFlowForLookupToken(opts.lookup);
+  if (!flow) {
+    failCommand(runtime, formatFlowLookupMiss(opts.lookup));
+    return;
+  }
+  const reason = requireCliString(
+    opts.reason,
+    "--reason",
+    runtime,
+  ) as ProductionContinuationStopReason | null;
+  const detail = requireCliString(opts.detail, "--detail", runtime);
+  if (!reason || !detail) {
+    return;
+  }
+  const stopped = recordFlowLawfulStop({
+    flowId: flow.flowId,
+    expectedRevision: flow.revision,
+    reason,
+    detail,
+    currentStep: normalizeOptionalString(opts.currentStep) ?? flow.currentStep,
+  });
+  if (!stopped.applied) {
+    failCommand(runtime, `Failed to record lawful stop: ${stopped.reason}.`);
+    return;
+  }
+  let result = stopped.flow;
+  if (opts.finish) {
+    if (reason !== "whole_run_complete") {
+      failCommand(runtime, "--finish is only valid with --reason whole_run_complete.");
+      return;
+    }
+    const finished = await import("../tasks/task-flow-runtime-internal.js").then((module) =>
+      module.finishFlow({
+        flowId: stopped.flow.flowId,
+        expectedRevision: stopped.flow.revision,
+        currentStep: normalizeOptionalString(opts.currentStep) ?? stopped.flow.currentStep,
+      }),
+    );
+    if (!finished.applied) {
+      failCommand(runtime, `Failed to finish production TaskFlow: ${finished.reason}.`);
+      return;
+    }
+    result = finished.flow;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, { flow: result });
+    return;
+  }
+  runtime.log(`Recorded lawful stop for production TaskFlow ${result.flowId}: ${reason}.`);
 }

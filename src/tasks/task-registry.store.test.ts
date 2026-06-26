@@ -258,6 +258,38 @@ describe("task-registry store runtime", () => {
     );
   });
 
+  it("round-trips mission metadata through sqlite restore", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-task-store-mission-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const created = createTaskRecord({
+          runtime: "acp",
+          ownerKey: "agent:main:main",
+          scopeKind: "session",
+          childSessionKey: "agent:main:acp:mission",
+          runId: "run-mission-restore",
+          task: "Trace the blind-test hang path",
+          missionId: "mission-grant-blind-test",
+          missionSummary: "Fix the Grant blind-test hangup path",
+          missionState: "active",
+          missionUpdatedAt: 1234,
+          status: "running",
+          deliveryStatus: "pending",
+        });
+
+        const restored = loadTaskRegistryStateFromSqlite();
+        expect(restored.tasks.get(created.taskId)).toMatchObject({
+          taskId: created.taskId,
+          missionId: "mission-grant-blind-test",
+          missionSummary: "Fix the Grant blind-test hangup path",
+          missionState: "active",
+          missionUpdatedAt: 1234,
+        });
+      },
+    );
+  });
+
   it("emits incremental observer events for restore, mutation, and delete", () => {
     const events: TaskRegistryObserverEvent[] = [];
     configureTaskRegistryRuntime({

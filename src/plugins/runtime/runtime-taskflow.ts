@@ -14,6 +14,8 @@ import {
   createManagedTaskFlow,
   failFlow,
   finishFlow,
+  recordFlowLawfulStop,
+  recordFlowNextExecutableLaunch,
   type TaskFlowUpdateResult,
   requestFlowCancel,
   resumeFlow,
@@ -108,6 +110,7 @@ function createBoundTaskFlowRuntime(params: {
       goal: input.goal,
       currentStep: input.currentStep,
       stateJson: input.stateJson,
+      continuation: input.continuation,
       waitJson: input.waitJson,
       cancelRequestedAt: input.cancelRequestedAt,
       createdAt: input.createdAt,
@@ -220,6 +223,51 @@ function createBoundTaskFlowRuntime(params: {
           stateJson: input.stateJson,
           updatedAt: input.updatedAt,
           endedAt: input.endedAt,
+        }),
+      );
+    },
+    recordNextExecutableLaunch: (input) => {
+      const flow = resolveManagedFlowForOwner({
+        flowId: input.flowId,
+        ownerKey,
+      });
+      if (!flow.ok) {
+        return {
+          applied: false,
+          code: flow.code,
+          ...(flow.current ? { current: flow.current } : {}),
+        };
+      }
+      return mapFlowUpdateResult(
+        recordFlowNextExecutableLaunch({
+          flowId: flow.flow.flowId,
+          expectedRevision: input.expectedRevision,
+          detail: input.detail,
+          currentStep: input.currentStep,
+          updatedAt: input.updatedAt,
+        }),
+      );
+    },
+    recordLawfulStop: (input) => {
+      const flow = resolveManagedFlowForOwner({
+        flowId: input.flowId,
+        ownerKey,
+      });
+      if (!flow.ok) {
+        return {
+          applied: false,
+          code: flow.code,
+          ...(flow.current ? { current: flow.current } : {}),
+        };
+      }
+      return mapFlowUpdateResult(
+        recordFlowLawfulStop({
+          flowId: flow.flow.flowId,
+          expectedRevision: input.expectedRevision,
+          reason: input.reason,
+          detail: input.detail,
+          currentStep: input.currentStep,
+          updatedAt: input.updatedAt,
         }),
       );
     },

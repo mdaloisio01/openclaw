@@ -20,6 +20,9 @@ const mocks = vi.hoisted(() => ({
   flowsListCommand: vi.fn(),
   flowsShowCommand: vi.fn(),
   flowsCancelCommand: vi.fn(),
+  flowsStartProductionCommand: vi.fn(),
+  flowsResumeProductionCommand: vi.fn(),
+  flowsLawfulStopCommand: vi.fn(),
   setVerbose: vi.fn(),
   runtime: {
     log: vi.fn(),
@@ -45,6 +48,9 @@ const tasksCancelCommand = mocks.tasksCancelCommand;
 const flowsListCommand = mocks.flowsListCommand;
 const flowsShowCommand = mocks.flowsShowCommand;
 const flowsCancelCommand = mocks.flowsCancelCommand;
+const flowsStartProductionCommand = mocks.flowsStartProductionCommand;
+const flowsResumeProductionCommand = mocks.flowsResumeProductionCommand;
+const flowsLawfulStopCommand = mocks.flowsLawfulStopCommand;
 const setVerbose = mocks.setVerbose;
 const runtime = mocks.runtime;
 
@@ -116,6 +122,9 @@ vi.mock("../../commands/flows.js", () => ({
   flowsListCommand: mocks.flowsListCommand,
   flowsShowCommand: mocks.flowsShowCommand,
   flowsCancelCommand: mocks.flowsCancelCommand,
+  flowsStartProductionCommand: mocks.flowsStartProductionCommand,
+  flowsResumeProductionCommand: mocks.flowsResumeProductionCommand,
+  flowsLawfulStopCommand: mocks.flowsLawfulStopCommand,
 }));
 
 vi.mock("../../globals.js", () => ({
@@ -153,6 +162,9 @@ describe("registerStatusHealthSessionsCommands", () => {
     flowsListCommand.mockResolvedValue(undefined);
     flowsShowCommand.mockResolvedValue(undefined);
     flowsCancelCommand.mockResolvedValue(undefined);
+    flowsStartProductionCommand.mockResolvedValue(undefined);
+    flowsResumeProductionCommand.mockResolvedValue(undefined);
+    flowsLawfulStopCommand.mockResolvedValue(undefined);
   });
 
   it("runs status command with timeout and debug-derived verbose", async () => {
@@ -487,6 +499,88 @@ describe("registerStatusHealthSessionsCommands", () => {
     await runCli(["tasks", "flow", "cancel", "flow-123"]);
     expectCommandOptions(flowsCancelCommand, {
       lookup: "flow-123",
+    });
+  });
+
+  it("routes production TaskFlow lifecycle commands through guarded handlers", async () => {
+    await runCli([
+      "tasks",
+      "flow",
+      "start-production",
+      "--owner-key",
+      "agent:orchestrator:main",
+      "--controller-id",
+      "gie/authority-mirror-decision",
+      "--goal",
+      "GIE authority mirror decision",
+      "--slice-id",
+      "gie-authority-mirror-decision-2026-06-22T0236Z",
+      "--slice-owner",
+      "Will / Top-Level Governance",
+      "--authority-path",
+      "/tmp/authority.md",
+      "--authority-basis",
+      "controlling build-state interpretation",
+      "--build-item",
+      "GIE authority mirror decision",
+      "--required-owner-lane",
+      "Will / Top-Level Governance",
+      "--attempted-owner-lane",
+      "Will / Top-Level Governance",
+      "--attempted-executor",
+      "will-orchestrator",
+      "--executor-role",
+      "governance_decision",
+      "--lawful-route-required",
+      "Will / Top-Level Governance decision",
+      "--current-step",
+      "authority_decision",
+      "--blocker",
+      "department_registry_mirror_alignment",
+      "--blocker",
+      "blocking_authority_state",
+    ]);
+    expectCommandOptions(flowsStartProductionCommand, {
+      ownerKey: "agent:orchestrator:main",
+      controllerId: "gie/authority-mirror-decision",
+      goal: "GIE authority mirror decision",
+      sliceId: "gie-authority-mirror-decision-2026-06-22T0236Z",
+      sliceOwner: "Will / Top-Level Governance",
+      authorityPath: "/tmp/authority.md",
+      authorityBasis: "controlling build-state interpretation",
+      buildItem: "GIE authority mirror decision",
+      requiredOwnerLane: "Will / Top-Level Governance",
+      attemptedOwnerLane: "Will / Top-Level Governance",
+      attemptedExecutor: "will-orchestrator",
+      executorRole: "governance_decision",
+      lawfulRouteRequired: "Will / Top-Level Governance decision",
+      currentStep: "authority_decision",
+      blocker: ["department_registry_mirror_alignment", "blocking_authority_state"],
+    });
+
+    await runCli(["tasks", "flow", "resume-production", "flow-123", "--current-step", "resume"]);
+    expectCommandOptions(flowsResumeProductionCommand, {
+      lookup: "flow-123",
+      currentStep: "resume",
+    });
+
+    await runCli([
+      "tasks",
+      "flow",
+      "lawful-stop",
+      "flow-123",
+      "--reason",
+      "blocker",
+      "--detail",
+      "authority decision remains blocked",
+      "--current-step",
+      "blocked",
+    ]);
+    expectCommandOptions(flowsLawfulStopCommand, {
+      lookup: "flow-123",
+      reason: "blocker",
+      detail: "authority decision remains blocked",
+      currentStep: "blocked",
     });
   });
 

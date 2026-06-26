@@ -24,8 +24,11 @@ import {
 import { configureTaskFlowRegistryRuntime } from "./task-flow-registry.store.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import {
+  activateTaskMissionById,
   cancelTaskById,
   createTaskRecord as createTaskRecordOrNull,
+  findLatestActiveMissionForOwnerKey,
+  findLatestTaskForMissionId,
   findLatestTaskForOwnerKey,
   findLatestTaskForRelatedSessionKey,
   findTaskByRunId,
@@ -46,12 +49,15 @@ import {
   resetTaskRegistryControlRuntimeForTests,
   resetTaskRegistryDeliveryRuntimeForTests,
   resetTaskRegistryForTests,
+  resolveMissionBoundFollowupForOwner,
   resolveTaskForLookupToken,
+  setTaskMissionById,
   setTaskRegistryControlRuntimeForTests,
   setTaskRegistryDeliveryRuntimeForTests,
   setTaskProgressById,
   setTaskTimingById,
   updateTaskNotifyPolicyById,
+  listTasksForMissionId,
 } from "./task-registry.js";
 import {
   configureTaskRegistryMaintenance,
@@ -1226,7 +1232,9 @@ describe("task-registry", () => {
       );
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
       expect(peekSystemEvents("agent:main:main")).toEqual([
-        expect.stringContaining("Background task ready for review: ACP background task"),
+        expect.stringContaining(
+          "Background task local result ready for review: ACP background task",
+        ),
       ]);
     });
   });
@@ -1258,7 +1266,9 @@ describe("task-registry", () => {
 
         await waitForAssertion(() =>
           expect(peekSystemEvents("agent:main:main")).toEqual([
-            expect.stringContaining("Background task ready for review: ACP background task"),
+            expect.stringContaining(
+              "Background task local result ready for review: ACP background task",
+            ),
           ]),
         );
         expectRecordFields(requireTaskById(task.taskId), {
@@ -1273,7 +1283,9 @@ describe("task-registry", () => {
           deliveryStatus: "pending",
         });
         expect(peekSystemEvents("agent:main:main")).toEqual([
-          expect.stringContaining("Background task ready for review: ACP background task"),
+          expect.stringContaining(
+            "Background task local result ready for review: ACP background task",
+          ),
         ]);
         expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
       },
@@ -1414,7 +1426,9 @@ describe("task-registry", () => {
       });
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
       expect(peekSystemEvents(ownerKey)).toEqual([
-        expect.stringContaining("Background task ready for review: ACP background task"),
+        expect.stringContaining(
+          "Background task local result ready for review: ACP background task",
+        ),
       ]);
       expect(hasPendingHeartbeatWake()).toBe(true);
     });
@@ -1539,7 +1553,9 @@ describe("task-registry", () => {
       );
       const events = peekSystemEvents("agent:main:main");
       expect(events).toHaveLength(1);
-      expect(events[0]).toContain("Background task ready for review: ACP background task");
+      expect(events[0]).toContain(
+        "Background task local result ready for review: ACP background task",
+      );
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
     });
   });
@@ -1623,7 +1639,7 @@ describe("task-registry", () => {
         const events = peekSystemEvents("agent:main:main");
         expect(events).toHaveLength(1);
         expect(events[0]).toBe(
-          "Background task ready for review: ACP background task (run run-deta). Next: parent will review/verify before calling it done.",
+          "Background task local result ready for review: ACP background task (run run-deta). Broader build execution is paused pending parent review.",
         );
       });
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
@@ -1701,11 +1717,42 @@ describe("task-registry", () => {
         const events = peekSystemEvents("agent:main:main");
         expect(events).toHaveLength(1);
         expect(events[0]).toBe(
-          "Background task ready for review: ACP background task (run run-succ). Created /tmp/file.txt and verified contents. Next: parent will review/verify before calling it done.",
+          "Background task local result ready for review: ACP background task (run run-succ). Created /tmp/file.txt and verified contents. Broader build execution is paused pending parent review.",
         );
       });
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
       expect(hasPendingHeartbeatWake()).toBe(true);
+    });
+  });
+
+  it("uses scope-explicit wording when a subordinate slice completion reaches the parent session", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest();
+
+      createTaskRecord({
+        runtime: "acp",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:acp:child",
+        parentTaskId: "task-parent-1",
+        missionId: "mission-grant-blind-test",
+        missionSummary: "Fix the Grant blind-test hang path",
+        missionState: "subordinate",
+        runId: "run-slice-scope",
+        task: "Blind-test slice work",
+        status: "succeeded",
+        deliveryStatus: "pending",
+        terminalSummary: "Phase 4 landed and passed tests.",
+      });
+
+      await waitForAssertion(() => {
+        const events = peekSystemEvents("agent:main:main");
+        expect(events).toHaveLength(1);
+        expect(events[0]).toBe(
+          "Background task local result ready for review: ACP background task (run run-slic). Phase 4 landed and passed tests. Broader build execution is paused pending parent review.",
+        );
+      });
     });
   });
 
@@ -1791,7 +1838,7 @@ describe("task-registry", () => {
       expectRecordFields(requireTaskById(victimTask.taskId), {
         status: "running",
       });
-      expect(getTaskById(victimTask.taskId)).not.toHaveProperty("error");
+      expect(getTaskById(victimTask.taskId)?.error).toBeUndefined();
     });
   });
 
@@ -1848,7 +1895,9 @@ describe("task-registry", () => {
         deliveryStatus: "pending",
       });
       expect(peekSystemEvents("agent:main:main")).toEqual([
-        expect.stringContaining("Background task ready for review: ACP background task"),
+        expect.stringContaining(
+          "Background task local result ready for review: ACP background task",
+        ),
       ]);
     });
   });
@@ -2102,6 +2151,395 @@ describe("task-registry", () => {
       expect(findLatestTaskForRelatedSessionKey("agent:main:subagent:child-1")?.taskId).toBe(
         older.taskId,
       );
+    });
+  });
+
+  it("indexes active mission state separately from subordinate task work", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      const mission = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:mission",
+        runId: "run-active-mission",
+        label: "Grant blind test",
+        task: "Fix the blind-test hang path",
+        missionId: "mission-grant-blind-test",
+        missionSummary: "Fix the Grant blind-test hangup path",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      const subordinate = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:mission-child",
+        parentTaskId: mission.taskId,
+        runId: "run-active-mission-child",
+        label: "Grant blind test child",
+        task: "Trace task-registry and blind-test seams",
+        missionId: "mission-grant-blind-test",
+        missionSummary: "Fix the Grant blind-test hangup path",
+        missionState: "subordinate",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      expect(findLatestActiveMissionForOwnerKey("agent:main:main")).toMatchObject({
+        taskId: mission.taskId,
+        missionId: "mission-grant-blind-test",
+        missionSummary: "Fix the Grant blind-test hangup path",
+        missionState: "active",
+      });
+      expect(findLatestTaskForMissionId("mission-grant-blind-test")).toMatchObject({
+        taskId: subordinate.taskId,
+        missionState: "subordinate",
+      });
+      expect(listTasksForMissionId("mission-grant-blind-test").map((task) => task.taskId)).toEqual([
+        subordinate.taskId,
+        mission.taskId,
+      ]);
+    });
+  });
+
+  it("updates mission metadata on an existing task", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      const task = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:update-mission",
+        runId: "run-update-mission",
+        task: "Inspect the hang path",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const updated = setTaskMissionById({
+        taskId: task.taskId,
+        missionId: "mission-grant-blind-test",
+        missionSummary: "Fix the Grant blind-test hangup path",
+        missionState: "active",
+        missionUpdatedAt: 4321,
+      });
+
+      expect(updated).toMatchObject({
+        taskId: task.taskId,
+        missionId: "mission-grant-blind-test",
+        missionSummary: "Fix the Grant blind-test hangup path",
+        missionState: "active",
+        missionUpdatedAt: 4321,
+      });
+      expect(getTaskById(task.taskId)).toMatchObject({
+        missionId: "mission-grant-blind-test",
+        missionState: "active",
+      });
+    });
+  });
+
+  it("abandons the old active mission when a corrected target is activated", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      const oldMission = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:old-mission",
+        runId: "run-old-mission",
+        task: "Work the drifted mission",
+        missionId: "mission-old",
+        missionSummary: "Old drifted frame",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      const oldSubordinate = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:old-mission-child",
+        runId: "run-old-mission-child",
+        parentTaskId: oldMission.taskId,
+        task: "Old subordinate task",
+        missionId: "mission-old",
+        missionSummary: "Old drifted frame",
+        missionState: "subordinate",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      const newMission = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:new-mission",
+        runId: "run-new-mission",
+        task: "Work the corrected target",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const receipt = activateTaskMissionById({
+        taskId: newMission.taskId,
+        missionId: "mission-new",
+        missionSummary: "Corrected target",
+        missionUpdatedAt: 5555,
+      });
+
+      expect(receipt).toEqual({
+        ownerKey: "agent:main:main",
+        abandonedMissionId: "mission-old",
+        abandonedTaskIds: [oldSubordinate.taskId, oldMission.taskId],
+        activatedTaskId: newMission.taskId,
+        activatedMissionId: "mission-new",
+        activatedAt: 5555,
+      });
+      expect(findLatestActiveMissionForOwnerKey("agent:main:main")).toMatchObject({
+        taskId: newMission.taskId,
+        missionId: "mission-new",
+        missionState: "active",
+      });
+      expect(getTaskById(oldMission.taskId)).toMatchObject({
+        missionId: "mission-old",
+        missionState: "abandoned",
+        missionUpdatedAt: 5555,
+      });
+      expect(getTaskById(oldSubordinate.taskId)).toMatchObject({
+        missionId: "mission-old",
+        missionState: "abandoned",
+        missionUpdatedAt: 5555,
+      });
+    });
+  });
+
+  it("blocks abandoned mission progress as a visible blocked terminal outcome until explicit reactivation", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      const oldMission = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:block-old",
+        runId: "run-block-old",
+        task: "Old mission task",
+        missionId: "mission-old",
+        missionSummary: "Old mission",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      const newMission = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:block-new",
+        runId: "run-block-new",
+        task: "New mission task",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      expect(
+        activateTaskMissionById({
+          taskId: newMission.taskId,
+          missionId: "mission-new",
+          missionSummary: "New mission",
+          missionUpdatedAt: 6000,
+        }),
+      ).toBeTruthy();
+
+      expect(
+        recordTaskProgressByRunId({
+          runId: "run-block-old",
+          runtime: "subagent",
+          progressSummary: "Still marching on the wrong thing",
+          lastEventAt: 7000,
+        }),
+      ).toMatchObject([
+        {
+          taskId: oldMission.taskId,
+          missionState: "abandoned",
+          status: "succeeded",
+          terminalOutcome: "blocked",
+          progressSummary: "Still marching on the wrong thing",
+          terminalSummary:
+            'Progress arrived for abandoned mission "Old mission" after the target changed. Reactivate it explicitly before continuing.',
+        },
+      ]);
+      expect(
+        setTaskProgressById({
+          taskId: oldMission.taskId,
+          progressSummary: "Wrong mission manual progress",
+          lastEventAt: 7001,
+        }),
+      ).toMatchObject({
+        taskId: oldMission.taskId,
+        missionState: "abandoned",
+        status: "succeeded",
+        terminalOutcome: "blocked",
+        progressSummary: "Still marching on the wrong thing",
+      });
+      expect(getTaskById(oldMission.taskId)).toMatchObject({
+        taskId: oldMission.taskId,
+        missionState: "abandoned",
+        status: "succeeded",
+        terminalOutcome: "blocked",
+        progressSummary: "Still marching on the wrong thing",
+      });
+
+      expect(
+        activateTaskMissionById({
+          taskId: oldMission.taskId,
+          missionId: "mission-old",
+          missionSummary: "Old mission reactivated",
+          missionUpdatedAt: 8000,
+        }),
+      ).toBeTruthy();
+
+      const resumed = recordTaskProgressByRunId({
+        runId: "run-block-old",
+        runtime: "subagent",
+        progressSummary: "Explicitly reactivated",
+        lastEventAt: 8001,
+      });
+
+      expect(resumed[0]).toMatchObject({
+        taskId: oldMission.taskId,
+        missionId: "mission-old",
+        missionState: "active",
+        progressSummary: "Explicitly reactivated",
+      });
+    });
+  });
+
+  it("blocks abandoned mission completions even when they claim local success", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      const oldMission = createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:block-complete",
+        runId: "run-block-complete",
+        task: "Old mission task",
+        missionId: "mission-old",
+        missionSummary: "Old mission",
+        missionState: "abandoned",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      expect(
+        markTaskTerminalByRunId({
+          runId: "run-block-complete",
+          runtime: "subagent",
+          status: "succeeded",
+          endedAt: 9000,
+          lastEventAt: 9000,
+          progressSummary: "Phase 4 landed and passed tests.",
+          terminalSummary: "Phase 4 landed and passed tests.",
+        }),
+      ).toMatchObject([
+        {
+          taskId: oldMission.taskId,
+          missionState: "abandoned",
+          status: "succeeded",
+          terminalOutcome: "blocked",
+          progressSummary: "Phase 4 landed and passed tests.",
+          terminalSummary:
+            'Progress arrived for abandoned mission "Old mission" after the target changed. Reactivate it explicitly before continuing.',
+        },
+      ]);
+      expect(getTaskById(oldMission.taskId)).toMatchObject({
+        taskId: oldMission.taskId,
+        missionState: "abandoned",
+        status: "succeeded",
+        terminalOutcome: "blocked",
+        progressSummary: "Phase 4 landed and passed tests.",
+        terminalSummary:
+          'Progress arrived for abandoned mission "Old mission" after the target changed. Reactivate it explicitly before continuing.',
+      });
+    });
+  });
+
+  it("rebinds bare continue to the single active mission for an owner", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:active-followup",
+        runId: "run-active-followup",
+        task: "Fix the active hang path",
+        missionId: "mission-hang-fix",
+        missionSummary: "Fix the Grant blind-test hang path",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      expect(
+        resolveMissionBoundFollowupForOwner({
+          ownerKey: "agent:main:main",
+          text: "continue",
+        }),
+      ).toEqual({
+        status: "bound",
+        ownerKey: "agent:main:main",
+        missionId: "mission-hang-fix",
+        missionSummary: "Fix the Grant blind-test hang path",
+        activeTaskId: expect.any(String),
+        reboundText:
+          "Continue the active mission (mission-hang-fix): Fix the Grant blind-test hang path",
+      });
+    });
+  });
+
+  it("fails closed when followup text arrives after the active mission was abandoned", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:abandoned-followup",
+        runId: "run-abandoned-followup",
+        task: "Old mission task",
+        missionId: "mission-old",
+        missionSummary: "Old drifted frame",
+        missionState: "abandoned",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      expect(
+        resolveMissionBoundFollowupForOwner({
+          ownerKey: "agent:main:main",
+          text: "yes",
+        }),
+      ).toEqual({
+        status: "blocked",
+        ownerKey: "agent:main:main",
+        reason: "no_active_mission",
+        message:
+          "There is mission history for this owner but no single active mission, so I will not bind `continue` or `yes` to a stale frame. Re-state the exact task.",
+      });
     });
   });
 
@@ -3176,6 +3614,15 @@ describe("task-registry", () => {
           delivery_failed: 0,
           missing_cleanup: 0,
           inconsistent_timestamps: 0,
+          accepted_not_yet_proven_active_too_long: 0,
+          build_open_all_related_sessions_terminal: 0,
+          execution_truth_conflicts_with_status_text: 0,
+          open_build_no_active_owner: 0,
+          owner_readout_finished_no_followthrough: 0,
+          parent_continuity_violation: 0,
+          parent_review_state_without_active_executor: 0,
+          rework_follow_through_violation: 0,
+          routed_to_owner_not_proven_active: 0,
         },
       });
     });
@@ -3298,7 +3745,7 @@ describe("task-registry", () => {
 
       expect(hoisted.sendMessageMock).not.toHaveBeenCalled();
       expect(peekSystemEvents("agent:main:main")).toEqual([
-        "Background task ready for review: ACP background task (run run-quie). Next: parent will review/verify before calling it done.",
+        "Background task local result ready for review: ACP background task (run run-quie). Broader build execution is paused pending parent review.",
       ]);
       relay.dispose();
       vi.useRealTimers();

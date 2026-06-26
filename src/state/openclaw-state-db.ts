@@ -244,6 +244,10 @@ function ensureAdditiveStateColumns(db: DatabaseSync): void {
   ensureColumn(db, "cron_jobs", "runtime_updated_at_ms INTEGER");
   ensureColumn(db, "cron_jobs", "schedule_identity TEXT");
   ensureColumn(db, "cron_jobs", "sort_order INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "task_runs", "mission_id TEXT");
+  ensureColumn(db, "task_runs", "mission_summary TEXT");
+  ensureColumn(db, "task_runs", "mission_state TEXT");
+  ensureColumn(db, "task_runs", "mission_updated_at INTEGER");
 }
 
 function ensureSchema(db: DatabaseSync, pathname: string): void {

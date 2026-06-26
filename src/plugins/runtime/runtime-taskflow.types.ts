@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { ProductionContinuationState } from "../../tasks/task-flow-registry.js";
 import type { JsonValue, TaskFlowRecord } from "../../tasks/task-flow-registry.types.js";
 import type {
   TaskDeliveryState,
@@ -19,7 +20,8 @@ export type ManagedTaskFlowMutationErrorCode =
   | "not_found"
   | "not_managed"
   | "revision_conflict"
-  | "persist_failed";
+  | "persist_failed"
+  | "guard_blocked";
 
 export type ManagedTaskFlowMutationResult =
   | {
@@ -44,6 +46,7 @@ export type ManagedTaskFlowCreateParams = {
   createdAt?: number;
   updatedAt?: number;
   endedAt?: number | null;
+  continuation?: Partial<ProductionContinuationState>;
 };
 
 export type BoundTaskFlowTaskRunResult =
@@ -101,6 +104,21 @@ export type BoundTaskFlowRuntime = {
     stateJson?: JsonValue | null;
     updatedAt?: number;
     endedAt?: number;
+  }) => ManagedTaskFlowMutationResult;
+  recordNextExecutableLaunch: (params: {
+    flowId: string;
+    expectedRevision: number;
+    detail: string;
+    currentStep?: string | null;
+    updatedAt?: number;
+  }) => ManagedTaskFlowMutationResult;
+  recordLawfulStop: (params: {
+    flowId: string;
+    expectedRevision: number;
+    reason: NonNullable<ProductionContinuationState["lawfulStopReason"]>;
+    detail?: string | null;
+    currentStep?: string | null;
+    updatedAt?: number;
   }) => ManagedTaskFlowMutationResult;
   fail: (params: {
     flowId: string;

@@ -5,6 +5,7 @@ export type TaskRegistryProcessState = {
   taskDeliveryStates: Map<string, TaskDeliveryState>;
   taskIdsByRunId: Map<string, Set<string>>;
   taskIdsByOwnerKey: Map<string, Set<string>>;
+  taskIdsByMissionId: Map<string, Set<string>>;
   taskIdsByParentFlowId: Map<string, Set<string>>;
   taskIdsByRelatedSessionKey: Map<string, Set<string>>;
   tasksWithPendingDelivery: Set<string>;
@@ -21,6 +22,7 @@ export function getTaskRegistryProcessState(): TaskRegistryProcessState {
     taskDeliveryStates: new Map<string, TaskDeliveryState>(),
     taskIdsByRunId: new Map<string, Set<string>>(),
     taskIdsByOwnerKey: new Map<string, Set<string>>(),
+    taskIdsByMissionId: new Map<string, Set<string>>(),
     taskIdsByParentFlowId: new Map<string, Set<string>>(),
     taskIdsByRelatedSessionKey: new Map<string, Set<string>>(),
     tasksWithPendingDelivery: new Set<string>(),

@@ -88,8 +88,9 @@ export type TaskFlowUpdateResult =
     }
   | {
       applied: false;
-      reason: "not_found" | "revision_conflict" | "persist_failed";
+      reason: "not_found" | "revision_conflict" | "persist_failed" | "guard_blocked";
       current?: TaskFlowRecord;
+      blockedSummary?: string;
     };
 
 export type TaskFlowSyncResult =
@@ -103,11 +104,113 @@ export type TaskFlowSyncResult =
       current: TaskFlowRecord;
     };
 
+export const BLIND_TEST_SLICE_CONTROLLER_ID = "governance/blind-test-slice";
+
+export type ProductionContinuationStopReason =
+  | "blocker"
+  | "owner_decision"
+  | "restart_or_reload"
+  | "hard_stop"
+  | "safety_stop"
+  | "whole_run_complete";
+
+export type ProductionContinuationEventType =
+  | "ACTIVE_PRODUCTION_RUN_STARTED"
+  | "BOUNDED_UNIT_STARTED"
+  | "BOUNDED_UNIT_PASSED"
+  | "PARENT_RUN_STILL_OPEN"
+  | "BLOCKER_STATE_FALSE"
+  | "CONTINUATION_REQUIRED_AFTER_LOCAL_SUCCESS"
+  | "NEXT_EXECUTABLE_UNIT_IDENTIFIED"
+  | "NEXT_EXECUTABLE_UNIT_LAUNCHED"
+  | "PARENT_CONTINUITY_VIOLATION"
+  | "LAWFUL_STOP_ALLOWED";
+
+export type ProductionContinuationUnitStatus = "started" | "passed" | "blocked" | "completed";
+
+export type ProductionContinuationEvent = {
+  type: ProductionContinuationEventType;
+  at: number;
+  detail?: string;
+};
+
+export type ProductionContinuationState = {
+  activeProductionRun: boolean;
+  currentUnitStatus: ProductionContinuationUnitStatus;
+  parentRunOpen: boolean;
+  blockerPresent: boolean;
+  ownerDecisionRequired: boolean;
+  restartOrReloadRequired: boolean;
+  hardStopPresent: boolean;
+  safetyStopPresent: boolean;
+  lawfulWholeRunCompletion: boolean;
+  continuationRequiredAfterLocalSuccess: boolean;
+  nextExecutableUnitIdentified: boolean;
+  nextExecutableUnitLaunched: boolean;
+  continuationViolation: boolean;
+  lawfulStopReason?: ProductionContinuationStopReason;
+  events: ProductionContinuationEvent[];
+};
+
+type BlindTestStageVerdict = "pending" | "passed" | "failed";
+type BlindTestFailureStage = "draft" | "implementation" | "closeout";
+type BlindTestHandbackStatus = "required" | "issued" | "completed";
+
+type BlindTestStageState = {
+  verdict: BlindTestStageVerdict;
+  reviewedAt?: number;
+  summary?: string;
+};
+
+type BlindTestReworkState = {
+  owed: boolean;
+  stage: BlindTestFailureStage;
+  failCount: number;
+  handbackStatus: BlindTestHandbackStatus;
+  reviewedAt: number;
+  summary?: string;
+  outcomeCode?: string;
+  transferOwner?: "Will";
+};
+
+export type BlindTestSliceState = {
+  kind: "blind_test_slice";
+  sliceKey: string;
+  subjectAgent: string;
+  draft: BlindTestStageState;
+  implementation: BlindTestStageState;
+  rework?: BlindTestReworkState;
+  continuation?: ProductionContinuationState;
+};
+
+export type BlindTestSliceCreateResult =
+  | {
+      created: true;
+      flow: TaskFlowRecord;
+      previousFlow?: TaskFlowRecord;
+    }
+  | {
+      created: false;
+      reason: "previous_slice_not_found" | "previous_slice_not_complete" | "persist_failed";
+      current?: TaskFlowRecord;
+      blockedSummary: string;
+    };
+
+type ManagedControllerState = {
+  kind?: string;
+  productionContinuation?: ProductionContinuationState;
+  [key: string]: JsonValue | undefined;
+};
+
 function cloneStructuredValue<T>(value: T | undefined): T | undefined {
   if (value === undefined) {
     return undefined;
   }
   return structuredClone(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function cloneFlowRecord(record: TaskFlowRecord): TaskFlowRecord {
@@ -172,6 +275,481 @@ function ensureNotifyPolicy(notifyPolicy?: TaskNotifyPolicy): TaskNotifyPolicy {
 
 function normalizeJsonBlob(value: JsonValue | null | undefined): JsonValue | undefined {
   return value === undefined ? undefined : cloneStructuredValue(value);
+}
+
+function normalizeBlindTestStageState(value: unknown): BlindTestStageState | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const verdict =
+    value.verdict === "pending" || value.verdict === "passed" || value.verdict === "failed"
+      ? value.verdict
+      : null;
+  if (!verdict) {
+    return null;
+  }
+  return {
+    verdict,
+    ...(typeof value.reviewedAt === "number" ? { reviewedAt: value.reviewedAt } : {}),
+    ...(typeof value.summary === "string" && value.summary.trim()
+      ? { summary: value.summary.trim() }
+      : {}),
+  };
+}
+
+function normalizeBlindTestReworkState(value: unknown): BlindTestReworkState | null {
+  if (!isRecord(value) || value.owed !== true) {
+    return null;
+  }
+  const stage =
+    value.stage === "draft" || value.stage === "implementation" || value.stage === "closeout"
+      ? value.stage
+      : null;
+  const failCount =
+    typeof value.failCount === "number" && Number.isFinite(value.failCount)
+      ? Math.max(1, Math.trunc(value.failCount))
+      : null;
+  const handbackStatus =
+    value.handbackStatus === "required" ||
+    value.handbackStatus === "issued" ||
+    value.handbackStatus === "completed"
+      ? value.handbackStatus
+      : null;
+  const reviewedAt =
+    typeof value.reviewedAt === "number" && Number.isFinite(value.reviewedAt)
+      ? value.reviewedAt
+      : null;
+  if (!stage || !failCount || !handbackStatus || reviewedAt == null) {
+    return null;
+  }
+  return {
+    owed: true,
+    stage,
+    failCount,
+    handbackStatus,
+    reviewedAt,
+    ...(typeof value.summary === "string" && value.summary.trim()
+      ? { summary: value.summary.trim() }
+      : {}),
+    ...(typeof value.outcomeCode === "string" && value.outcomeCode.trim()
+      ? { outcomeCode: value.outcomeCode.trim() }
+      : {}),
+    ...(value.transferOwner === "Will" ? { transferOwner: "Will" as const } : {}),
+  };
+}
+
+function normalizeBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function normalizeProductionContinuationStopReason(
+  value: unknown,
+): ProductionContinuationStopReason | undefined {
+  return value === "blocker" ||
+    value === "owner_decision" ||
+    value === "restart_or_reload" ||
+    value === "hard_stop" ||
+    value === "safety_stop" ||
+    value === "whole_run_complete"
+    ? value
+    : undefined;
+}
+
+function normalizeProductionContinuationEventType(
+  value: unknown,
+): ProductionContinuationEventType | undefined {
+  return value === "ACTIVE_PRODUCTION_RUN_STARTED" ||
+    value === "BOUNDED_UNIT_STARTED" ||
+    value === "BOUNDED_UNIT_PASSED" ||
+    value === "PARENT_RUN_STILL_OPEN" ||
+    value === "BLOCKER_STATE_FALSE" ||
+    value === "CONTINUATION_REQUIRED_AFTER_LOCAL_SUCCESS" ||
+    value === "NEXT_EXECUTABLE_UNIT_IDENTIFIED" ||
+    value === "NEXT_EXECUTABLE_UNIT_LAUNCHED" ||
+    value === "PARENT_CONTINUITY_VIOLATION" ||
+    value === "LAWFUL_STOP_ALLOWED"
+    ? value
+    : undefined;
+}
+
+function normalizeProductionContinuationUnitStatus(
+  value: unknown,
+): ProductionContinuationUnitStatus | undefined {
+  return value === "started" || value === "passed" || value === "blocked" || value === "completed"
+    ? value
+    : undefined;
+}
+
+function normalizeProductionContinuationEvent(value: unknown): ProductionContinuationEvent | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const type = normalizeProductionContinuationEventType(value.type);
+  const at =
+    typeof value.at === "number" && Number.isFinite(value.at) ? Math.trunc(value.at) : undefined;
+  if (!type || at === undefined) {
+    return null;
+  }
+  return {
+    type,
+    at,
+    ...(typeof value.detail === "string" && value.detail.trim()
+      ? { detail: value.detail.trim() }
+      : {}),
+  };
+}
+
+function normalizeProductionContinuationState(value: unknown): ProductionContinuationState | null {
+  if (!isRecord(value) || normalizeBoolean(value.activeProductionRun) !== true) {
+    return null;
+  }
+  const currentUnitStatus = normalizeProductionContinuationUnitStatus(value.currentUnitStatus);
+  if (!currentUnitStatus) {
+    return null;
+  }
+  const events = Array.isArray(value.events)
+    ? value.events
+        .map((entry) => normalizeProductionContinuationEvent(entry))
+        .filter((entry): entry is ProductionContinuationEvent => Boolean(entry))
+    : [];
+  return {
+    activeProductionRun: true,
+    currentUnitStatus,
+    parentRunOpen: normalizeBoolean(value.parentRunOpen) ?? true,
+    blockerPresent: normalizeBoolean(value.blockerPresent) ?? false,
+    ownerDecisionRequired: normalizeBoolean(value.ownerDecisionRequired) ?? false,
+    restartOrReloadRequired: normalizeBoolean(value.restartOrReloadRequired) ?? false,
+    hardStopPresent: normalizeBoolean(value.hardStopPresent) ?? false,
+    safetyStopPresent: normalizeBoolean(value.safetyStopPresent) ?? false,
+    lawfulWholeRunCompletion: normalizeBoolean(value.lawfulWholeRunCompletion) ?? false,
+    continuationRequiredAfterLocalSuccess:
+      normalizeBoolean(value.continuationRequiredAfterLocalSuccess) ?? false,
+    nextExecutableUnitIdentified: normalizeBoolean(value.nextExecutableUnitIdentified) ?? false,
+    nextExecutableUnitLaunched: normalizeBoolean(value.nextExecutableUnitLaunched) ?? false,
+    continuationViolation: normalizeBoolean(value.continuationViolation) ?? false,
+    ...(normalizeProductionContinuationStopReason(value.lawfulStopReason)
+      ? { lawfulStopReason: normalizeProductionContinuationStopReason(value.lawfulStopReason)! }
+      : {}),
+    events,
+  };
+}
+
+function normalizeBlindTestSliceState(value: unknown): BlindTestSliceState | null {
+  if (!isRecord(value) || value.kind !== "blind_test_slice") {
+    return null;
+  }
+  const sliceKey = normalizeOptionalString(value.sliceKey);
+  const subjectAgent = normalizeOptionalString(value.subjectAgent);
+  const draft = normalizeBlindTestStageState(value.draft);
+  const implementation = normalizeBlindTestStageState(value.implementation);
+  const rework = normalizeBlindTestReworkState(value.rework);
+  const continuation = normalizeProductionContinuationState(value.continuation);
+  if (!sliceKey || !subjectAgent || !draft || !implementation) {
+    return null;
+  }
+  return {
+    kind: "blind_test_slice",
+    sliceKey,
+    subjectAgent,
+    draft,
+    implementation,
+    ...(rework ? { rework } : {}),
+    ...(continuation ? { continuation } : {}),
+  };
+}
+
+function createBlindTestSliceState(params: {
+  sliceKey: string;
+  subjectAgent: string;
+  createdAt?: number;
+  continuation?: Partial<ProductionContinuationState>;
+}): BlindTestSliceState {
+  const createdAt = params.createdAt ?? Date.now();
+  const continuation =
+    params.continuation?.activeProductionRun === true
+      ? createStartedProductionContinuationState({
+          continuation: params.continuation,
+          at: createdAt,
+        })
+      : undefined;
+  return {
+    kind: "blind_test_slice",
+    sliceKey: params.sliceKey,
+    subjectAgent: params.subjectAgent,
+    draft: { verdict: "pending" },
+    implementation: { verdict: "pending" },
+    ...(continuation ? { continuation } : {}),
+  };
+}
+
+function hasLawfulStopState(state: ProductionContinuationState | undefined): boolean {
+  if (!state?.activeProductionRun) {
+    return false;
+  }
+  return (
+    state.blockerPresent ||
+    state.ownerDecisionRequired ||
+    state.restartOrReloadRequired ||
+    state.hardStopPresent ||
+    state.safetyStopPresent ||
+    state.lawfulWholeRunCompletion
+  );
+}
+
+function appendContinuationEvent(
+  state: ProductionContinuationState,
+  type: ProductionContinuationEventType,
+  at: number,
+  detail?: string,
+): ProductionContinuationState {
+  return {
+    ...state,
+    events: [
+      ...state.events,
+      {
+        type,
+        at,
+        ...(detail?.trim() ? { detail: detail.trim() } : {}),
+      },
+    ],
+  };
+}
+
+function createProductionContinuationState(params: {
+  activeProductionRun: boolean;
+  currentUnitStatus: ProductionContinuationUnitStatus;
+  parentRunOpen?: boolean;
+  blockerPresent?: boolean;
+  ownerDecisionRequired?: boolean;
+  restartOrReloadRequired?: boolean;
+  hardStopPresent?: boolean;
+  safetyStopPresent?: boolean;
+  lawfulWholeRunCompletion?: boolean;
+  continuationRequiredAfterLocalSuccess?: boolean;
+  nextExecutableUnitIdentified?: boolean;
+  nextExecutableUnitLaunched?: boolean;
+  continuationViolation?: boolean;
+  lawfulStopReason?: ProductionContinuationStopReason;
+  at: number;
+}): ProductionContinuationState {
+  let state: ProductionContinuationState = {
+    activeProductionRun: true,
+    currentUnitStatus: params.currentUnitStatus,
+    parentRunOpen: params.parentRunOpen ?? true,
+    blockerPresent: params.blockerPresent ?? false,
+    ownerDecisionRequired: params.ownerDecisionRequired ?? false,
+    restartOrReloadRequired: params.restartOrReloadRequired ?? false,
+    hardStopPresent: params.hardStopPresent ?? false,
+    safetyStopPresent: params.safetyStopPresent ?? false,
+    lawfulWholeRunCompletion: params.lawfulWholeRunCompletion ?? false,
+    continuationRequiredAfterLocalSuccess: params.continuationRequiredAfterLocalSuccess ?? false,
+    nextExecutableUnitIdentified: params.nextExecutableUnitIdentified ?? false,
+    nextExecutableUnitLaunched: params.nextExecutableUnitLaunched ?? false,
+    continuationViolation: params.continuationViolation ?? false,
+    ...(params.lawfulStopReason ? { lawfulStopReason: params.lawfulStopReason } : {}),
+    events: [],
+  };
+  state = appendContinuationEvent(state, "ACTIVE_PRODUCTION_RUN_STARTED", params.at);
+  state = appendContinuationEvent(state, "BOUNDED_UNIT_STARTED", params.at);
+  return state;
+}
+
+function createStartedProductionContinuationState(params: {
+  continuation: Partial<ProductionContinuationState>;
+  at: number;
+}): ProductionContinuationState {
+  return createProductionContinuationState({
+    activeProductionRun: true,
+    currentUnitStatus: "started",
+    parentRunOpen: params.continuation.parentRunOpen ?? true,
+    blockerPresent: params.continuation.blockerPresent ?? false,
+    ownerDecisionRequired: params.continuation.ownerDecisionRequired ?? false,
+    restartOrReloadRequired: params.continuation.restartOrReloadRequired ?? false,
+    hardStopPresent: params.continuation.hardStopPresent ?? false,
+    safetyStopPresent: params.continuation.safetyStopPresent ?? false,
+    lawfulWholeRunCompletion: params.continuation.lawfulWholeRunCompletion ?? false,
+    continuationRequiredAfterLocalSuccess:
+      params.continuation.continuationRequiredAfterLocalSuccess ?? false,
+    nextExecutableUnitIdentified: params.continuation.nextExecutableUnitIdentified ?? false,
+    nextExecutableUnitLaunched: params.continuation.nextExecutableUnitLaunched ?? false,
+    continuationViolation: params.continuation.continuationViolation ?? false,
+    ...(params.continuation.lawfulStopReason
+      ? { lawfulStopReason: params.continuation.lawfulStopReason }
+      : {}),
+    at: params.at,
+  });
+}
+
+function updateContinuationAfterPass(
+  state: ProductionContinuationState | undefined,
+  at: number,
+): ProductionContinuationState | undefined {
+  if (!state?.activeProductionRun) {
+    return state;
+  }
+  let next: ProductionContinuationState = {
+    ...state,
+    currentUnitStatus: "passed",
+    continuationViolation: false,
+  };
+  next = appendContinuationEvent(next, "BOUNDED_UNIT_PASSED", at);
+  if (next.parentRunOpen) {
+    next = appendContinuationEvent(next, "PARENT_RUN_STILL_OPEN", at);
+  }
+  if (!hasLawfulStopState(next)) {
+    next = {
+      ...next,
+      continuationRequiredAfterLocalSuccess: true,
+    };
+    next = appendContinuationEvent(next, "BLOCKER_STATE_FALSE", at);
+    next = appendContinuationEvent(next, "CONTINUATION_REQUIRED_AFTER_LOCAL_SUCCESS", at);
+  } else {
+    next = {
+      ...next,
+      continuationRequiredAfterLocalSuccess: false,
+    };
+    next = appendContinuationEvent(next, "LAWFUL_STOP_ALLOWED", at, next.lawfulStopReason);
+  }
+  return next;
+}
+
+function updateContinuationAfterViolation(
+  state: ProductionContinuationState | undefined,
+  at: number,
+  detail: string,
+): ProductionContinuationState | undefined {
+  if (!state?.activeProductionRun) {
+    return state;
+  }
+  let next: ProductionContinuationState = {
+    ...state,
+    continuationViolation: true,
+  };
+  next = appendContinuationEvent(next, "PARENT_CONTINUITY_VIOLATION", at, detail);
+  return next;
+}
+
+function updateContinuationAfterNextLaunch(
+  state: ProductionContinuationState | undefined,
+  at: number,
+  detail: string,
+): ProductionContinuationState | undefined {
+  if (!state?.activeProductionRun) {
+    return state;
+  }
+  let next: ProductionContinuationState = {
+    ...state,
+    nextExecutableUnitIdentified: true,
+    nextExecutableUnitLaunched: true,
+    continuationViolation: false,
+  };
+  next = appendContinuationEvent(next, "NEXT_EXECUTABLE_UNIT_IDENTIFIED", at, detail);
+  next = appendContinuationEvent(next, "NEXT_EXECUTABLE_UNIT_LAUNCHED", at, detail);
+  return next;
+}
+
+function buildBlindTestReworkState(params: {
+  current: BlindTestSliceState;
+  stage: BlindTestFailureStage;
+  reviewedAt: number;
+  summary?: string | null;
+  outcomeCode?: string | null;
+}): BlindTestReworkState {
+  const previousCount = params.current.rework?.failCount ?? 0;
+  const failCount = previousCount + 1;
+  return {
+    owed: true,
+    stage: params.stage,
+    failCount,
+    handbackStatus: "required",
+    reviewedAt: params.reviewedAt,
+    ...(normalizeOptionalString(params.summary)
+      ? { summary: normalizeOptionalString(params.summary)! }
+      : {}),
+    ...(normalizeOptionalString(params.outcomeCode)
+      ? { outcomeCode: normalizeOptionalString(params.outcomeCode)! }
+      : {}),
+    ...(failCount >= 3 ? { transferOwner: "Will" as const } : {}),
+  };
+}
+
+function isBlindTestSliceFlow(flow: TaskFlowRecord): boolean {
+  return flow.syncMode === "managed" && flow.controllerId === BLIND_TEST_SLICE_CONTROLLER_ID;
+}
+
+function getBlindTestSliceState(flow: TaskFlowRecord): BlindTestSliceState | null {
+  return normalizeBlindTestSliceState(flow.stateJson);
+}
+
+function getManagedControllerState(flow: TaskFlowRecord): ManagedControllerState | null {
+  if (flow.syncMode !== "managed" || !isRecord(flow.stateJson)) {
+    return null;
+  }
+  return flow.stateJson as ManagedControllerState;
+}
+
+function attachProductionContinuationToStateJson(params: {
+  flow: TaskFlowRecord;
+  stateJson?: JsonValue | null;
+  continuation?: ProductionContinuationState;
+}): JsonValue | undefined {
+  const baseState = params.stateJson === undefined ? params.flow.stateJson : params.stateJson;
+  if (isBlindTestSliceFlow(params.flow)) {
+    const blindState =
+      (baseState !== undefined ? normalizeBlindTestSliceState(baseState) : null) ??
+      getBlindTestSliceState(params.flow);
+    if (!blindState) {
+      return normalizeJsonBlob(baseState);
+    }
+    return {
+      ...blindState,
+      ...(params.continuation ? { continuation: params.continuation } : {}),
+    };
+  }
+  if (isRecord(baseState)) {
+    return {
+      ...cloneStructuredValue(baseState),
+      ...(params.continuation ? { productionContinuation: params.continuation } : {}),
+    };
+  }
+  if (!params.continuation) {
+    return normalizeJsonBlob(baseState);
+  }
+  return {
+    kind: "managed_controller_state",
+    productionContinuation: params.continuation,
+  };
+}
+
+export function getBlindTestProductionContinuation(
+  flow: TaskFlowRecord,
+): ProductionContinuationState | null {
+  return getBlindTestSliceState(flow)?.continuation ?? null;
+}
+
+export function getTaskFlowProductionContinuation(
+  flow: TaskFlowRecord,
+): ProductionContinuationState | null {
+  if (isBlindTestSliceFlow(flow)) {
+    return getBlindTestProductionContinuation(flow);
+  }
+  const managedState = getManagedControllerState(flow);
+  if (!managedState) {
+    return null;
+  }
+  return normalizeProductionContinuationState(managedState.productionContinuation);
+}
+
+function buildGuardBlockedResult(
+  current: TaskFlowRecord,
+  blockedSummary: string,
+): TaskFlowUpdateResult {
+  return {
+    applied: false,
+    reason: "guard_blocked",
+    current: cloneFlowRecord(current),
+    blockedSummary,
+  };
 }
 
 function assertFlowOwnerKey(ownerKey: string): string {
@@ -437,13 +1015,184 @@ export function createFlowRecord(params: CreateFlowRecordParams): TaskFlowRecord
 export function createManagedTaskFlow(
   params: FlowRecordCreateFields & {
     controllerId: string;
+    continuation?: Partial<ProductionContinuationState>;
   },
 ): TaskFlowRecord | null {
+  const createdAt = params.createdAt ?? Date.now();
+  const continuation =
+    params.continuation?.activeProductionRun === true
+      ? createStartedProductionContinuationState({
+          continuation: params.continuation,
+          at: createdAt,
+        })
+      : undefined;
+  const flowPreview = {
+    syncMode: "managed",
+    controllerId: params.controllerId,
+    stateJson: params.stateJson,
+  } as TaskFlowRecord;
   return createFlowRecord({
     ...params,
     syncMode: "managed",
     controllerId: assertControllerId(params.controllerId),
+    stateJson: attachProductionContinuationToStateJson({
+      flow: flowPreview,
+      stateJson: params.stateJson,
+      continuation,
+    }),
+    createdAt,
   });
+}
+
+export function createBlindTestSliceFlow(params: {
+  ownerKey: string;
+  requesterOrigin?: TaskFlowRecord["requesterOrigin"];
+  notifyPolicy?: TaskNotifyPolicy;
+  goal: string;
+  sliceKey: string;
+  subjectAgent: string;
+  createdAt?: number;
+  updatedAt?: number;
+  continuation?: Partial<ProductionContinuationState>;
+}): TaskFlowRecord | null {
+  return createManagedTaskFlow({
+    ownerKey: params.ownerKey,
+    requesterOrigin: params.requesterOrigin,
+    controllerId: BLIND_TEST_SLICE_CONTROLLER_ID,
+    notifyPolicy: params.notifyPolicy,
+    status: "running",
+    goal: params.goal,
+    currentStep: "draft_review_required",
+    stateJson: createBlindTestSliceState({
+      sliceKey: params.sliceKey,
+      subjectAgent: params.subjectAgent,
+      createdAt: params.createdAt,
+      continuation: params.continuation,
+    }),
+    createdAt: params.createdAt,
+    updatedAt: params.updatedAt,
+  });
+}
+
+export function createNextBlindTestSliceFlow(params: {
+  previousFlowId: string;
+  expectedPreviousRevision: number;
+  goal: string;
+  sliceKey: string;
+  subjectAgent: string;
+  createdAt?: number;
+  updatedAt?: number;
+}): BlindTestSliceCreateResult {
+  const previous = getTaskFlowById(params.previousFlowId);
+  if (!previous || !isBlindTestSliceFlow(previous)) {
+    return {
+      created: false,
+      reason: "previous_slice_not_found",
+      blockedSummary: "Previous blind-test slice was not found.",
+    };
+  }
+  if (previous.revision !== params.expectedPreviousRevision) {
+    return {
+      created: false,
+      reason: "previous_slice_not_complete",
+      current: previous,
+      blockedSummary: "Previous blind-test slice changed before the next slice could start.",
+    };
+  }
+  const previousState = getBlindTestSliceState(previous);
+  const continuationAllowsPreCloseLaunch =
+    previousState?.continuation?.continuationRequiredAfterLocalSuccess === true &&
+    previousState.implementation.verdict === "passed";
+  if (
+    !previousState ||
+    previousState.implementation.verdict !== "passed" ||
+    (previous.status !== "succeeded" && !continuationAllowsPreCloseLaunch)
+  ) {
+    return {
+      created: false,
+      reason: "previous_slice_not_complete",
+      current: previous,
+      blockedSummary:
+        "Next blind-test slice cannot start until the prior slice has a passing implementation review and is closed successfully.",
+    };
+  }
+  let previousRevision = params.expectedPreviousRevision;
+  let requesterOrigin = previous.requesterOrigin;
+  let notifyPolicy = previous.notifyPolicy;
+  let ownerKey = previous.ownerKey;
+  if (
+    continuationAllowsPreCloseLaunch &&
+    previousState.continuation?.nextExecutableUnitLaunched !== true
+  ) {
+    const launchedAt = params.updatedAt ?? params.createdAt ?? Date.now();
+    const launchedContinuation = updateContinuationAfterNextLaunch(
+      previousState.continuation,
+      launchedAt,
+      `Launch blind-test slice ${params.sliceKey}`,
+    );
+    const updatedPrevious = updateFlowRecordByIdExpectedRevision({
+      flowId: previous.flowId,
+      expectedRevision: params.expectedPreviousRevision,
+      patch: {
+        status: "running",
+        currentStep: "next_executable_unit_launched_ready_for_closeout",
+        stateJson: {
+          ...previousState,
+          ...(launchedContinuation ? { continuation: launchedContinuation } : {}),
+        },
+        blockedSummary: null,
+        updatedAt: launchedAt,
+      },
+    });
+    if (!updatedPrevious.applied) {
+      return {
+        created: false,
+        reason:
+          updatedPrevious.reason === "persist_failed"
+            ? "persist_failed"
+            : "previous_slice_not_complete",
+        ...(updatedPrevious.current ? { current: updatedPrevious.current } : {}),
+        blockedSummary:
+          updatedPrevious.blockedSummary ??
+          "Previous blind-test slice changed before the next slice could start.",
+      };
+    }
+    previousRevision = updatedPrevious.flow.revision;
+    requesterOrigin = updatedPrevious.flow.requesterOrigin;
+    notifyPolicy = updatedPrevious.flow.notifyPolicy;
+    ownerKey = updatedPrevious.flow.ownerKey;
+  }
+  const flow = createBlindTestSliceFlow({
+    ownerKey,
+    requesterOrigin,
+    notifyPolicy,
+    goal: params.goal,
+    sliceKey: params.sliceKey,
+    subjectAgent: params.subjectAgent,
+    createdAt: params.createdAt,
+    updatedAt: params.updatedAt,
+    continuation:
+      previousState.continuation?.activeProductionRun === true
+        ? {
+            activeProductionRun: true,
+            parentRunOpen: previousState.continuation.parentRunOpen,
+          }
+        : undefined,
+  });
+  if (!flow) {
+    return {
+      created: false,
+      reason: "persist_failed",
+      blockedSummary: "Blind-test slice persistence failed.",
+    };
+  }
+  return {
+    created: true,
+    flow,
+    ...(previousRevision !== params.expectedPreviousRevision
+      ? { previousFlow: getTaskFlowById(params.previousFlowId) ?? undefined }
+      : {}),
+  };
 }
 
 export function createTaskFlowForTask(params: {
@@ -586,6 +1335,222 @@ export function resumeFlow(params: {
   });
 }
 
+export function recordBlindTestDraftReview(params: {
+  flowId: string;
+  expectedRevision: number;
+  verdict: Extract<BlindTestStageVerdict, "passed" | "failed">;
+  summary?: string | null;
+  reviewedAt?: number;
+  updatedAt?: number;
+}): TaskFlowUpdateResult {
+  const flow = getTaskFlowById(params.flowId);
+  if (!flow) {
+    return {
+      applied: false,
+      reason: "not_found",
+    };
+  }
+  if (!isBlindTestSliceFlow(flow)) {
+    return buildGuardBlockedResult(flow, "Draft review is only valid for blind-test slice flows.");
+  }
+  const currentState = getBlindTestSliceState(flow);
+  if (!currentState) {
+    return buildGuardBlockedResult(flow, "Blind-test slice state is missing or invalid.");
+  }
+  const reviewedAt = params.reviewedAt ?? params.updatedAt ?? Date.now();
+  const nextState: BlindTestSliceState = {
+    ...currentState,
+    draft: {
+      verdict: params.verdict,
+      reviewedAt,
+      ...(normalizeOptionalString(params.summary)
+        ? { summary: normalizeOptionalString(params.summary)! }
+        : {}),
+    },
+    implementation:
+      params.verdict === "failed" ? { verdict: "pending" } : currentState.implementation,
+    ...(params.verdict === "failed"
+      ? {
+          rework: buildBlindTestReworkState({
+            current: currentState,
+            stage: "draft",
+            reviewedAt,
+            summary: params.summary,
+          }),
+        }
+      : { rework: undefined }),
+  };
+  const transferToWill = nextState.rework?.transferOwner === "Will";
+  return updateFlowRecordByIdExpectedRevision({
+    flowId: flow.flowId,
+    expectedRevision: params.expectedRevision,
+    patch: {
+      status: params.verdict === "passed" ? "running" : "blocked",
+      currentStep:
+        params.verdict === "passed"
+          ? "implementation_review_required"
+          : transferToWill
+            ? "will_takeover_required"
+            : "draft_rework_required",
+      stateJson: nextState,
+      waitJson: null,
+      blockedTaskId: null,
+      blockedSummary:
+        params.verdict === "failed"
+          ? transferToWill
+            ? "Blind-test slice failed three times. Transfer this same slice to Will now."
+            : (normalizeOptionalString(params.summary) ?? "Draft review failed.")
+          : null,
+      endedAt: null,
+      updatedAt: params.updatedAt ?? reviewedAt,
+    },
+  });
+}
+
+export function recordBlindTestImplementationReview(params: {
+  flowId: string;
+  expectedRevision: number;
+  verdict: Extract<BlindTestStageVerdict, "passed" | "failed">;
+  summary?: string | null;
+  reviewedAt?: number;
+  updatedAt?: number;
+}): TaskFlowUpdateResult {
+  const flow = getTaskFlowById(params.flowId);
+  if (!flow) {
+    return {
+      applied: false,
+      reason: "not_found",
+    };
+  }
+  if (!isBlindTestSliceFlow(flow)) {
+    return buildGuardBlockedResult(
+      flow,
+      "Implementation review is only valid for blind-test slice flows.",
+    );
+  }
+  const currentState = getBlindTestSliceState(flow);
+  if (!currentState) {
+    return buildGuardBlockedResult(flow, "Blind-test slice state is missing or invalid.");
+  }
+  if (currentState.draft.verdict !== "passed") {
+    return buildGuardBlockedResult(
+      flow,
+      "Implementation review cannot complete until the blind-test draft review passes.",
+    );
+  }
+  const reviewedAt = params.reviewedAt ?? params.updatedAt ?? Date.now();
+  const continuation: ProductionContinuationState | undefined =
+    params.verdict === "passed"
+      ? updateContinuationAfterPass(currentState.continuation, reviewedAt)
+      : currentState.continuation
+        ? {
+            ...currentState.continuation,
+            currentUnitStatus: "blocked",
+          }
+        : undefined;
+  const nextState: BlindTestSliceState = {
+    ...currentState,
+    implementation: {
+      verdict: params.verdict,
+      reviewedAt,
+      ...(normalizeOptionalString(params.summary)
+        ? { summary: normalizeOptionalString(params.summary)! }
+        : {}),
+    },
+    ...(params.verdict === "failed"
+      ? {
+          rework: buildBlindTestReworkState({
+            current: currentState,
+            stage: "implementation",
+            reviewedAt,
+            summary: params.summary,
+          }),
+        }
+      : { rework: undefined }),
+    ...(continuation ? { continuation } : {}),
+  };
+  const transferToWill = nextState.rework?.transferOwner === "Will";
+  return updateFlowRecordByIdExpectedRevision({
+    flowId: flow.flowId,
+    expectedRevision: params.expectedRevision,
+    patch: {
+      status: params.verdict === "passed" ? "running" : "blocked",
+      currentStep:
+        params.verdict === "passed"
+          ? "implementation_passed_ready_for_closeout"
+          : transferToWill
+            ? "will_takeover_required"
+            : "implementation_rework_required",
+      stateJson: nextState,
+      waitJson: null,
+      blockedTaskId: null,
+      blockedSummary:
+        params.verdict === "failed"
+          ? transferToWill
+            ? "Blind-test slice failed three times. Transfer this same slice to Will now."
+            : (normalizeOptionalString(params.summary) ?? "Implementation review failed.")
+          : null,
+      endedAt: null,
+      updatedAt: params.updatedAt ?? reviewedAt,
+    },
+  });
+}
+
+export function recordBlindTestCloseoutFailure(params: {
+  flowId: string;
+  expectedRevision: number;
+  summary?: string | null;
+  outcomeCode?: string | null;
+  reviewedAt?: number;
+  updatedAt?: number;
+}): TaskFlowUpdateResult {
+  const flow = getTaskFlowById(params.flowId);
+  if (!flow) {
+    return {
+      applied: false,
+      reason: "not_found",
+    };
+  }
+  if (!isBlindTestSliceFlow(flow)) {
+    return buildGuardBlockedResult(
+      flow,
+      "Closeout review is only valid for blind-test slice flows.",
+    );
+  }
+  const currentState = getBlindTestSliceState(flow);
+  if (!currentState) {
+    return buildGuardBlockedResult(flow, "Blind-test slice state is missing or invalid.");
+  }
+  const reviewedAt = params.reviewedAt ?? params.updatedAt ?? Date.now();
+  const rework = buildBlindTestReworkState({
+    current: currentState,
+    stage: "closeout",
+    reviewedAt,
+    summary: params.summary,
+    outcomeCode: params.outcomeCode,
+  });
+  const transferToWill = rework.transferOwner === "Will";
+  return updateFlowRecordByIdExpectedRevision({
+    flowId: flow.flowId,
+    expectedRevision: params.expectedRevision,
+    patch: {
+      status: "blocked",
+      currentStep: transferToWill ? "will_takeover_required" : "closeout_rework_required",
+      stateJson: {
+        ...currentState,
+        rework,
+      },
+      waitJson: null,
+      blockedTaskId: null,
+      blockedSummary: transferToWill
+        ? "Blind-test slice failed three times. Transfer this same slice to Will now."
+        : (normalizeOptionalString(params.summary) ?? "Closeout review failed."),
+      endedAt: null,
+      updatedAt: params.updatedAt ?? reviewedAt,
+    },
+  });
+}
+
 export function finishFlow(params: {
   flowId: string;
   expectedRevision: number;
@@ -594,7 +1559,110 @@ export function finishFlow(params: {
   updatedAt?: number;
   endedAt?: number;
 }): TaskFlowUpdateResult {
-  const endedAt = params.endedAt ?? params.updatedAt ?? Date.now();
+  const current = getTaskFlowById(params.flowId);
+  if (!current) {
+    return {
+      applied: false,
+      reason: "not_found",
+    };
+  }
+  if (isBlindTestSliceFlow(current)) {
+    const state = getBlindTestSliceState(current);
+    if (!state) {
+      return buildGuardBlockedResult(
+        current,
+        "Blind-test slice cannot close because its state is missing or invalid.",
+      );
+    }
+    if (state.implementation.verdict !== "passed") {
+      return buildGuardBlockedResult(
+        current,
+        "Blind-test slice cannot close until the implemented slice passes review.",
+      );
+    }
+    if (
+      state.continuation?.activeProductionRun === true &&
+      state.continuation.continuationRequiredAfterLocalSuccess &&
+      !state.continuation.nextExecutableUnitLaunched &&
+      !hasLawfulStopState(state.continuation)
+    ) {
+      const violationAt = params.updatedAt ?? params.endedAt ?? Date.now();
+      const detail =
+        "Active production run cannot pause or close after a passed bounded unit before the next executable unit launches.";
+      const violationState: BlindTestSliceState = {
+        ...state,
+        continuation: updateContinuationAfterViolation(state.continuation, violationAt, detail),
+      };
+      const violationUpdate = updateFlowRecordByIdExpectedRevision({
+        flowId: current.flowId,
+        expectedRevision: params.expectedRevision,
+        patch: {
+          status: "blocked",
+          currentStep: "continuation_launch_required",
+          stateJson: violationState,
+          blockedSummary: detail,
+          updatedAt: violationAt,
+        },
+      });
+      return {
+        applied: false,
+        reason: "guard_blocked",
+        ...(violationUpdate.applied ? { current: violationUpdate.flow } : { current }),
+        blockedSummary: detail,
+      };
+    }
+  }
+  const terminalAt = params.endedAt ?? params.updatedAt ?? Date.now();
+  const continuation = getTaskFlowProductionContinuation(current);
+  if (continuation?.activeProductionRun === true) {
+    const passedContinuation =
+      continuation.currentUnitStatus === "passed" || continuation.currentUnitStatus === "completed"
+        ? continuation
+        : updateContinuationAfterPass(continuation, terminalAt);
+    if (
+      passedContinuation?.continuationRequiredAfterLocalSuccess &&
+      !passedContinuation.nextExecutableUnitLaunched &&
+      !hasLawfulStopState(passedContinuation)
+    ) {
+      const detail =
+        "Active production run cannot pause or close after a passed bounded unit before the next executable unit launches.";
+      const violationContinuation = updateContinuationAfterViolation(
+        passedContinuation,
+        terminalAt,
+        detail,
+      );
+      const violationUpdate = updateFlowRecordByIdExpectedRevision({
+        flowId: current.flowId,
+        expectedRevision: params.expectedRevision,
+        patch: {
+          status: "blocked",
+          currentStep: "continuation_launch_required",
+          stateJson: attachProductionContinuationToStateJson({
+            flow: current,
+            stateJson: params.stateJson,
+            continuation: violationContinuation,
+          }),
+          blockedSummary: detail,
+          updatedAt: terminalAt,
+        },
+      });
+      return {
+        applied: false,
+        reason: "guard_blocked",
+        ...(violationUpdate.applied ? { current: violationUpdate.flow } : { current }),
+        blockedSummary: detail,
+      };
+    }
+    params = {
+      ...params,
+      stateJson: attachProductionContinuationToStateJson({
+        flow: current,
+        stateJson: params.stateJson,
+        continuation: passedContinuation,
+      }),
+    };
+  }
+  const endedAt = terminalAt;
   return updateFlowRecordByIdExpectedRevision({
     flowId: params.flowId,
     expectedRevision: params.expectedRevision,
@@ -607,6 +1675,141 @@ export function finishFlow(params: {
       blockedSummary: null,
       endedAt,
       updatedAt: params.updatedAt ?? endedAt,
+    },
+  });
+}
+
+function updateContinuationForLawfulStop(params: {
+  state: ProductionContinuationState | undefined;
+  reason: ProductionContinuationStopReason;
+  at: number;
+  detail?: string;
+}): ProductionContinuationState | undefined {
+  if (!params.state?.activeProductionRun) {
+    return params.state;
+  }
+  let next: ProductionContinuationState = {
+    ...params.state,
+    currentUnitStatus:
+      params.reason === "whole_run_complete"
+        ? "completed"
+        : params.reason === "blocker"
+          ? "blocked"
+          : params.state.currentUnitStatus,
+    blockerPresent: params.reason === "blocker",
+    ownerDecisionRequired: params.reason === "owner_decision",
+    restartOrReloadRequired: params.reason === "restart_or_reload",
+    hardStopPresent: params.reason === "hard_stop",
+    safetyStopPresent: params.reason === "safety_stop",
+    lawfulWholeRunCompletion: params.reason === "whole_run_complete",
+    continuationRequiredAfterLocalSuccess: false,
+    continuationViolation: false,
+    lawfulStopReason: params.reason,
+  };
+  next = appendContinuationEvent(
+    next,
+    "LAWFUL_STOP_ALLOWED",
+    params.at,
+    params.detail ?? params.reason,
+  );
+  return next;
+}
+
+export function recordFlowNextExecutableLaunch(params: {
+  flowId: string;
+  expectedRevision: number;
+  detail: string;
+  currentStep?: string | null;
+  updatedAt?: number;
+}): TaskFlowUpdateResult {
+  const current = getTaskFlowById(params.flowId);
+  if (!current) {
+    return {
+      applied: false,
+      reason: "not_found",
+    };
+  }
+  const continuation = getTaskFlowProductionContinuation(current);
+  if (!continuation?.activeProductionRun) {
+    return buildGuardBlockedResult(
+      current,
+      "Flow is not currently bound to an active production continuation contract.",
+    );
+  }
+  const launchedAt = params.updatedAt ?? Date.now();
+  const passedContinuation =
+    continuation.currentUnitStatus === "passed" || continuation.currentUnitStatus === "completed"
+      ? continuation
+      : updateContinuationAfterPass(continuation, launchedAt);
+  const launchedContinuation = updateContinuationAfterNextLaunch(
+    passedContinuation,
+    launchedAt,
+    params.detail,
+  );
+  return updateFlowRecordByIdExpectedRevision({
+    flowId: current.flowId,
+    expectedRevision: params.expectedRevision,
+    patch: {
+      status: "running",
+      currentStep: params.currentStep,
+      stateJson: attachProductionContinuationToStateJson({
+        flow: current,
+        continuation: launchedContinuation,
+      }),
+      blockedSummary: null,
+      endedAt: null,
+      updatedAt: launchedAt,
+    },
+  });
+}
+
+export function recordFlowLawfulStop(params: {
+  flowId: string;
+  expectedRevision: number;
+  reason: ProductionContinuationStopReason;
+  status?: Extract<TaskFlowStatus, "blocked" | "cancelled">;
+  detail?: string | null;
+  currentStep?: string | null;
+  updatedAt?: number;
+}): TaskFlowUpdateResult {
+  const current = getTaskFlowById(params.flowId);
+  if (!current) {
+    return {
+      applied: false,
+      reason: "not_found",
+    };
+  }
+  const continuation = getTaskFlowProductionContinuation(current);
+  if (!continuation?.activeProductionRun) {
+    return buildGuardBlockedResult(
+      current,
+      "Flow is not currently bound to an active production continuation contract.",
+    );
+  }
+  const updatedAt = params.updatedAt ?? Date.now();
+  const nextContinuation = updateContinuationForLawfulStop({
+    state: continuation,
+    reason: params.reason,
+    at: updatedAt,
+    detail: normalizeOptionalString(params.detail) ?? undefined,
+  });
+  return updateFlowRecordByIdExpectedRevision({
+    flowId: current.flowId,
+    expectedRevision: params.expectedRevision,
+    patch: {
+      status:
+        params.reason === "whole_run_complete" ? current.status : (params.status ?? "blocked"),
+      currentStep: params.currentStep,
+      stateJson: attachProductionContinuationToStateJson({
+        flow: current,
+        continuation: nextContinuation,
+      }),
+      blockedSummary:
+        params.reason === "whole_run_complete"
+          ? null
+          : (normalizeOptionalString(params.detail) ?? current.blockedSummary ?? null),
+      endedAt: null,
+      updatedAt,
     },
   });
 }

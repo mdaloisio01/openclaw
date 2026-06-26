@@ -7,7 +7,16 @@ export type TaskAuditCode =
   | "lost"
   | "delivery_failed"
   | "missing_cleanup"
-  | "inconsistent_timestamps";
+  | "inconsistent_timestamps"
+  | "accepted_not_yet_proven_active_too_long"
+  | "parent_review_state_without_active_executor"
+  | "open_build_no_active_owner"
+  | "owner_readout_finished_no_followthrough"
+  | "routed_to_owner_not_proven_active"
+  | "build_open_all_related_sessions_terminal"
+  | "execution_truth_conflicts_with_status_text"
+  | "parent_continuity_violation"
+  | "rework_follow_through_violation";
 
 export type TaskAuditFinding = {
   severity: TaskAuditSeverity;
@@ -42,6 +51,15 @@ export function createEmptyTaskAuditSummary(): TaskAuditSummary {
       delivery_failed: 0,
       missing_cleanup: 0,
       inconsistent_timestamps: 0,
+      accepted_not_yet_proven_active_too_long: 0,
+      parent_review_state_without_active_executor: 0,
+      open_build_no_active_owner: 0,
+      owner_readout_finished_no_followthrough: 0,
+      routed_to_owner_not_proven_active: 0,
+      build_open_all_related_sessions_terminal: 0,
+      execution_truth_conflicts_with_status_text: 0,
+      parent_continuity_violation: 0,
+      rework_follow_through_violation: 0,
     },
   };
 }

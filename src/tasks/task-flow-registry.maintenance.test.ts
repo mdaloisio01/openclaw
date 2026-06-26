@@ -5,6 +5,7 @@ import {
   createFlowRecord as createFlowRecordOrNull,
   createManagedTaskFlow as createManagedTaskFlowOrNull,
   getTaskFlowById,
+  getTaskFlowProductionContinuation,
   listTaskFlowRecords,
   requestFlowCancel,
   resetTaskFlowRegistryForTests,
@@ -114,6 +115,38 @@ describe("task-flow-registry maintenance", () => {
       expect(storedFlow.flowId).toBe(flow.flowId);
       expect(storedFlow.status).toBe("cancelled");
       expect(storedFlow.cancelRequestedAt).toBe(100);
+    });
+  });
+
+  it("records lawful hard-stop proof when maintenance finalizes a production continuation cancel", async () => {
+    await withTaskFlowMaintenanceStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/task-flow-maintenance",
+        goal: "Cancel production continuation work",
+        status: "running",
+        cancelRequestedAt: 100,
+        createdAt: 1,
+        updatedAt: 100,
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      expect(await runTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+
+      const storedFlow = getTaskFlowById(flow.flowId);
+      if (!storedFlow) {
+        throw new Error("Expected cancel-requested continuation flow to remain registered");
+      }
+      expect(storedFlow.status).toBe("cancelled");
+      const continuation = getTaskFlowProductionContinuation(storedFlow);
+      expect(continuation?.lawfulStopReason).toBe("hard_stop");
+      expect(continuation?.continuationRequiredAfterLocalSuccess).toBe(false);
     });
   });
 
@@ -228,6 +261,36 @@ describe("task-flow-registry maintenance", () => {
       expect(storedFlow.status).toBe("running");
       expect(storedFlow.cancelRequestedAt).toBe(100);
       expect(child.parentFlowId).toBe(flow.flowId);
+    });
+  });
+
+  it("classifies stale queued managed flows without executor proof as lost", async () => {
+    await withTaskFlowMaintenanceStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/task-flow-maintenance",
+        goal: "Queued without executor proof",
+        status: "queued",
+        createdAt: 1,
+        updatedAt: 1,
+      });
+
+      expect(previewTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+
+      expect(await runTaskFlowRegistryMaintenance()).toEqual({
+        reconciled: 1,
+        pruned: 0,
+      });
+      const storedFlow = getTaskFlowById(flow.flowId);
+      if (!storedFlow) {
+        throw new Error("Expected orphaned queued flow to remain registered");
+      }
+      expect(storedFlow.status).toBe("lost");
+      expect(storedFlow.blockedSummary).toContain("without executor proof");
+      expect(storedFlow.endedAt).toBeGreaterThanOrEqual(30 * 60_000);
     });
   });
 

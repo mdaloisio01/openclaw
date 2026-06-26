@@ -3,6 +3,7 @@ import type { RuntimeEnv } from "../runtime.js";
 import { createRunningTaskRun as createRunningTaskRunOrNull } from "../tasks/task-executor.js";
 import {
   createManagedTaskFlow as createManagedTaskFlowOrNull,
+  getTaskFlowProductionContinuation,
   resetTaskFlowRegistryForTests,
 } from "../tasks/task-flow-registry.js";
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
@@ -12,11 +13,34 @@ import {
 } from "../tasks/task-registry.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { flowsCancelCommand, flowsListCommand, flowsShowCommand } from "./flows.js";
+import {
+  flowsCancelCommand,
+  flowsLawfulStopCommand,
+  flowsListCommand,
+  flowsResumeProductionCommand,
+  flowsShowCommand,
+  flowsStartProductionCommand,
+} from "./flows.js";
+
+const runRuntimeAssetGuardPreflight = vi.hoisted(() =>
+  vi.fn(() => ({
+    ok: true,
+    status: 0,
+    operation: "production preflight",
+    scriptPath: "/repo/scripts/runtime-asset-guard.mjs",
+    message: "runtime asset guard passed",
+    stdout: "{}",
+    stderr: "",
+  })),
+);
 
 vi.mock("../config/config.js", () => ({
   getRuntimeConfig: vi.fn(() => ({})),
   loadConfig: vi.fn(() => ({})),
+}));
+
+vi.mock("../infra/runtime-asset-guard-preflight.js", () => ({
+  runRuntimeAssetGuardPreflight,
 }));
 
 const ORIGINAL_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
@@ -92,6 +116,16 @@ describe("flows commands", () => {
     resetTaskRegistryDeliveryRuntimeForTests();
     resetTaskRegistryForTests({ persist: false });
     resetTaskFlowRegistryForTests({ persist: false });
+    runRuntimeAssetGuardPreflight.mockReset();
+    runRuntimeAssetGuardPreflight.mockReturnValue({
+      ok: true,
+      status: 0,
+      operation: "production preflight",
+      scriptPath: "/repo/scripts/runtime-asset-guard.mjs",
+      message: "runtime asset guard passed",
+      stdout: "{}",
+      stderr: "",
+    });
   });
 
   it("lists TaskFlows as JSON with linked tasks and summaries", async () => {
@@ -326,6 +360,191 @@ describe("flows commands", () => {
       expect(vi.mocked(runtime.log).mock.calls.map(([line]) => String(line))).toEqual([
         `Cancelled ${flow.flowId} (managed) with status cancelled.`,
       ]);
+    });
+  });
+
+  it("starts a governed production TaskFlow with authority metadata and active continuation", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      const runtime = createRuntime();
+      await flowsStartProductionCommand(
+        {
+          ownerKey: "agent:orchestrator:main",
+          controllerId: "gie/authority-mirror-decision",
+          goal: "GIE authority mirror decision",
+          sliceId: "gie-authority-mirror-decision-2026-06-22T0236Z",
+          sliceOwner: "Will / Top-Level Governance",
+          authorityPath:
+            "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/gie_build_state_interpretation_after_sadb_sampler_takeover_2026-06-19T0514Z.md",
+          authorityBasis: "controlling build-state interpretation",
+          buildItem: "GIE authority mirror decision",
+          requiredOwnerLane: "Will / Top-Level Governance",
+          attemptedOwnerLane: "Will / Top-Level Governance",
+          attemptedExecutor: "will-orchestrator",
+          executorRole: "governance_decision",
+          lawfulRouteRequired: "Will / Top-Level Governance decision",
+          currentStep: "authority_decision",
+          blocker: ["department_registry_mirror_alignment", "blocking_authority_state"],
+          json: true,
+        },
+        runtime,
+      );
+
+      expect(runtime.error).not.toHaveBeenCalled();
+      expect(runtime.exit).not.toHaveBeenCalled();
+      const payload = vi.mocked(runtime.writeJson).mock.calls[0]?.[0] as { flow: TaskFlowRecord };
+      expect(payload.flow).toMatchObject({
+        syncMode: "managed",
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "gie/authority-mirror-decision",
+        status: "running",
+        goal: "GIE authority mirror decision",
+        currentStep: "authority_decision",
+      });
+      expect(payload.flow.stateJson).toMatchObject({
+        kind: "production_taskflow_slice",
+        sliceId: "gie-authority-mirror-decision-2026-06-22T0236Z",
+        sliceOwner: "Will / Top-Level Governance",
+        buildItem: "GIE authority mirror decision",
+        requiredOwnerLane: "Will / Top-Level Governance",
+        attemptedOwnerLane: "Will / Top-Level Governance",
+        attemptedExecutor: "will-orchestrator",
+        executorRole: "governance_decision",
+        productionContinuation: {
+          activeProductionRun: true,
+          currentUnitStatus: "started",
+        },
+      });
+      expect(getTaskFlowProductionContinuation(payload.flow)?.activeProductionRun).toBe(true);
+    });
+  });
+
+  it("rejects production TaskFlow start without required authority fields", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      const runtime = createRuntime();
+      await flowsStartProductionCommand(
+        {
+          ownerKey: "agent:orchestrator:main",
+          controllerId: "gie/authority-mirror-decision",
+          goal: "GIE authority mirror decision",
+          sliceId: "gie-authority-mirror-decision-2026-06-22T0236Z",
+          sliceOwner: "Will / Top-Level Governance",
+          authorityBasis: "controlling build-state interpretation",
+        },
+        runtime,
+      );
+
+      expect(runtime.error).toHaveBeenCalledWith("--authority-path is required.");
+      expect(runtime.exit).toHaveBeenCalledWith(1);
+      expect(runtime.writeJson).not.toHaveBeenCalled();
+    });
+  });
+
+  it("resumes only managed active-production TaskFlows", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "gie/authority-mirror-decision",
+        goal: "GIE authority mirror decision",
+        status: "blocked",
+        currentStep: "blocked",
+        continuation: { activeProductionRun: true },
+        createdAt: 100,
+        updatedAt: 100,
+      });
+
+      const runtime = createRuntime();
+      await flowsResumeProductionCommand(
+        { lookup: flow.flowId, currentStep: "authority_decision", json: true },
+        runtime,
+      );
+
+      expect(runtime.error).not.toHaveBeenCalled();
+      const payload = vi.mocked(runtime.writeJson).mock.calls[0]?.[0] as { flow: TaskFlowRecord };
+      expect(payload.flow.status).toBe("running");
+      expect(payload.flow.currentStep).toBe("authority_decision");
+      expect(getTaskFlowProductionContinuation(payload.flow)?.activeProductionRun).toBe(true);
+    });
+  });
+
+  it("blocks production TaskFlow resume when runtime guard fails", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      runRuntimeAssetGuardPreflight.mockReturnValue({
+        ok: false,
+        status: 1,
+        operation: "production preflight",
+        scriptPath: "/repo/scripts/runtime-asset-guard.mjs",
+        message:
+          "blocker=runtime_internal_import_missing; operation=production preflight importer=dist/index.js specifier=./missing.js missing=dist/missing.js",
+        stdout: "{}",
+        stderr: "",
+      });
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "gie/authority-mirror-decision",
+        goal: "GIE authority mirror decision",
+        status: "blocked",
+        currentStep: "blocked",
+        continuation: { activeProductionRun: true },
+        createdAt: 100,
+        updatedAt: 100,
+      });
+
+      const runtime = createRuntime();
+      await flowsResumeProductionCommand(
+        { lookup: flow.flowId, currentStep: "authority_decision", json: true },
+        runtime,
+      );
+
+      expect(runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("Production resume blocked by runtime asset guard"),
+      );
+      expect(runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("runtime_internal_import_missing"),
+      );
+      expect(runtime.exit).toHaveBeenCalledWith(1);
+      expect(runtime.writeJson).not.toHaveBeenCalled();
+    });
+  });
+
+  it("records lawful blocker stop so active-production watchdog no longer requires the flow", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "gie/authority-mirror-decision",
+        goal: "GIE authority mirror decision",
+        status: "running",
+        currentStep: "authority_decision",
+        continuation: { activeProductionRun: true },
+        createdAt: 100,
+        updatedAt: 100,
+      });
+
+      const runtime = createRuntime();
+      await flowsLawfulStopCommand(
+        {
+          lookup: flow.flowId,
+          reason: "blocker",
+          detail: "department registry mirror authority decision remains blocked",
+          currentStep: "authority_blocked",
+          json: true,
+        },
+        runtime,
+      );
+
+      expect(runtime.error).not.toHaveBeenCalled();
+      const payload = vi.mocked(runtime.writeJson).mock.calls[0]?.[0] as { flow: TaskFlowRecord };
+      const continuation = getTaskFlowProductionContinuation(payload.flow);
+      expect(payload.flow.status).toBe("blocked");
+      expect(payload.flow.blockedSummary).toBe(
+        "department registry mirror authority decision remains blocked",
+      );
+      expect(continuation).toMatchObject({
+        activeProductionRun: true,
+        currentUnitStatus: "blocked",
+        blockerPresent: true,
+        lawfulStopReason: "blocker",
+        continuationRequiredAfterLocalSuccess: false,
+      });
     });
   });
 });

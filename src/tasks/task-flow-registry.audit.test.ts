@@ -7,7 +7,13 @@ import {
   type TaskFlowAuditFinding,
 } from "./task-flow-registry.audit.js";
 import {
+  createBlindTestSliceFlow,
   createManagedTaskFlow as createManagedTaskFlowOrNull,
+  finishFlow,
+  recordFlowLawfulStop,
+  recordFlowNextExecutableLaunch,
+  recordBlindTestDraftReview,
+  recordBlindTestImplementationReview,
   resetTaskFlowRegistryForTests,
   setFlowWaiting,
 } from "./task-flow-registry.js";
@@ -228,6 +234,25 @@ describe("task-flow-registry audit", () => {
     });
   });
 
+  it("flags stale queued managed flows that never gained executor proof", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/task-flow-audit",
+        goal: "Queued without executor proof",
+        status: "queued",
+        createdAt: 1,
+        updatedAt: 1,
+      });
+
+      const findings = listTaskFlowAuditFindings({ now: 31 * 60_000 });
+      expect(requireFinding(findings, "stale_queued", flow.flowId).flow?.flowId).toBe(flow.flowId);
+      expect(requireFinding(findings, "missing_linked_tasks", flow.flowId).detail).toContain(
+        "no executor proof",
+      );
+    });
+  });
+
   it("reports cancel-stuck before maintenance finalizes the flow", async () => {
     await withTaskFlowAuditStateDir(async () => {
       const flow = createManagedTaskFlow({
@@ -242,6 +267,175 @@ describe("task-flow-registry audit", () => {
 
       const findings = listTaskFlowAuditFindings({ now: 6 * 60_000 });
       expect(requireFinding(findings, "cancel_stuck", flow.flowId).flow?.flowId).toBe(flow.flowId);
+    });
+  });
+
+  it("reports continuation-required flows that have not launched the next executable unit", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Grant production blind-test slice 1",
+        sliceKey: "prod-slice-1",
+        subjectAgent: "Grant",
+        createdAt: 1,
+        updatedAt: 1,
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      if (!flow) {
+        throw new Error("Expected blind-test flow creation");
+      }
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        verdict: "passed",
+        reviewedAt: 2,
+        updatedAt: 2,
+      });
+      if (!draftPassed.applied) {
+        throw new Error("Expected draft pass");
+      }
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: flow.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        reviewedAt: 3,
+        updatedAt: 3,
+      });
+      if (!implementationPassed.applied) {
+        throw new Error("Expected implementation pass");
+      }
+
+      const findings = listTaskFlowAuditFindings({ now: 31 * 60_000 });
+      expect(
+        requireFinding(
+          findings,
+          "continuation_required_not_launched",
+          implementationPassed.flow.flowId,
+        ).flow?.flowId,
+      ).toBe(implementationPassed.flow.flowId);
+    });
+  });
+
+  it("clears continuation-required findings after the next executable unit launch is recorded", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Grant production blind-test slice 1",
+        sliceKey: "prod-slice-1",
+        subjectAgent: "Grant",
+        createdAt: 1,
+        updatedAt: 1,
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      if (!flow) {
+        throw new Error("Expected blind-test flow creation");
+      }
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        verdict: "passed",
+        reviewedAt: 2,
+        updatedAt: 2,
+      });
+      if (!draftPassed.applied) {
+        throw new Error("Expected draft pass");
+      }
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: flow.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        reviewedAt: 3,
+        updatedAt: 3,
+      });
+      if (!implementationPassed.applied) {
+        throw new Error("Expected implementation pass");
+      }
+      const launched = recordFlowNextExecutableLaunch({
+        flowId: implementationPassed.flow.flowId,
+        expectedRevision: implementationPassed.flow.revision,
+        detail: "REWORK_EXECUTOR_LAUNCHED: accepted same-slice rework run run-prod-slice-1",
+        currentStep: "closeout_rework_running",
+        updatedAt: 4,
+      });
+      expect(launched.applied).toBe(true);
+
+      const findings = listTaskFlowAuditFindings({ now: 31 * 60_000 });
+      expect(
+        findings.some(
+          (finding) =>
+            finding.code === "continuation_required_not_launched" &&
+            finding.flow?.flowId === implementationPassed.flow.flowId,
+        ),
+      ).toBe(false);
+    });
+  });
+
+  it("reports generic managed continuation flows that have not launched the next executable unit", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/task-flow-audit",
+        goal: "Run managed production controller",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const blockedClose = finishFlow({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        endedAt: 100,
+      });
+      expect(blockedClose.applied).toBe(false);
+      if (blockedClose.applied || !blockedClose.current) {
+        throw new Error("Expected blocked managed continuation close");
+      }
+
+      const findings = listTaskFlowAuditFindings({ now: 101 });
+      expect(
+        requireFinding(findings, "continuation_required_not_launched", flow.flowId).detail,
+      ).toContain("next executable unit");
+    });
+  });
+
+  it("does not report managed continuation findings after a lawful blocker is recorded", async () => {
+    await withTaskFlowAuditStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/task-flow-audit",
+        goal: "Managed controller blocked lawfully",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const lawfulStop = recordFlowLawfulStop({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        reason: "blocker",
+        detail: "Approval token missing.",
+        updatedAt: 120,
+      });
+      expect(lawfulStop.applied).toBe(true);
+
+      const findings = listTaskFlowAuditFindings({ now: 121 });
+      expect(
+        findings.some(
+          (finding) =>
+            finding.code === "continuation_required_not_launched" &&
+            finding.flow?.flowId === flow.flowId,
+        ),
+      ).toBe(false);
     });
   });
 });

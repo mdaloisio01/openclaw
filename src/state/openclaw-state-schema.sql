@@ -998,6 +998,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
   run_id TEXT,
   label TEXT,
   task TEXT NOT NULL,
+  mission_id TEXT,
+  mission_summary TEXT,
+  mission_state TEXT,
   status TEXT NOT NULL,
   delivery_status TEXT NOT NULL,
   notify_policy TEXT NOT NULL,
@@ -1008,6 +1011,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   cleanup_after INTEGER,
   error TEXT,
   progress_summary TEXT,
+  mission_updated_at INTEGER,
   terminal_summary TEXT,
   terminal_outcome TEXT
 );

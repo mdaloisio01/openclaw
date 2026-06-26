@@ -10,6 +10,7 @@ import { normalizeAccountId } from "./account-id.js";
 
 export {
   getSubagentDepth,
+  isCronRunSessionKey,
   isCronSessionKey,
   isAcpSessionKey,
   isSubagentSessionKey,

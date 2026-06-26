@@ -82,6 +82,18 @@ function parseTimeoutMs(timeout: unknown): number | null | undefined {
   return parsed;
 }
 
+function collectOptionValue(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+function hasJsonOption(opts: { json?: boolean }, command?: Command): boolean {
+  return Boolean(
+    opts.json ||
+    (command?.parent?.opts() as { json?: boolean } | undefined)?.json ||
+    (command?.parent?.parent?.opts() as { json?: boolean } | undefined)?.json,
+  );
+}
+
 function parseTasksAuditLimit(limit: unknown): number | null | undefined {
   const parsed = parseStrictPositiveIntOrUndefined(limit);
   if (limit !== undefined && parsed === undefined) {
@@ -167,12 +179,12 @@ export function registerStatusHealthSessionsCommands(program: Command) {
       () =>
         `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/health", "docs.openclaw.ai/cli/health")}\n`,
     )
-    .action(async (opts) => {
+    .action(async (opts, command) => {
       await runWithVerboseAndTimeout(opts, async ({ verbose, timeoutMs }) => {
         const { healthCommand } = await import("../../commands/health.js");
         await healthCommand(
           {
-            json: Boolean(opts.json),
+            json: hasJsonOption(opts, command),
             timeoutMs,
             verbose,
           },
@@ -371,12 +383,12 @@ export function registerStatusHealthSessionsCommands(program: Command) {
           ["openclaw commitments dismiss cm_abc123", "Dismiss a follow-up."],
         ])}`,
     )
-    .action(async (opts) => {
+    .action(async (opts, command) => {
       await runCommandWithRuntime(defaultRuntime, async () => {
         const { commitmentsListCommand } = await loadCommitmentsCommands();
         await commitmentsListCommand(
           {
-            json: Boolean(opts.json),
+            json: hasJsonOption(opts, command),
             agent: opts.agent as string | undefined,
             status: opts.status as string | undefined,
             all: Boolean(opts.all),
@@ -602,6 +614,111 @@ export function registerStatusHealthSessionsCommands(program: Command) {
   const tasksFlowCmd = tasksCmd
     .command("flow")
     .description("Inspect durable TaskFlow state under tasks");
+
+  tasksFlowCmd
+    .command("start-production")
+    .description("Start a managed active-production TaskFlow with required authority metadata")
+    .requiredOption("--owner-key <key>", "Flow owner key")
+    .requiredOption("--controller-id <id>", "Managed controller id")
+    .requiredOption("--goal <text>", "TaskFlow goal")
+    .requiredOption("--slice-id <id>", "Governed slice id")
+    .requiredOption("--slice-owner <owner>", "Lawful slice owner")
+    .requiredOption("--authority-path <path>", "Controlling authority artifact path")
+    .requiredOption("--authority-basis <text>", "Authority basis for this production slice")
+    .requiredOption("--build-item <item>", "Current controlling build-plan item")
+    .requiredOption("--required-owner-lane <owner>", "SOP/build-plan required owner or lane")
+    .requiredOption("--attempted-owner-lane <owner>", "Owner/lane the flow would run as")
+    .requiredOption("--attempted-executor <executor>", "Executor attempting the work")
+    .requiredOption("--executor-role <role>", "Executor role for this exact work")
+    .requiredOption(
+      "--lawful-route-required <route>",
+      "Lawful route required when owner mismatch blocks",
+    )
+    .option("--current-step <step>", "Current flow step")
+    .option("--blocker <code>", "Known SOP blocker code", collectOptionValue, [])
+    .option("--json", "Output as JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsStartProductionCommand } = await loadFlowsCommands();
+        await flowsStartProductionCommand(
+          {
+            ownerKey: opts.ownerKey as string | undefined,
+            controllerId: opts.controllerId as string | undefined,
+            goal: opts.goal as string | undefined,
+            sliceId: opts.sliceId as string | undefined,
+            sliceOwner: opts.sliceOwner as string | undefined,
+            authorityPath: opts.authorityPath as string | undefined,
+            authorityBasis: opts.authorityBasis as string | undefined,
+            buildItem: opts.buildItem as string | undefined,
+            requiredOwnerLane: opts.requiredOwnerLane as string | undefined,
+            attemptedOwnerLane: opts.attemptedOwnerLane as string | undefined,
+            attemptedExecutor: opts.attemptedExecutor as string | undefined,
+            executorRole: opts.executorRole as string | undefined,
+            lawfulRouteRequired: opts.lawfulRouteRequired as string | undefined,
+            currentStep: opts.currentStep as string | undefined,
+            blocker: opts.blocker as string[] | undefined,
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowCmd
+    .command("resume-production")
+    .description("Resume a managed active-production TaskFlow")
+    .argument("<lookup>", "Flow id or owner key")
+    .option("--current-step <step>", "Current flow step")
+    .option("--json", "Output as JSON", false)
+    .action(async (lookup, opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsResumeProductionCommand } = await loadFlowsCommands();
+        await flowsResumeProductionCommand(
+          {
+            lookup,
+            currentStep: opts.currentStep as string | undefined,
+            json: hasJsonOption(opts, command),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowCmd
+    .command("lawful-stop")
+    .description("Record a lawful active-production stop for a managed TaskFlow")
+    .argument("<lookup>", "Flow id or owner key")
+    .requiredOption(
+      "--reason <reason>",
+      "Stop reason (blocker, owner_decision, restart_or_reload, hard_stop, safety_stop, whole_run_complete)",
+    )
+    .requiredOption("--detail <text>", "Stop detail")
+    .option("--current-step <step>", "Current flow step")
+    .option("--finish", "Finish the flow after whole-run completion", false)
+    .option("--json", "Output as JSON", false)
+    .action(async (lookup, opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsLawfulStopCommand } = await loadFlowsCommands();
+        await flowsLawfulStopCommand(
+          {
+            lookup,
+            reason: opts.reason as
+              | "blocker"
+              | "owner_decision"
+              | "restart_or_reload"
+              | "hard_stop"
+              | "safety_stop"
+              | "whole_run_complete"
+              | undefined,
+            detail: opts.detail as string | undefined,
+            currentStep: opts.currentStep as string | undefined,
+            finish: Boolean(opts.finish),
+            json: hasJsonOption(opts, command),
+          },
+          defaultRuntime,
+        );
+      });
+    });
 
   tasksFlowCmd
     .command("list")

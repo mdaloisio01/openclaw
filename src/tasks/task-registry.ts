@@ -30,8 +30,11 @@ import {
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import {
   getTaskFlowById,
+  getTaskFlowProductionContinuation,
+  recordFlowLawfulStop,
   syncFlowFromTaskResult,
   updateFlowRecordByIdExpectedRevision,
+  type TaskFlowUpdateResult,
 } from "./task-flow-runtime-internal.js";
 import type { TaskRegistryControlRuntime } from "./task-registry-control.types.js";
 import { getTaskRegistryProcessState } from "./task-registry.process-state.js";
@@ -47,6 +50,7 @@ import type {
   TaskDeliveryStatus,
   TaskEventKind,
   TaskEventRecord,
+  TaskMissionState,
   TaskNotifyPolicy,
   TaskRecord,
   TaskRegistrySummary,
@@ -66,6 +70,7 @@ const tasks = taskRegistryProcessState.tasks;
 const taskDeliveryStates = taskRegistryProcessState.taskDeliveryStates;
 const taskIdsByRunId = taskRegistryProcessState.taskIdsByRunId;
 const taskIdsByOwnerKey = taskRegistryProcessState.taskIdsByOwnerKey;
+const taskIdsByMissionId = taskRegistryProcessState.taskIdsByMissionId;
 const taskIdsByParentFlowId = taskRegistryProcessState.taskIdsByParentFlowId;
 const taskIdsByRelatedSessionKey = taskRegistryProcessState.taskIdsByRelatedSessionKey;
 const tasksWithPendingDelivery = taskRegistryProcessState.tasksWithPendingDelivery;
@@ -394,6 +399,7 @@ function clearTaskRegistryMemory(): void {
   taskDeliveryStates.clear();
   taskIdsByRunId.clear();
   taskIdsByOwnerKey.clear();
+  taskIdsByMissionId.clear();
   taskIdsByParentFlowId.clear();
   taskIdsByRelatedSessionKey.clear();
   tasksWithPendingDelivery.clear();
@@ -477,6 +483,57 @@ function normalizeTaskTerminalOutcome(
   value: TaskTerminalOutcome | null | undefined,
 ): TaskTerminalOutcome | undefined {
   return value === "succeeded" || value === "blocked" ? value : undefined;
+}
+
+function normalizeTaskMissionState(
+  value: TaskMissionState | null | undefined,
+): TaskMissionState | undefined {
+  return value === "active" || value === "subordinate" || value === "abandoned" ? value : undefined;
+}
+
+function blocksForwardProgressForAbandonedMission(params: {
+  current: TaskRecord;
+  nextStatus?: TaskStatus;
+}): boolean {
+  if (params.current.missionState !== "abandoned") {
+    return false;
+  }
+  if (params.nextStatus && isTerminalTaskStatus(params.nextStatus)) {
+    return false;
+  }
+  return true;
+}
+
+function formatAbandonedMissionBlockedSummary(task: TaskRecord): string {
+  const missionSummary = normalizeTaskSummary(task.missionSummary);
+  if (missionSummary) {
+    return `Progress arrived for abandoned mission "${missionSummary}" after the target changed. Reactivate it explicitly before continuing.`;
+  }
+  const missionId = normalizeOptionalString(task.missionId);
+  if (missionId) {
+    return `Progress arrived for abandoned mission ${missionId} after the target changed. Reactivate it explicitly before continuing.`;
+  }
+  return "Progress arrived for an abandoned mission after the target changed. Reactivate it explicitly before continuing.";
+}
+
+function buildAbandonedMissionBlockedPatch(params: {
+  current: TaskRecord;
+  eventAt: number;
+  progressSummary?: string | null;
+}): Partial<TaskRecord> | null {
+  if (params.current.missionState !== "abandoned" || isTerminalTaskStatus(params.current.status)) {
+    return null;
+  }
+  return {
+    status: "succeeded",
+    endedAt: params.eventAt,
+    lastEventAt: params.eventAt,
+    ...(params.progressSummary !== undefined
+      ? { progressSummary: normalizeTaskSummary(params.progressSummary) }
+      : {}),
+    terminalOutcome: "blocked",
+    terminalSummary: formatAbandonedMissionBlockedSummary(params.current),
+  };
 }
 
 function shouldApplyRunScopedStatusUpdate(params: {
@@ -651,6 +708,22 @@ function deleteOwnerKeyIndex(taskId: string, task: Pick<TaskRecord, "ownerKey">)
   deleteIndexedKey(taskIdsByOwnerKey, key, taskId);
 }
 
+function addMissionIdIndex(taskId: string, task: Pick<TaskRecord, "missionId">) {
+  const key = normalizeOptionalString(task.missionId);
+  if (!key) {
+    return;
+  }
+  addIndexedKey(taskIdsByMissionId, key, taskId);
+}
+
+function deleteMissionIdIndex(taskId: string, task: Pick<TaskRecord, "missionId">) {
+  const key = normalizeOptionalString(task.missionId);
+  if (!key) {
+    return;
+  }
+  deleteIndexedKey(taskIdsByMissionId, key, taskId);
+}
+
 function addParentFlowIdIndex(taskId: string, task: Pick<TaskRecord, "parentFlowId">) {
   const key = task.parentFlowId?.trim();
   if (!key) {
@@ -696,6 +769,13 @@ function rebuildOwnerKeyIndex() {
   taskIdsByOwnerKey.clear();
   for (const [taskId, task] of tasks.entries()) {
     addOwnerKeyIndex(taskId, task);
+  }
+}
+
+function rebuildMissionIdIndex() {
+  taskIdsByMissionId.clear();
+  for (const [taskId, task] of tasks.entries()) {
+    addMissionIdIndex(taskId, task);
   }
 }
 
@@ -857,6 +937,10 @@ function mergeExistingTaskForCreate(
     agentId?: string;
     label?: string;
     task: string;
+    missionId?: string;
+    missionSummary?: string | null;
+    missionState?: TaskMissionState | null;
+    missionUpdatedAt?: number;
     preferMetadata?: boolean;
     deliveryStatus?: TaskDeliveryStatus;
     notifyPolicy?: TaskNotifyPolicy;
@@ -894,6 +978,25 @@ function mergeExistingTaskForCreate(
   }
   if (params.agentId?.trim() && !existing.agentId?.trim()) {
     patch.agentId = params.agentId.trim();
+  }
+  const nextMissionId = normalizeOptionalString(params.missionId);
+  if (nextMissionId && !existing.missionId?.trim()) {
+    patch.missionId = nextMissionId;
+  }
+  const nextMissionSummary = normalizeTaskSummary(params.missionSummary);
+  if (nextMissionSummary && (!existing.missionSummary || params.preferMetadata)) {
+    patch.missionSummary = nextMissionSummary;
+  }
+  const nextMissionState = normalizeTaskMissionState(params.missionState);
+  if (nextMissionState && (!existing.missionState || params.preferMetadata)) {
+    patch.missionState = nextMissionState;
+  }
+  if (
+    patch.missionId !== undefined ||
+    patch.missionSummary !== undefined ||
+    patch.missionState !== undefined
+  ) {
+    patch.missionUpdatedAt = params.missionUpdatedAt ?? Date.now();
   }
   const nextLabel = params.label?.trim();
   if (params.preferMetadata) {
@@ -1016,18 +1119,28 @@ function syncManagedFlowCancellationFromTask(task: TaskRecord): void {
   }
   const endedAt = task.endedAt ?? task.lastEventAt ?? Date.now();
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const result = updateFlowRecordByIdExpectedRevision({
-      flowId,
-      expectedRevision: flow.revision,
-      patch: {
-        status: "cancelled",
-        blockedTaskId: null,
-        blockedSummary: null,
-        waitJson: null,
-        endedAt,
-        updatedAt: endedAt,
-      },
-    });
+    const result: TaskFlowUpdateResult =
+      getTaskFlowProductionContinuation(flow)?.activeProductionRun === true
+        ? recordFlowLawfulStop({
+            flowId,
+            expectedRevision: flow.revision,
+            reason: "hard_stop",
+            status: "cancelled",
+            detail: "Managed flow cancellation completed after all linked child tasks settled.",
+            updatedAt: endedAt,
+          })
+        : updateFlowRecordByIdExpectedRevision({
+            flowId,
+            expectedRevision: flow.revision,
+            patch: {
+              status: "cancelled",
+              blockedTaskId: null,
+              blockedSummary: null,
+              waitJson: null,
+              endedAt,
+              updatedAt: endedAt,
+            },
+          });
     if (result.applied || result.reason === "not_found") {
       return;
     }
@@ -1124,6 +1237,7 @@ function restoreTaskRegistryOnce() {
     }
     rebuildRunIdIndex();
     rebuildOwnerKeyIndex();
+    rebuildMissionIdIndex();
     rebuildParentFlowIdIndex();
     rebuildRelatedSessionKeyIndex();
     emitTaskRegistryObserverEvent(() => ({
@@ -1162,6 +1276,8 @@ function updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | nu
     normalizeOptionalString(current.ownerKey) !== normalizeOptionalString(next.ownerKey) ||
     normalizeOptionalString(current.childSessionKey) !==
       normalizeOptionalString(next.childSessionKey);
+  const missionIndexChanged =
+    normalizeOptionalString(current.missionId) !== normalizeOptionalString(next.missionId);
   const parentFlowIndexChanged = current.parentFlowId?.trim() !== next.parentFlowId?.trim();
   // Persist before mutating memory. If the store rejects the write, keep the
   // in-memory mirror at the durable value and report that no mutation applied.
@@ -1177,6 +1293,10 @@ function updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | nu
     addOwnerKeyIndex(taskId, next);
     deleteRelatedSessionKeyIndex(taskId, current);
     addRelatedSessionKeyIndex(taskId, next);
+  }
+  if (missionIndexChanged) {
+    deleteMissionIdIndex(taskId, current);
+    addMissionIdIndex(taskId, next);
   }
   if (parentFlowIndexChanged) {
     deleteParentFlowIdIndex(taskId, current);
@@ -1487,6 +1607,26 @@ export function setTaskProgressById(params: {
   lastEventAt?: number;
 }): TaskRecord | null {
   ensureTaskRegistryReady();
+  const current = tasks.get(params.taskId);
+  if (!current) {
+    return null;
+  }
+  const eventAt = params.lastEventAt ?? Date.now();
+  const abandonedMissionBlockedPatch = buildAbandonedMissionBlockedPatch({
+    current,
+    eventAt,
+    progressSummary: params.progressSummary,
+  });
+  if (abandonedMissionBlockedPatch) {
+    const blocked = updateTask(params.taskId, abandonedMissionBlockedPatch);
+    if (blocked) {
+      void maybeDeliverTaskTerminalUpdate(blocked.taskId);
+    }
+    return blocked;
+  }
+  if (blocksForwardProgressForAbandonedMission({ current })) {
+    return cloneTaskRecord(current);
+  }
   const patch: Partial<TaskRecord> = {};
   if (params.progressSummary !== undefined) {
     patch.progressSummary = normalizeTaskSummary(params.progressSummary);
@@ -1497,6 +1637,261 @@ export function setTaskProgressById(params: {
   return updateTask(params.taskId, patch);
 }
 
+export function setTaskMissionById(params: {
+  taskId: string;
+  missionId?: string | null;
+  missionSummary?: string | null;
+  missionState?: TaskMissionState | null;
+  missionUpdatedAt?: number;
+}): TaskRecord | null {
+  ensureTaskRegistryReady();
+  const patch: Partial<TaskRecord> = {};
+  if (params.missionId !== undefined) {
+    patch.missionId = normalizeOptionalString(params.missionId);
+  }
+  if (params.missionSummary !== undefined) {
+    patch.missionSummary = normalizeTaskSummary(params.missionSummary);
+  }
+  if (params.missionState !== undefined) {
+    patch.missionState = normalizeTaskMissionState(params.missionState);
+  }
+  if (
+    params.missionId !== undefined ||
+    params.missionSummary !== undefined ||
+    params.missionState !== undefined
+  ) {
+    patch.missionUpdatedAt = params.missionUpdatedAt ?? Date.now();
+  }
+  return updateTask(params.taskId, patch);
+}
+
+export type TaskMissionCorrectionReceipt = {
+  ownerKey: string;
+  abandonedMissionId?: string;
+  abandonedTaskIds: string[];
+  activatedTaskId: string;
+  activatedMissionId: string;
+  activatedAt: number;
+};
+
+export type MissionBoundFollowupResolution =
+  | { status: "not_applicable" }
+  | {
+      status: "bound";
+      ownerKey: string;
+      missionId: string;
+      missionSummary?: string;
+      activeTaskId: string;
+      reboundText: string;
+    }
+  | {
+      status: "blocked";
+      ownerKey: string;
+      reason: "no_active_mission" | "multiple_active_missions";
+      message: string;
+    };
+
+function normalizeMissionFollowupText(text: string): "continue" | "yes" | null {
+  const normalized = text.trim().toLowerCase();
+  if (normalized === "continue") {
+    return "continue";
+  }
+  if (normalized === "yes" || normalized === "y") {
+    return "yes";
+  }
+  return null;
+}
+
+function formatMissionFollowupBlockedMessage(
+  reason: "no_active_mission" | "multiple_active_missions",
+) {
+  if (reason === "multiple_active_missions") {
+    return "I have more than one active mission for this owner, so I will not guess what `continue` or `yes` means. Re-state the exact task.";
+  }
+  return "There is mission history for this owner but no single active mission, so I will not bind `continue` or `yes` to a stale frame. Re-state the exact task.";
+}
+
+function escapeMissionPromptValue(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+export function formatActiveMissionLabel(params: {
+  missionId: string;
+  missionSummary?: string | null;
+}): string {
+  const missionSummary = params.missionSummary?.trim();
+  return missionSummary
+    ? `Active mission (${params.missionId}): ${missionSummary}`
+    : `Active mission (${params.missionId})`;
+}
+
+export function formatActiveMissionContextBlock(params: {
+  missionId: string;
+  missionSummary?: string | null;
+  authority?: string | null;
+}): string {
+  const missionLabel = formatActiveMissionLabel(params);
+  const missionId = escapeMissionPromptValue(params.missionId.trim());
+  const missionSummary = params.missionSummary?.trim();
+  const authority = escapeMissionPromptValue((params.authority ?? "task-registry").trim());
+  return [
+    "<active_mission>",
+    `<mission_id>${missionId}</mission_id>`,
+    missionSummary
+      ? `<mission_summary>${escapeMissionPromptValue(missionSummary)}</mission_summary>`
+      : "<mission_summary />",
+    `<authority>${authority}</authority>`,
+    `<legacy_label>${escapeMissionPromptValue(missionLabel)}</legacy_label>`,
+    "</active_mission>",
+  ].join("\n");
+}
+
+export function buildActiveMissionContextBlockForOwnerKey(ownerKey: string): string | null {
+  ensureTaskRegistryReady();
+  const normalizedOwnerKey = normalizeOptionalString(ownerKey);
+  if (!normalizedOwnerKey) {
+    return null;
+  }
+  const activeMission = findLatestActiveMissionForOwnerKey(normalizedOwnerKey);
+  const missionId = normalizeOptionalString(activeMission?.missionId);
+  if (!activeMission || !missionId) {
+    return null;
+  }
+  return formatActiveMissionContextBlock({
+    missionId,
+    missionSummary: activeMission.missionSummary,
+  });
+}
+
+function formatMissionBoundFollowupText(params: {
+  directive: "continue" | "yes";
+  missionId: string;
+  missionSummary?: string;
+}): string {
+  const missionLabel = params.missionSummary?.trim()
+    ? `the active mission (${params.missionId}): ${params.missionSummary.trim()}`
+    : `the active mission (${params.missionId})`;
+  return params.directive === "yes" ? `Yes. Continue ${missionLabel}` : `Continue ${missionLabel}`;
+}
+
+export function activateTaskMissionById(params: {
+  taskId: string;
+  missionId: string;
+  missionSummary?: string | null;
+  missionUpdatedAt?: number;
+}): TaskMissionCorrectionReceipt | null {
+  ensureTaskRegistryReady();
+  const current = tasks.get(params.taskId);
+  if (!current) {
+    return null;
+  }
+  const ownerKey = normalizeOptionalString(current.ownerKey);
+  const missionId = normalizeOptionalString(params.missionId);
+  if (!ownerKey || !missionId) {
+    return null;
+  }
+  const activatedAt = params.missionUpdatedAt ?? Date.now();
+  const previousActiveMission = findLatestActiveMissionForOwnerKey(ownerKey);
+  const abandonedMissionId =
+    previousActiveMission && normalizeOptionalString(previousActiveMission.missionId) !== missionId
+      ? normalizeOptionalString(previousActiveMission.missionId)
+      : undefined;
+  const abandonedTaskIds: string[] = [];
+
+  if (abandonedMissionId) {
+    for (const task of listTasksForMissionId(abandonedMissionId).filter(
+      (candidate) => normalizeOptionalString(candidate.ownerKey) === ownerKey,
+    )) {
+      const updated = updateTask(task.taskId, {
+        missionState: "abandoned",
+        missionUpdatedAt: activatedAt,
+      });
+      if (updated) {
+        abandonedTaskIds.push(updated.taskId);
+      }
+    }
+  }
+
+  const activated = setTaskMissionById({
+    taskId: params.taskId,
+    missionId,
+    missionSummary: params.missionSummary,
+    missionState: "active",
+    missionUpdatedAt: activatedAt,
+  });
+  if (!activated) {
+    return null;
+  }
+
+  return {
+    ownerKey,
+    ...(abandonedMissionId ? { abandonedMissionId } : {}),
+    abandonedTaskIds,
+    activatedTaskId: activated.taskId,
+    activatedMissionId: missionId,
+    activatedAt,
+  };
+}
+
+export function resolveMissionBoundFollowupForOwner(params: {
+  ownerKey: string;
+  text: string;
+}): MissionBoundFollowupResolution {
+  ensureTaskRegistryReady();
+  const ownerKey = normalizeOptionalString(params.ownerKey);
+  const directive = normalizeMissionFollowupText(params.text);
+  if (!ownerKey || !directive) {
+    return { status: "not_applicable" };
+  }
+  const ownerTasks = listTasksForOwnerKey(ownerKey).filter((task) =>
+    Boolean(task.missionId?.trim()),
+  );
+  if (ownerTasks.length === 0) {
+    return { status: "not_applicable" };
+  }
+
+  const activeMissionTasks = ownerTasks.filter((task) => task.missionState === "active");
+  const activeMissionIds = uniqueStrings(
+    activeMissionTasks
+      .map((task) => normalizeOptionalString(task.missionId))
+      .filter((missionId): missionId is string => Boolean(missionId)),
+  );
+  if (activeMissionIds.length > 1) {
+    return {
+      status: "blocked",
+      ownerKey,
+      reason: "multiple_active_missions",
+      message: formatMissionFollowupBlockedMessage("multiple_active_missions"),
+    };
+  }
+
+  const activeMission = activeMissionTasks[0];
+  const missionId = normalizeOptionalString(activeMission?.missionId);
+  if (!activeMission || !missionId) {
+    return {
+      status: "blocked",
+      ownerKey,
+      reason: "no_active_mission",
+      message: formatMissionFollowupBlockedMessage("no_active_mission"),
+    };
+  }
+
+  return {
+    status: "bound",
+    ownerKey,
+    missionId,
+    ...(activeMission.missionSummary?.trim()
+      ? { missionSummary: activeMission.missionSummary.trim() }
+      : {}),
+    activeTaskId: activeMission.taskId,
+    reboundText: formatMissionBoundFollowupText({
+      directive,
+      missionId,
+      missionSummary: activeMission.missionSummary,
+    }),
+  };
+}
+
 export function setTaskTimingById(params: {
   taskId: string;
   startedAt?: number;
@@ -1504,6 +1899,16 @@ export function setTaskTimingById(params: {
   lastEventAt?: number;
 }): TaskRecord | null {
   ensureTaskRegistryReady();
+  const current = tasks.get(params.taskId);
+  if (!current) {
+    return null;
+  }
+  if (
+    blocksForwardProgressForAbandonedMission({ current }) &&
+    (params.startedAt != null || (params.lastEventAt != null && params.endedAt == null))
+  ) {
+    return cloneTaskRecord(current);
+  }
   const patch: Partial<TaskRecord> = {};
   if (params.startedAt != null) {
     patch.startedAt = params.startedAt;
@@ -1688,13 +2093,19 @@ export function createTaskRecord(params: {
   runId?: string;
   label?: string;
   task: string;
+  missionId?: string;
+  missionSummary?: string | null;
+  missionState?: TaskMissionState | null;
+  missionUpdatedAt?: number;
   preferMetadata?: boolean;
   status?: TaskStatus;
   deliveryStatus?: TaskDeliveryStatus;
   notifyPolicy?: TaskNotifyPolicy;
   startedAt?: number;
+  endedAt?: number;
   lastEventAt?: number;
   cleanupAfter?: number;
+  error?: string | null;
   progressSummary?: string | null;
   terminalSummary?: string | null;
   terminalOutcome?: TaskTerminalOutcome | null;
@@ -1751,7 +2162,11 @@ export function createTaskRecord(params: {
     ownerKey,
     scopeKind,
   });
-  const lastEventAt = params.lastEventAt ?? params.startedAt ?? now;
+  const lastEventAt = params.lastEventAt ?? params.endedAt ?? params.startedAt ?? now;
+  const missionId = normalizeOptionalString(params.missionId);
+  const missionSummary = normalizeTaskSummary(params.missionSummary);
+  const missionState = normalizeTaskMissionState(params.missionState);
+  const hasMissionMetadata = Boolean(missionId || missionSummary || missionState);
   const record: TaskRecord = normalizeTaskTimestamps({
     taskId,
     runtime: params.runtime,
@@ -1767,14 +2182,20 @@ export function createTaskRecord(params: {
     runId: normalizeOptionalString(params.runId),
     label: normalizeOptionalString(params.label),
     task: params.task,
+    missionId,
+    missionSummary,
+    missionState,
     status,
     deliveryStatus,
     notifyPolicy,
     createdAt: now,
     startedAt: params.startedAt,
+    endedAt: params.endedAt,
     lastEventAt,
     cleanupAfter: params.cleanupAfter,
+    error: normalizeOptionalString(params.error),
     progressSummary: normalizeTaskSummary(params.progressSummary),
+    missionUpdatedAt: hasMissionMetadata ? (params.missionUpdatedAt ?? lastEventAt) : undefined,
     terminalSummary: normalizeTaskSummary(params.terminalSummary),
     terminalOutcome: resolveTaskTerminalOutcome({
       status,
@@ -1800,6 +2221,7 @@ export function createTaskRecord(params: {
   }
   addRunIdIndex(taskId, record.runId);
   addOwnerKeyIndex(taskId, record);
+  addMissionIdIndex(taskId, record);
   addParentFlowIdIndex(taskId, record);
   addRelatedSessionKeyIndex(taskId, record);
   syncFlowFromTaskAfterTaskMutation(record, "create");
@@ -1835,7 +2257,24 @@ function updateTaskStateByRunId(params: {
   const updated: TaskRecord[] = [];
   for (const current of matches) {
     const patch: Partial<TaskRecord> = {};
+    const eventAt = params.lastEventAt ?? params.endedAt ?? Date.now();
     const nextStatus = params.status ? normalizeTaskStatus(params.status) : current.status;
+    const abandonedMissionBlockedPatch = buildAbandonedMissionBlockedPatch({
+      current,
+      eventAt,
+      progressSummary: params.progressSummary,
+    });
+    if (abandonedMissionBlockedPatch) {
+      const task = updateTask(current.taskId, abandonedMissionBlockedPatch);
+      if (task) {
+        updated.push(task);
+        void maybeDeliverTaskTerminalUpdate(task.taskId);
+      }
+      continue;
+    }
+    if (blocksForwardProgressForAbandonedMission({ current, nextStatus: params.status })) {
+      continue;
+    }
     if (
       params.status &&
       !shouldApplyRunScopedStatusUpdate({
@@ -1845,7 +2284,6 @@ function updateTaskStateByRunId(params: {
     ) {
       continue;
     }
-    const eventAt = params.lastEventAt ?? params.endedAt ?? Date.now();
     if (params.status) {
       patch.status = normalizeTaskStatus(params.status);
     }
@@ -2281,6 +2719,24 @@ export function listTasksForOwnerKey(ownerKey: string): TaskRecord[] {
   return listTasksFromIndex(taskIdsByOwnerKey, key);
 }
 
+export function findLatestActiveMissionForOwnerKey(ownerKey: string): TaskRecord | undefined {
+  return listTasksForOwnerKey(ownerKey).find((task) => task.missionState === "active");
+}
+
+export function findLatestTaskForMissionId(missionId: string): TaskRecord | undefined {
+  const task = listTasksForMissionId(missionId)[0];
+  return task ? cloneTaskRecord(task) : undefined;
+}
+
+export function listTasksForMissionId(missionId: string): TaskRecord[] {
+  ensureTaskRegistryReady();
+  const key = normalizeOptionalString(missionId);
+  if (!key) {
+    return [];
+  }
+  return listTasksFromIndex(taskIdsByMissionId, key);
+}
+
 export function listFreshTasksForOwnerKey(ownerKey: string): TaskRecord[] {
   ensureTaskRegistryReady();
   const key = normalizeOptionalString(ownerKey);
@@ -2355,6 +2811,7 @@ export function deleteTaskRecordById(taskId: string): boolean {
     return false;
   }
   deleteOwnerKeyIndex(taskId, current);
+  deleteMissionIdIndex(taskId, current);
   deleteParentFlowIdIndex(taskId, current);
   deleteRelatedSessionKeyIndex(taskId, current);
   tasks.delete(taskId);

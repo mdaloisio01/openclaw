@@ -1,6 +1,8 @@
 import type { JsonValue } from "../../tasks/task-flow-registry.types.js";
 import type {
+  TaskBuildExecutionState,
   TaskDeliveryStatus,
+  TaskMissionState,
   TaskNotifyPolicy,
   TaskRuntime,
   TaskScopeKind,
@@ -46,6 +48,15 @@ export type TaskRunView = {
   progressSummary?: string;
   terminalSummary?: string;
   terminalOutcome?: TaskTerminalOutcome;
+  missionId?: string;
+  missionSummary?: string;
+  missionState?: TaskMissionState;
+  missionUpdatedAt?: number;
+  buildExecutionTruth: {
+    state: TaskBuildExecutionState;
+    broaderBuildOpen: boolean;
+    proofSummary: string;
+  };
 };
 
 export type TaskRunDetail = TaskRunView;

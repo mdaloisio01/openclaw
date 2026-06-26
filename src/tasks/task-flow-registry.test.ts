@@ -1,13 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
+  BLIND_TEST_SLICE_CONTROLLER_ID,
+  createBlindTestSliceFlow as createBlindTestSliceFlowOrNull,
+  createNextBlindTestSliceFlow,
   createFlowRecord as createFlowRecordOrNull,
   createTaskFlowForTask as createTaskFlowForTaskOrNull,
   createManagedTaskFlow as createManagedTaskFlowOrNull,
   deleteTaskFlowRecordById,
   failFlow,
+  finishFlow,
+  getTaskFlowProductionContinuation,
   getTaskFlowById,
   listTaskFlowRecords,
+  recordFlowLawfulStop,
+  recordFlowNextExecutableLaunch,
+  recordBlindTestCloseoutFailure,
+  recordBlindTestDraftReview,
+  recordBlindTestImplementationReview,
   requestFlowCancel,
   resetTaskFlowRegistryForTests,
   resumeFlow,
@@ -32,6 +42,16 @@ function createManagedTaskFlow(
   const flow = createManagedTaskFlowOrNull(params);
   if (!flow) {
     throw new Error("expected managed TaskFlow creation to succeed");
+  }
+  return flow;
+}
+
+function createBlindTestSliceFlow(
+  params: Parameters<typeof createBlindTestSliceFlowOrNull>[0],
+): TaskFlowRecord {
+  const flow = createBlindTestSliceFlowOrNull(params);
+  if (!flow) {
+    throw new Error("expected blind-test TaskFlow creation to succeed");
   }
   return flow;
 }
@@ -432,6 +452,29 @@ describe("task-flow-registry", () => {
       expect(delivered.endedAt).toBe(200);
       expect(delivered.updatedAt).toBe(200);
 
+      const deliveryDebtSuccess = syncFlowFromTask({
+        taskId: "task-delivery-debt",
+        parentFlowId: mirrored.flowId,
+        status: "succeeded",
+        terminalOutcome: "succeeded",
+        notifyPolicy: "done_only",
+        label: "Fix permissions",
+        task: "Fix permissions",
+        lastEventAt: 275,
+        endedAt: 275,
+        terminalSummary:
+          "Required completion delivery failed before reaching the requester: requester wake failed.",
+      });
+      if (!deliveryDebtSuccess) {
+        throw new Error("Expected delivery-debt mirrored flow update");
+      }
+      expect(deliveryDebtSuccess.flowId).toBe(mirrored.flowId);
+      expect(deliveryDebtSuccess.status).toBe("succeeded");
+      expect(deliveryDebtSuccess.blockedTaskId ?? null).toBeNull();
+      expect(deliveryDebtSuccess.blockedSummary ?? null).toBeNull();
+      expect(deliveryDebtSuccess.endedAt).toBe(275);
+      expect(deliveryDebtSuccess.updatedAt).toBe(275);
+
       const terminalCreated = createTaskFlowForTask({
         task: {
           ownerKey: "agent:main:main",
@@ -509,6 +552,539 @@ describe("task-flow-registry", () => {
       }
       expect(resumed.flow.flowId).toBe(created.flowId);
       expect(resumed.flow.stateJson).toBeNull();
+    });
+  });
+
+  it("requires implementation pass before a blind-test slice can close", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const created = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Blind test Grant slice 1",
+        sliceKey: "slice-1",
+        subjectAgent: "Grant",
+      });
+
+      expect(created.controllerId).toBe(BLIND_TEST_SLICE_CONTROLLER_ID);
+      expect(created.currentStep).toBe("draft_review_required");
+
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        verdict: "passed",
+        summary: "Draft passes. Now implement it.",
+        reviewedAt: 100,
+      });
+      expect(draftPassed.applied).toBe(true);
+      if (!draftPassed.applied) {
+        throw new Error("Expected blind-test draft review pass to apply");
+      }
+      expect(draftPassed.flow.status).toBe("running");
+      expect(draftPassed.flow.currentStep).toBe("implementation_review_required");
+
+      const prematureClose = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        endedAt: 110,
+      });
+      expect(prematureClose).toMatchObject({
+        applied: false,
+        reason: "guard_blocked",
+        blockedSummary: "Blind-test slice cannot close until the implemented slice passes review.",
+        current: {
+          flowId: created.flowId,
+          status: "running",
+        },
+      });
+
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: created.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        summary: "Implemented slice passes.",
+        reviewedAt: 120,
+      });
+      expect(implementationPassed.applied).toBe(true);
+      if (!implementationPassed.applied) {
+        throw new Error("Expected blind-test implementation review pass to apply");
+      }
+      expect(implementationPassed.flow.currentStep).toBe(
+        "implementation_passed_ready_for_closeout",
+      );
+
+      const closed = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: implementationPassed.flow.revision,
+        endedAt: 130,
+      });
+      expect(closed.applied).toBe(true);
+      if (!closed.applied) {
+        throw new Error("Expected blind-test flow close to apply");
+      }
+      expect(closed.flow.status).toBe("succeeded");
+      expect(closed.flow.endedAt).toBe(130);
+    });
+  });
+
+  it("blocks managed-flow close after local success until the next executable unit launches", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Run bounded production controller",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const blockedClose = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        endedAt: 200,
+      });
+
+      expect(blockedClose).toMatchObject({
+        applied: false,
+        reason: "guard_blocked",
+        blockedSummary:
+          "Active production run cannot pause or close after a passed bounded unit before the next executable unit launches.",
+        current: {
+          flowId: created.flowId,
+          status: "blocked",
+          currentStep: "continuation_launch_required",
+        },
+      });
+      if (blockedClose.applied || !blockedClose.current) {
+        throw new Error("Expected blocked close current flow snapshot");
+      }
+      const blockedContinuation = getTaskFlowProductionContinuation(blockedClose.current);
+      expect(blockedContinuation?.continuationRequiredAfterLocalSuccess).toBe(true);
+      expect(blockedContinuation?.continuationViolation).toBe(true);
+
+      const launched = recordFlowNextExecutableLaunch({
+        flowId: created.flowId,
+        expectedRevision: blockedClose.current.revision,
+        detail: "Launch bounded unit 2",
+        currentStep: "bounded_unit_2_running",
+        updatedAt: 210,
+      });
+      expect(launched.applied).toBe(true);
+      if (!launched.applied) {
+        throw new Error("Expected next-launch update to apply");
+      }
+      const launchedContinuation = getTaskFlowProductionContinuation(launched.flow);
+      expect(launchedContinuation?.nextExecutableUnitIdentified).toBe(true);
+      expect(launchedContinuation?.nextExecutableUnitLaunched).toBe(true);
+
+      const closed = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: launched.flow.revision,
+        endedAt: 220,
+      });
+      expect(closed.applied).toBe(true);
+      if (!closed.applied) {
+        throw new Error("Expected managed flow close after next launch");
+      }
+      expect(closed.flow.status).toBe("succeeded");
+    });
+  });
+
+  it("allows lawful whole-run completion on managed continuation flows", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Complete entire production run",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const lawfulStop = recordFlowLawfulStop({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        reason: "whole_run_complete",
+        detail: "No further bounded units remain.",
+        updatedAt: 300,
+      });
+      expect(lawfulStop.applied).toBe(true);
+      if (!lawfulStop.applied) {
+        throw new Error("Expected lawful whole-run completion update to apply");
+      }
+      const lawfulContinuation = getTaskFlowProductionContinuation(lawfulStop.flow);
+      expect(lawfulContinuation?.lawfulWholeRunCompletion).toBe(true);
+      expect(lawfulContinuation?.lawfulStopReason).toBe("whole_run_complete");
+
+      const closed = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: lawfulStop.flow.revision,
+        endedAt: 310,
+      });
+      expect(closed.applied).toBe(true);
+      if (!closed.applied) {
+        throw new Error("Expected close after lawful whole-run completion");
+      }
+      expect(closed.flow.status).toBe("succeeded");
+    });
+  });
+
+  it("blocks implementation review before draft pass and blocks next-slice creation until prior slice closes cleanly", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const firstSlice = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Blind test Grant slice 1",
+        sliceKey: "slice-1",
+        subjectAgent: "Grant",
+      });
+
+      const implementationBeforeDraft = recordBlindTestImplementationReview({
+        flowId: firstSlice.flowId,
+        expectedRevision: firstSlice.revision,
+        verdict: "passed",
+        reviewedAt: 200,
+      });
+      expect(implementationBeforeDraft).toMatchObject({
+        applied: false,
+        reason: "guard_blocked",
+        blockedSummary:
+          "Implementation review cannot complete until the blind-test draft review passes.",
+      });
+
+      const nextBeforeClose = createNextBlindTestSliceFlow({
+        previousFlowId: firstSlice.flowId,
+        expectedPreviousRevision: firstSlice.revision,
+        goal: "Blind test Grant slice 2",
+        sliceKey: "slice-2",
+        subjectAgent: "Grant",
+      });
+      expect(nextBeforeClose).toMatchObject({
+        created: false,
+        reason: "previous_slice_not_complete",
+        blockedSummary:
+          "Next blind-test slice cannot start until the prior slice has a passing implementation review and is closed successfully.",
+      });
+
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: firstSlice.flowId,
+        expectedRevision: firstSlice.revision,
+        verdict: "passed",
+        reviewedAt: 210,
+      });
+      if (!draftPassed.applied) {
+        throw new Error("Expected draft pass");
+      }
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: firstSlice.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        reviewedAt: 220,
+      });
+      if (!implementationPassed.applied) {
+        throw new Error("Expected implementation pass");
+      }
+      const closed = finishFlow({
+        flowId: firstSlice.flowId,
+        expectedRevision: implementationPassed.flow.revision,
+        endedAt: 230,
+      });
+      if (!closed.applied) {
+        throw new Error("Expected first slice close");
+      }
+
+      const secondSlice = createNextBlindTestSliceFlow({
+        previousFlowId: firstSlice.flowId,
+        expectedPreviousRevision: closed.flow.revision,
+        goal: "Blind test Grant slice 2",
+        sliceKey: "slice-2",
+        subjectAgent: "Grant",
+      });
+      expect(secondSlice.created).toBe(true);
+      if (!secondSlice.created) {
+        throw new Error("Expected next blind-test slice creation to succeed");
+      }
+      expect(secondSlice.flow.ownerKey).toBe("agent:main:main");
+      expect(secondSlice.flow.currentStep).toBe("draft_review_required");
+    });
+  });
+
+  it("requires next executable launch before an active production blind-test slice can close", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const firstSlice = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Blind test Grant production slice 1",
+        sliceKey: "prod-slice-1",
+        subjectAgent: "Grant",
+        createdAt: 10,
+        updatedAt: 10,
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: firstSlice.flowId,
+        expectedRevision: firstSlice.revision,
+        verdict: "passed",
+        reviewedAt: 20,
+        updatedAt: 20,
+      });
+      if (!draftPassed.applied) {
+        throw new Error("Expected draft pass");
+      }
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: firstSlice.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        reviewedAt: 30,
+        updatedAt: 30,
+      });
+      if (!implementationPassed.applied) {
+        throw new Error("Expected implementation pass");
+      }
+
+      expect(
+        (
+          implementationPassed.flow.stateJson as {
+            continuation?: {
+              continuationRequiredAfterLocalSuccess?: boolean;
+              events?: { type: string }[];
+            };
+          }
+        ).continuation,
+      ).toMatchObject({
+        continuationRequiredAfterLocalSuccess: true,
+      });
+
+      const blockedClose = finishFlow({
+        flowId: firstSlice.flowId,
+        expectedRevision: implementationPassed.flow.revision,
+        updatedAt: 40,
+        endedAt: 40,
+      });
+      expect(blockedClose).toMatchObject({
+        applied: false,
+        reason: "guard_blocked",
+        blockedSummary:
+          "Active production run cannot pause or close after a passed bounded unit before the next executable unit launches.",
+        current: {
+          flowId: firstSlice.flowId,
+          status: "blocked",
+          currentStep: "continuation_launch_required",
+        },
+      });
+      if (blockedClose.applied || !blockedClose.current) {
+        throw new Error("Expected continuation guard to block close");
+      }
+      expect(
+        (
+          blockedClose.current.stateJson as {
+            continuation?: { continuationViolation?: boolean; events?: { type: string }[] };
+          }
+        ).continuation,
+      ).toMatchObject({
+        continuationViolation: true,
+      });
+
+      const secondSlice = createNextBlindTestSliceFlow({
+        previousFlowId: firstSlice.flowId,
+        expectedPreviousRevision: blockedClose.current.revision,
+        goal: "Blind test Grant production slice 2",
+        sliceKey: "prod-slice-2",
+        subjectAgent: "Grant",
+        createdAt: 50,
+        updatedAt: 50,
+      });
+      expect(secondSlice.created).toBe(true);
+      if (!secondSlice.created) {
+        throw new Error("Expected next slice creation to succeed");
+      }
+      expect(secondSlice.previousFlow).toMatchObject({
+        status: "running",
+        currentStep: "next_executable_unit_launched_ready_for_closeout",
+      });
+
+      const closed = finishFlow({
+        flowId: firstSlice.flowId,
+        expectedRevision: secondSlice.previousFlow?.revision ?? blockedClose.current.revision,
+        updatedAt: 60,
+        endedAt: 60,
+      });
+      expect(closed.applied).toBe(true);
+      if (!closed.applied) {
+        throw new Error("Expected close after next launch");
+      }
+      expect(closed.flow.status).toBe("succeeded");
+    });
+  });
+
+  it("allows lawful whole-run completion for active production slices", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const created = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Blind test Grant final production slice",
+        sliceKey: "prod-final",
+        subjectAgent: "Grant",
+        createdAt: 10,
+        updatedAt: 10,
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: false,
+          lawfulWholeRunCompletion: true,
+          lawfulStopReason: "whole_run_complete",
+        },
+      });
+
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        verdict: "passed",
+        reviewedAt: 20,
+        updatedAt: 20,
+      });
+      if (!draftPassed.applied) {
+        throw new Error("Expected draft pass");
+      }
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: created.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        reviewedAt: 30,
+        updatedAt: 30,
+      });
+      if (!implementationPassed.applied) {
+        throw new Error("Expected implementation pass");
+      }
+
+      const closed = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: implementationPassed.flow.revision,
+        updatedAt: 40,
+        endedAt: 40,
+      });
+      expect(closed.applied).toBe(true);
+      if (!closed.applied) {
+        throw new Error("Expected lawful whole-run completion close");
+      }
+      expect(closed.flow.status).toBe("succeeded");
+    });
+  });
+
+  it("tracks closeout rework and escalates the same slice to Will on the third failure", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const created = createBlindTestSliceFlow({
+        ownerKey: "agent:main:main",
+        goal: "Blind test Grant slice 3",
+        sliceKey: "slice-3",
+        subjectAgent: "Grant",
+      });
+
+      const draftPassed = recordBlindTestDraftReview({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        verdict: "passed",
+        reviewedAt: 100,
+      });
+      if (!draftPassed.applied) {
+        throw new Error("Expected draft pass");
+      }
+      const implementationPassed = recordBlindTestImplementationReview({
+        flowId: created.flowId,
+        expectedRevision: draftPassed.flow.revision,
+        verdict: "passed",
+        reviewedAt: 110,
+      });
+      if (!implementationPassed.applied) {
+        throw new Error("Expected implementation pass");
+      }
+
+      const firstFail = recordBlindTestCloseoutFailure({
+        flowId: created.flowId,
+        expectedRevision: implementationPassed.flow.revision,
+        summary: "Readable proof is missing. Retry the same slice.",
+        outcomeCode: "rejected_proof_missing",
+        reviewedAt: 120,
+      });
+      expect(firstFail.applied).toBe(true);
+      if (!firstFail.applied) {
+        throw new Error("Expected first closeout failure");
+      }
+      expect(firstFail.flow.currentStep).toBe("closeout_rework_required");
+      expect(firstFail.flow.blockedSummary).toBe(
+        "Readable proof is missing. Retry the same slice.",
+      );
+      expect(
+        (firstFail.flow.stateJson as { rework?: { failCount?: number; stage?: string } }).rework,
+      ).toMatchObject({
+        failCount: 1,
+        stage: "closeout",
+      });
+
+      const secondFail = recordBlindTestCloseoutFailure({
+        flowId: created.flowId,
+        expectedRevision: firstFail.flow.revision,
+        summary: "Still missing proof. Retry the same slice.",
+        outcomeCode: "rejected_proof_missing",
+        reviewedAt: 130,
+      });
+      expect(secondFail.applied).toBe(true);
+      if (!secondFail.applied) {
+        throw new Error("Expected second closeout failure");
+      }
+      expect(
+        (secondFail.flow.stateJson as { rework?: { failCount?: number } }).rework?.failCount,
+      ).toBe(2);
+
+      const thirdFail = recordBlindTestCloseoutFailure({
+        flowId: created.flowId,
+        expectedRevision: secondFail.flow.revision,
+        summary: "Third failure",
+        outcomeCode: "rejected_proof_missing",
+        reviewedAt: 140,
+      });
+      expect(thirdFail.applied).toBe(true);
+      if (!thirdFail.applied) {
+        throw new Error("Expected third closeout failure");
+      }
+      expect(thirdFail.flow.currentStep).toBe("will_takeover_required");
+      expect(thirdFail.flow.blockedSummary).toBe(
+        "Blind-test slice failed three times. Transfer this same slice to Will now.",
+      );
+      expect(
+        (
+          thirdFail.flow.stateJson as {
+            rework?: { failCount?: number; transferOwner?: string; handbackStatus?: string };
+          }
+        ).rework,
+      ).toMatchObject({
+        failCount: 3,
+        transferOwner: "Will",
+        handbackStatus: "required",
+      });
     });
   });
 });

@@ -91,6 +91,8 @@ export function createAgentHarnessTaskRuntime(
   const runtime = params.runtime;
   const scope = assertAgentHarnessTaskRuntimeScope(params.scope);
   const requesterSessionKey = scope.requesterSessionKey;
+  const scopedParentFlowId = normalizeOptionalString(scope.parentFlowId);
+  const scopedParentTaskId = normalizeOptionalString(scope.parentTaskId);
   const taskKind = normalizeOptionalString(params.taskKind);
   const runIdPrefix = normalizeOptionalString(params.runIdPrefix);
   const assertRunId = (runId: string) => assertScopedRunId(runId, runIdPrefix);
@@ -98,6 +100,19 @@ export function createAgentHarnessTaskRuntime(
     taskParams: AgentHarnessScopedCreateRunningTaskRunParams,
   ): TaskRecord | null => {
     assertRunId(taskParams.runId);
+    const requestedParentFlowId = normalizeOptionalString(taskParams.parentFlowId);
+    const requestedParentTaskId = normalizeOptionalString(taskParams.parentTaskId);
+    if (!scopedParentFlowId && (requestedParentFlowId || requestedParentTaskId)) {
+      throw new Error(
+        "Agent harness task runtime requires host-issued continuation linkage for parent-linked detached tasks.",
+      );
+    }
+    if (requestedParentFlowId && requestedParentFlowId !== scopedParentFlowId) {
+      throw new Error("Agent harness task runtime parentFlowId must match the host-issued scope.");
+    }
+    if (requestedParentTaskId && requestedParentTaskId !== scopedParentTaskId) {
+      throw new Error("Agent harness task runtime parentTaskId must match the host-issued scope.");
+    }
     return createRunningTaskRun({
       ...taskParams,
       runtime,
@@ -105,6 +120,8 @@ export function createAgentHarnessTaskRuntime(
       requesterSessionKey,
       ownerKey: requesterSessionKey,
       scopeKind: "session",
+      ...(scopedParentFlowId && !requestedParentFlowId ? { parentFlowId: scopedParentFlowId } : {}),
+      ...(scopedParentTaskId && !requestedParentTaskId ? { parentTaskId: scopedParentTaskId } : {}),
     });
   };
   return {

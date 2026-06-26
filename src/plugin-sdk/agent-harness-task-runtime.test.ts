@@ -78,6 +78,33 @@ describe("agent-harness-task-runtime", () => {
     );
   });
 
+  it("applies host-issued continuation linkage to created task records", () => {
+    const runtime = createAgentHarnessTaskRuntime({
+      runtime: "subagent",
+      taskKind: "example-harness",
+      scope: createAgentHarnessTaskRuntimeScope({
+        requesterSessionKey: "agent:main:channel:C123",
+        parentFlowId: "flow-parent-1",
+        parentTaskId: "task-parent-1",
+      }),
+      runIdPrefix: "example:",
+    });
+
+    runtime.createRunningTaskRun({
+      runId: "example:child-1",
+      sourceId: "example:child-1",
+      task: "do linked work",
+      label: "worker",
+    });
+
+    expect(createRunningTaskRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentFlowId: "flow-parent-1",
+        parentTaskId: "task-parent-1",
+      }),
+    );
+  });
+
   it("rejects task run ids outside the configured harness scope", () => {
     const runtime = createAgentHarnessTaskRuntime({
       runtime: "subagent",
@@ -92,6 +119,23 @@ describe("agent-harness-task-runtime", () => {
         endedAt: 1,
       }),
     ).toThrow(/outside the configured scope/);
+  });
+
+  it("rejects caller-invented continuation linkage outside the host-issued scope", () => {
+    const runtime = createAgentHarnessTaskRuntime({
+      runtime: "subagent",
+      scope: createScope(),
+      runIdPrefix: "example:",
+    });
+
+    expect(() =>
+      runtime.createRunningTaskRun({
+        runId: "example:child-1",
+        sourceId: "example:child-1",
+        task: "invented parent linkage",
+        parentFlowId: "flow-parent-1",
+      }),
+    ).toThrow(/host-issued continuation linkage/);
   });
 
   it("rejects caller-forged task runtime scopes", async () => {

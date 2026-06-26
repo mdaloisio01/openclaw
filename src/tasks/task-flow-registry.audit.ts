@@ -1,18 +1,24 @@
 import { listTasksForFlowId } from "./runtime-internal.js";
-import { getTaskFlowRegistryRestoreFailure, listTaskFlowRecords } from "./task-flow-registry.js";
+import {
+  getTaskFlowProductionContinuation,
+  getTaskFlowRegistryRestoreFailure,
+  listTaskFlowRecords,
+} from "./task-flow-registry.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import type { TaskRecord } from "./task-registry.types.js";
 
 export type TaskFlowAuditSeverity = "warn" | "error";
 export type TaskFlowAuditCode =
   | "restore_failed"
+  | "stale_queued"
   | "stale_running"
   | "stale_waiting"
   | "stale_blocked"
   | "cancel_stuck"
   | "missing_linked_tasks"
   | "blocked_task_missing"
-  | "inconsistent_timestamps";
+  | "inconsistent_timestamps"
+  | "continuation_required_not_launched";
 
 export type TaskFlowAuditFinding = {
   severity: TaskFlowAuditSeverity;
@@ -32,12 +38,14 @@ export type TaskFlowAuditSummary = {
 export type TaskFlowAuditOptions = {
   now?: number;
   flows?: TaskFlowRecord[];
+  staleQueuedMs?: number;
   staleRunningMs?: number;
   staleWaitingMs?: number;
   staleBlockedMs?: number;
   cancelStuckMs?: number;
 };
 
+const DEFAULT_STALE_QUEUED_MS = 30 * 60_000;
 const DEFAULT_STALE_RUNNING_MS = 30 * 60_000;
 const DEFAULT_STALE_WAITING_MS = 30 * 60_000;
 const DEFAULT_STALE_BLOCKED_MS = 30 * 60_000;
@@ -125,6 +133,7 @@ export function createEmptyTaskFlowAuditSummary(): TaskFlowAuditSummary {
     errors: 0,
     byCode: {
       restore_failed: 0,
+      stale_queued: 0,
       stale_running: 0,
       stale_waiting: 0,
       stale_blocked: 0,
@@ -132,6 +141,7 @@ export function createEmptyTaskFlowAuditSummary(): TaskFlowAuditSummary {
       missing_linked_tasks: 0,
       blocked_task_missing: 0,
       inconsistent_timestamps: 0,
+      continuation_required_not_launched: 0,
     },
   };
 }
@@ -141,6 +151,7 @@ export function listTaskFlowAuditFindings(
 ): TaskFlowAuditFinding[] {
   const flows = options.flows ?? listTaskFlowRecords();
   const now = options.now ?? Date.now();
+  const staleQueuedMs = options.staleQueuedMs ?? DEFAULT_STALE_QUEUED_MS;
   const staleRunningMs = options.staleRunningMs ?? DEFAULT_STALE_RUNNING_MS;
   const staleWaitingMs = options.staleWaitingMs ?? DEFAULT_STALE_WAITING_MS;
   const staleBlockedMs = options.staleBlockedMs ?? DEFAULT_STALE_BLOCKED_MS;
@@ -165,6 +176,18 @@ export function listTaskFlowAuditFindings(
     const activeTasks = linkedTasks.filter(
       (task) => task.status === "queued" || task.status === "running",
     );
+
+    if (flow.status === "queued" && ageMs >= staleQueuedMs) {
+      findings.push(
+        createFinding({
+          severity: "warn",
+          code: "stale_queued",
+          flow,
+          ageMs,
+          detail: "queued TaskFlow has not advanced recently",
+        }),
+      );
+    }
 
     if (flow.status === "running" && ageMs >= staleRunningMs) {
       findings.push(
@@ -224,13 +247,18 @@ export function listTaskFlowAuditFindings(
 
     if (
       flow.syncMode === "managed" &&
-      (flow.status === "running" || flow.status === "waiting" || flow.status === "blocked") &&
+      (flow.status === "queued" ||
+        flow.status === "running" ||
+        flow.status === "waiting" ||
+        flow.status === "blocked") &&
       ageMs >=
-        (flow.status === "running"
-          ? staleRunningMs
-          : flow.status === "waiting"
-            ? staleWaitingMs
-            : staleBlockedMs) &&
+        (flow.status === "queued"
+          ? staleQueuedMs
+          : flow.status === "running"
+            ? staleRunningMs
+            : flow.status === "waiting"
+              ? staleWaitingMs
+              : staleBlockedMs) &&
       linkedTasks.length === 0 &&
       !hasBlockingMetadata(flow)
     ) {
@@ -240,7 +268,10 @@ export function listTaskFlowAuditFindings(
           code: "missing_linked_tasks",
           flow,
           ageMs,
-          detail: "managed TaskFlow has no linked tasks or wait state",
+          detail:
+            flow.status === "queued"
+              ? "managed queued TaskFlow has no executor proof, linked tasks, or wait state"
+              : "managed TaskFlow has no linked tasks or wait state",
         }),
       );
     }
@@ -258,6 +289,24 @@ export function listTaskFlowAuditFindings(
           }),
         );
       }
+    }
+
+    const continuation = getTaskFlowProductionContinuation(flow);
+    if (
+      continuation?.activeProductionRun === true &&
+      continuation.continuationRequiredAfterLocalSuccess === true &&
+      continuation.nextExecutableUnitLaunched !== true
+    ) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "continuation_required_not_launched",
+          flow,
+          ageMs,
+          detail:
+            "active production continuation requires the next executable unit to launch before this flow can pause or close",
+        }),
+      );
     }
 
     const inconsistency = findTimestampInconsistency(flow);

@@ -10,6 +10,7 @@ import {
 import { parseDeliveryContextJson } from "./task-registry.sqlite.shared.js";
 import type { TaskRegistryStoreSnapshot } from "./task-registry.store.types.js";
 import {
+  parseOptionalTaskMissionState,
   parseOptionalTaskTerminalOutcome,
   parseTaskDeliveryStatus,
   parseTaskNotifyPolicy,
@@ -33,6 +34,7 @@ type TaskRegistryRow = Selectable<TaskRunsTable> & {
   status: string;
   delivery_status: string;
   notify_policy: string;
+  mission_state: string | null;
   terminal_outcome: string | null;
 };
 
@@ -58,6 +60,9 @@ const TASK_RUN_SELECT_COLUMNS = [
   "run_id",
   "label",
   "task",
+  "mission_id",
+  "mission_summary",
+  "mission_state",
   "status",
   "delivery_status",
   "notify_policy",
@@ -68,6 +73,7 @@ const TASK_RUN_SELECT_COLUMNS = [
   "cleanup_after",
   "error",
   "progress_summary",
+  "mission_updated_at",
   "terminal_summary",
   "terminal_outcome",
 ] as const;
@@ -90,7 +96,9 @@ function rowToTaskRecord(row: TaskRegistryRow): TaskRecord {
   const endedAt = normalizeNumber(row.ended_at);
   const lastEventAt = normalizeNumber(row.last_event_at);
   const cleanupAfter = normalizeNumber(row.cleanup_after);
+  const missionUpdatedAt = normalizeNumber(row.mission_updated_at);
   const scopeKind = parseTaskScopeKind(row.scope_kind);
+  const missionState = parseOptionalTaskMissionState(row.mission_state);
   const terminalOutcome = parseOptionalTaskTerminalOutcome(row.terminal_outcome);
   const requesterSessionKey =
     scopeKind === "system" ? "" : row.requester_session_key?.trim() || row.owner_key;
@@ -119,6 +127,10 @@ function rowToTaskRecord(row: TaskRegistryRow): TaskRecord {
     ...(cleanupAfter != null ? { cleanupAfter } : {}),
     ...(row.error ? { error: row.error } : {}),
     ...(row.progress_summary ? { progressSummary: row.progress_summary } : {}),
+    ...(row.mission_id ? { missionId: row.mission_id } : {}),
+    ...(row.mission_summary ? { missionSummary: row.mission_summary } : {}),
+    ...(missionState ? { missionState } : {}),
+    ...(missionUpdatedAt != null ? { missionUpdatedAt } : {}),
     ...(row.terminal_summary ? { terminalSummary: row.terminal_summary } : {}),
     ...(terminalOutcome ? { terminalOutcome } : {}),
   };
@@ -150,6 +162,9 @@ function bindTaskRecordBase(record: TaskRecord): Insertable<TaskRunsTable> {
     run_id: record.runId ?? null,
     label: record.label ?? null,
     task: record.task,
+    mission_id: record.missionId ?? null,
+    mission_summary: record.missionSummary ?? null,
+    mission_state: record.missionState ?? null,
     status: record.status,
     delivery_status: record.deliveryStatus,
     notify_policy: record.notifyPolicy,
@@ -160,6 +175,7 @@ function bindTaskRecordBase(record: TaskRecord): Insertable<TaskRunsTable> {
     cleanup_after: record.cleanupAfter ?? null,
     error: record.error ?? null,
     progress_summary: record.progressSummary ?? null,
+    mission_updated_at: record.missionUpdatedAt ?? null,
     terminal_summary: record.terminalSummary ?? null,
     terminal_outcome: record.terminalOutcome ?? null,
   };
@@ -238,6 +254,9 @@ function upsertTaskRow(db: DatabaseSync, row: Insertable<TaskRunsTable>): void {
           run_id: (eb) => eb.ref("excluded.run_id"),
           label: (eb) => eb.ref("excluded.label"),
           task: (eb) => eb.ref("excluded.task"),
+          mission_id: (eb) => eb.ref("excluded.mission_id"),
+          mission_summary: (eb) => eb.ref("excluded.mission_summary"),
+          mission_state: (eb) => eb.ref("excluded.mission_state"),
           status: (eb) => eb.ref("excluded.status"),
           delivery_status: (eb) => eb.ref("excluded.delivery_status"),
           notify_policy: (eb) => eb.ref("excluded.notify_policy"),
@@ -248,6 +267,7 @@ function upsertTaskRow(db: DatabaseSync, row: Insertable<TaskRunsTable>): void {
           cleanup_after: (eb) => eb.ref("excluded.cleanup_after"),
           error: (eb) => eb.ref("excluded.error"),
           progress_summary: (eb) => eb.ref("excluded.progress_summary"),
+          mission_updated_at: (eb) => eb.ref("excluded.mission_updated_at"),
           terminal_summary: (eb) => eb.ref("excluded.terminal_summary"),
           terminal_outcome: (eb) => eb.ref("excluded.terminal_outcome"),
         }),

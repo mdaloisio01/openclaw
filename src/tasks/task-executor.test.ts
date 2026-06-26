@@ -25,6 +25,7 @@ import {
 } from "./task-executor.js";
 import {
   createManagedTaskFlow as createManagedTaskFlowOrNull,
+  getTaskFlowProductionContinuation,
   getTaskFlowById,
   listTaskFlowRecords,
   resetTaskFlowRegistryForTests,
@@ -616,6 +617,54 @@ describe("task-executor", () => {
       expect(cancelledFlow?.cancelRequestedAt).toBe(cancelRequestedAt);
       expect(cancelledFlow?.status).toBe("cancelled");
       expect(cancelledFlow?.endedAt).toBe(50);
+    });
+  });
+
+  it("routes managed continuation cancellation through a lawful hard-stop instead of bypassing the contract", async () => {
+    await withTaskExecutorStateDir(async () => {
+      hoisted.cancelSessionMock.mockRejectedValue(new Error("still shutting down"));
+
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-flow",
+        goal: "Long running production batch",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      const created = runTaskInFlow({
+        flowId: flow.flowId,
+        runtime: "acp",
+        childSessionKey: "agent:codex:acp:child",
+        runId: "run-flow-production-cancel",
+        task: "Inspect a PR",
+        status: "running",
+        startedAt: 10,
+        lastEventAt: 10,
+      });
+      requireCreatedFlowTask(created);
+
+      const cancelled = await cancelFlowById({
+        cfg: {} as never,
+        flowId: flow.flowId,
+      });
+      expect(cancelled.cancelled).toBe(false);
+      expect(cancelled.reason).toBe("One or more child tasks are still active.");
+
+      failTaskRunByRunId({
+        runId: "run-flow-production-cancel",
+        endedAt: 50,
+        lastEventAt: 50,
+        error: "cancel completed later",
+        status: "cancelled",
+      });
+
+      const cancelledFlow = getTaskFlowById(flow.flowId);
+      expect(cancelledFlow?.status).toBe("cancelled");
+      const continuation = cancelledFlow ? getTaskFlowProductionContinuation(cancelledFlow) : null;
+      expect(continuation?.lawfulStopReason).toBe("hard_stop");
+      expect(continuation?.continuationRequiredAfterLocalSuccess).toBe(false);
     });
   });
 
