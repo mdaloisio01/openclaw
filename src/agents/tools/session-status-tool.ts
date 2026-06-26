@@ -17,7 +17,10 @@ import {
 } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { triggerSessionPatchHook } from "../../gateway/session-patch-hooks.js";
-import { resolveSessionModelIdentityRef } from "../../gateway/session-utils.js";
+import {
+  loadGatewaySessionRow,
+  resolveSessionModelIdentityRef,
+} from "../../gateway/session-utils.js";
 import { loadManifestMetadataSnapshot } from "../../plugins/manifest-contract-eligibility.js";
 import {
   buildAgentMainSessionKey,
@@ -54,6 +57,10 @@ import {
 } from "../tool-description-presets.js";
 import type { AnyAgentTool } from "./common.js";
 import { normalizeToolModelOverride, readStringParam } from "./common.js";
+import {
+  buildSessionExecutionTruthFromSnapshot,
+  type SharedSessionExecutionTruth,
+} from "./session-execution-truth.js";
 import {
   createAgentToAgentPolicy,
   createSessionVisibilityGuard,
@@ -219,6 +226,8 @@ type SessionStatusRouteDetails = {
   deliveryContext?: SessionStatusDeliveryContextDetails;
 };
 
+type SessionExecutionTruth = SharedSessionExecutionTruth;
+
 const INTERNAL_SESSION_KEY_ORIGIN_PREFIXES = new Set(["main", "cron", "subagent", "acp"]);
 
 function readRouteThreadId(value: unknown): string | number | undefined {
@@ -334,6 +343,23 @@ ${JSON.stringify(details, null, 2)}
 \`\`\``;
 }
 
+function buildSessionExecutionTruth(params: {
+  sessionKey: string;
+  agentId: string;
+}): SessionExecutionTruth | undefined {
+  const row = loadGatewaySessionRow(params.sessionKey, { agentId: params.agentId });
+  if (!row) {
+    return undefined;
+  }
+  return buildSessionExecutionTruthFromSnapshot({
+    status: row.status,
+    subagentRunState: row.subagentRunState,
+    hasActiveSubagentRun: row.hasActiveSubagentRun === true,
+    endedAt: row.endedAt,
+    sourceLabel: "Session snapshot",
+  });
+}
+
 function resolveActiveStatusModelIdentity(params: {
   activeModelId?: string;
   activeModelProvider?: string;
@@ -393,11 +419,13 @@ function formatSessionTaskLine(params: {
     return undefined;
   }
   const headline =
-    snapshot.activeCount > 0
-      ? `${snapshot.activeCount} active`
-      : snapshot.recentFailureCount > 0
-        ? `${snapshot.recentFailureCount} recent failure${snapshot.recentFailureCount === 1 ? "" : "s"}`
-        : `latest ${task.status.replaceAll("_", " ")}`;
+    snapshot.runningCount > 0
+      ? `${snapshot.runningCount} running${snapshot.acceptedCount > 0 ? ` · ${snapshot.acceptedCount} accepted/not yet proven active` : ""}`
+      : snapshot.acceptedCount > 0
+        ? `${snapshot.acceptedCount} accepted/not yet proven active`
+        : snapshot.recentFailureCount > 0
+          ? `${snapshot.recentFailureCount} recent failure${snapshot.recentFailureCount === 1 ? "" : "s"}`
+          : `latest ${task.status.replaceAll("_", " ")}`;
   const title = formatTaskStatusTitle(task);
   const detail = formatTaskStatusDetail(task);
   const parts = [headline, task.runtime, title, detail].filter(Boolean);
@@ -929,6 +957,10 @@ export function createSessionStatusTool(opts?: {
         activeDeliveryContext: opts?.activeDeliveryContext,
         isLiveRunSession: isLiveRouteSession,
       });
+      const sessionExecutionTruth = buildSessionExecutionTruth({
+        sessionKey: resolved.key,
+        agentId,
+      });
       const routeContextText = formatSessionStatusRouteContext(routeDetails);
       const visibleStatusText = routeContextText
         ? `${fullStatusText}
@@ -960,6 +992,7 @@ ${routeContextText}`
               }
             : {}),
           statusText: visibleStatusText,
+          ...(sessionExecutionTruth ? { sessionExecutionTruth } : {}),
           ...routeDetails,
         },
       };

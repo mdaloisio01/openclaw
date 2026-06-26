@@ -965,6 +965,18 @@ describe("sessions_send gating", () => {
     const details = requireDetails(result);
     expect(details.status).toBe("accepted");
     expect(details.sessionKey).toBe(MAIN_AGENT_SESSION_KEY);
+    expect(details.runningNow).toBe(false);
+    expect(details.runningNowAnswer).toBe("no");
+    expect(details.runningNowProofSummary).toBe(
+      "Follow-up was accepted by the target session, but continued execution is not yet proven from this tool result alone.",
+    );
+    expect(details.followupExecutionTruth).toMatchObject({
+      runningNow: false,
+      liveExecutionState: "accepted_not_yet_proven_active",
+      source: "agent_wait_timeout",
+      proofSummary:
+        "Follow-up was accepted by the target session, but continued execution is not yet proven from this tool result alone.",
+    });
     const flowParams = vi.mocked(runSessionsSendA2AFlow).mock.calls[0]?.[0];
     expect(flowParams?.waitRunId).toBe("run-fire-and-forget");
     expect(flowParams?.baseline?.text).toBe("older reply from a previous run");
@@ -1001,6 +1013,18 @@ describe("sessions_send gating", () => {
     const details = requireDetails(result);
     expect(details.status).toBe("accepted");
     expect(details.sessionKey).toBe(MAIN_AGENT_SESSION_KEY);
+    expect(details.runningNow).toBe(false);
+    expect(details.runningNowAnswer).toBe("no");
+    expect(details.runningNowProofSummary).toBe(
+      "Follow-up was accepted by the target session, but continued execution is not yet proven from this tool result alone.",
+    );
+    expect(details.followupExecutionTruth).toMatchObject({
+      runningNow: false,
+      liveExecutionState: "accepted_not_yet_proven_active",
+      source: "agent_wait_timeout",
+      proofSummary:
+        "Follow-up was accepted by the target session, but continued execution is not yet proven from this tool result alone.",
+    });
     const flowParams = vi.mocked(runSessionsSendA2AFlow).mock.calls[0]?.[0];
     expect(flowParams?.waitRunId).toBe("run-fire-and-forget");
     expect(flowParams?.baseline).toBeUndefined();

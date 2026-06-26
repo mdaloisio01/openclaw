@@ -10,6 +10,7 @@ import { GATEWAY_CLIENT_IDS } from "../../../packages/gateway-protocol/src/clien
 import {
   ErrorCodes,
   errorShape,
+  type ErrorShape,
   type SessionOperationEvent,
   validateSessionsAbortParams,
   validateSessionsCleanupParams,
@@ -44,6 +45,10 @@ import {
   waitForEmbeddedAgentRunEnd,
 } from "../../agents/embedded-agent-runner/runs.js";
 import { compactEmbeddedAgentSession } from "../../agents/embedded-agent.js";
+import {
+  getLatestSubagentRunByChildSessionKey,
+  isSubagentRunLive,
+} from "../../agents/subagent-registry-read.js";
 import { clearSessionQueues } from "../../auto-reply/reply/queue/cleanup.js";
 import { normalizeReasoningLevel, normalizeThinkLevel } from "../../auto-reply/thinking.js";
 import {
@@ -116,6 +121,7 @@ import {
   type SessionsPreviewEntry,
   type SessionsPreviewResult,
 } from "../session-utils.js";
+import type { GatewaySessionRow } from "../session-utils.types.js";
 import { applySessionsPatchToStore } from "../sessions-patch.js";
 import { resolveSessionKeyFromResolveParams } from "../sessions-resolve.js";
 import { setGatewayDedupeEntry } from "./agent-wait-dedupe.js";
@@ -257,6 +263,145 @@ function resolveGatewaySessionTargetFromKey(
     ...(opts?.agentId ? { agentId: opts.agentId } : {}),
   });
   return { cfg, target, storePath: target.storePath };
+}
+
+type FollowupExecutionLiveState =
+  | "active_confirmed"
+  | "accepted_not_yet_proven_active"
+  | "completed_immediately"
+  | "reactivation_failed"
+  | "delivery_failed";
+
+type FollowupExecutionTruth = {
+  deliveryStatus: "acknowledged" | "failed";
+  previousRunId?: string;
+  followupRunId?: string;
+  reactivationApplied: boolean;
+  runningNow: boolean;
+  liveExecutionState: FollowupExecutionLiveState;
+  observedAt: number;
+  sessionStatusSnapshot?: GatewaySessionRow["status"];
+  subagentRunStateSnapshot?: GatewaySessionRow["subagentRunState"];
+  startedAt?: number;
+  endedAt?: number;
+  proofSummary: string;
+};
+
+function buildFollowupExecutionReceipt(truth: FollowupExecutionTruth | undefined): {
+  runningNow?: boolean;
+  runningNowAnswer?: "yes" | "no";
+  runningNowProofSummary?: string;
+} {
+  if (!truth) {
+    return {};
+  }
+  return {
+    runningNow: truth.runningNow,
+    runningNowAnswer: truth.runningNow ? "yes" : "no",
+    runningNowProofSummary: truth.proofSummary,
+  };
+}
+
+function normalizeRespondError(error: unknown): ErrorShape | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+  const candidate = error as {
+    code?: unknown;
+    message?: unknown;
+    details?: unknown;
+    retryable?: unknown;
+    retryAfterMs?: unknown;
+  };
+  if (typeof candidate.code !== "string" || typeof candidate.message !== "string") {
+    return undefined;
+  }
+  return {
+    code: candidate.code,
+    message: candidate.message,
+    ...(candidate.details !== undefined ? { details: candidate.details } : {}),
+    ...(typeof candidate.retryable === "boolean" ? { retryable: candidate.retryable } : {}),
+    ...(typeof candidate.retryAfterMs === "number" ? { retryAfterMs: candidate.retryAfterMs } : {}),
+  };
+}
+
+async function resolveFollowupExecutionTruth(params: {
+  deliveryAcknowledged: boolean;
+  sessionKey: string;
+  runId?: string;
+  requestedAgentId?: string;
+}): Promise<FollowupExecutionTruth | undefined> {
+  const runId = normalizeOptionalString(params.runId);
+  if (!runId) {
+    return undefined;
+  }
+  const observedAt = Date.now();
+  const previousRun = getLatestSubagentRunByChildSessionKey(params.sessionKey);
+  const reactivationApplied = params.deliveryAcknowledged
+    ? await reactivateCompletedSubagentSession({
+        sessionKey: params.sessionKey,
+        runId,
+      })
+    : false;
+  const sessionRow = loadGatewaySessionRow(params.sessionKey, {
+    ...(params.requestedAgentId ? { agentId: params.requestedAgentId } : {}),
+    now: observedAt,
+  });
+  const latestRun = getLatestSubagentRunByChildSessionKey(params.sessionKey);
+  const latestRunIsLive = isSubagentRunLive(latestRun);
+  const sessionSnapshotStatus = sessionRow?.status;
+  let liveExecutionState: FollowupExecutionLiveState;
+  let proofSummary: string;
+
+  if (!params.deliveryAcknowledged) {
+    liveExecutionState = "delivery_failed";
+    proofSummary = "Follow-up delivery did not acknowledge, so active execution was not proven.";
+  } else if (!reactivationApplied) {
+    liveExecutionState = "reactivation_failed";
+    proofSummary =
+      "Follow-up delivery acknowledged, but completed-session reactivation did not apply.";
+  } else if (sessionSnapshotStatus === "running") {
+    liveExecutionState = "active_confirmed";
+    proofSummary =
+      "Follow-up delivery acknowledged, reactivation applied, and the session snapshot is running.";
+  } else if (
+    sessionSnapshotStatus === "done" ||
+    sessionSnapshotStatus === "failed" ||
+    sessionSnapshotStatus === "killed" ||
+    sessionSnapshotStatus === "timeout" ||
+    typeof sessionRow?.endedAt === "number"
+  ) {
+    liveExecutionState = "completed_immediately";
+    proofSummary =
+      "Follow-up delivery acknowledged and reactivation applied, but the session snapshot is already terminal.";
+  } else if (latestRun?.runId === runId && latestRunIsLive) {
+    liveExecutionState = "active_confirmed";
+    proofSummary =
+      "Follow-up delivery acknowledged, reactivation applied, and the latest child run is live.";
+  } else if (latestRun?.runId === runId) {
+    liveExecutionState = "completed_immediately";
+    proofSummary =
+      "Follow-up delivery acknowledged and reactivation applied, but the reactivated child run is already terminal.";
+  } else {
+    liveExecutionState = "accepted_not_yet_proven_active";
+    proofSummary =
+      "Follow-up delivery acknowledged, but active execution was not yet proven on the latest child run snapshot.";
+  }
+
+  return {
+    deliveryStatus: params.deliveryAcknowledged ? "acknowledged" : "failed",
+    previousRunId: previousRun?.runId,
+    followupRunId: runId,
+    reactivationApplied,
+    runningNow: liveExecutionState === "active_confirmed",
+    liveExecutionState,
+    observedAt,
+    sessionStatusSnapshot: sessionSnapshotStatus,
+    subagentRunStateSnapshot: sessionRow?.subagentRunState,
+    startedAt: sessionRow?.startedAt,
+    endedAt: sessionRow?.endedAt,
+    proofSummary,
+  };
 }
 
 function resolveOptionalInitialSessionMessage(params: {
@@ -945,6 +1090,13 @@ async function handleSessionSend(params: {
   let sendPayload: unknown;
   let sendCached = false;
   let startedRunId: string | undefined;
+  let sendError: unknown;
+  let sendMeta:
+    | {
+        cached?: boolean;
+      }
+    | undefined;
+  let payloadIncludesPendingMessageSeq = false;
   const rawIdempotencyKey = (p as { idempotencyKey?: string }).idempotencyKey;
   const idempotencyKey =
     typeof rawIdempotencyKey === "string" && rawIdempotencyKey.trim()
@@ -965,46 +1117,31 @@ async function handleSessionSend(params: {
       sendAcked = ok;
       sendPayload = payload;
       sendCached = meta?.cached === true;
+      sendError = error;
+      sendMeta = meta;
       startedRunId =
         payload &&
         typeof payload === "object" &&
         typeof (payload as { runId?: unknown }).runId === "string"
           ? (payload as { runId: string }).runId
           : undefined;
-      if (ok && shouldAttachPendingMessageSeq({ payload, cached: meta?.cached === true })) {
-        params.respond(
-          true,
-          {
-            ...(payload && typeof payload === "object" ? payload : {}),
-            messageSeq,
-            ...(interruptedActiveRun ? { interruptedActiveRun: true } : {}),
-          },
-          undefined,
-          meta,
-        );
-        return;
-      }
-      params.respond(
-        ok,
-        ok && payload && typeof payload === "object"
-          ? {
-              ...payload,
-              ...(interruptedActiveRun ? { interruptedActiveRun: true } : {}),
-            }
-          : payload,
-        error,
-        meta,
-      );
+      payloadIncludesPendingMessageSeq = shouldAttachPendingMessageSeq({
+        payload,
+        cached: meta?.cached === true,
+      });
     },
     context: params.context,
     client: params.client,
     isWebchatConnect: params.isWebchatConnect,
   });
+  let followupExecutionTruth: FollowupExecutionTruth | undefined;
   if (sendAcked) {
-    if (shouldAttachPendingMessageSeq({ payload: sendPayload, cached: sendCached })) {
-      await reactivateCompletedSubagentSession({
+    if (payloadIncludesPendingMessageSeq) {
+      followupExecutionTruth = await resolveFollowupExecutionTruth({
+        deliveryAcknowledged: true,
         sessionKey: canonicalKey,
         runId: startedRunId,
+        ...(canonicalKey === "global" && requestedAgentId ? { requestedAgentId } : {}),
       });
     }
     emitSessionsChanged(params.context, {
@@ -1012,7 +1149,42 @@ async function handleSessionSend(params: {
       ...(canonicalKey === "global" && requestedAgentId ? { agentId: requestedAgentId } : {}),
       reason: interruptedActiveRun ? "steer" : "send",
     });
+  } else if (payloadIncludesPendingMessageSeq) {
+    followupExecutionTruth = await resolveFollowupExecutionTruth({
+      deliveryAcknowledged: false,
+      sessionKey: canonicalKey,
+      runId: startedRunId,
+      ...(canonicalKey === "global" && requestedAgentId ? { requestedAgentId } : {}),
+    });
   }
+  if (sendAcked && payloadIncludesPendingMessageSeq) {
+    params.respond(
+      true,
+      {
+        ...(sendPayload && typeof sendPayload === "object" ? sendPayload : {}),
+        messageSeq,
+        ...buildFollowupExecutionReceipt(followupExecutionTruth),
+        ...(followupExecutionTruth ? { followupExecutionTruth } : {}),
+        ...(interruptedActiveRun ? { interruptedActiveRun: true } : {}),
+      },
+      undefined,
+      sendMeta,
+    );
+    return;
+  }
+  params.respond(
+    sendAcked,
+    sendAcked && sendPayload && typeof sendPayload === "object"
+      ? {
+          ...sendPayload,
+          ...buildFollowupExecutionReceipt(followupExecutionTruth),
+          ...(followupExecutionTruth ? { followupExecutionTruth } : {}),
+          ...(interruptedActiveRun ? { interruptedActiveRun: true } : {}),
+        }
+      : sendPayload,
+    normalizeRespondError(sendError),
+    sendMeta,
+  );
 }
 export const sessionsHandlers: GatewayRequestHandlers = {
   "sessions.list": async ({ params, respond, context }) => {

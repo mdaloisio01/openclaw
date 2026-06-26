@@ -194,9 +194,18 @@ type SessionsSendDetails = {
   reply?: string;
   error?: string;
   sessionKey?: string;
+  runningNow?: boolean;
+  runningNowAnswer?: string;
+  runningNowProofSummary?: string;
   delivery?: {
     status?: string;
     mode?: string;
+  };
+  followupExecutionTruth?: {
+    runningNow?: boolean;
+    liveExecutionState?: string;
+    source?: string;
+    proofSummary?: string;
   };
 };
 

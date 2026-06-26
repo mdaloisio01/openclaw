@@ -41,6 +41,13 @@ type SessionsListDetails = {
     };
     elevatedLevel?: string;
     fastMode?: boolean;
+    sessionExecutionTruth?: {
+      liveExecutionState?: string;
+      proofSummary?: string;
+      runningNow?: boolean;
+      sessionStatusSnapshot?: string;
+      subagentRunStateSnapshot?: string;
+    };
     reasoningLevel?: string;
     responseUsage?: string;
     thinkingLevel?: string;
@@ -194,6 +201,75 @@ describe("sessions-list-tool", () => {
     expect(session?.responseUsage).toBe("full");
   });
 
+  it("exposes active-confirmed execution truth in sessions_list results", async () => {
+    mocks.gatewayCall.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [
+            {
+              key: "agent:main:subagent:running-child",
+              kind: "direct",
+              sessionId: "sess-running-child",
+              status: "running",
+              hasActiveSubagentRun: true,
+              subagentRunState: "active",
+            },
+          ],
+        };
+      }
+      return {};
+    });
+    const tool = createSessionsListTool({ config: {} as never });
+
+    const result = await tool.execute("call-4", {});
+    const details = getSessionsListDetails(result);
+
+    expect(details.sessions?.[0]?.sessionExecutionTruth).toEqual({
+      runningNow: true,
+      liveExecutionState: "active_confirmed",
+      sessionStatusSnapshot: "running",
+      subagentRunStateSnapshot: "active",
+      proofSummary: "Session list snapshot shows an active run right now.",
+    });
+  });
+
+  it("exposes terminal execution truth in sessions_list results", async () => {
+    mocks.gatewayCall.mockImplementation(async (opts: unknown) => {
+      const request = opts as { method?: string };
+      if (request.method === "sessions.list") {
+        return {
+          path: "/tmp/sessions.json",
+          sessions: [
+            {
+              key: "agent:main:subagent:done-child",
+              kind: "direct",
+              sessionId: "sess-done-child",
+              status: "done",
+              hasActiveSubagentRun: false,
+              subagentRunState: "historical",
+              endedAt: 321,
+            },
+          ],
+        };
+      }
+      return {};
+    });
+    const tool = createSessionsListTool({ config: {} as never });
+
+    const result = await tool.execute("call-5", {});
+    const details = getSessionsListDetails(result);
+
+    expect(details.sessions?.[0]?.sessionExecutionTruth).toEqual({
+      runningNow: false,
+      liveExecutionState: "not_running_terminal",
+      sessionStatusSnapshot: "done",
+      subagentRunStateSnapshot: "historical",
+      proofSummary: "Session list snapshot is terminal, so it is not actively running now.",
+    });
+  });
+
   it.each([
     [{ limit: 1.5 }, "limit must be a positive integer"],
     [{ activeMinutes: 0 }, "activeMinutes must be a positive integer"],
@@ -202,7 +278,7 @@ describe("sessions-list-tool", () => {
   ])("rejects invalid numeric parameter %o", async (params, message) => {
     const tool = createSessionsListTool({ config: {} as never });
 
-    await expect(tool.execute("call-4", params)).rejects.toThrow(message);
+    await expect(tool.execute("call-invalid-numeric", params)).rejects.toThrow(message);
     expect(mocks.gatewayCall).not.toHaveBeenCalled();
   });
 });

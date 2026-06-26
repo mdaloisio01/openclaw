@@ -23,6 +23,10 @@ export {
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type {
+  SessionExecutionTruthSessionStatus,
+  SharedSessionExecutionTruth,
+} from "./session-execution-truth.js";
 
 export type SessionKind = "main" | "group" | "cron" | "hook" | "node" | "other";
 
@@ -33,7 +37,11 @@ export type SessionListDeliveryContext = {
   threadId?: string | number;
 };
 
-export type SessionRunStatus = "running" | "done" | "failed" | "killed" | "timeout";
+export type SessionRunStatus = SessionExecutionTruthSessionStatus;
+
+export type SessionListExecutionTruth = SharedSessionExecutionTruth & {
+  sessionStatusSnapshot?: SessionRunStatus;
+};
 
 export type SessionListRow = {
   key: string;
@@ -76,6 +84,7 @@ export type SessionListRow = {
   lastAccountId?: string;
   lastThreadId?: string | number;
   transcriptPath?: string;
+  sessionExecutionTruth?: SessionListExecutionTruth;
   messages?: unknown[];
 };
 

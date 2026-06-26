@@ -117,6 +117,21 @@ describe("sessions.send completed subagent follow-up status", () => {
     expect(call?.[1]?.runId).toBe("run-new");
     expect(call?.[1]?.status).toBe("started");
     expect(call?.[1]?.messageSeq).toBe(1);
+    expect(call?.[1]?.runningNow).toBe(true);
+    expect(call?.[1]?.runningNowAnswer).toBe("yes");
+    expect(call?.[1]).toMatchObject({
+      followupExecutionTruth: {
+        deliveryStatus: "acknowledged",
+        previousRunId: "run-old",
+        followupRunId: "run-new",
+        reactivationApplied: true,
+        runningNow: true,
+        liveExecutionState: "active_confirmed",
+        sessionStatusSnapshot: "running",
+        proofSummary:
+          "Follow-up delivery acknowledged, reactivation applied, and the session snapshot is running.",
+      },
+    });
     expect(call?.[2]).toBeUndefined();
     expect(call?.[3]).toBeUndefined();
     expectSubagentFollowupReactivation({
@@ -124,6 +139,96 @@ describe("sessions.send completed subagent follow-up status", () => {
       broadcastToConnIds,
       completedRun,
       childSessionKey,
+    });
+  });
+
+  it("marks a reactivated follow-up as completed immediately when the latest child run is already terminal", async () => {
+    const childSessionKey = "agent:main:subagent:followup";
+    const completedRun = {
+      runId: "run-old",
+      childSessionKey,
+      controllerSessionKey: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "initial task",
+      cleanup: "keep" as const,
+      createdAt: 1,
+      startedAt: 2,
+      endedAt: 3,
+      outcome: { status: "ok" as const },
+    };
+    const immediatelyDoneRun = {
+      ...completedRun,
+      runId: "run-new",
+      createdAt: 4,
+      startedAt: 5,
+      endedAt: 6,
+    };
+
+    loadSessionEntryMock.mockReturnValue({
+      cfg: {},
+      canonicalKey: childSessionKey,
+      storePath: "/tmp/sessions.json",
+      entry: { sessionId: "sess-followup" },
+    });
+    readSessionMessagesMock.mockReturnValue([]);
+    getLatestSubagentRunByChildSessionKeyMock
+      .mockReturnValueOnce(completedRun)
+      .mockReturnValueOnce(immediatelyDoneRun);
+    replaceSubagentRunAfterSteerMock.mockReturnValue(true);
+    loadGatewaySessionRowMock.mockReturnValue({
+      status: "done",
+      startedAt: 123,
+      endedAt: 130,
+      runtimeMs: 10,
+      subagentRunState: "historical",
+    });
+    chatSendMock.mockImplementation(async ({ respond }: { respond: RespondFn }) => {
+      respond(true, { runId: "run-new", status: "started" }, undefined, undefined);
+    });
+
+    const respondMock = vi.fn();
+    const respond = respondMock as unknown as RespondFn;
+    const context = {
+      chatAbortControllers: new Map(),
+      broadcastToConnIds: vi.fn(),
+      getSessionEventSubscriberConnIds: () => new Set<string>(),
+      getRuntimeConfig: () => ({}),
+    } as unknown as GatewayRequestContext;
+
+    await sessionsHandlers["sessions.send"]({
+      req: { id: "req-1" } as never,
+      params: {
+        key: childSessionKey,
+        message: "follow-up",
+        idempotencyKey: "run-new",
+      },
+      respond,
+      context,
+      client: null,
+      isWebchatConnect: () => false,
+    });
+
+    const call = respondMock.mock.calls.at(0) as
+      | [boolean, { followupExecutionTruth?: Record<string, unknown> }, unknown?, unknown?]
+      | undefined;
+    expect(call?.[0]).toBe(true);
+    expect(call?.[1]).toMatchObject({
+      runningNow: false,
+      runningNowAnswer: "no",
+      followupExecutionTruth: {
+        deliveryStatus: "acknowledged",
+        previousRunId: "run-old",
+        followupRunId: "run-new",
+        reactivationApplied: true,
+        runningNow: false,
+        liveExecutionState: "completed_immediately",
+        sessionStatusSnapshot: "done",
+        subagentRunStateSnapshot: "historical",
+        endedAt: 130,
+        proofSummary:
+          "Follow-up delivery acknowledged and reactivation applied, but the session snapshot is already terminal.",
+      },
     });
   });
 

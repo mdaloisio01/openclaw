@@ -35,9 +35,11 @@ import {
   readStringArrayParam,
   readStringParam,
 } from "./common.js";
+import { buildSessionExecutionTruthFromSnapshot } from "./session-execution-truth.js";
 import {
   createAgentToAgentPolicy,
   createSessionVisibilityRowChecker,
+  type SessionListExecutionTruth,
   classifySessionKind,
   deriveChannel,
   resolveDisplaySessionKey,
@@ -73,6 +75,20 @@ function readSessionRunStatus(value: unknown): SessionRunStatus | undefined {
     value === "timeout"
     ? value
     : undefined;
+}
+
+function buildSessionExecutionTruth(
+  entry: Record<string, unknown>,
+): SessionListExecutionTruth | undefined {
+  return buildSessionExecutionTruthFromSnapshot({
+    status: readSessionRunStatus(entry.status),
+    subagentRunState:
+      typeof entry.subagentRunState === "string" ? entry.subagentRunState : undefined,
+    hasActiveSubagentRun: entry.hasActiveSubagentRun === true,
+    endedAt: typeof entry.endedAt === "number" ? entry.endedAt : undefined,
+    sourceLabel: "Session list snapshot",
+    suppressWhenEmpty: true,
+  });
 }
 
 export function createSessionsListTool(opts?: {
@@ -161,6 +177,7 @@ export function createSessionsListTool(opts?: {
         if (!entry || typeof entry !== "object") {
           continue;
         }
+        const entryRecord = entry as Record<string, unknown>;
         const key = typeof entry.key === "string" ? entry.key : "";
         if (!key) {
           continue;
@@ -257,6 +274,7 @@ export function createSessionsListTool(opts?: {
           }
         }
 
+        const sessionExecutionTruth = buildSessionExecutionTruth(entryRecord);
         const row: SessionListRow = {
           key: displayKey,
           agentId: resolvedAgentId,
@@ -335,6 +353,7 @@ export function createSessionsListTool(opts?: {
           lastTo: deliveryTo ?? readStringValue(entry.lastTo),
           lastAccountId,
           transcriptPath,
+          ...(sessionExecutionTruth ? { sessionExecutionTruth } : {}),
         };
         if (
           sessionId &&

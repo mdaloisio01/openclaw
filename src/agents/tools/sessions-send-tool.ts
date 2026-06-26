@@ -65,6 +65,25 @@ type GatewayCaller = typeof callGateway;
 const SESSIONS_SEND_REPLY_HISTORY_LIMIT = 50;
 const SESSIONS_SEND_MESSAGE_ALIASES = ["SendMessage", "content", "text"] as const;
 
+type SessionsSendFollowupExecutionTruth = {
+  runningNow: boolean;
+  liveExecutionState: "active_confirmed" | "accepted_not_yet_proven_active" | "delivery_failed";
+  proofSummary: string;
+  source: "active_run_queue" | "agent_wait_timeout";
+};
+
+function buildRunningNowReceipt(params: { runningNow: boolean; proofSummary: string }): {
+  runningNow: boolean;
+  runningNowAnswer: "yes" | "no";
+  runningNowProofSummary: string;
+} {
+  return {
+    runningNow: params.runningNow,
+    runningNowAnswer: params.runningNow ? "yes" : "no",
+    runningNowProofSummary: params.proofSummary,
+  };
+}
+
 function normalizeSessionsSendArguments(args: unknown): Record<string, unknown> {
   const params =
     args && typeof args === "object" && !Array.isArray(args)
@@ -653,11 +672,26 @@ export function createSessionsSendTool(opts?: {
         if (!start.activeRunQueue) {
           startA2AFlow(undefined, runId, start.a2aSessionKey, start.a2aDisplayKey);
         }
+        const proofSummary = start.activeRunQueue
+          ? "Follow-up was accepted onto the active run queue, but continued execution is not yet proven from this tool result alone."
+          : "Follow-up was accepted by the target session, but continued execution is not yet proven from this tool result alone.";
         return jsonResult({
           runId,
           status: "accepted",
           sessionKey: displayKey,
           delivery,
+          ...buildRunningNowReceipt({
+            runningNow: false,
+            proofSummary,
+          }),
+          followupExecutionTruth: {
+            runningNow: false,
+            liveExecutionState: start.activeRunQueue
+              ? "accepted_not_yet_proven_active"
+              : "accepted_not_yet_proven_active",
+            proofSummary,
+            source: start.activeRunQueue ? "active_run_queue" : "agent_wait_timeout",
+          } satisfies SessionsSendFollowupExecutionTruth,
         });
       }
 
@@ -694,11 +728,23 @@ export function createSessionsSendTool(opts?: {
         }
         if (!isTerminalAgentWaitTimeout(result)) {
           startA2AFlow(undefined, runId);
+          const proofSummary =
+            "Follow-up was accepted, but the run had not yet produced terminal proof before the wait window ended.";
           return jsonResult({
             runId,
             status: "accepted",
             sessionKey: displayKey,
             delivery,
+            ...buildRunningNowReceipt({
+              runningNow: false,
+              proofSummary,
+            }),
+            followupExecutionTruth: {
+              runningNow: false,
+              liveExecutionState: "accepted_not_yet_proven_active",
+              proofSummary,
+              source: "agent_wait_timeout",
+            } satisfies SessionsSendFollowupExecutionTruth,
           });
         }
         return jsonResult({

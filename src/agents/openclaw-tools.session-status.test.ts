@@ -127,6 +127,28 @@ async function createGatewaySessionUtilsModuleMock() {
     ...actual,
     loadCombinedSessionStoreForGateway: (cfg: unknown) =>
       loadCombinedSessionStoreForGatewayMock(cfg),
+    loadGatewaySessionRow: (sessionKey: string, options?: { agentId?: string }) => {
+      if (sessionKey === "agent:main:subagent:running-child") {
+        return {
+          key: sessionKey,
+          kind: "direct",
+          status: "running",
+          hasActiveSubagentRun: true,
+          subagentRunState: "active",
+        };
+      }
+      if (sessionKey === "agent:main:subagent:done-child") {
+        return {
+          key: sessionKey,
+          kind: "direct",
+          status: "done",
+          hasActiveSubagentRun: false,
+          subagentRunState: "historical",
+          endedAt: 123,
+        };
+      }
+      return actual.loadGatewaySessionRow(sessionKey, options);
+    },
   };
 }
 
@@ -1187,10 +1209,100 @@ describe("session_status tool", () => {
     const firstContent = result.content?.[0];
     const text = (firstContent as { text: string } | undefined)?.text ?? "";
 
-    expect(text).toContain("📌 Tasks: 1 active");
+    expect(text).toContain("📌 Tasks: 1 running");
     expect(text).toContain("acp");
     expect(text).toContain("Summarize inbox backlog");
     expect(text).toContain("Indexing the latest threads");
+  });
+
+  it("exposes active-confirmed execution truth for a running subagent child session", async () => {
+    resetSessionStore({
+      "agent:main:subagent:running-child": {
+        sessionId: "running-child-session",
+        updatedAt: 10,
+        parentSessionKey: "agent:main:main",
+      },
+    });
+    mockConfig = {
+      session: { mainKey: "main", scope: "per-sender" },
+      tools: {
+        sessions: { visibility: "agent" },
+        agentToAgent: { enabled: true, allow: ["*"] },
+      },
+      agents: {
+        defaults: {
+          model: { primary: "openai/gpt-5.4" },
+          models: {},
+        },
+      },
+    };
+
+    const tool = getSessionStatusTool("agent:main:main");
+    const result = await tool.execute("call-running-child-status", {
+      sessionKey: "agent:main:subagent:running-child",
+    });
+
+    const details = result.details as {
+      ok?: boolean;
+      sessionExecutionTruth?: {
+        runningNow?: boolean;
+        liveExecutionState?: string;
+        proofSummary?: string;
+      };
+    };
+    expect(details.ok).toBe(true);
+    expect(details.sessionExecutionTruth).toMatchObject({
+      runningNow: true,
+      liveExecutionState: "active_confirmed",
+      proofSummary: "Session snapshot shows an active run right now.",
+    });
+  });
+
+  it("exposes terminal execution truth for a finished subagent child session", async () => {
+    resetSessionStore({
+      "agent:main:subagent:done-child": {
+        sessionId: "done-child-session",
+        updatedAt: 10,
+        parentSessionKey: "agent:main:main",
+      },
+    });
+    mockConfig = {
+      session: { mainKey: "main", scope: "per-sender" },
+      tools: {
+        sessions: { visibility: "agent" },
+        agentToAgent: { enabled: true, allow: ["*"] },
+      },
+      agents: {
+        defaults: {
+          model: { primary: "openai/gpt-5.4" },
+          models: {},
+        },
+      },
+    };
+
+    const tool = getSessionStatusTool("agent:main:main");
+    const result = await tool.execute("call-done-child-status", {
+      sessionKey: "agent:main:subagent:done-child",
+    });
+
+    const details = result.details as {
+      ok?: boolean;
+      sessionExecutionTruth?: {
+        runningNow?: boolean;
+        liveExecutionState?: string;
+        sessionStatusSnapshot?: string;
+        subagentRunStateSnapshot?: string;
+        proofSummary?: string;
+      };
+    };
+    expect(details.ok).toBe(true);
+    expect(details.sessionExecutionTruth).toMatchObject({
+      runningNow: false,
+      liveExecutionState: "not_running_terminal",
+      sessionStatusSnapshot: "done",
+      subagentRunStateSnapshot: "historical",
+      proofSummary: "Session snapshot is terminal, so it is not actively running now.",
+    });
   });
 
   it("hides stale completed task rows from session_status output", async () => {
@@ -1230,7 +1342,7 @@ describe("session_status tool", () => {
     const firstContent = result.content?.[0];
     const text = (firstContent as { text: string } | undefined)?.text ?? "";
 
-    expect(text).toContain("📌 Tasks: 1 active");
+    expect(text).toContain("📌 Tasks: 1 running");
     expect(text).toContain("live task");
     expect(text).not.toContain("stale completed task");
     expect(text).not.toContain("finished long ago");
