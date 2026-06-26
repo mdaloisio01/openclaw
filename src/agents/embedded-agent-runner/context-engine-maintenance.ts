@@ -228,6 +228,9 @@ function buildTurnMaintenanceTaskDescriptor(params: { sessionKey: string }) {
     8,
   )}`;
   return createQueuedTaskRun({
+    // Deferred transcript maintenance is session-scoped housekeeping. It must
+    // not claim parent production continuation ownership unless a future owner
+    // path proves that linkage explicitly.
     runtime: "acp",
     taskKind: TURN_MAINTENANCE_TASK_KIND,
     sourceId: TURN_MAINTENANCE_TASK_KIND,

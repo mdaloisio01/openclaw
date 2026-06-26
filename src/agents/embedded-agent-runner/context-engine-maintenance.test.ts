@@ -7,9 +7,17 @@ import {
   resetCommandQueueStateForTest,
 } from "../../process/command-queue.js";
 import * as commandQueueModule from "../../process/command-queue.js";
+import { resolveTaskBuildExecutionTruth } from "../../tasks/task-build-execution-truth.js";
 import { createQueuedTaskRun as createQueuedTaskRunOrNull } from "../../tasks/task-executor.js";
-import { resetTaskFlowRegistryForTests } from "../../tasks/task-flow-registry.js";
 import {
+  createManagedTaskFlow,
+  finishFlow,
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-registry.js";
+import {
+  createTaskRecord,
   getTaskById,
   listTasksForOwnerKey,
   resetTaskRegistryDeliveryRuntimeForTests,
@@ -668,6 +676,103 @@ describe("runContextEngineMaintenance", () => {
         );
 
         await foregroundTurn;
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("keeps deferred turn maintenance standalone even when the session has an active production mission", async () => {
+    await withStateDirEnv("openclaw-turn-maintenance-parent-truth-", async () => {
+      vi.useFakeTimers();
+      try {
+        resetCommandQueueStateForTest();
+        resetTaskRegistryForTests({ persist: false });
+        resetTaskFlowRegistryForTests({ persist: false });
+
+        const sessionKey = "agent:main:session-parented";
+        const flow = createManagedTaskFlow({
+          ownerKey: sessionKey,
+          controllerId: "tests/context-engine-parented-maintenance",
+          goal: "Continue parent production run",
+          status: "running",
+          continuation: {
+            activeProductionRun: true,
+            parentRunOpen: true,
+          },
+        });
+        const blockedClose = finishFlow({
+          flowId: flow.flowId,
+          expectedRevision: flow.revision,
+          endedAt: 10,
+        });
+        if (blockedClose.applied || !blockedClose.current) {
+          throw new Error("Expected continuation-required parent flow");
+        }
+        const missionTask = createTaskRecord({
+          runtime: "acp",
+          ownerKey: sessionKey,
+          requesterSessionKey: sessionKey,
+          scopeKind: "session",
+          parentFlowId: blockedClose.current.flowId,
+          task: "Parent production mission",
+          missionId: "mission-context-engine-parented",
+          missionSummary: "Launch the next executable unit before pause",
+          missionState: "active",
+          status: "running",
+          deliveryStatus: "pending",
+        });
+        if (!missionTask) {
+          throw new Error("Expected parent mission task");
+        }
+
+        const maintain = vi.fn(async () => ({
+          changed: false,
+          bytesFreed: 0,
+          rewrittenEntries: 0,
+        }));
+        const backgroundEngine = {
+          info: {
+            id: "test",
+            name: "Test Engine",
+            turnMaintenanceMode: "background" as const,
+          },
+          ingest: async () => ({ ingested: true }),
+          assemble: async ({ messages }: { messages: unknown[] }) => ({
+            messages,
+            estimatedTokens: 0,
+          }),
+          compact: async () => ({ ok: true, compacted: false }),
+          maintain,
+        } as NonNullable<Parameters<typeof runContextEngineMaintenance>[0]["contextEngine"]>;
+
+        await runContextEngineMaintenance({
+          contextEngine: backgroundEngine,
+          sessionId: "session-parented",
+          sessionKey,
+          sessionFile: "/tmp/session-parented.jsonl",
+          reason: "turn",
+        });
+
+        await waitForAssertion(() => expect(maintain).toHaveBeenCalledTimes(1));
+
+        const maintenanceTasks = listTasksForOwnerKey(sessionKey).filter(
+          (task) => task.taskKind === TURN_MAINTENANCE_TASK_KIND,
+        );
+        expect(maintenanceTasks).toHaveLength(1);
+        const maintenanceTask = maintenanceTasks[0];
+        expect(maintenanceTask?.parentFlowId).not.toBe(blockedClose.current.flowId);
+        expect(maintenanceTask?.parentTaskId).toBeUndefined();
+        expect(
+          maintenanceTask?.parentFlowId
+            ? getTaskFlowProductionContinuation(getTaskFlowById(maintenanceTask.parentFlowId)!)
+            : null,
+        ).toBeNull();
+        expect(resolveTaskBuildExecutionTruth(maintenanceTask!)).toMatchObject({
+          state: "paused_pending_parent_review",
+          broaderBuildOpen: true,
+        });
+        expect(missionTask.parentFlowId).toBe(blockedClose.current.flowId);
       } finally {
         vi.useRealTimers();
       }
@@ -1533,7 +1638,7 @@ describe("runContextEngineMaintenance", () => {
         await waitForAssertion(() =>
           expectSystemEventContaining(
             sessionKey,
-            "Background task done: Context engine turn maintenance",
+            "Background task local result ready for review: Context engine turn maintenance",
           ),
         );
 
