@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadSessionStore, type SessionEntry } from "../config/sessions.js";
 import { callGateway } from "../gateway/call.js";
+import { listActiveWorkCheckpoints, writeActiveWorkCheckpoint } from "./active-work-checkpoint.js";
 import {
   INTERNAL_RUNTIME_CONTEXT_BEGIN,
   INTERNAL_RUNTIME_CONTEXT_END,
@@ -666,6 +667,121 @@ describe("main-session-restart-recovery", () => {
 
     expect(result).toEqual({ recovered: 0, failed: 0, skipped: 0 });
     expect(callGateway).not.toHaveBeenCalled();
+  });
+
+  it("prefers a structured restart checkpoint over transcript-tail guessing", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:main": {
+        sessionId: "main-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        abortedLastRun: true,
+      },
+    });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: "restart and validate" },
+      { role: "assistant", content: "partial answer before restart" },
+    ]);
+    const checkpoint = await writeActiveWorkCheckpoint({
+      stateDir: tmpDir,
+      input: {
+        sessionKey: "agent:main:main",
+        sessionId: "main-session",
+        runId: "run-main",
+        requestingAgentToolPath: "exec",
+        restartCommand: "systemctl --user restart openclaw-gateway.service",
+        restartIntent: "gateway restart",
+        activeObjective: "Activate the gateway runtime.",
+        currentPhase: "post-restart validation pending",
+        lastCompletedProof: "build info verified",
+        nextValidationStep: "check gateway health",
+        stopConditions: ["health fails"],
+        pendingApprovalState: "none",
+        safeToAutoResume: true,
+        requiresOperatorReview: false,
+      },
+    });
+
+    const result = await recoverRestartAbortedMainSessions({ stateDir: tmpDir });
+
+    expect(result).toEqual({ recovered: 1, failed: 0, skipped: 0 });
+    expect(callGateway).toHaveBeenCalledOnce();
+    expect(firstGatewayParams()).toMatchObject({
+      message: expect.stringContaining(`Checkpoint: ${checkpoint.checkpointId}`),
+      sessionKey: "agent:main:main",
+      lane: "main",
+    });
+    expect(String(firstGatewayParams().message)).toContain("check gateway health");
+    const checkpoints = await listActiveWorkCheckpoints({
+      stateDir: tmpDir,
+      includeCompleted: true,
+    });
+    expect(checkpoints[0]).toMatchObject({
+      checkpointId: checkpoint.checkpointId,
+      status: "continued",
+      completionReason: "restart recovery queued continuation",
+    });
+  });
+
+  it("delivers a blocked notice for expired structured restart checkpoints", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:main": {
+        sessionId: "main-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+        abortedLastRun: true,
+        lastChannel: "discord",
+        lastTo: "discord:dm:mark",
+      },
+    });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: "restart and validate" },
+      { role: "toolResult", content: "approval-pending" },
+    ]);
+    const checkpoint = await writeActiveWorkCheckpoint({
+      stateDir: tmpDir,
+      nowMs: 1_000,
+      ttlMs: 10,
+      input: {
+        sessionKey: "agent:main:main",
+        sessionId: "main-session",
+        requestingAgentToolPath: "exec",
+        restartCommand: "systemctl --user restart openclaw-gateway.service",
+        restartIntent: "gateway restart",
+        activeObjective: "Activate the gateway runtime.",
+        currentPhase: "post-restart validation pending",
+        lastCompletedProof: "build info verified",
+        nextValidationStep: "check gateway health",
+        stopConditions: ["health fails"],
+        pendingApprovalState: "none",
+        safeToAutoResume: true,
+        requiresOperatorReview: false,
+      },
+    });
+
+    const result = await recoverRestartAbortedMainSessions({ stateDir: tmpDir });
+
+    expect(result).toEqual({ recovered: 0, failed: 1, skipped: 0 });
+    const gatewayCall = vi.mocked(callGateway).mock.calls[0]?.[0] as
+      | { method?: string; params?: Record<string, unknown> }
+      | undefined;
+    expect(gatewayCall?.method).toBe("message.action");
+    expect(String((gatewayCall?.params?.params as Record<string, unknown>)?.message)).toContain(
+      "could not auto-resume safely",
+    );
+    expect(String((gatewayCall?.params?.params as Record<string, unknown>)?.message)).toContain(
+      checkpoint.checkpointId,
+    );
+    const checkpoints = await listActiveWorkCheckpoints({
+      stateDir: tmpDir,
+      includeCompleted: true,
+    });
+    expect(checkpoints[0]).toMatchObject({
+      checkpointId: checkpoint.checkpointId,
+      status: "expired",
+    });
   });
 
   it("fails marked sessions whose transcript tail cannot be resumed", async () => {

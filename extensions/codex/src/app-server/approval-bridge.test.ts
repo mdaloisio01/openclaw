@@ -231,6 +231,40 @@ describe("Codex app-server approval bridge", () => {
     findApprovalEvent(params, { status: "approved", approvalId: "plugin:approval-1" });
   });
 
+  it("preserves gateway restart abort reason when approval wait is interrupted", async () => {
+    const params = createParams();
+    const abortController = new AbortController();
+    mockCallGatewayTool.mockImplementation(async (method) => {
+      if (method === "plugin.approval.request") {
+        return { id: "plugin:restart-abort", status: "accepted" };
+      }
+      abortController.abort("gateway_restart_interrupted_turn");
+      await new Promise(() => undefined);
+    });
+
+    const result = await handleCodexAppServerApprovalRequest({
+      method: "item/commandExecution/requestApproval",
+      requestParams: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        itemId: "cmd-restart",
+        command: "systemctl --user restart openclaw-gateway.service",
+      },
+      paramsForRun: params,
+      threadId: "thread-1",
+      turnId: "turn-1",
+      signal: abortController.signal,
+    });
+
+    expect(result).toEqual({ decision: "cancel" });
+    findApprovalEvent(params, {
+      status: "failed",
+      approvalId: "plugin:restart-abort",
+      message:
+        "Codex app-server approval cancelled because the run stopped (gateway_restart_interrupted_turn).",
+    });
+  });
+
   it("normalizes prefixed channel targets for OpenClaw tool policy context", async () => {
     const params = createParams();
     params.messageChannel = "telegram";

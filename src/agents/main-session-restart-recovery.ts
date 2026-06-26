@@ -30,6 +30,11 @@ import {
   type DeliveryContext,
 } from "../utils/delivery-context.shared.js";
 import { isDeliverableMessageChannel } from "../utils/message-channel.js";
+import {
+  listActiveWorkCheckpoints,
+  updateActiveWorkCheckpointStatus,
+  type ActiveWorkCheckpoint,
+} from "./active-work-checkpoint.js";
 import { resolveAgentSessionDirs } from "./session-dirs.js";
 import type { SessionLockInspection } from "./session-write-lock.js";
 
@@ -255,6 +260,33 @@ function buildResumeMessage(pendingFinalDeliveryText?: string | null): string {
   return base;
 }
 
+function buildCheckpointResumeMessage(checkpoint: ActiveWorkCheckpoint): string {
+  return [
+    "[System] The previous turn was interrupted by a gateway restart.",
+    "A structured restart checkpoint is available. Continue only from this safe checkpoint state.",
+    `Checkpoint: ${checkpoint.checkpointId}`,
+    `Objective: ${checkpoint.activeObjective}`,
+    `Current phase: ${checkpoint.currentPhase}`,
+    `Last completed proof: ${checkpoint.lastCompletedProof}`,
+    `Next validation step: ${checkpoint.nextValidationStep}`,
+    `Stop conditions: ${checkpoint.stopConditions.join("; ")}`,
+    "Do not run destructive operations after restart. If continuation needs destructive work, report blocked and ask for operator review.",
+  ].join("\n");
+}
+
+function buildCheckpointBlockedNotice(params: {
+  checkpoint: ActiveWorkCheckpoint;
+  reason: string;
+}): string {
+  return [
+    "Gateway restart recovery found a structured checkpoint but could not auto-resume safely.",
+    `Checkpoint: ${params.checkpoint.checkpointId}`,
+    `Reason: ${params.reason}`,
+    `Next validation step: ${params.checkpoint.nextValidationStep}`,
+    "Operator review is required before continuing.",
+  ].join("\n");
+}
+
 async function markSessionFailed(params: {
   storePath: string;
   sessionKey: string;
@@ -345,10 +377,12 @@ async function sendUnresumableSessionNotice(params: {
 function resolveRestartRecoveryDeliveryContext(params: {
   cfg?: OpenClawConfig;
   entry: SessionEntry;
+  checkpoint?: ActiveWorkCheckpoint;
   includeSessionDeliveryFallback?: boolean;
   sessionKey: string;
 }): DeliveryContext | undefined {
   const deliveryContext =
+    normalizeDeliveryContext(params.checkpoint?.deliveryContext) ??
     normalizeDeliveryContext(params.entry.pendingFinalDeliveryContext) ??
     normalizeDeliveryContext(params.entry.restartRecoveryDeliveryContext) ??
     (params.includeSessionDeliveryFallback ? deliveryContextFromSession(params.entry) : undefined);
@@ -381,6 +415,7 @@ async function resumeMainSession(params: {
   entry: SessionEntry;
   storePath: string;
   sessionKey: string;
+  checkpoint?: ActiveWorkCheckpoint;
   pendingFinalDeliveryText?: string | null;
 }): Promise<boolean> {
   const sanitizedPendingText =
@@ -390,11 +425,14 @@ async function resumeMainSession(params: {
   const deliveryContext = resolveRestartRecoveryDeliveryContext({
     cfg: params.cfg,
     entry: params.entry,
+    checkpoint: params.checkpoint,
     sessionKey: params.sessionKey,
   });
   try {
     const agentParams: Record<string, unknown> = {
-      message: buildResumeMessage(sanitizedPendingText),
+      message: params.checkpoint
+        ? buildCheckpointResumeMessage(params.checkpoint)
+        : buildResumeMessage(sanitizedPendingText),
       sessionKey: params.sessionKey,
       idempotencyKey: crypto.randomUUID(),
       deliver: Boolean(deliveryContext),
@@ -449,12 +487,71 @@ async function resumeMainSession(params: {
     );
     log.info(
       `resumed interrupted main session: ${params.sessionKey}${
-        sanitizedPendingText ? " (with pending payload)" : ""
+        params.checkpoint
+          ? ` (checkpoint=${params.checkpoint.checkpointId})`
+          : sanitizedPendingText
+            ? " (with pending payload)"
+            : ""
       }`,
     );
     return true;
   } catch (err) {
     log.warn(`failed to resume interrupted main session ${params.sessionKey}: ${String(err)}`);
+    return false;
+  }
+}
+
+async function sendCheckpointBlockedNotice(params: {
+  cfg?: OpenClawConfig;
+  checkpoint: ActiveWorkCheckpoint;
+  entry: SessionEntry;
+  reason: string;
+  sessionKey: string;
+}): Promise<boolean> {
+  const deliveryContext = resolveRestartRecoveryDeliveryContext({
+    cfg: params.cfg,
+    entry: params.entry,
+    checkpoint: params.checkpoint,
+    includeSessionDeliveryFallback: true,
+    sessionKey: params.sessionKey,
+  });
+  if (!deliveryContext) {
+    return false;
+  }
+  const messageParams: Record<string, unknown> = {
+    to: deliveryContext.to,
+    message: buildCheckpointBlockedNotice({
+      checkpoint: params.checkpoint,
+      reason: params.reason,
+    }),
+    bestEffort: true,
+  };
+  if (deliveryContext.threadId != null) {
+    messageParams.threadId = deliveryContext.threadId;
+  }
+  const actionParams: Record<string, unknown> = {
+    channel: deliveryContext.channel,
+    action: "send",
+    sessionKey: params.sessionKey,
+    sessionId: params.entry.sessionId,
+    idempotencyKey: `main-session-restart-checkpoint:${params.checkpoint.checkpointId}:blocked`,
+    params: messageParams,
+  };
+  const accountId = normalizeOptionalString(deliveryContext.accountId);
+  if (accountId) {
+    actionParams.accountId = accountId;
+  }
+  try {
+    await callGateway({
+      method: "message.action",
+      params: actionParams,
+      timeoutMs: 10_000,
+    });
+    return true;
+  } catch (err) {
+    log.warn(
+      `failed to send checkpoint blocked notice ${params.checkpoint.checkpointId}: ${String(err)}`,
+    );
     return false;
   }
 }
@@ -508,6 +605,8 @@ async function recoverStore(params: {
   cfg?: OpenClawConfig;
   storePath: string;
   resumedSessionKeys: Set<string>;
+  checkpoints: ActiveWorkCheckpoint[];
+  stateDir?: string;
 }): Promise<{ recovered: number; failed: number; skipped: number }> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
   let store: Record<string, SessionEntry>;
@@ -531,6 +630,78 @@ async function recoverStore(params: {
     }
     if (params.resumedSessionKeys.has(sessionKey)) {
       result.skipped++;
+      continue;
+    }
+
+    const checkpoint = params.checkpoints.find((candidate) =>
+      candidate.status === "pending" || candidate.status === "expired"
+        ? (candidate.sessionKey && candidate.sessionKey === sessionKey) ||
+          (candidate.sessionId && candidate.sessionId === entry.sessionId)
+        : false,
+    );
+    if (checkpoint) {
+      if (checkpoint.status === "expired") {
+        await sendCheckpointBlockedNotice({
+          cfg: params.cfg,
+          checkpoint,
+          entry,
+          reason: "restart checkpoint expired before startup recovery could safely continue",
+          sessionKey,
+        });
+        await updateActiveWorkCheckpointStatus({
+          checkpoint,
+          status: "expired",
+          reason: "checkpoint expired before restart recovery",
+          stateDir: params.stateDir,
+        });
+        result.failed++;
+        continue;
+      }
+      if (!checkpoint.safeToAutoResume || checkpoint.requiresOperatorReview) {
+        const reason =
+          checkpoint.unsafeAutoResumeReason ??
+          "checkpoint requires operator review before continuation";
+        await sendCheckpointBlockedNotice({
+          cfg: params.cfg,
+          checkpoint,
+          entry,
+          reason,
+          sessionKey,
+        });
+        await updateActiveWorkCheckpointStatus({
+          checkpoint,
+          status: "blocked",
+          reason,
+          stateDir: params.stateDir,
+        });
+        result.failed++;
+        continue;
+      }
+      const resumed = await resumeMainSession({
+        cfg: params.cfg,
+        entry,
+        storePath: params.storePath,
+        sessionKey,
+        checkpoint,
+      });
+      if (resumed) {
+        await updateActiveWorkCheckpointStatus({
+          checkpoint,
+          status: "continued",
+          reason: "restart recovery queued continuation",
+          stateDir: params.stateDir,
+        });
+        params.resumedSessionKeys.add(sessionKey);
+        result.recovered++;
+      } else {
+        await updateActiveWorkCheckpointStatus({
+          checkpoint,
+          status: "blocked",
+          reason: "failed to queue restart continuation",
+          stateDir: params.stateDir,
+        });
+        result.failed++;
+      }
       continue;
     }
 
@@ -614,12 +785,17 @@ export async function recoverRestartAbortedMainSessions(
 ): Promise<{ recovered: number; failed: number; skipped: number }> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
   const resumedSessionKeys = params.resumedSessionKeys ?? new Set<string>();
+  const checkpoints = await listActiveWorkCheckpoints({
+    stateDir: params.stateDir,
+  });
 
   for (const storePath of await resolveRestartRecoveryStorePaths(params)) {
     const storeResult = await recoverStore({
       cfg: params.cfg,
       storePath,
       resumedSessionKeys,
+      checkpoints,
+      stateDir: params.stateDir,
     });
     result.recovered += storeResult.recovered;
     result.failed += storeResult.failed;

@@ -103,6 +103,30 @@ export async function waitForPluginApprovalDecision(params: {
   }
 }
 
+export function classifyPluginApprovalAbortReason(reason: unknown): string {
+  const text =
+    reason instanceof Error
+      ? reason.message
+      : typeof reason === "string"
+        ? reason
+        : reason === undefined
+          ? ""
+          : String(reason);
+  if (/gateway[_ -]?restart|restart[_ -]?interrupted|service restart/i.test(text)) {
+    return "gateway_restart_interrupted_turn";
+  }
+  if (/timeout/i.test(text)) {
+    return "approval_timeout";
+  }
+  if (/cancel/i.test(text)) {
+    return "operator_cancelled";
+  }
+  if (/unavailable|route/i.test(text)) {
+    return "approval_route_unavailable";
+  }
+  return "run_aborted";
+}
+
 export function mapExecDecisionToOutcome(
   decision: ExecApprovalDecision | null | undefined,
 ): AppServerApprovalOutcome {

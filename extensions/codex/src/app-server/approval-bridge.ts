@@ -14,6 +14,7 @@ import { normalizeTrimmedStringList } from "openclaw/plugin-sdk/string-coerce-ru
 import { formatCodexDisplayText } from "../command-formatters.js";
 import {
   approvalRequestExplicitlyUnavailable,
+  classifyPluginApprovalAbortReason,
   mapExecDecisionToOutcome,
   requestPluginApproval,
   type AppServerApprovalOutcome,
@@ -81,6 +82,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
     paramsForRun: params.paramsForRun,
   });
 
+  let approvalId: string | undefined;
   try {
     const policyOutcome = await runOpenClawToolPolicyForApprovalRequest({
       method: params.method,
@@ -138,7 +140,7 @@ export async function handleCodexAppServerApprovalRequest(params: {
       toolCallId: context.itemId,
     });
 
-    const approvalId = requestResult?.id;
+    approvalId = requestResult?.id;
     if (!approvalId) {
       emitApprovalEvent(params.paramsForRun, {
         phase: "resolved",
@@ -189,15 +191,19 @@ export async function handleCodexAppServerApprovalRequest(params: {
     return buildApprovalResponse(params.method, context.requestParams, outcome);
   } catch (error) {
     const cancelled = params.signal?.aborted === true;
+    const abortReason = cancelled
+      ? classifyPluginApprovalAbortReason(params.signal?.reason ?? error)
+      : undefined;
     emitApprovalEvent(params.paramsForRun, {
       phase: "resolved",
       kind: context.kind,
       status: cancelled ? "failed" : "unavailable",
       title: context.title,
+      ...(approvalId ? { approvalId, approvalSlug: approvalId } : {}),
       ...context.eventDetails,
       ...approvalEventScope(params.method, cancelled ? "cancelled" : "denied"),
       message: cancelled
-        ? "Codex app-server approval cancelled because the run stopped."
+        ? `Codex app-server approval cancelled because the run stopped (${abortReason}).`
         : `Codex app-server approval route failed: ${formatCodexDisplayText(
             formatErrorMessage(error),
           )}`,

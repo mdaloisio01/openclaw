@@ -54,6 +54,7 @@ import {
 import type { SkillSnapshot, SkillTelemetrySource } from "../skills/types.js";
 import { resolveSkillWorkshopToolApproval } from "../skills/workshop/policy.js";
 import { isPlainObject } from "../utils.js";
+import { writeActiveWorkCheckpoint, type ActiveWorkCheckpoint } from "./active-work-checkpoint.js";
 import { adjustedParamsByToolCallId } from "./agent-tools.before-tool-call.state.js";
 import { copyChannelAgentToolMeta, getChannelAgentToolMeta } from "./channel-tools.js";
 import {
@@ -203,6 +204,7 @@ const MAX_TRACKED_ADJUSTED_PARAMS = 1024;
 const LOOP_WARNING_BUCKET_SIZE = 10;
 const MAX_LOOP_WARNING_KEYS = 256;
 const OPENCLAW_SOURCE_REPO_DIR = "/home/will/openclaw-source";
+const OPENCLAW_GATEWAY_SERVICE_NAME = "openclaw-gateway.service";
 const execFile = promisify(execFileCallback);
 const SHELL_WRITE_RISK_RE =
   /\b(rm|mv|cp|touch|mkdir|rmdir|truncate|tee|patch|git\s+(?:add|reset|stash|clean|checkout|restore|commit|merge|rebase|pull|push|switch|worktree)|npm\s+run\s+build|pnpm\s+run\s+build|yarn\s+build)\b/;
@@ -245,6 +247,18 @@ function getStringParam(params: unknown, keys: string[]): string | undefined {
     }
   }
   return undefined;
+}
+
+function withStringParam(params: unknown, nextValue: string): unknown {
+  if (!isPlainObject(params)) {
+    return params;
+  }
+  for (const key of ["cmd", "command", "script", "input"]) {
+    if (typeof params[key] === "string" && params[key].trim().length > 0) {
+      return { ...params, [key]: nextValue };
+    }
+  }
+  return params;
 }
 
 function isShellTool(toolName: string): boolean {
@@ -292,6 +306,155 @@ function isReadOnlyDiagnosticShellCommand(command: string): boolean {
   return READ_ONLY_DIAGNOSTIC_COMMAND_RE.test(trimmed);
 }
 
+export type GatewaySelfRestartCommand =
+  | {
+      detected: true;
+      action: "restart" | "start" | "stop";
+      command: string;
+      shouldUseSafeBroker: boolean;
+      safeBrokerCommand?: string;
+    }
+  | { detected: false };
+
+function tokenizeSimpleCommand(command: string): string[] | undefined {
+  const trimmed = command.trim();
+  if (!trimmed || /[;&|`$<>]/.test(trimmed)) {
+    return undefined;
+  }
+  const matches = trimmed.match(/"[^"]*"|'[^']*'|\S+/g);
+  if (!matches) {
+    return undefined;
+  }
+  return matches.map((token) => token.replace(/^["']|["']$/g, ""));
+}
+
+function basenameToken(value: string | undefined): string {
+  return path.basename(value ?? "");
+}
+
+export function classifyGatewaySelfRestartCommand(
+  command: string | undefined,
+): GatewaySelfRestartCommand {
+  if (!command) {
+    return { detected: false };
+  }
+  const tokens = tokenizeSimpleCommand(command);
+  if (!tokens?.length) {
+    return { detected: false };
+  }
+  const executable = basenameToken(tokens[0]);
+  if (executable === "systemctl") {
+    const hasUserFlag = tokens.includes("--user");
+    const action = tokens.find(
+      (token) => token === "restart" || token === "start" || token === "stop",
+    );
+    if (
+      hasUserFlag &&
+      (action === "restart" || action === "start" || action === "stop") &&
+      tokens.includes(OPENCLAW_GATEWAY_SERVICE_NAME)
+    ) {
+      return {
+        detected: true,
+        action,
+        command: command.trim(),
+        shouldUseSafeBroker: action === "restart",
+        ...(action === "restart" ? { safeBrokerCommand: "openclaw gateway restart --safe" } : {}),
+      };
+    }
+  }
+  if (executable === "openclaw") {
+    const [second, third] = tokens.slice(1);
+    if (second === "gateway" && third === "restart") {
+      return {
+        detected: true,
+        action: "restart",
+        command: command.trim(),
+        shouldUseSafeBroker: !tokens.includes("--safe"),
+        safeBrokerCommand: tokens.includes("--safe") ? command.trim() : `${command.trim()} --safe`,
+      };
+    }
+  }
+  return { detected: false };
+}
+
+function isGatewaySelfRestartToolCall(
+  toolName: string,
+  params: unknown,
+): GatewaySelfRestartCommand {
+  if (!isShellTool(toolName)) {
+    return { detected: false };
+  }
+  return classifyGatewaySelfRestartCommand(
+    getStringParam(params, ["cmd", "command", "script", "input"]),
+  );
+}
+
+function buildGatewayRestartCheckpointInput(params: {
+  command: GatewaySelfRestartCommand & { detected: true };
+  toolName: string;
+  ctx?: HookContext;
+}): Parameters<typeof writeActiveWorkCheckpoint>[0]["input"] {
+  return {
+    sessionKey: params.ctx?.sessionKey,
+    sessionId: params.ctx?.sessionId,
+    runId: params.ctx?.runId,
+    requestingAgentToolPath: params.toolName,
+    restartCommand: params.command.command,
+    restartIntent: `gateway ${params.command.action}`,
+    activeObjective: "Gateway self-restart requested from an active OpenClaw tool turn.",
+    currentPhase: "pre-restart tool call",
+    lastCompletedProof: "Gateway self-restart command was detected before execution.",
+    nextValidationStep:
+      "After gateway startup health passes, report restart truth and continue only read-only validation or ask for operator review.",
+    stopConditions: [
+      "Gateway health fails after restart.",
+      "Continuation would require destructive operations.",
+      "Continuation would require private context export.",
+      "The interrupted transcript cannot be safely resumed.",
+    ],
+    pendingApprovalState: "none",
+    safeToAutoResume: true,
+    requiresOperatorReview: false,
+  };
+}
+
+async function resolveGatewaySelfRestartCheckpoint(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+}): Promise<{ checkpoint: ActiveWorkCheckpoint; params: unknown } | undefined> {
+  const restartCommand = isGatewaySelfRestartToolCall(args.toolName, args.params);
+  if (!restartCommand.detected) {
+    return undefined;
+  }
+  const checkpoint = await writeActiveWorkCheckpoint({
+    input: buildGatewayRestartCheckpointInput({
+      command: restartCommand,
+      toolName: args.toolName,
+      ctx: args.ctx,
+    }),
+  });
+  log.warn(
+    `gateway restart checkpoint written checkpointId=${checkpoint.checkpointId} action=${restartCommand.action} safeToAutoResume=${checkpoint.safeToAutoResume}`,
+  );
+  emitTrustedDiagnosticEvent({
+    type: "tool.execution.started",
+    ...(args.ctx?.runId && { runId: args.ctx.runId }),
+    ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
+    ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),
+    toolName: "gateway-self-restart-checkpoint",
+    toolSource: "core",
+    paramsSummary: { kind: "object" },
+  });
+  if (restartCommand.shouldUseSafeBroker && restartCommand.safeBrokerCommand) {
+    return {
+      checkpoint,
+      params: withStringParam(args.params, restartCommand.safeBrokerCommand),
+    };
+  }
+  return { checkpoint, params: args.params };
+}
+
 function isSourceModifyingToolCall(toolName: string, params: unknown): boolean {
   if (isKnownSourceModifyingTool(toolName)) {
     return true;
@@ -302,6 +465,9 @@ function isSourceModifyingToolCall(toolName: string, params: unknown): boolean {
   const command = getStringParam(params, ["cmd", "command", "script", "input"]);
   if (!command) {
     return true;
+  }
+  if (classifyGatewaySelfRestartCommand(command).detected) {
+    return false;
   }
   return !isReadOnlyDiagnosticShellCommand(command);
 }
@@ -962,7 +1128,7 @@ export async function runBeforeToolCallHook(args: {
   approvalMode?: "request" | "report" | "defer";
 }): Promise<HookOutcome> {
   const toolName = normalizeToolName(args.toolName || "tool");
-  const params = applySourceReplyStopContractToToolParams(toolName, args.params, args.ctx);
+  let params = applySourceReplyStopContractToToolParams(toolName, args.params, args.ctx);
 
   if (args.ctx?.sessionKey) {
     const { getDiagnosticSessionState, logToolLoopAction, detectToolCallLoop, recordToolCall } =
@@ -1031,6 +1197,15 @@ export async function runBeforeToolCallHook(args: {
         loopScope,
       );
     }
+  }
+
+  const gatewayRestartCheckpoint = await resolveGatewaySelfRestartCheckpoint({
+    toolName,
+    params,
+    ctx: args.ctx,
+  });
+  if (gatewayRestartCheckpoint) {
+    params = gatewayRestartCheckpoint.params;
   }
 
   const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({ toolName, params });
