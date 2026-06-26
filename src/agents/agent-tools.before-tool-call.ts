@@ -1,5 +1,7 @@
+import { execFile as execFileCallback } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { addTimerTimeoutGraceMs } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.types.js";
@@ -19,6 +21,10 @@ import {
   freezeDiagnosticTraceContext,
   type DiagnosticTraceContext,
 } from "../infra/diagnostic-trace-context.js";
+import {
+  buildDirtyTreeHygieneReport,
+  type DirtyTreeHygieneReport,
+} from "../infra/dirty-tree-hygiene.js";
 import {
   DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS,
   MAX_PLUGIN_APPROVAL_TIMEOUT_MS,
@@ -115,7 +121,11 @@ export type HookContext = {
 };
 
 type HookBlockedKind = "veto" | "failure";
-type HookBlockedReason = "plugin-before-tool-call" | "plugin-approval" | "tool-loop";
+type HookBlockedReason =
+  | "plugin-before-tool-call"
+  | "plugin-approval"
+  | "tool-loop"
+  | "dirty-tree-hygiene";
 type HookOutcome =
   | {
       blocked: true;
@@ -192,6 +202,19 @@ const BEFORE_TOOL_CALL_HOOK_FAILURE_REASON =
 const MAX_TRACKED_ADJUSTED_PARAMS = 1024;
 const LOOP_WARNING_BUCKET_SIZE = 10;
 const MAX_LOOP_WARNING_KEYS = 256;
+const OPENCLAW_SOURCE_REPO_DIR = "/home/will/openclaw-source";
+const execFile = promisify(execFileCallback);
+const SHELL_WRITE_RISK_RE =
+  /\b(rm|mv|cp|touch|mkdir|rmdir|truncate|tee|patch|git\s+(?:add|reset|stash|clean|checkout|restore|commit|merge|rebase|pull|push|switch|worktree)|npm\s+run\s+build|pnpm\s+run\s+build|yarn\s+build)\b/;
+const READ_ONLY_DIAGNOSTIC_COMMAND_RE =
+  /^(?:git\s+(?:status|diff|log|show|rev-parse|branch)(?:\s|$)|rg(?:\s|$)|grep(?:\s|$)|sed(?:\s|$)|cat(?:\s|$)|ls(?:\s|$)|find(?:\s|$)|pwd(?:\s|$)|wc(?:\s|$)|head(?:\s|$)|tail(?:\s|$)|nl(?:\s|$)|jq(?:\s|$)|vitest(?:\s|$)|npx\s+vitest(?:\s|$)|pnpm\s+vitest(?:\s|$)|npm\s+test(?:\s|$)|pnpm\s+test(?:\s|$)|yarn\s+test(?:\s|$))/;
+
+type DirtyTreeStatusReader = (repoDir: string) => Promise<string>;
+let dirtyTreeStatusReader: DirtyTreeStatusReader = readGitStatusShort;
+
+export function setDirtyTreeHygieneStatusReaderForTest(reader?: DirtyTreeStatusReader): void {
+  dirtyTreeStatusReader = reader ?? readGitStatusShort;
+}
 
 /**
  * Error used when before_tool_call intentionally vetoes a tool call.
@@ -201,6 +224,129 @@ export class BeforeToolCallBlockedError extends Error {
     super(reason);
     this.name = "BeforeToolCallBlockedError";
   }
+}
+
+async function readGitStatusShort(repoDir: string): Promise<string> {
+  const { stdout } = await execFile("git", ["-C", repoDir, "status", "--short"], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024,
+  });
+  return stdout;
+}
+
+function getStringParam(params: unknown, keys: string[]): string | undefined {
+  if (!isPlainObject(params)) {
+    return undefined;
+  }
+  for (const key of keys) {
+    const value = params[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function isShellTool(toolName: string): boolean {
+  return matchesToolName(toolName, [
+    "bash",
+    "shell",
+    "exec",
+    "exec_command",
+    "terminal",
+    "run_command",
+  ]);
+}
+
+function isKnownSourceModifyingTool(toolName: string): boolean {
+  return matchesToolName(toolName, [
+    "apply_patch",
+    "edit",
+    "write",
+    "multi_edit",
+    "delete",
+    "move",
+    "rename",
+    "create_file",
+    "file_write",
+  ]);
+}
+
+function matchesToolName(toolName: string, candidates: string[]): boolean {
+  return candidates.some(
+    (candidate) => toolName === candidate || toolName.endsWith(`.${candidate}`),
+  );
+}
+
+function isReadOnlyDiagnosticShellCommand(command: string): boolean {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return false;
+  }
+  if (/[;&|`$<>]/.test(trimmed)) {
+    return false;
+  }
+  if (SHELL_WRITE_RISK_RE.test(trimmed)) {
+    return false;
+  }
+  return READ_ONLY_DIAGNOSTIC_COMMAND_RE.test(trimmed);
+}
+
+function isSourceModifyingToolCall(toolName: string, params: unknown): boolean {
+  if (isKnownSourceModifyingTool(toolName)) {
+    return true;
+  }
+  if (!isShellTool(toolName)) {
+    return false;
+  }
+  const command = getStringParam(params, ["cmd", "command", "script", "input"]);
+  if (!command) {
+    return true;
+  }
+  return !isReadOnlyDiagnosticShellCommand(command);
+}
+
+function formatDirtyTreeHygieneBlockMessage(report: DirtyTreeHygieneReport): string {
+  const groups = report.groups.map((group) => `${group.group} (${group.paths.length})`).join(", ");
+  return [
+    "Dirty-tree hygiene blocked this source-modifying tool call.",
+    "The working tree is broad/mixed across package boundaries.",
+    `Package groups detected: ${groups || "unknown"}.`,
+    `Risk counts: staged=${report.stagedCount}, unstaged=${report.unstagedCount}, untracked=${report.untrackedCount}.`,
+    "Run read-only status/diff review first, then package or clean the unrelated work before continuing.",
+  ].join(" ");
+}
+
+async function resolveDirtyTreeHygieneBlock(args: {
+  toolName: string;
+  params: unknown;
+}): Promise<HookOutcome | undefined> {
+  if (!isSourceModifyingToolCall(args.toolName, args.params)) {
+    return undefined;
+  }
+  let statusShortOutput: string;
+  try {
+    statusShortOutput = await dirtyTreeStatusReader(OPENCLAW_SOURCE_REPO_DIR);
+  } catch (err) {
+    return {
+      blocked: true,
+      kind: "veto",
+      deniedReason: "dirty-tree-hygiene",
+      reason: `Dirty-tree hygiene could not read git status for ${OPENCLAW_SOURCE_REPO_DIR}: ${String(err)}`,
+      params: args.params,
+    };
+  }
+  const report = buildDirtyTreeHygieneReport(statusShortOutput);
+  if (report.risk !== "broad-mixed") {
+    return undefined;
+  }
+  return {
+    blocked: true,
+    kind: "veto",
+    deniedReason: "dirty-tree-hygiene",
+    reason: formatDirtyTreeHygieneBlockMessage(report),
+    params: args.params,
+  };
 }
 
 export function recordAdjustedParamsForToolCall(
@@ -885,6 +1031,11 @@ export async function runBeforeToolCallHook(args: {
         loopScope,
       );
     }
+  }
+
+  const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({ toolName, params });
+  if (dirtyTreeHygieneBlock) {
+    return dirtyTreeHygieneBlock;
   }
 
   const hookRunner = getGlobalHookRunner();

@@ -1,0 +1,181 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import {
+  runBeforeToolCallHook,
+  setDirtyTreeHygieneStatusReaderForTest,
+  wrapToolWithBeforeToolCallHook,
+} from "./agent-tools.before-tool-call.js";
+
+vi.mock("../plugins/hook-runner-global.js", async () => {
+  const actual = await vi.importActual<typeof import("../plugins/hook-runner-global.js")>(
+    "../plugins/hook-runner-global.js",
+  );
+  return {
+    ...actual,
+    getGlobalHookRunner: vi.fn(),
+  };
+});
+
+const mockGetGlobalHookRunner = vi.mocked(getGlobalHookRunner);
+
+describe("before_tool_call dirty-tree hygiene gate", () => {
+  let hookRunner: {
+    hasHooks: ReturnType<typeof vi.fn>;
+    runBeforeToolCall: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    hookRunner = {
+      hasHooks: vi.fn().mockReturnValue(false),
+      runBeforeToolCall: vi.fn(),
+    };
+    mockGetGlobalHookRunner.mockReturnValue(hookRunner as any);
+  });
+
+  afterEach(() => {
+    setDirtyTreeHygieneStatusReaderForTest();
+  });
+
+  function setStatus(status: string, calls?: string[]): void {
+    setDirtyTreeHygieneStatusReaderForTest(async (repoDir) => {
+      calls?.push(`git -C ${repoDir} status --short`);
+      return status;
+    });
+  }
+
+  function createWrappedPatchTool(name = "apply_patch") {
+    const execute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "patched" }],
+      details: { ok: true },
+    });
+    return {
+      execute,
+      tool: wrapToolWithBeforeToolCallHook({ name, execute } as any, {
+        agentId: "main",
+      }),
+    };
+  }
+
+  function requireBlockedResult(result: unknown): Record<string, unknown> {
+    expect(typeof result).toBe("object");
+    expect(result).not.toBeNull();
+    const record = result as Record<string, unknown>;
+    expect(record.details).toMatchObject({
+      status: "blocked",
+      deniedReason: "dirty-tree-hygiene",
+    });
+    return record;
+  }
+
+  function getBlockedText(result: unknown): string {
+    const record = requireBlockedResult(result);
+    const content = record.content;
+    expect(Array.isArray(content)).toBe(true);
+    const firstContent = Array.isArray(content) ? content[0] : undefined;
+    expect(typeof firstContent).toBe("object");
+    expect(firstContent).not.toBeNull();
+    return String((firstContent as Record<string, unknown>).text);
+  }
+
+  it("allows source-modifying tool calls when the tree is clean", async () => {
+    setStatus("");
+    const { execute, tool } = createWrappedPatchTool("functions.apply_patch");
+
+    const result = await tool.execute(
+      "patch-clean",
+      { patch: "*** Begin Patch\n*** End Patch" },
+      undefined,
+      undefined,
+    );
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ details: { ok: true } });
+  });
+
+  it("does not hard-block a narrow coherent dirty package", async () => {
+    setStatus(" M src/infra/dirty-tree-hygiene.ts\n?? src/infra/new-helper.ts\n");
+    const { execute, tool } = createWrappedPatchTool();
+
+    const result = await tool.execute(
+      "patch-narrow",
+      { patch: "*** Begin Patch\n*** End Patch" },
+      undefined,
+      undefined,
+    );
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ details: { ok: true } });
+  });
+
+  it("blocks source-modifying tool calls when the dirty tree is broad and mixed", async () => {
+    setStatus(
+      [
+        "M  extensions/codex/src/app-server/confirmation-gate.ts",
+        " M src/infra/dirty-tree-hygiene.ts",
+        "?? src/infra/heartbeat-runner-new.ts",
+      ].join("\n"),
+    );
+    const { execute, tool } = createWrappedPatchTool();
+
+    const result = await tool.execute(
+      "patch-broad",
+      { patch: "*** Begin Patch\n*** End Patch" },
+      undefined,
+      undefined,
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    const text = getBlockedText(result);
+    expect(text).toContain("broad/mixed");
+    expect(text).toContain("codex-app-server");
+    expect(text).toContain("production-flow-watchdog");
+    expect(text).toContain("staged=1");
+    expect(text).toContain("unstaged=1");
+    expect(text).toContain("untracked=1");
+  });
+
+  it("allows read-only diagnostic shell commands during broad mixed dirty-tree risk", async () => {
+    const statusCalls: string[] = [];
+    setStatus(
+      " M extensions/codex/src/app-server/run-attempt.ts\n?? src/tasks/probe.ts\n",
+      statusCalls,
+    );
+
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.exec_command",
+      params: { cmd: "git status --short" },
+      ctx: { agentId: "main" },
+    });
+
+    expect(result).toEqual({ blocked: false, params: { cmd: "git status --short" } });
+    expect(statusCalls).toEqual([]);
+  });
+
+  it("uses only read-only git status for dirty-tree hygiene checks", async () => {
+    const statusCalls: string[] = [];
+    setStatus("", statusCalls);
+    const { tool } = createWrappedPatchTool();
+
+    await tool.execute(
+      "patch-read-only-gate",
+      { patch: "*** Begin Patch\n*** End Patch" },
+      undefined,
+      undefined,
+    );
+
+    expect(statusCalls).toEqual(["git -C /home/will/openclaw-source status --short"]);
+    expect(statusCalls.join("\n")).not.toMatch(/\b(reset|stash|clean|add|rm)\b/);
+  });
+
+  it("leaves stale confirmation-policy behavior unaffected", async () => {
+    setStatus("");
+
+    const result = await runBeforeToolCallHook({
+      toolName: "message",
+      params: { text: "update" },
+      ctx: { agentId: "main" },
+    });
+
+    expect(result).toEqual({ blocked: false, params: { text: "update" } });
+  });
+});
