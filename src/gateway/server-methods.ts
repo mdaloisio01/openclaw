@@ -405,7 +405,18 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
     loadHandlers: loadTalkHandlers,
   }),
   ...createLazyCoreHandlers({
-    methods: ["tasks.list", "tasks.get", "tasks.cancel"],
+    methods: [
+      "tasks.list",
+      "tasks.get",
+      "tasks.cancel",
+      "tasks.startProductionFlow",
+      "tasks.resumeProductionFlow",
+      "tasks.runTaskInFlow",
+      "tasks.recordTaskInFlowProgress",
+      "tasks.completeTaskInFlow",
+      "tasks.recordProductionFlowLawfulStop",
+      "tasks.probeProductionWatchdogLifecycle",
+    ],
     loadHandlers: loadTasksHandlers,
   }),
   ...createLazyCoreHandlers({
