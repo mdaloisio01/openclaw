@@ -1,3 +1,4 @@
+import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import type { MemorySource } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
@@ -44,6 +45,9 @@ type MemorySearchToolResult =
 
 const MEMORY_SEARCH_TOOL_TIMEOUT_MS = 15_000;
 const MEMORY_SEARCH_TOOL_COOLDOWN_MS = 60_000;
+const LOCAL_MEMORY_FALLBACK_MAX_FILES = 64;
+const LOCAL_MEMORY_FALLBACK_MAX_CHUNKS_PER_FILE = 6;
+const LOCAL_MEMORY_FALLBACK_SNIPPET_LINES = 5;
 
 const memorySearchToolCooldowns = new Map<string, { until: number; error: string }>();
 
@@ -206,6 +210,229 @@ function normalizeActiveMemoryQmdSearchMode(
   return value === "inherit" || value === "search" || value === "vsearch" || value === "query"
     ? value
     : "search";
+}
+
+function normalizeTextForLocalSearch(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function buildLocalFallbackNeedles(query: string): string[] {
+  const trimmed = query.trim();
+  const candidates = [
+    trimmed,
+    ...trimmed
+      .split("|")
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0),
+  ];
+  return [...new Set(candidates.filter((value) => value.length >= 4))];
+}
+
+function buildLocalFallbackTokens(query: string): string[] {
+  const stopwords = new Set([
+    "the",
+    "and",
+    "then",
+    "that",
+    "with",
+    "from",
+    "this",
+    "have",
+    "what",
+    "when",
+    "where",
+    "which",
+    "order",
+  ]);
+  return [
+    ...new Set(
+      (query.toLowerCase().match(/[a-z0-9#._-]{3,}/g) ?? []).filter(
+        (token) => !stopwords.has(token),
+      ),
+    ),
+  ];
+}
+
+function stripReadContinuationNote(text: string): string {
+  return text.replace(/\n?\[More content available\.[^\]]+\]\s*$/u, "");
+}
+
+function scoreLocalFallbackChunk(params: {
+  query: string;
+  text: string;
+  needles: string[];
+  tokens: string[];
+}): { score: number; matchedIndex: number } | null {
+  const normalizedText = normalizeTextForLocalSearch(params.text);
+  if (!normalizedText) {
+    return null;
+  }
+  const normalizedQuery = normalizeTextForLocalSearch(params.query);
+  const exactMatches = params.needles
+    .map((needle) => ({
+      needle: normalizeTextForLocalSearch(needle),
+      index: normalizedText.indexOf(normalizeTextForLocalSearch(needle)),
+    }))
+    .filter((entry) => entry.needle.length > 0 && entry.index >= 0);
+  if (exactMatches.length > 0) {
+    const fullQueryMatch = exactMatches.find((entry) => entry.needle === normalizedQuery);
+    return {
+      score: fullQueryMatch ? 0.995 : Math.min(0.99, 0.94 + exactMatches.length * 0.01),
+      matchedIndex: (fullQueryMatch ?? exactMatches[0])?.index ?? 0,
+    };
+  }
+  if (params.tokens.length === 0) {
+    return null;
+  }
+  const positions = params.tokens
+    .map((token) => ({ token, index: normalizedText.indexOf(token) }))
+    .filter((entry) => entry.index >= 0);
+  if (positions.length < Math.min(3, params.tokens.length)) {
+    return null;
+  }
+  const coverage = positions.length / params.tokens.length;
+  if (coverage < 0.6) {
+    return null;
+  }
+  let orderedMatches = 0;
+  let lastIndex = -1;
+  for (const token of params.tokens) {
+    const next = normalizedText.indexOf(token, lastIndex + 1);
+    if (next >= 0) {
+      orderedMatches += 1;
+      lastIndex = next;
+    }
+  }
+  return {
+    score: Math.min(0.93, 0.72 + coverage * 0.18 + (orderedMatches / params.tokens.length) * 0.03),
+    matchedIndex: positions[0]?.index ?? 0,
+  };
+}
+
+function buildLocalFallbackResult(params: {
+  relPath: string;
+  chunkText: string;
+  fromLine: number;
+  score: number;
+  matchedIndex: number;
+}): MemorySearchResult {
+  const cleanedText = stripReadContinuationNote(params.chunkText);
+  const lines = cleanedText.split(/\r?\n/u);
+  const prefix = cleanedText.slice(0, Math.max(0, params.matchedIndex));
+  const matchedLineOffset = prefix.split(/\r?\n/u).length - 1;
+  const snippetStartOffset = Math.max(0, matchedLineOffset - 2);
+  const snippetLines = lines.slice(
+    snippetStartOffset,
+    snippetStartOffset + LOCAL_MEMORY_FALLBACK_SNIPPET_LINES,
+  );
+  const startLine = params.fromLine + snippetStartOffset;
+  const endLine = startLine + Math.max(0, snippetLines.length - 1);
+  return {
+    path: params.relPath,
+    startLine,
+    endLine,
+    score: params.score,
+    snippet: snippetLines.join("\n").trim(),
+    source: "memory",
+  };
+}
+
+async function searchMemoryFilesLocally(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  workspaceDir?: string;
+  extraPaths?: string[];
+  query: string;
+  maxResults?: number;
+}): Promise<{
+  results: MemorySearchResult[];
+  debug: {
+    used: boolean;
+    staleIndexSuspected: boolean;
+    scannedFiles: number;
+    scannedChunks: number;
+    matchedFiles: number;
+  };
+}> {
+  if (!params.workspaceDir) {
+    return {
+      results: [],
+      debug: {
+        used: false,
+        staleIndexSuspected: false,
+        scannedFiles: 0,
+        scannedChunks: 0,
+        matchedFiles: 0,
+      },
+    };
+  }
+  const { listMemoryFiles, readAgentMemoryFile } = await loadMemoryToolRuntime();
+  const files = (await listMemoryFiles(params.workspaceDir, params.extraPaths)).slice(
+    0,
+    LOCAL_MEMORY_FALLBACK_MAX_FILES,
+  );
+  const needles = buildLocalFallbackNeedles(params.query);
+  const tokens = buildLocalFallbackTokens(params.query);
+  const matches: MemorySearchResult[] = [];
+  let scannedChunks = 0;
+  for (const absPath of files) {
+    const relPath = path.relative(params.workspaceDir, absPath).replace(/\\/g, "/");
+    if (!relPath) {
+      continue;
+    }
+    let from = 1;
+    for (
+      let chunkIndex = 0;
+      chunkIndex < LOCAL_MEMORY_FALLBACK_MAX_CHUNKS_PER_FILE;
+      chunkIndex += 1
+    ) {
+      scannedChunks += 1;
+      const chunk = await readAgentMemoryFile({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        relPath,
+        from,
+      });
+      const cleanedText = stripReadContinuationNote(chunk.text);
+      if (!cleanedText.trim()) {
+        break;
+      }
+      const scored = scoreLocalFallbackChunk({
+        query: params.query,
+        text: cleanedText,
+        needles,
+        tokens,
+      });
+      if (scored) {
+        matches.push(
+          buildLocalFallbackResult({
+            relPath,
+            chunkText: cleanedText,
+            fromLine: chunk.from ?? from,
+            score: scored.score,
+            matchedIndex: scored.matchedIndex,
+          }),
+        );
+        break;
+      }
+      if (!chunk.truncated || !chunk.nextFrom) {
+        break;
+      }
+      from = chunk.nextFrom;
+    }
+  }
+  const effectiveMax = Math.max(1, params.maxResults ?? 10);
+  const results = sortMemorySearchToolResults(matches).slice(0, effectiveMax);
+  return {
+    results,
+    debug: {
+      used: results.length > 0,
+      staleIndexSuspected: results.length > 0,
+      scannedFiles: files.length,
+      scannedChunks,
+      matchedFiles: results.length,
+    },
+  };
 }
 
 function isActiveMemorySessionKey(sessionKey?: string): boolean {
@@ -400,6 +627,15 @@ export function createMemorySearchTool(options: {
             let model: string | undefined;
             let fallback: unknown;
             let searchMode: string | undefined;
+            let localFallbackDebug:
+              | {
+                  used: boolean;
+                  staleIndexSuspected: boolean;
+                  scannedFiles: number;
+                  scannedChunks: number;
+                  matchedFiles: number;
+                }
+              | undefined;
             let searchDebug:
               | {
                   backend: string;
@@ -408,6 +644,13 @@ export function createMemorySearchTool(options: {
                   fallback?: string;
                   searchMs: number;
                   hits: number;
+                  localFallback?: {
+                    used: boolean;
+                    staleIndexSuspected: boolean;
+                    scannedFiles: number;
+                    scannedChunks: number;
+                    matchedFiles: number;
+                  };
                 }
               | undefined;
             if (shouldQueryMemory && memory && !("error" in memory)) {
@@ -464,6 +707,20 @@ export function createMemorySearchTool(options: {
                   rawResults = rawResults.filter((hit) => hit.source === "memory");
                 }
                 const status = activeMemory.manager.status();
+                if (requestedCorpus !== "sessions" && rawResults.length === 0) {
+                  const localFallback = await searchMemoryFilesLocally({
+                    cfg,
+                    agentId,
+                    workspaceDir: status.workspaceDir,
+                    extraPaths: status.extraPaths,
+                    query,
+                    maxResults,
+                  });
+                  if (localFallback.results.length > 0) {
+                    rawResults = localFallback.results;
+                  }
+                  localFallbackDebug = localFallback.debug;
+                }
                 const decorated = decorateCitations(rawResults, includeCitations);
                 const resolved = resolveMemoryBackendConfig({ cfg, agentId });
                 const memoryResults =
@@ -498,6 +755,7 @@ export function createMemorySearchTool(options: {
                   fallback: latestDebug?.fallback,
                   searchMs: Math.max(0, Date.now() - searchStartedAt),
                   hits: rawResults.length,
+                  ...(localFallbackDebug ? { localFallback: localFallbackDebug } : {}),
                 };
               });
             }

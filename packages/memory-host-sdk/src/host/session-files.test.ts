@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   buildSessionEntry,
+  listHotSessionFilesForAgent,
   listSessionFilesForAgent,
   sessionPathForFile,
   type SessionFileEntry,
@@ -66,6 +67,30 @@ describe("listSessionFilesForAgent", () => {
     );
 
     const files = await listSessionFilesForAgent("main");
+
+    expect(files.map((filePath) => path.basename(filePath)).toSorted()).toEqual(
+      included.toSorted(),
+    );
+  });
+});
+
+describe("listHotSessionFilesForAgent", () => {
+  it("excludes deleted, reset, and checkpoint artifacts from hot session listing", async () => {
+    const sessionsDir = path.join(tmpDir, "agents", "main", "sessions");
+    fsSync.mkdirSync(sessionsDir, { recursive: true });
+
+    const included = ["active.jsonl", "team.checkpoint.notes.jsonl"];
+    const excluded = [
+      "active.jsonl.reset.2026-02-16T22-26-33.000Z",
+      "active.jsonl.deleted.2026-02-16T22-27-33.000Z",
+      "active.checkpoint.11111111-1111-4111-8111-111111111111.jsonl",
+    ];
+
+    for (const fileName of [...included, ...excluded]) {
+      fsSync.writeFileSync(path.join(sessionsDir, fileName), "");
+    }
+
+    const files = await listHotSessionFilesForAgent("main");
 
     expect(files.map((filePath) => path.basename(filePath)).toSorted()).toEqual(
       included.toSorted(),

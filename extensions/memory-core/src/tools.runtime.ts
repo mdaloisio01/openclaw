@@ -1,4 +1,5 @@
 export {
+  listMemoryFiles,
   readAgentMemoryFile,
   resolveMemoryBackendConfig,
 } from "openclaw/plugin-sdk/memory-core-host-runtime-files";

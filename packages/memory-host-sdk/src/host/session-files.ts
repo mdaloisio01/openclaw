@@ -313,6 +313,16 @@ export async function listSessionFilesForAgent(agentId: string): Promise<string[
   }
 }
 
+export async function listHotSessionFilesForAgent(agentId: string): Promise<string[]> {
+  const files = await listSessionFilesForAgent(agentId);
+  return files.filter((filePath) => {
+    const fileName = path.basename(filePath);
+    return (
+      !isSessionArchiveArtifactName(fileName) && !isCompactionCheckpointTranscriptFileName(fileName)
+    );
+  });
+}
+
 function extractAgentIdFromSessionPath(absPath: string): string | null {
   const parts = path.normalize(path.resolve(absPath)).split(path.sep).filter(Boolean);
   const sessionsIndex = parts.lastIndexOf("sessions");

@@ -5414,6 +5414,137 @@ describe("QmdMemoryManager", () => {
     await manager.close();
   });
 
+  it("keeps deleted, reset, and checkpoint session archives out of hot QMD session exports", async () => {
+    cfg = {
+      ...cfg,
+      memory: {
+        backend: "qmd",
+        qmd: {
+          includeDefaultMemory: false,
+          sessions: { enabled: true },
+          update: {
+            interval: "0s",
+            debounceMs: 0,
+            onBoot: true,
+            waitForBootSync: true,
+          },
+          paths: [{ path: workspaceDir, pattern: "**/*.md", name: "workspace" }],
+        },
+      },
+    } as OpenClawConfig;
+
+    const sessionsDir = path.join(stateDir, "agents", agentId, "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(sessionsDir, "active.jsonl"),
+      `${JSON.stringify({ type: "message", message: { role: "user", content: "active" } })}\n`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(sessionsDir, "active.jsonl.deleted.2026-02-16T22-27-33.000Z"),
+      `${JSON.stringify({ type: "message", message: { role: "user", content: "deleted" } })}\n`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(sessionsDir, "active.jsonl.reset.2026-02-16T22-26-33.000Z"),
+      `${JSON.stringify({ type: "message", message: { role: "user", content: "reset" } })}\n`,
+      "utf-8",
+    );
+    await fs.writeFile(
+      path.join(sessionsDir, "active.checkpoint.11111111-1111-4111-8111-111111111111.jsonl"),
+      `${JSON.stringify({ type: "message", message: { role: "user", content: "checkpoint" } })}\n`,
+      "utf-8",
+    );
+
+    const { manager } = await createManager({ mode: "full" });
+    const sessionExportDir = path.join(stateDir, "agents", agentId, "qmd", "sessions");
+
+    await expect(fs.readdir(sessionExportDir)).resolves.toEqual(["active.md"]);
+    await manager.close();
+  });
+
+  it("excludes file_hub exports from the hot workspace collection while keeping regular notes", async () => {
+    cfg = {
+      ...cfg,
+      memory: {
+        backend: "qmd",
+        qmd: {
+          includeDefaultMemory: true,
+          update: { interval: "0s", debounceMs: 0, onBoot: false },
+          paths: [{ path: workspaceDir, pattern: "**/*.md", name: "workspace" }],
+        },
+      },
+    } as OpenClawConfig;
+
+    await fs.mkdir(path.join(workspaceDir, "notes"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "file_hub", "exports"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "notes", "keep.md"), "# keep\n", "utf-8");
+    await fs.writeFile(
+      path.join(workspaceDir, "file_hub", "exports", "report.md"),
+      "# cold\n",
+      "utf-8",
+    );
+    await fs.writeFile(path.join(workspaceDir, "memory", "daily.md"), "# daily\n", "utf-8");
+    await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), "# root memory\n", "utf-8");
+
+    const { manager } = await createManager({ mode: "status" });
+    await manager.sync({ reason: "manual", force: true });
+
+    const mirrorDir = path.join(
+      stateDir,
+      "agents",
+      agentId,
+      "qmd",
+      "collections",
+      "workspace-main",
+    );
+    await expect(fs.readFile(path.join(mirrorDir, "notes", "keep.md"), "utf-8")).resolves.toContain(
+      "keep",
+    );
+    await expectPathMissing(path.join(mirrorDir, "file_hub", "exports", "report.md"));
+    await expectPathMissing(path.join(mirrorDir, "memory", "daily.md"));
+    await expectPathMissing(path.join(mirrorDir, "MEMORY.md"));
+    await manager.close();
+  });
+
+  it("keeps daily memory in the hot workspace collection when default memory collections are disabled", async () => {
+    cfg = {
+      ...cfg,
+      memory: {
+        backend: "qmd",
+        qmd: {
+          includeDefaultMemory: false,
+          update: { interval: "0s", debounceMs: 0, onBoot: false },
+          paths: [{ path: workspaceDir, pattern: "**/*.md", name: "workspace" }],
+        },
+      },
+    } as OpenClawConfig;
+
+    await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+    await fs.writeFile(path.join(workspaceDir, "memory", "daily.md"), "# daily\n", "utf-8");
+    await fs.writeFile(path.join(workspaceDir, "MEMORY.md"), "# root memory\n", "utf-8");
+
+    const { manager } = await createManager({ mode: "status" });
+    await manager.sync({ reason: "manual", force: true });
+
+    const mirrorDir = path.join(
+      stateDir,
+      "agents",
+      agentId,
+      "qmd",
+      "collections",
+      "workspace-main",
+    );
+    await expect(
+      fs.readFile(path.join(mirrorDir, "memory", "daily.md"), "utf-8"),
+    ).resolves.toContain("daily");
+    await expect(fs.readFile(path.join(mirrorDir, "MEMORY.md"), "utf-8")).resolves.toContain(
+      "root memory",
+    );
+    await manager.close();
+  });
+
   it("reports vector availability as unavailable when qmd status shows zero vectors", async () => {
     spawnMock.mockImplementation((_cmd: string, args: string[]) => {
       if (args[0] === "status") {

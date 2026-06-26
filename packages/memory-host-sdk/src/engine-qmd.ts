@@ -3,6 +3,7 @@
 export { extractKeywords, isQueryStopWordToken } from "./host/query-expansion.js";
 export {
   buildSessionEntry,
+  listHotSessionFilesForAgent,
   listSessionFilesForAgent,
   loadDreamingNarrativeTranscriptPathSetForAgent,
   loadSessionTranscriptClassificationForAgent,

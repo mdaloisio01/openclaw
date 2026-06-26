@@ -23,10 +23,10 @@ import {
   deriveQmdScopeChannel,
   deriveQmdScopeChatType,
   isQmdScopeAllowed,
-  listSessionFilesForAgent,
   parseQmdQueryJson,
   resolveCliSpawnInvocation,
   runCliCommand,
+  listSessionFilesForAgent,
   type QmdQueryResult,
   type SessionFileEntry,
 } from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
@@ -255,6 +255,7 @@ type ManagedCollection = {
   path: string;
   pattern: string;
   kind: "memory" | "custom" | "sessions";
+  indexPath?: string;
 };
 
 type QmdManagerMode = "full" | "status" | "cli";
@@ -342,6 +343,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private readonly indexPath: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly syncSettings: ReturnType<typeof resolveMemorySearchSyncConfig>;
+  private readonly managedCollections: ManagedCollection[];
   private readonly managedCollectionNames: string[];
   private readonly collectionRoots = new Map<string, CollectionRoot>();
   private readonly sources = new Set<MemorySource>();
@@ -354,6 +356,15 @@ export class QmdMemoryManager implements MemorySearchManager {
     {
       hash: string;
       mtimeMs: number;
+      target: string;
+    }
+  >();
+  private readonly mirroredCollectionState = new Map<
+    string,
+    {
+      collectionName: string;
+      mtimeMs: number;
+      size: number;
       target: string;
     }
   >();
@@ -438,6 +449,7 @@ export class QmdMemoryManager implements MemorySearchManager {
         },
       ];
     }
+    this.managedCollections = this.buildManagedCollections(this.qmd.collections);
     this.managedCollectionNames = this.computeManagedCollectionNames();
   }
 
@@ -466,14 +478,14 @@ export class QmdMemoryManager implements MemorySearchManager {
     await this.ensureCollections();
     if (mode === "cli") {
       log.info(
-        `qmd manager initialized for agent "${this.agentId}" mode=cli collections=${this.qmd.collections.length} durationMs=${Date.now() - startTime}`,
+        `qmd manager initialized for agent "${this.agentId}" mode=cli collections=${this.managedCollections.length} durationMs=${Date.now() - startTime}`,
       );
       return;
     }
 
     this.ensureWatcher();
     log.info(
-      `qmd manager initialized for agent "${this.agentId}" mode=full collections=${this.qmd.collections.length} durationMs=${Date.now() - startTime}`,
+      `qmd manager initialized for agent "${this.agentId}" mode=full collections=${this.managedCollections.length} durationMs=${Date.now() - startTime}`,
     );
 
     if (this.qmd.update.onBoot) {
@@ -529,7 +541,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private bootstrapCollections(): void {
     this.collectionRoots.clear();
     this.sources.clear();
-    for (const collection of this.qmd.collections) {
+    for (const collection of this.managedCollections) {
       const kind: MemorySource = collection.kind === "sessions" ? "sessions" : "memory";
       this.collectionRoots.set(collection.name, { path: collection.path, kind });
       this.sources.add(kind);
@@ -544,7 +556,7 @@ export class QmdMemoryManager implements MemorySearchManager {
 
     await this.migrateLegacyUnscopedCollections(existing);
 
-    for (const collection of this.qmd.collections) {
+    for (const collection of this.managedCollections) {
       const listed = existing.get(collection.name);
       if (listed && !this.shouldRebindCollection(collection, listed)) {
         continue;
@@ -560,10 +572,15 @@ export class QmdMemoryManager implements MemorySearchManager {
         }
       }
       try {
+        await this.materializeManagedCollection(collection);
         await this.ensureCollectionPath(collection);
-        await this.addCollection(collection.path, collection.name, collection.pattern);
+        await this.addCollection(
+          this.getManagedCollectionIndexPath(collection),
+          collection.name,
+          collection.pattern,
+        );
         existing.set(collection.name, {
-          path: collection.path,
+          path: this.getManagedCollectionIndexPath(collection),
           pattern: collection.pattern,
         });
       } catch (err) {
@@ -581,7 +598,7 @@ export class QmdMemoryManager implements MemorySearchManager {
             }));
           if (rebound) {
             existing.set(collection.name, {
-              path: collection.path,
+              path: this.getManagedCollectionIndexPath(collection),
               pattern: collection.pattern,
             });
           } else {
@@ -616,8 +633,13 @@ export class QmdMemoryManager implements MemorySearchManager {
     }
 
     try {
+      await this.materializeManagedCollection(collection);
       await this.ensureCollectionPath(collection);
-      await this.addCollection(collection.path, collection.name, collection.pattern);
+      await this.addCollection(
+        this.getManagedCollectionIndexPath(collection),
+        collection.name,
+        collection.pattern,
+      );
       return true;
     } catch (retryErr) {
       const retryMessage = formatErrorMessage(retryErr);
@@ -661,12 +683,12 @@ export class QmdMemoryManager implements MemorySearchManager {
       if (!details.path || typeof details.pattern !== "string") {
         continue;
       }
-      if (!this.pathsMatch(details.path, collection.path)) {
+      if (!this.pathsMatch(details.path, this.getManagedCollectionIndexPath(collection))) {
         continue;
       }
       if (
         !this.patternsMatchForManagedCollection(
-          collection.path,
+          this.getManagedCollectionIndexPath(collection),
           details.pattern,
           collection.pattern,
         )
@@ -738,9 +760,14 @@ export class QmdMemoryManager implements MemorySearchManager {
     }
 
     try {
-      await this.addCollection(collection.path, collection.name, collection.pattern);
+      await this.materializeManagedCollection(collection);
+      await this.addCollection(
+        this.getManagedCollectionIndexPath(collection),
+        collection.name,
+        collection.pattern,
+      );
       existing.set(collection.name, {
-        path: collection.path,
+        path: this.getManagedCollectionIndexPath(collection),
         pattern: collection.pattern,
       });
       return true;
@@ -756,7 +783,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private async migrateLegacyUnscopedCollections(
     existing: Map<string, ListedCollection>,
   ): Promise<void> {
-    for (const collection of this.qmd.collections) {
+    for (const collection of this.managedCollections) {
       if (existing.has(collection.name)) {
         continue;
       }
@@ -799,13 +826,16 @@ export class QmdMemoryManager implements MemorySearchManager {
     collection: ManagedCollection,
     listedLegacy: ListedCollection,
   ): boolean {
-    if (listedLegacy.path && !this.pathsMatch(listedLegacy.path, collection.path)) {
+    if (
+      listedLegacy.path &&
+      !this.pathsMatch(listedLegacy.path, this.getManagedCollectionIndexPath(collection))
+    ) {
       return false;
     }
     if (
       typeof listedLegacy.pattern === "string" &&
       !this.patternsMatchForManagedCollection(
-        collection.path,
+        this.getManagedCollectionIndexPath(collection),
         listedLegacy.pattern,
         collection.pattern,
       )
@@ -819,11 +849,12 @@ export class QmdMemoryManager implements MemorySearchManager {
     path: string;
     pattern: string;
     kind: "memory" | "custom" | "sessions";
+    indexPath?: string;
   }): Promise<void> {
     if (!this.isDirectoryGlobPattern(collection.pattern)) {
       return;
     }
-    await fs.mkdir(collection.path, { recursive: true });
+    await fs.mkdir(this.getManagedCollectionIndexPath(collection), { recursive: true });
   }
 
   private isDirectoryGlobPattern(pattern: string): boolean {
@@ -985,12 +1016,17 @@ export class QmdMemoryManager implements MemorySearchManager {
       // add fails (for example on timeout).
       return false;
     }
-    if (!this.pathsMatch(listed.path, collection.path)) {
+    const collectionIndexPath = this.getManagedCollectionIndexPath(collection);
+    if (!this.pathsMatch(listed.path, collectionIndexPath)) {
       return true;
     }
     if (
       typeof listed.pattern === "string" &&
-      !this.patternsMatchForManagedCollection(collection.path, listed.pattern, collection.pattern)
+      !this.patternsMatchForManagedCollection(
+        collectionIndexPath,
+        listed.pattern,
+        collection.pattern,
+      )
     ) {
       return true;
     }
@@ -1074,7 +1110,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   }
 
   private async rebuildManagedCollectionsForRepair(reason: string): Promise<void> {
-    for (const collection of this.qmd.collections) {
+    for (const collection of this.managedCollections) {
       try {
         await this.removeCollection(collection.name);
       } catch (removeErr) {
@@ -1084,7 +1120,12 @@ export class QmdMemoryManager implements MemorySearchManager {
         }
       }
       try {
-        await this.addCollection(collection.path, collection.name, collection.pattern);
+        await this.materializeManagedCollection(collection);
+        await this.addCollection(
+          this.getManagedCollectionIndexPath(collection),
+          collection.name,
+          collection.pattern,
+        );
       } catch (addErr) {
         const addMessage = formatErrorMessage(addErr);
         if (!this.isCollectionAlreadyExistsError(addMessage)) {
@@ -1430,7 +1471,7 @@ export class QmdMemoryManager implements MemorySearchManager {
       },
       custom: {
         qmd: {
-          collections: this.qmd.collections.length,
+          collections: this.managedCollections.length,
           lastUpdateAt: this.lastUpdateAt,
           embedFailures: this.embedFailureCount,
           embedBackoffUntil: this.embedBackoffUntil,
@@ -1544,6 +1585,7 @@ export class QmdMemoryManager implements MemorySearchManager {
         if (this.sessionExporter) {
           await this.exportSessions();
         }
+        await this.materializeManagedCollections();
         await this.runQmdUpdateWithRetry(reason);
         this.dirty = false;
       });
@@ -1592,7 +1634,7 @@ export class QmdMemoryManager implements MemorySearchManager {
       return;
     }
     const watchPaths = new Set<string>();
-    for (const collection of this.qmd.collections) {
+    for (const collection of this.managedCollections) {
       if (collection.kind === "sessions") {
         continue;
       }
@@ -1761,9 +1803,12 @@ export class QmdMemoryManager implements MemorySearchManager {
     if (windowMs <= 0) {
       return 0;
     }
-    const customCollections = this.qmd.collections
+    const customCollections = this.managedCollections
       .filter((collection) => collection.kind === "custom")
-      .map((collection) => `${collection.path}\u0000${collection.pattern}`)
+      .map(
+        (collection) =>
+          `${this.getManagedCollectionIndexPath(collection)}\u0000${collection.pattern}`,
+      )
       .toSorted()
       .join("\u0001");
     if (!customCollections) {
@@ -2352,7 +2397,9 @@ export class QmdMemoryManager implements MemorySearchManager {
     const exportDir = this.sessionExporter.dir;
     await fs.mkdir(exportDir, { recursive: true });
     const exportRoot = await root(exportDir);
-    const files = await listSessionFilesForAgent(this.agentId);
+    const files = (await listSessionFilesForAgent(this.agentId)).filter((sessionFile) =>
+      this.isHotSessionTranscriptPath(sessionFile),
+    );
     const keep = new Set<string>();
     const tracked = new Set<string>();
     const cutoff = this.sessionExporter.retentionMs
@@ -2397,6 +2444,165 @@ export class QmdMemoryManager implements MemorySearchManager {
         this.exportedSessionState.delete(sessionFile);
       }
     }
+  }
+
+  private buildManagedCollections(collections: ManagedCollection[]): ManagedCollection[] {
+    return collections.map((collection) => {
+      if (!this.shouldMaterializeWorkspaceHotCollection(collection)) {
+        return collection;
+      }
+      const indexPath = path.join(this.qmdDir, "collections", collection.name);
+      return {
+        ...collection,
+        indexPath,
+      };
+    });
+  }
+
+  private hasDefaultMemoryCollections(collections: ManagedCollection[]): boolean {
+    return collections.some((collection) => collection.kind === "memory");
+  }
+
+  private shouldMaterializeWorkspaceHotCollection(collection: ManagedCollection): boolean {
+    return (
+      collection.kind === "custom" &&
+      collection.pattern === "**/*.md" &&
+      this.pathsMatch(collection.path, this.workspaceDir)
+    );
+  }
+
+  private getManagedCollectionIndexPath(collection: { path: string; indexPath?: string }): string {
+    return collection.indexPath ?? collection.path;
+  }
+
+  private async materializeManagedCollections(): Promise<void> {
+    for (const collection of this.managedCollections) {
+      await this.materializeManagedCollection(collection);
+    }
+  }
+
+  private async materializeManagedCollection(collection: ManagedCollection): Promise<void> {
+    if (!collection.indexPath || !this.shouldMaterializeWorkspaceHotCollection(collection)) {
+      return;
+    }
+    const keep = new Set<string>();
+    await fs.mkdir(collection.indexPath, { recursive: true });
+    for await (const relPath of this.iterHotWorkspaceMarkdownPaths(collection.path)) {
+      const source = path.join(collection.path, relPath);
+      const target = path.join(collection.indexPath, relPath);
+      const stat = await fs.stat(source);
+      const stateKey = `${collection.name}\u0000${source}`;
+      const previous = this.mirroredCollectionState.get(stateKey);
+      if (!previous || previous.mtimeMs !== stat.mtimeMs || previous.size !== stat.size) {
+        await fs.mkdir(path.dirname(target), { recursive: true });
+        await fs.copyFile(source, target);
+      }
+      this.mirroredCollectionState.set(stateKey, {
+        collectionName: collection.name,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        target,
+      });
+      keep.add(target);
+    }
+    await this.pruneMirroredCollectionTargets(collection, keep);
+  }
+
+  private async *iterHotWorkspaceMarkdownPaths(
+    rootDir: string,
+    prefix = "",
+  ): AsyncGenerator<string> {
+    let entries: fsSync.Dirent[];
+    try {
+      entries = await fs.readdir(path.join(rootDir, prefix), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const relPath = path.posix.join(prefix, entry.name).replace(/^\/+/, "");
+      if (entry.isDirectory()) {
+        if (this.shouldExcludeHotWorkspaceRelativePath(relPath, true)) {
+          continue;
+        }
+        yield* this.iterHotWorkspaceMarkdownPaths(rootDir, relPath);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(".md")) {
+        continue;
+      }
+      if (this.shouldExcludeHotWorkspaceRelativePath(relPath, false)) {
+        continue;
+      }
+      yield relPath;
+    }
+  }
+
+  private shouldExcludeHotWorkspaceRelativePath(relPath: string, isDirectory: boolean): boolean {
+    const normalized = relPath.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!normalized) {
+      return false;
+    }
+    if (normalized === "file_hub/exports" || normalized.startsWith("file_hub/exports/")) {
+      return true;
+    }
+    if (!this.hasDefaultMemoryCollections(this.managedCollections)) {
+      return false;
+    }
+    if (normalized === "memory" && isDirectory) {
+      return true;
+    }
+    return isDefaultMemoryPath(normalized);
+  }
+
+  private async pruneMirroredCollectionTargets(
+    collection: ManagedCollection,
+    keep: ReadonlySet<string>,
+  ): Promise<void> {
+    const indexPath = this.getManagedCollectionIndexPath(collection);
+    for (const [stateKey, state] of this.mirroredCollectionState) {
+      if (state.collectionName !== collection.name) {
+        continue;
+      }
+      if (keep.has(state.target)) {
+        continue;
+      }
+      await fs.rm(state.target, { force: true }).catch(() => undefined);
+      this.mirroredCollectionState.delete(stateKey);
+    }
+    for await (const target of this.iterMirroredMarkdownPaths(indexPath)) {
+      if (keep.has(target)) {
+        continue;
+      }
+      await fs.rm(target, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async *iterMirroredMarkdownPaths(rootDir: string, prefix = ""): AsyncGenerator<string> {
+    let entries: fsSync.Dirent[];
+    try {
+      entries = await fs.readdir(path.join(rootDir, prefix), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const relPath = path.posix.join(prefix, entry.name).replace(/^\/+/, "");
+      if (entry.isDirectory()) {
+        yield* this.iterMirroredMarkdownPaths(rootDir, relPath);
+        continue;
+      }
+      if (entry.isFile() && entry.name.endsWith(".md")) {
+        yield path.join(rootDir, relPath);
+      }
+    }
+  }
+
+  private isHotSessionTranscriptPath(sessionFile: string): boolean {
+    const fileName = path.basename(sessionFile);
+    return (
+      !fileName.includes(".jsonl.deleted.") &&
+      !fileName.includes(".jsonl.reset.") &&
+      !/\.checkpoint\.[0-9a-f-]+\.jsonl$/i.test(fileName)
+    );
   }
 
   private renderSessionMarkdown(entry: SessionFileEntry): string {
@@ -3220,7 +3426,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   private computeManagedCollectionNames(): string[] {
     const seen = new Set<string>();
     const names: string[] = [];
-    for (const collection of this.qmd.collections) {
+    for (const collection of this.managedCollections) {
       const name = collection.name?.trim();
       if (!name || seen.has(name)) {
         continue;

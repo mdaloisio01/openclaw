@@ -5,6 +5,8 @@ import {
   getMemorySearchManagerMockParams,
   resetMemoryToolMockState,
   setMemoryBackend,
+  setMemoryFileList,
+  setMemoryReadFileImpl,
   setMemorySearchImpl,
   setMemorySearchManagerImpl,
 } from "./memory-tool-manager-mock.js";
@@ -254,6 +256,102 @@ describe("memory_search unavailable payloads", () => {
       "MEMORY.md",
     );
     expect(searchCalls).toBe(2);
+  });
+
+  it("falls back to bounded local memory scanning for exact filename history misses", async () => {
+    setMemoryFileList(["/workspace/memory/2026-06-10.md"]);
+    setMemoryReadFileImpl(async (params) => {
+      if (params.relPath !== "memory/2026-06-10.md") {
+        return { text: "", path: params.relPath, from: params.from ?? 1, lines: 0 };
+      }
+      if ((params.from ?? 1) === 1) {
+        return {
+          path: params.relPath,
+          from: 1,
+          lines: 120,
+          truncated: true,
+          nextFrom: 121,
+          text: Array.from({ length: 120 }, (_, index) => `line ${index + 1}`).join("\n"),
+        };
+      }
+      if ((params.from ?? 1) === 121) {
+        return {
+          path: params.relPath,
+          from: 121,
+          lines: 120,
+          truncated: true,
+          nextFrom: 241,
+          text: Array.from({ length: 120 }, (_, index) => `line ${index + 121}`).join("\n"),
+        };
+      }
+      return {
+        path: params.relPath,
+        from: 241,
+        lines: 6,
+        text: [
+          "291 filler",
+          "292 filler",
+          "293 filler",
+          "GIE Self improvment update.md",
+          "GIE Improvment Planning Task.md",
+          "# GIE System-Wide Agent Capability promotion plan.txt",
+        ].join("\n"),
+      };
+    });
+
+    const tool = createMemorySearchToolOrThrow({
+      config: {
+        agents: { list: [{ id: "main", default: true }] },
+        memory: { citations: "off" },
+      },
+    });
+    const result = await tool.execute("local-fallback-exact", {
+      query:
+        "GIE Self improvment update.md|GIE Improvment Planning Task.md|# GIE System-Wide Agent Capability promotion plan.txt",
+    });
+    const details = result.details as {
+      results: Array<{ path: string; startLine: number; snippet: string }>;
+      debug?: { localFallback?: { used?: boolean; staleIndexSuspected?: boolean } };
+    };
+
+    expect(details.results[0]?.path).toBe("memory/2026-06-10.md");
+    expect(details.results[0]?.startLine).toBeGreaterThanOrEqual(241);
+    expect(details.results[0]?.snippet).toContain("GIE Self improvment update.md");
+    expect(details.debug?.localFallback?.used).toBe(true);
+    expect(details.debug?.localFallback?.staleIndexSuspected).toBe(true);
+  });
+
+  it("falls back to bounded local memory scanning for ordered history wording misses", async () => {
+    setMemoryFileList(["/workspace/memory/2026-06-09.md"]);
+    setMemoryReadFileImpl(async (params) => ({
+      path: params.relPath,
+      from: params.from ?? 1,
+      lines: 8,
+      text: [
+        "notes",
+        "GIE Self improvment update.md",
+        "GIE Improvment Planning Task.md",
+        "# GIE System-Wide Agent Capability promotion plan.txt",
+      ].join("\n"),
+    }));
+
+    const tool = createMemorySearchToolOrThrow({
+      config: {
+        agents: { list: [{ id: "main", default: true }] },
+        memory: { citations: "off" },
+      },
+    });
+    const result = await tool.execute("local-fallback-ordered", {
+      query: "GIE self improvement planning promotion order",
+    });
+    const details = result.details as {
+      results: Array<{ path: string; snippet: string }>;
+      debug?: { localFallback?: { used?: boolean } };
+    };
+
+    expect(details.results[0]?.path).toBe("memory/2026-06-09.md");
+    expect(details.results[0]?.snippet).toContain("GIE Improvment Planning Task.md");
+    expect(details.debug?.localFallback?.used).toBe(true);
   });
 
   it("returns structured search debug metadata for qmd results", async () => {
