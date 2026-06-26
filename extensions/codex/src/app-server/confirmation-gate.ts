@@ -1,5 +1,6 @@
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { CodexWorkspaceBootstrapContext } from "./attempt-context.js";
+import type { CodexConfirmationPolicy } from "./config.js";
 import type { CodexAppServerThreadBinding } from "./session-binding.js";
 
 export type CodexConfirmationGatePending = {
@@ -38,17 +39,6 @@ export type CodexConfirmationGateDecision =
 export type CodexConfirmationGateBinding = {
   confirmationGate?: CodexConfirmationGatePending;
 };
-
-const CONFIRMATION_POLICY_PATTERNS = [
-  "Before doing anything on a new instruction from Mark",
-  "first paraphrase back in short plain English",
-  "wait for Mark to confirm yes/no",
-];
-const CONFIRMATION_POLICY_SUSPENSION_PATTERNS = [
-  "old mandatory paraphrase/yes-no gate is suspended",
-  "Do not ask for yes/no confirmation before ordinary requests",
-  "Do not ask for yes/no confirmation before status requests",
-];
 
 const YES_PATTERN =
   /^(?:yes|y|yeah|yep|correct|confirmed|confirm|do it|run it|go|go ahead|proceed|continue|ok|okay)$/iu;
@@ -99,6 +89,7 @@ export function withCodexConfirmationGatePending<T extends CodexAppServerThreadB
 export function resolveCodexConfirmationGateDecision(params: {
   prompt: string;
   trigger?: string;
+  confirmationPolicy?: CodexConfirmationPolicy;
   workspaceBootstrapContext: CodexWorkspaceBootstrapContext;
   startupBinding?: CodexAppServerThreadBinding;
   historyMessages?: readonly AgentMessage[];
@@ -113,7 +104,7 @@ export function resolveCodexConfirmationGateDecision(params: {
     return { action: "none", reason: "automation-turn" };
   }
 
-  if (!workspaceRequiresConfirmation(params.workspaceBootstrapContext)) {
+  if (!workspaceRequiresConfirmation(params.confirmationPolicy)) {
     return { action: "none", reason: "policy-not-required" };
   }
 
@@ -155,23 +146,8 @@ export function resolveCodexConfirmationGateDecision(params: {
   };
 }
 
-function workspaceRequiresConfirmation(context: CodexWorkspaceBootstrapContext): boolean {
-  const haystacks = [
-    ...context.bootstrapFiles.map((file) => file.content ?? ""),
-    context.developerInstructions,
-    context.turnScopedDeveloperInstructions,
-    context.memoryCollaborationInstructions,
-  ].filter((text): text is string => Boolean(text?.trim()));
-  if (
-    haystacks.some((text) =>
-      CONFIRMATION_POLICY_SUSPENSION_PATTERNS.some((pattern) => text.includes(pattern)),
-    )
-  ) {
-    return false;
-  }
-  return haystacks.some((text) =>
-    CONFIRMATION_POLICY_PATTERNS.some((pattern) => text.includes(pattern)),
-  );
+function workspaceRequiresConfirmation(policy: CodexConfirmationPolicy | undefined): boolean {
+  return policy === "confirm-new-instructions";
 }
 
 function classifyConfirmationReply(prompt: string): "yes" | "no" | "other" {

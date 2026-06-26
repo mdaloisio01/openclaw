@@ -21,14 +21,23 @@ function confirmationWorkspace(): CodexWorkspaceBootstrapContext {
   };
 }
 
-function suspendedConfirmationWorkspace(): CodexWorkspaceBootstrapContext {
+function stalePolicyWorkspace(): CodexWorkspaceBootstrapContext {
   return {
     bootstrapFiles: [
       {
         name: "AGENTS.md",
         path: "/workspace/AGENTS.md",
-        content:
-          "## Mark Instruction Confirmation Law\n\nEmergency confirmation-loop rule:\n\n- The old mandatory paraphrase/yes-no gate is suspended.\n- Do not ask for yes/no confirmation before ordinary requests.",
+        content: [
+          "## Mark Instruction Confirmation Law",
+          "",
+          "Before doing anything on a new instruction from Mark, first paraphrase back in short plain English and wait for Mark to confirm yes/no.",
+          "",
+          "Emergency confirmation-loop rule:",
+          "",
+          "- The old mandatory paraphrase/yes-no gate is suspended.",
+          "- Do not ask for yes/no confirmation before ordinary requests.",
+          "- Do not ask for yes/no confirmation before status requests.",
+        ].join("\n"),
       },
     ],
     contextFiles: [],
@@ -56,6 +65,7 @@ describe("Codex confirmation gate", () => {
   it("creates a pending confirmation for a new instruction when workspace policy requires it", () => {
     const decision = resolveCodexConfirmationGateDecision({
       prompt: "run the server-side fix",
+      confirmationPolicy: "confirm-new-instructions",
       workspaceBootstrapContext: confirmationWorkspace(),
       runId: "run-1",
       now: new Date("2026-06-25T04:01:00.000Z"),
@@ -74,10 +84,25 @@ describe("Codex confirmation gate", () => {
     );
   });
 
-  it("does not create a pending confirmation when the emergency suspension policy is present", () => {
+  it.each(["update", "status", "what is the blocker?"])(
+    "does not create a pending confirmation for normal message %j when policy is disabled",
+    (prompt) => {
+      const decision = resolveCodexConfirmationGateDecision({
+        prompt,
+        confirmationPolicy: "disabled",
+        workspaceBootstrapContext: confirmationWorkspace(),
+        runId: "run-1",
+        now: new Date("2026-06-25T16:20:00.000Z"),
+      });
+
+      expect(decision).toEqual({ action: "none", reason: "policy-not-required" });
+    },
+  );
+
+  it("does not create a pending confirmation from stale prompt or memory prose by itself", () => {
     const decision = resolveCodexConfirmationGateDecision({
-      prompt: "update",
-      workspaceBootstrapContext: suspendedConfirmationWorkspace(),
+      prompt: "status",
+      workspaceBootstrapContext: stalePolicyWorkspace(),
       runId: "run-1",
       now: new Date("2026-06-25T16:20:00.000Z"),
     });
@@ -85,9 +110,25 @@ describe("Codex confirmation gate", () => {
     expect(decision).toEqual({ action: "none", reason: "policy-not-required" });
   });
 
+  it("lets explicit confirmation policy win over stale suspension prose", () => {
+    const decision = resolveCodexConfirmationGateDecision({
+      prompt: "status",
+      confirmationPolicy: "confirm-new-instructions",
+      workspaceBootstrapContext: stalePolicyWorkspace(),
+      runId: "run-1",
+      now: new Date("2026-06-25T16:20:00.000Z"),
+    });
+
+    expect(decision).toMatchObject({
+      action: "request_confirmation",
+      pending: { mission: "status" },
+    });
+  });
+
   it("releases only the latest pending mission on yes", () => {
     const decision = resolveCodexConfirmationGateDecision({
       prompt: "yes",
+      confirmationPolicy: "confirm-new-instructions",
       workspaceBootstrapContext: confirmationWorkspace(),
       startupBinding: bindingWithPending("fix the stored mission"),
     });
@@ -102,6 +143,7 @@ describe("Codex confirmation gate", () => {
     const pendingBinding = bindingWithPending("fix the stored mission");
     const noDecision = resolveCodexConfirmationGateDecision({
       prompt: "no",
+      confirmationPolicy: "confirm-new-instructions",
       workspaceBootstrapContext: confirmationWorkspace(),
       startupBinding: pendingBinding,
     });
@@ -112,6 +154,7 @@ describe("Codex confirmation gate", () => {
 
     const ambiguousDecision = resolveCodexConfirmationGateDecision({
       prompt: "what do you mean?",
+      confirmationPolicy: "confirm-new-instructions",
       workspaceBootstrapContext: confirmationWorkspace(),
       startupBinding: pendingBinding,
     });

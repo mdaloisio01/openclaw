@@ -95,6 +95,7 @@ describe("Codex app-server config", () => {
           approvalsReviewer: "guardian_subagent",
           serviceTier: "flex",
           codeModeOnly: true,
+          confirmationPolicy: "confirm-new-instructions",
           turnCompletionIdleTimeoutMs: 120_000,
           postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
         },
@@ -111,6 +112,7 @@ describe("Codex app-server config", () => {
       approvalsReviewer: "guardian_subagent",
       serviceTier: "flex",
       codeModeOnly: true,
+      confirmationPolicy: "confirm-new-instructions",
       turnCompletionIdleTimeoutMs: 120_000,
       postToolRawAssistantCompletionIdleTimeoutMs: 180_000,
     });
@@ -119,6 +121,23 @@ describe("Codex app-server config", () => {
       url: "ws://127.0.0.1:39175",
       headers: { "X-Test": "yes" },
     });
+  });
+
+  it("defaults confirmation policy to disabled and lets config outrank environment", () => {
+    expect(resolveRuntimeForTest().confirmationPolicy).toBe("disabled");
+
+    expect(
+      resolveRuntimeForTest({
+        env: { OPENCLAW_CODEX_CONFIRMATION_POLICY: "confirm-new-instructions" },
+      }).confirmationPolicy,
+    ).toBe("confirm-new-instructions");
+
+    expect(
+      resolveRuntimeForTest({
+        pluginConfig: { appServer: { confirmationPolicy: "disabled" } },
+        env: { OPENCLAW_CODEX_CONFIRMATION_POLICY: "confirm-new-instructions" },
+      }).confirmationPolicy,
+    ).toBe("disabled");
   });
 
   it("clamps oversized app-server timer config", () => {

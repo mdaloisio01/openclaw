@@ -720,6 +720,7 @@ export async function runCodexAppServerAttempt(
   const confirmationGateDecision = resolveCodexConfirmationGateDecision({
     prompt: params.prompt,
     trigger: params.trigger,
+    confirmationPolicy: appServer.confirmationPolicy,
     workspaceBootstrapContext,
     startupBinding,
     historyMessages,

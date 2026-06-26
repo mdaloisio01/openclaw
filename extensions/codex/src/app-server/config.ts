@@ -57,6 +57,7 @@ export type CodexAppServerEffectiveApprovalPolicy =
 export type CodexAppServerSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type CodexAppServerApprovalsReviewer = "user" | "auto_review" | "guardian_subagent";
 type CodexAppServerCommandSource = "managed" | "resolved-managed" | "config" | "env";
+export type CodexConfirmationPolicy = "disabled" | "confirm-new-instructions";
 export type CodexDynamicToolsLoading = "searchable" | "direct";
 export type CodexPluginDestructivePolicy = boolean;
 
@@ -157,6 +158,7 @@ export type CodexAppServerRuntimeOptions = {
   requestTimeoutMs: number;
   turnCompletionIdleTimeoutMs: number;
   postToolRawAssistantCompletionIdleTimeoutMs?: number;
+  confirmationPolicy?: CodexConfirmationPolicy;
   approvalPolicy: CodexAppServerEffectiveApprovalPolicy;
   approvalPolicySource?: CodexAppServerApprovalPolicySource;
   sandbox: CodexAppServerSandboxMode;
@@ -186,6 +188,7 @@ export type CodexPluginConfig = {
     requestTimeoutMs?: number;
     turnCompletionIdleTimeoutMs?: number;
     postToolRawAssistantCompletionIdleTimeoutMs?: number;
+    confirmationPolicy?: CodexConfirmationPolicy;
     approvalPolicy?: CodexAppServerApprovalPolicy;
     sandbox?: CodexAppServerSandboxMode;
     approvalsReviewer?: CodexAppServerApprovalsReviewer;
@@ -214,6 +217,7 @@ export const CODEX_APP_SERVER_CONFIG_KEYS = [
   "requestTimeoutMs",
   "turnCompletionIdleTimeoutMs",
   "postToolRawAssistantCompletionIdleTimeoutMs",
+  "confirmationPolicy",
   "approvalPolicy",
   "sandbox",
   "approvalsReviewer",
@@ -262,6 +266,7 @@ const codexAppServerApprovalPolicySchema = z.enum([
 ]);
 const codexAppServerSandboxSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const codexAppServerApprovalsReviewerSchema = z.enum(["user", "auto_review", "guardian_subagent"]);
+const codexConfirmationPolicySchema = z.enum(["disabled", "confirm-new-instructions"]);
 const codexDynamicToolsLoadingSchema = z.enum(["searchable", "direct"]);
 const codexAppServerServiceTierSchema = z
   .preprocess(
@@ -331,6 +336,7 @@ const codexPluginConfigSchema = z
         requestTimeoutMs: z.number().positive().optional(),
         turnCompletionIdleTimeoutMs: z.number().positive().optional(),
         postToolRawAssistantCompletionIdleTimeoutMs: z.number().positive().optional(),
+        confirmationPolicy: codexConfirmationPolicySchema.optional(),
         approvalPolicy: codexAppServerApprovalPolicySchema.optional(),
         sandbox: codexAppServerSandboxSchema.optional(),
         approvalsReviewer: codexAppServerApprovalsReviewerSchema.optional(),
@@ -504,6 +510,10 @@ export function resolveCodexAppServerRuntimeOptions(
     ? normalizedPolicyMode
     : (explicitPolicyMode ?? normalizedPolicyMode ?? defaultPolicy?.mode ?? "yolo");
   const serviceTier = normalizeCodexServiceTier(config.serviceTier);
+  const confirmationPolicy =
+    resolveConfirmationPolicy(config.confirmationPolicy) ??
+    resolveConfirmationPolicy(env.OPENCLAW_CODEX_CONFIRMATION_POLICY) ??
+    "disabled";
   if (transport === "websocket" && !url) {
     throw new Error(
       "plugins.entries.codex.config.appServer.url is required when appServer.transport is websocket",
@@ -550,6 +560,7 @@ export function resolveCodexAppServerRuntimeOptions(
           ),
         }
       : {}),
+    confirmationPolicy,
     approvalPolicy: forcedPolicy?.approvalPolicy ?? approvalPolicy,
     approvalPolicySource,
     sandbox:
@@ -564,6 +575,10 @@ export function resolveCodexAppServerRuntimeOptions(
       (policyMode === "guardian" ? "auto_review" : "user"),
     ...(serviceTier ? { serviceTier } : {}),
   };
+}
+
+function resolveConfirmationPolicy(value: unknown): CodexConfirmationPolicy | undefined {
+  return value === "disabled" || value === "confirm-new-instructions" ? value : undefined;
 }
 
 export function isCodexAppServerApprovalPolicyAllowedByRequirements(
