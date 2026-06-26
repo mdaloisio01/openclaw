@@ -1,3 +1,8 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { markReplyPayloadAsProgressHeartbeat } from "../auto-reply/reply-payload.js";
+import { routeReply } from "../auto-reply/reply/route-reply.js";
+import type { OriginatingChannelType } from "../auto-reply/templating.js";
+import type { ReplyPayload } from "../auto-reply/types.js";
 import type { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
 import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
@@ -5,10 +10,14 @@ import type { ResolveContextEngineOptions } from "../context-engine/registry.js"
 import type { ContextEngine, SubagentEndReason } from "../context-engine/types.js";
 import { callGateway } from "../gateway/call.js";
 import { getAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
+import { requestHeartbeat } from "../infra/heartbeat-wake.js";
+import { enqueueSystemEvent } from "../infra/system-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { formatBlockedLivenessError, isBlockedLivenessState } from "../shared/agent-liveness.js";
+import { normalizeAssistantPhase } from "../shared/chat-message-content.js";
 import { createLazyImportLoader, createLazyPromiseLoader } from "../shared/lazy-promise.js";
 import { importRuntimeModule } from "../shared/runtime-import.js";
+import { sanitizeTaskStatusText } from "../tasks/task-status.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import {
@@ -218,6 +227,9 @@ const LIFECYCLE_TIMEOUT_RETRY_GRACE_MS = 15_000;
 const SESSION_RUN_TTL_MS = 5 * 60_000; // 5 minutes
 /** Absolute TTL for orphaned pendingLifecycleError / pendingLifecycleTimeout entries. */
 const PENDING_LIFECYCLE_TERMINAL_TTL_MS = 5 * 60_000; // 5 minutes
+const SUBAGENT_PROGRESS_STALL_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 5_000 : 3 * 60_000;
+const SUBAGENT_PROGRESS_EMIT_MIN_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 250 : 15_000;
+const SUBAGENT_FAILURE_STREAK_WINDOW_MS = 6 * 60 * 60_000;
 /** Grace period before treating a "running" subagent without a live run context as stale. */
 const STALE_ACTIVE_SUBAGENT_GRACE_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 1_000 : 60_000;
 const SUSPENDED_DELIVERY_CRON_EXPIRY_MS = 2 * 60 * 60_000;
@@ -314,6 +326,15 @@ const pendingLifecycleTimeoutByRunId = new Map<
     startedAt?: number;
   }
 >();
+type SubagentProgressRelayState = {
+  lastActivityAt: number;
+  lastSummary?: string;
+  lastSummaryAt?: number;
+  stallNoticeCount: number;
+  terminalFailureNotified?: boolean;
+};
+const subagentProgressRelayByRunId = new Map<string, SubagentProgressRelayState>();
+const subagentFailureStreakByKey = new Map<string, { count: number; lastFailedAt: number }>();
 
 function clearPendingLifecycleError(runId: string) {
   const pending = pendingLifecycleErrorByRunId.get(runId);
@@ -347,6 +368,220 @@ function clearAllPendingLifecycleTimeouts() {
   pendingLifecycleTimeoutByRunId.clear();
 }
 
+function resolveSubagentRelayLabel(entry: SubagentRunRecord): string {
+  return (
+    sanitizeTaskStatusText(entry.label ?? entry.task, { maxChars: 80 }) ||
+    sanitizeTaskStatusText(entry.task, { maxChars: 80 }) ||
+    "Subagent"
+  );
+}
+
+function ensureSubagentProgressRelayState(entry: SubagentRunRecord): SubagentProgressRelayState {
+  let state = subagentProgressRelayByRunId.get(entry.runId);
+  if (!state) {
+    state = {
+      lastActivityAt: entry.startedAt ?? entry.createdAt ?? Date.now(),
+      stallNoticeCount: 0,
+    };
+    subagentProgressRelayByRunId.set(entry.runId, state);
+  }
+  return state;
+}
+
+function emitSubagentRequesterSystemEvent(
+  entry: SubagentRunRecord,
+  text: string,
+  contextSuffix: string,
+): void {
+  const sessionKey = normalizeOptionalString(entry.requesterSessionKey);
+  const trimmed = text.trim();
+  if (!sessionKey || !trimmed) {
+    return;
+  }
+  const contextKey = `subagent:${entry.runId}:${contextSuffix}`;
+  const fallback = () => {
+    enqueueSystemEvent(trimmed, {
+      sessionKey,
+      contextKey,
+      deliveryContext: entry.requesterOrigin,
+    });
+    requestHeartbeat({
+      source: "subagent-progress",
+      intent: "event",
+      reason: "subagent:progress",
+      sessionKey,
+    });
+  };
+  const directOrigin = resolveRoutableDeliveryContext(entry.requesterOrigin);
+  if (!directOrigin) {
+    fallback();
+    return;
+  }
+  const payload: ReplyPayload = {
+    text: trimmed,
+    isStatusNotice: true,
+  };
+  const isActiveRunNotice =
+    contextSuffix === "start" || contextSuffix === "progress" || contextSuffix.startsWith("stall");
+  const routedPayload = isActiveRunNotice
+    ? markReplyPayloadAsProgressHeartbeat(payload, {
+        category: "working",
+        activeRunContinues: true,
+      })
+    : payload;
+  void routeReply({
+    payload: routedPayload,
+    channel: directOrigin.channel,
+    to: directOrigin.to,
+    accountId: directOrigin.accountId,
+    threadId: directOrigin.threadId,
+    cfg: subagentRegistryDeps.getRuntimeConfig(),
+    sessionKey,
+    policySessionKey: sessionKey,
+    replyKind: "block",
+  })
+    .then((result) => {
+      if (!result.ok) {
+        fallback();
+      }
+    })
+    .catch(() => {
+      fallback();
+    });
+}
+
+function resolveRoutableDeliveryContext(
+  context: DeliveryContext | undefined,
+): (DeliveryContext & { channel: OriginatingChannelType; to: string }) | undefined {
+  const channel = normalizeOptionalString(context?.channel);
+  const to = normalizeOptionalString(context?.to);
+  if (!context || !channel || !to) {
+    return undefined;
+  }
+  return {
+    ...context,
+    channel: channel as OriginatingChannelType,
+    to,
+  };
+}
+
+function noteSubagentRelayActivity(entry: SubagentRunRecord, at = Date.now()): void {
+  const state = ensureSubagentProgressRelayState(entry);
+  state.lastActivityAt = at;
+  state.stallNoticeCount = 0;
+}
+
+function maybeEmitSubagentProgressUpdate(
+  entry: SubagentRunRecord,
+  summary: string | undefined,
+  at = Date.now(),
+): void {
+  const cleaned = sanitizeTaskStatusText(summary, { maxChars: 160 });
+  if (!cleaned) {
+    return;
+  }
+  const state = ensureSubagentProgressRelayState(entry);
+  state.lastActivityAt = at;
+  if (state.lastSummary === cleaned) {
+    return;
+  }
+  if (
+    typeof state.lastSummaryAt === "number" &&
+    at - state.lastSummaryAt < SUBAGENT_PROGRESS_EMIT_MIN_MS
+  ) {
+    return;
+  }
+  state.lastSummary = cleaned;
+  state.lastSummaryAt = at;
+  emitSubagentRequesterSystemEvent(
+    entry,
+    `Subagent update: ${resolveSubagentRelayLabel(entry)}. ${cleaned}`,
+    "progress",
+  );
+}
+
+function emitSubagentStartedUpdate(entry: SubagentRunRecord): void {
+  ensureSubagentProgressRelayState(entry);
+  emitSubagentRequesterSystemEvent(
+    entry,
+    `Subagent started: ${resolveSubagentRelayLabel(entry)}.`,
+    "start",
+  );
+}
+
+function buildSubagentFailureStreakKey(entry: SubagentRunRecord): string {
+  return `${entry.requesterSessionKey}::${resolveSubagentRelayLabel(entry).toLowerCase()}`;
+}
+
+function clearSubagentFailureStreak(entry: SubagentRunRecord): void {
+  subagentFailureStreakByKey.delete(buildSubagentFailureStreakKey(entry));
+}
+
+function noteSubagentFailureStreak(entry: SubagentRunRecord, now = Date.now()): number {
+  const key = buildSubagentFailureStreakKey(entry);
+  const current = subagentFailureStreakByKey.get(key);
+  const nextCount =
+    current && now - current.lastFailedAt <= SUBAGENT_FAILURE_STREAK_WINDOW_MS
+      ? current.count + 1
+      : 1;
+  subagentFailureStreakByKey.set(key, { count: nextCount, lastFailedAt: now });
+  return nextCount;
+}
+
+function noteConfirmedSubagentFailure(entry: SubagentRunRecord, outcome: SubagentRunOutcome): void {
+  const state = ensureSubagentProgressRelayState(entry);
+  if (state.terminalFailureNotified) {
+    return;
+  }
+  state.terminalFailureNotified = true;
+  const label = resolveSubagentRelayLabel(entry);
+  const failureCount = noteSubagentFailureStreak(entry);
+  if (outcome.status !== "error" && outcome.status !== "timeout") {
+    return;
+  }
+  const detail =
+    outcome.status === "error"
+      ? sanitizeTaskStatusText(outcome.error, { errorContext: true, maxChars: 160 })
+      : undefined;
+  if (failureCount >= 2) {
+    emitSubagentRequesterSystemEvent(
+      entry,
+      `Subagent failed again: ${label}. Reclaim locally instead of letting it keep burning time.${detail ? ` ${detail}` : ""}`,
+      "failure-repeat",
+    );
+    return;
+  }
+  emitSubagentRequesterSystemEvent(
+    entry,
+    outcome.status === "timeout"
+      ? `Subagent timed out: ${label}.`
+      : `Subagent failed: ${label}.${detail ? ` ${detail}` : ""}`,
+    "failure",
+  );
+}
+
+function buildSubagentProgressSummaryFromEvent(evt: {
+  stream: string;
+  data?: Record<string, unknown>;
+}): string | undefined {
+  if (evt.stream === "plan") {
+    const title = sanitizeTaskStatusText(evt.data?.title, { maxChars: 120 });
+    return title ? `Plan updated: ${title}` : undefined;
+  }
+  if (evt.stream === "item") {
+    const phase = typeof evt.data?.phase === "string" ? evt.data.phase : undefined;
+    if (phase !== "start") {
+      return undefined;
+    }
+    return sanitizeTaskStatusText(evt.data?.title, { maxChars: 120 }) || undefined;
+  }
+  if (evt.stream === "patch") {
+    const summary = sanitizeTaskStatusText(evt.data?.summary, { maxChars: 120 });
+    return summary ? `Patch applied: ${summary}` : "Patch applied.";
+  }
+  return undefined;
+}
+
 type CompleteSubagentRunParams = {
   runId: string;
   endedAt?: number;
@@ -359,8 +594,17 @@ type CompleteSubagentRunParams = {
 };
 
 async function completeSubagentRunWithRecovery(params: CompleteSubagentRunParams, source: string) {
+  const entryBeforeCompletion = subagentRuns.get(params.runId);
   try {
     await completeSubagentRun(params);
+    if (entryBeforeCompletion) {
+      if (params.outcome.status === "ok") {
+        clearSubagentFailureStreak(entryBeforeCompletion);
+      } else if (params.outcome.status === "error" || params.outcome.status === "timeout") {
+        noteConfirmedSubagentFailure(entryBeforeCompletion, params.outcome);
+      }
+    }
+    subagentProgressRelayByRunId.delete(params.runId);
     return;
   } catch (error) {
     const current = subagentRuns.get(params.runId);
@@ -786,6 +1030,27 @@ function resolveSuspendedDeliveryExpiryMs(entry: SubagentRunRecord): number {
   return SUSPENDED_DELIVERY_INTERACTIVE_EXPIRY_MS;
 }
 
+function shouldSkipDiscardSuspendedPendingFinalDelivery(entry: SubagentRunRecord): {
+  skip: boolean;
+  reason?: string;
+} {
+  const delivery = ensureDeliveryState(entry);
+  const completion = ensureCompletionState(entry);
+  const frozenText =
+    delivery.payload?.frozenResultText ??
+    delivery.payload?.fallbackFrozenResultText ??
+    completion.resultText ??
+    completion.fallbackResultText;
+  const replayProofExists = Boolean(delivery.announcedAt || delivery.deliveredAt);
+  if (frozenText && !replayProofExists) {
+    return {
+      skip: true,
+      reason: "frozen-output still exists without replay proof",
+    };
+  }
+  return { skip: false };
+}
+
 async function discardSuspendedPendingFinalDelivery(
   runId: string,
   entry: SubagentRunRecord,
@@ -890,6 +1155,17 @@ async function sweepSubagentRuns() {
         const suspendedAgeMs = now - (entry.delivery?.suspendedAt ?? now);
         const expired = suspendedAgeMs >= resolveSuspendedDeliveryExpiryMs(entry);
         if (expired || pressureDiscardRunIds.has(runId)) {
+          const discardGuard = shouldSkipDiscardSuspendedPendingFinalDelivery(entry);
+          if (discardGuard.skip) {
+            log.warn("subagent suspended delivery discard skipped", {
+              reason: discardGuard.reason,
+              runId: entry.runId,
+              childSessionKey: entry.childSessionKey,
+              requesterSessionKey: entry.requesterSessionKey,
+              discardAttempt: expired ? "expired" : "pressure-pruned",
+            });
+            continue;
+          }
           await discardSuspendedPendingFinalDelivery(
             runId,
             entry,
@@ -901,6 +1177,23 @@ async function sweepSubagentRuns() {
         continue;
       }
       if (typeof entry.endedAt !== "number") {
+        const progressState = ensureSubagentProgressRelayState(entry);
+        const inactiveMs = now - progressState.lastActivityAt;
+        const nextStallThresholdMs =
+          SUBAGENT_PROGRESS_STALL_MS * Math.max(1, progressState.stallNoticeCount + 1);
+        if (inactiveMs >= nextStallThresholdMs) {
+          progressState.stallNoticeCount += 1;
+          progressState.lastSummary = undefined;
+          progressState.lastSummaryAt = now;
+          const seconds = Math.max(1, Math.round(inactiveMs / 1000));
+          emitSubagentRequesterSystemEvent(
+            entry,
+            progressState.stallNoticeCount >= 2
+              ? `Subagent stalled again: ${resolveSubagentRelayLabel(entry)}. No visible progress for ${seconds}s. Reclaim locally instead of letting it keep burning time.`
+              : `Subagent stalled: ${resolveSubagentRelayLabel(entry)}. No visible progress for ${seconds}s.`,
+            `stall-${progressState.stallNoticeCount}`,
+          );
+        }
         const hasLiveRunContext = Boolean(getAgentRunContext(runId));
         const activeAgeMs = now - (entry.startedAt ?? entry.createdAt);
         if (!hasLiveRunContext && activeAgeMs >= STALE_ACTIVE_SUBAGENT_GRACE_MS) {
@@ -1058,11 +1351,38 @@ function ensureListener() {
   listenerStarted = true;
   listenerStop = subagentRegistryDeps.onAgentEvent((evt) => {
     void (async () => {
-      if (!evt || evt.stream !== "lifecycle") {
+      if (!evt) {
+        return;
+      }
+      const entry = subagentRuns.get(evt.runId);
+      if (entry) {
+        const eventAt = evt.ts || Date.now();
+        if (evt.stream === "assistant") {
+          const assistantPhase = normalizeAssistantPhase(
+            (evt.data as { phase?: unknown } | undefined)?.phase,
+          );
+          const delta =
+            typeof (evt.data as { delta?: unknown } | undefined)?.delta === "string"
+              ? ((evt.data as { delta?: string }).delta ?? "")
+              : typeof (evt.data as { text?: unknown } | undefined)?.text === "string"
+                ? ((evt.data as { text?: string }).text ?? "")
+                : "";
+          if (assistantPhase === "commentary" && delta.trim()) {
+            noteSubagentRelayActivity(entry, eventAt);
+          }
+        } else {
+          noteSubagentRelayActivity(entry, eventAt);
+          maybeEmitSubagentProgressUpdate(
+            entry,
+            buildSubagentProgressSummaryFromEvent(evt),
+            eventAt,
+          );
+        }
+      }
+      if (evt.stream !== "lifecycle") {
         return;
       }
       const phase = evt.data?.phase;
-      const entry = subagentRuns.get(evt.runId);
       if (!entry) {
         if (phase === "end" && typeof evt.sessionKey === "string") {
           await refreshFrozenResultFromSession(evt.sessionKey);
@@ -1232,6 +1552,10 @@ export function replaceSubagentRunAfterSteer(params: {
 
 export function registerSubagentRun(params: RegisterSubagentRunParams) {
   subagentRunManager.registerSubagentRun(params);
+  const entry = subagentRuns.get(params.runId);
+  if (entry) {
+    emitSubagentStartedUpdate(entry);
+  }
 }
 
 export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
@@ -1245,6 +1569,8 @@ export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
   endedHookInFlightRunIds.clear();
   clearAllPendingLifecycleErrors();
   clearAllPendingLifecycleTimeouts();
+  subagentProgressRelayByRunId.clear();
+  subagentFailureStreakByKey.clear();
   contextEngineInitLoader.clear();
   contextEngineRegistryLoader.clear();
   runtimePluginsLoader.clear();

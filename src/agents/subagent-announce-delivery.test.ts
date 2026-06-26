@@ -1204,6 +1204,136 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     );
   });
 
+  it("directly delivers explicit owner-boundary stop truth instead of raw child output when stop metadata is present", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverDiscordDirectMessageCompletion({
+      callGateway,
+      sendMessage,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "direct completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "raw route artifact output",
+          stopReason: "owner_boundary_stop",
+          stopAllowed: true,
+          nextOwner: "Fleet Command",
+          openTruth: "routed to lawful owner, build still open.",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "discord",
+        accountId: "acct-1",
+        to: "dm:U123",
+        content:
+          "routed to lawful owner, build still open. I am stopping here because this reached a lawful owner boundary. The remaining substantive work belongs to Fleet Command. SOP forbids me from continuing that owner's lane without override.",
+        idempotencyKey: "announce-dm-fallback-empty:text-direct",
+      }),
+    );
+  });
+
+  it("does not turn owner-execution-in-progress truth into a terminal direct message fallback", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverDiscordDirectMessageCompletion({
+      callGateway,
+      sendMessage,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "direct completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "phase landed",
+          stopReason: "owner_execution_in_progress",
+          stopAllowed: false,
+          nextOwner: "Grant",
+          openTruth: "owner execution in progress, build still open.",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: false,
+      path: "direct",
+      reason: "completion_handoff_pending",
+      error:
+        "still-open completion requires active continuation or lawful handoff; direct terminal fallback is forbidden",
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("steers still-open owner execution completions back into an active requester run", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+    const queueEmbeddedAgentMessageWithOutcome = createQueueOutcomeMock(true);
+
+    const result = await deliverTelegramDirectMessageCompletion({
+      callGateway,
+      sendMessage,
+      isActive: true,
+      queueEmbeddedAgentMessageWithOutcome,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "direct completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "phase landed",
+          stopReason: "owner_execution_in_progress",
+          stopAllowed: false,
+          nextOwner: "Grant",
+          openTruth: "owner execution in progress, build still open.",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "steered",
+    });
+    expect(queueEmbeddedAgentMessageWithOutcome).toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it("directly delivers direct-message subagent text when the announce agent omits the result", async () => {
     const callGateway = createGatewayMock({
       result: {

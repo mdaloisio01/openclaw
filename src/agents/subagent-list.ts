@@ -20,6 +20,7 @@ import {
 import {
   getSubagentSessionRuntimeMs,
   getSubagentSessionStartedAt,
+  resolveSubagentMaterialProgressState,
 } from "./subagent-registry-read.js";
 import { getSubagentRunsSnapshotForRead } from "./subagent-registry-state.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
@@ -38,6 +39,14 @@ type SubagentListItem = {
   label: string;
   task: string;
   status: string;
+  materialProgressState?: string;
+  closeoutReview?: {
+    status?: string;
+    outcomeCode?: string;
+    requiresCorrectedCloseout?: boolean;
+    missingFields?: string[];
+    missingProofPaths?: string[];
+  };
   pendingDescendants: number;
   runtime: string;
   runtimeMs: number;
@@ -162,6 +171,9 @@ function resolveRunStatus(entry: SubagentRunRecord, options?: { pendingDescendan
   if (!hasSubagentRunEnded(entry)) {
     return "running";
   }
+  if (entry.completion?.grantCloseoutGate?.requiresCorrectedCloseout === true) {
+    return "closeout rejected (corrected closeout required)";
+  }
   const status = entry.outcome?.status ?? "done";
   if (status === "ok") {
     return "done";
@@ -248,6 +260,8 @@ export function buildSubagentList(params: {
     const status = resolveRunStatus(entry, {
       pendingDescendants,
     });
+    const materialProgressState = resolveSubagentMaterialProgressState(entry);
+    const closeoutGate = entry.completion?.grantCloseoutGate;
     const childSessions = childSessionsByController.get(entry.childSessionKey) ?? [];
     const runtime = formatDurationCompact(runtimeMs) ?? "n/a";
     const label = truncateLine(resolveSubagentLabel(entry), 48);
@@ -264,6 +278,24 @@ export function buildSubagentList(params: {
       label,
       task,
       status,
+      ...(materialProgressState ? { materialProgressState } : {}),
+      ...(closeoutGate
+        ? {
+            closeoutReview: {
+              status: closeoutGate.reviewStatus ?? (closeoutGate.passed ? "passed" : "rejected"),
+              ...(closeoutGate.outcomeCode ? { outcomeCode: closeoutGate.outcomeCode } : {}),
+              ...(closeoutGate.requiresCorrectedCloseout !== undefined
+                ? { requiresCorrectedCloseout: closeoutGate.requiresCorrectedCloseout }
+                : {}),
+              ...(closeoutGate.missingFields?.length
+                ? { missingFields: closeoutGate.missingFields }
+                : {}),
+              ...(closeoutGate.missingProofPaths?.length
+                ? { missingProofPaths: closeoutGate.missingProofPaths }
+                : {}),
+            },
+          }
+        : {}),
       pendingDescendants,
       runtime,
       runtimeMs,

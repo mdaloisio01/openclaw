@@ -1,4 +1,6 @@
+import { promises as fs } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createSubagentSpawnTestConfig,
@@ -21,6 +23,7 @@ const hoisted = vi.hoisted(() => ({
 
 let resetSubagentRegistryForTests: typeof import("./subagent-registry.js").resetSubagentRegistryForTests;
 let spawnSubagentDirect: typeof import("./subagent-spawn.js").spawnSubagentDirect;
+let applyGrantHardeningContext: typeof import("./subagent-spawn.js").__testing.applyGrantHardeningContext;
 
 function createConfigOverride(overrides?: Record<string, unknown>) {
   return createSubagentSpawnTestConfig(os.tmpdir(), {
@@ -61,7 +64,11 @@ function firstRegisteredSubagentRun(): Record<string, unknown> {
 
 describe("spawnSubagentDirect seam flow", () => {
   beforeAll(async () => {
-    ({ resetSubagentRegistryForTests, spawnSubagentDirect } = await loadSubagentSpawnModuleForTest({
+    ({
+      resetSubagentRegistryForTests,
+      spawnSubagentDirect,
+      __testing: { applyGrantHardeningContext },
+    } = await loadSubagentSpawnModuleForTest({
       callGatewayMock: hoisted.callGatewayMock,
       getRuntimeConfig: () => hoisted.configOverride,
       loadSessionStoreMock: hoisted.loadSessionStoreMock,
@@ -947,6 +954,304 @@ describe("spawnSubagentDirect seam flow", () => {
     expect(params.message).toContain("  keep indentation");
     expect(params.message).not.toContain("**Your Role**");
     expect(params.extraSystemPrompt).toBe("system-prompt");
+  });
+
+  it("injects the Grant hardening bundle into Grant-labeled runs", async () => {
+    const calls: Array<{ method?: string; params?: unknown }> = [];
+    hoisted.callGatewayMock.mockImplementation(
+      async (request: { method?: string; params?: unknown }) => {
+        calls.push(request);
+        if (request.method === "agent") {
+          return { runId: "run-grant", status: "accepted", acceptedAt: 1000 };
+        }
+        if (request.method?.startsWith("sessions.")) {
+          return { ok: true };
+        }
+        return {};
+      },
+    );
+    installSessionStoreCaptureMock(hoisted.updateSessionStoreMock);
+    const grantWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "grant-hardening-"));
+    await fs.mkdir(path.join(grantWorkspace, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(grantWorkspace, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(grantWorkspace, "templates", "grant"), { recursive: true });
+    await fs.writeFile(
+      path.join(grantWorkspace, "docs", "grant", "grant_doctrine.md"),
+      [
+        "# Grant Doctrine",
+        "",
+        "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+        "Grant remains a bounded governed execution owner under Will.",
+        "Will remains the packet-sharpening and top command layer.",
+        "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+        "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+        "",
+        "Doctrine body",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "docs", "grant", "grant_corrections_matrix.md"),
+      "# Grant Corrections Matrix\n\n## Active corrections\n\nCorrections body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_run_checklist.md"),
+      "# Grant Run Checklist\nChecklist body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_closeout_gate.md"),
+      "# Grant Closeout Gate\nCloseout body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_after_action_audit_template.md"),
+      "# Grant After-Action Audit Template\nAudit body",
+      "utf8",
+    );
+    hoisted.configOverride = createConfigOverride({
+      agents: {
+        defaults: {
+          workspace: grantWorkspace,
+        },
+        list: [
+          {
+            id: "main",
+            workspace: grantWorkspace,
+          },
+        ],
+      },
+    });
+
+    const result = await spawnSubagentDirect(
+      {
+        task: "execute the assigned Grant slice",
+        label: "Grant - Production Slice",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "discord",
+        workspaceDir: grantWorkspace,
+      },
+    );
+
+    expect(result.status).toBe("accepted");
+    const agentCall = calls.find((call) => call.method === "agent");
+    const params = agentCall?.params as { message?: string; extraSystemPrompt?: string };
+    expect(params.extraSystemPrompt).toContain("system-prompt");
+    expect(params.extraSystemPrompt).toContain("## Grant Hardening Context");
+    expect(params.extraSystemPrompt).toContain("[Grant Injection Verification]");
+    expect(params.extraSystemPrompt).toContain("# Grant Doctrine");
+    expect(params.extraSystemPrompt).toContain("# Grant Corrections Matrix");
+    expect(params.message).toContain("[Grant Run Checklist - Mandatory]");
+    expect(params.message).toContain("# Grant Run Checklist");
+    expect(params.message).toContain("[Grant Closeout Gate - Mandatory]");
+    expect(params.message).toContain("# Grant Closeout Gate");
+    expect(params.message).toContain("[Grant After-Action Audit Reference]");
+  });
+
+  it("fails closed when a Grant-labeled run is missing the hardening bundle", async () => {
+    installSessionStoreCaptureMock(hoisted.updateSessionStoreMock);
+    const grantWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "grant-hardening-missing-"));
+    hoisted.configOverride = createConfigOverride({
+      agents: {
+        defaults: {
+          workspace: grantWorkspace,
+        },
+        list: [
+          {
+            id: "main",
+            workspace: grantWorkspace,
+          },
+        ],
+      },
+    });
+
+    const result = await spawnSubagentDirect(
+      {
+        task: "execute the assigned Grant slice",
+        label: "Grant - Missing Bundle",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "discord",
+        workspaceDir: grantWorkspace,
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.error ?? "").toContain(
+      "Grant hardening bundle required for this run but unavailable",
+    );
+    expect(
+      hoisted.callGatewayMock.mock.calls.some(
+        (call) => (call[0] as { method?: string }).method === "agent",
+      ),
+    ).toBe(false);
+  });
+
+  it("injects the Grant hardening bundle when the child agent id is grant even without a Grant label", async () => {
+    const grantWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "grant-hardening-agent-"));
+    await fs.mkdir(path.join(grantWorkspace, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(grantWorkspace, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(grantWorkspace, "templates", "grant"), { recursive: true });
+    await fs.writeFile(
+      path.join(grantWorkspace, "docs", "grant", "grant_doctrine.md"),
+      [
+        "# Grant Doctrine",
+        "",
+        "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+        "Grant remains a bounded governed execution owner under Will.",
+        "Will remains the packet-sharpening and top command layer.",
+        "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+        "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "docs", "grant", "grant_corrections_matrix.md"),
+      "# Grant Corrections Matrix\n\n## Active corrections\n\nCorrections body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_run_checklist.md"),
+      "# Grant Run Checklist\nChecklist body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_closeout_gate.md"),
+      "# Grant Closeout Gate\nCloseout body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_after_action_audit_template.md"),
+      "# Grant After-Action Audit Template\nAudit body",
+      "utf8",
+    );
+    const result = await applyGrantHardeningContext({
+      childSystemPrompt: "system-prompt",
+      childTaskMessage: "task-message",
+      task: "execute the assigned bounded slice",
+      agentId: "grant",
+      workspaceDir: grantWorkspace,
+    });
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") {
+      throw new Error(result.error);
+    }
+    expect(result.childSystemPrompt).toContain("[Grant Injection Verification]");
+    expect(result.childSystemPrompt).toContain("# Grant Doctrine");
+    expect(result.childTaskMessage).toContain("[Grant Run Checklist - Mandatory]");
+  });
+
+  it("fails closed when the Grant doctrine is missing the required boundary rule", async () => {
+    installSessionStoreCaptureMock(hoisted.updateSessionStoreMock);
+    const grantWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "grant-hardening-stale-"));
+    await fs.mkdir(path.join(grantWorkspace, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(grantWorkspace, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(grantWorkspace, "templates", "grant"), { recursive: true });
+    await fs.writeFile(
+      path.join(grantWorkspace, "docs", "grant", "grant_doctrine.md"),
+      "# Grant Doctrine\nDoctrine body without the required boundary lock.",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "docs", "grant", "grant_corrections_matrix.md"),
+      "# Grant Corrections Matrix\n\n## Active corrections\n\nCorrections body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_run_checklist.md"),
+      "# Grant Run Checklist\nChecklist body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_closeout_gate.md"),
+      "# Grant Closeout Gate\nCloseout body",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(grantWorkspace, "templates", "grant", "grant_after_action_audit_template.md"),
+      "# Grant After-Action Audit Template\nAudit body",
+      "utf8",
+    );
+
+    const result = await spawnSubagentDirect(
+      {
+        task: "execute the assigned Grant slice",
+        label: "Grant - stale doctrine",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+        agentChannel: "discord",
+        workspaceDir: grantWorkspace,
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.error ?? "").toContain("Grant doctrine missing required boundary rule");
   });
 
   it("returns an error when the initial child session patch is rejected", async () => {

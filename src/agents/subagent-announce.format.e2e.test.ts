@@ -557,7 +557,63 @@ describe("subagent announce formatting", () => {
 
     const call = getAgentCall() as { params?: { message?: string } };
     const msg = call?.params?.message as string;
-    expect(msg).toContain("completed; ready for parent review");
+    expect(msg).toContain("status: completed; ready for parent review");
+  });
+
+  it("keeps blocked completion status aligned with blocked runtime findings", async () => {
+    readLatestAssistantReplyMock.mockResolvedValue(
+      "Background task blocked: ACP background task (run run-deli). Writable session or apply_patch authorization required.",
+    );
+
+    await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-blocked-alignment",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      ...defaultOutcomeAnnounce,
+    });
+
+    const call = getAgentCall() as {
+      params?: {
+        message?: string;
+        internalEvents?: Array<{ status?: string; statusLabel?: string; result?: string }>;
+      };
+    };
+    expect(call?.params?.message).toContain("blocked; follow-up required");
+    expect(call?.params?.internalEvents?.[0]?.statusLabel).toBe("blocked; follow-up required");
+    expect(call?.params?.internalEvents?.[0]?.result).toContain(
+      "Background task blocked: ACP background task (run run-deli). Writable session or apply_patch authorization required.",
+    );
+  });
+
+  it("keeps local-slice completion status aligned with scope-safe runtime findings", async () => {
+    readLatestAssistantReplyMock.mockResolvedValue(
+      "Background task local result ready for review: ACP background task (run run-slic). Phase 4 landed and passed tests. Broader build execution is paused pending parent review.",
+    );
+
+    await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-slice-alignment",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      ...defaultOutcomeAnnounce,
+    });
+
+    const call = getAgentCall() as {
+      params?: {
+        message?: string;
+        internalEvents?: Array<{ status?: string; statusLabel?: string; result?: string }>;
+      };
+    };
+    expect(call?.params?.message).toContain(
+      "local result ready for review; broader build still open",
+    );
+    expect(call?.params?.internalEvents?.[0]?.statusLabel).toBe(
+      "local result ready for review; broader build still open",
+    );
+    expect(call?.params?.internalEvents?.[0]?.result).toContain(
+      "Background task local result ready for review: ACP background task (run run-slic). Phase 4 landed and passed tests. Broader build execution is paused pending parent review.",
+    );
   });
 
   it("rechecks timed-out waits before announcing timeout when the run finishes immediately after", async () => {

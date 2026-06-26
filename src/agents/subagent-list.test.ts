@@ -107,6 +107,58 @@ describe("buildSubagentList", () => {
     expect(list.active[0]?.line).toContain("review_subagents: Review worker");
   });
 
+  it("surfaces rejected Grant closeouts as corrected-closeout required instead of done", () => {
+    const now = Date.now();
+    const run = {
+      runId: "run-grant-rejected-closeout",
+      childSessionKey: "agent:main:subagent:grant-rejected",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "Grant governed execution slice",
+      cleanup: "keep",
+      label: "Grant rejected closeout",
+      createdAt: now - 30_000,
+      startedAt: now - 30_000,
+      endedAt: now - 1_000,
+      outcome: { status: "ok" },
+      completion: {
+        required: true,
+        grantCloseoutGate: {
+          applies: true,
+          passed: false,
+          reviewStatus: "rejected",
+          outcomeCode: "rejected_closeout_missing_truth",
+          assessedAt: now - 500,
+          missingFields: ["run label", "proof path(s)"],
+          requiresCorrectedCloseout: true,
+          materialProgressState: "closeout_rejected",
+        },
+      },
+    } satisfies SubagentRunRecord;
+    addSubagentRunForTests(run);
+    const cfg = {
+      commands: { text: true },
+      channels: { whatsapp: { allowFrom: ["*"] } },
+    } as OpenClawConfig;
+
+    const list = buildSubagentList({
+      cfg,
+      runs: [run],
+      recentMinutes: 30,
+    });
+
+    expect(list.recent[0]?.status).toBe("closeout rejected (corrected closeout required)");
+    expect(list.recent[0]?.materialProgressState).toBe("closeout_rejected");
+    expect(list.recent[0]?.closeoutReview).toMatchObject({
+      status: "rejected",
+      outcomeCode: "rejected_closeout_missing_truth",
+      requiresCorrectedCloseout: true,
+      missingFields: ["run label", "proof path(s)"],
+    });
+    expect(list.recent[0]?.line).toContain("closeout rejected (corrected closeout required)");
+    expect(list.recent[0]?.line).not.toContain(" done");
+  });
+
   it("keeps ended orchestrators active while descendants remain pending", () => {
     const now = Date.now();
     const orchestratorRun = {

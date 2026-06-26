@@ -47,7 +47,10 @@ export function getSubagentSessionRuntimeMs(
 }
 
 export function resolveSubagentSessionStatus(
-  entry: Pick<SubagentRunRecord, "endedAt" | "endedReason" | "outcome"> | null | undefined,
+  entry:
+    | Pick<SubagentRunRecord, "endedAt" | "endedReason" | "outcome" | "completion">
+    | null
+    | undefined,
 ): "running" | "killed" | "failed" | "timeout" | "done" | undefined {
   if (!entry) {
     return undefined;
@@ -58,6 +61,9 @@ export function resolveSubagentSessionStatus(
   if (entry.endedReason === SUBAGENT_ENDED_REASON_KILLED) {
     return "killed";
   }
+  if (entry.completion?.grantCloseoutGate?.requiresCorrectedCloseout === true) {
+    return "failed";
+  }
   const status = entry.outcome?.status;
   if (status === "error") {
     return "failed";
@@ -66,4 +72,36 @@ export function resolveSubagentSessionStatus(
     return "timeout";
   }
   return "done";
+}
+
+export function resolveSubagentMaterialProgressState(
+  entry: Pick<SubagentRunRecord, "endedAt" | "outcome" | "completion"> | null | undefined,
+):
+  | "running_no_closeout_yet"
+  | "closeout_rejected"
+  | "closeout_review_passed"
+  | "runtime_completed_no_closeout_gate"
+  | "runtime_failed"
+  | "runtime_timeout"
+  | undefined {
+  if (!entry) {
+    return undefined;
+  }
+  const gate = entry.completion?.grantCloseoutGate;
+  if (gate?.requiresCorrectedCloseout === true || gate?.reviewStatus === "rejected") {
+    return "closeout_rejected";
+  }
+  if (gate?.reviewStatus === "passed" || gate?.passed === true) {
+    return "closeout_review_passed";
+  }
+  if (!entry.endedAt) {
+    return "running_no_closeout_yet";
+  }
+  if (entry.outcome?.status === "error") {
+    return "runtime_failed";
+  }
+  if (entry.outcome?.status === "timeout") {
+    return "runtime_timeout";
+  }
+  return "runtime_completed_no_closeout_gate";
 }

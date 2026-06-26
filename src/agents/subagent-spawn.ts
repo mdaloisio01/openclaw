@@ -34,6 +34,7 @@ import { resolveUserPath } from "../utils.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import { listAgentIds, resolveAgentDir } from "./agent-scope-config.js";
 import type { BootstrapContextMode } from "./bootstrap-files.js";
+import { buildGrantRunInjection, loadGrantHardeningRulebook } from "./grant-hardening-rulebook.js";
 import {
   inheritedToolAllowPatch,
   inheritedToolDenyPatch,
@@ -122,6 +123,111 @@ export type {
 
 export { decodeStrictBase64 };
 
+type GrantHardeningBundle =
+  | {
+      status: "ok";
+      systemPromptSuffix: string;
+      taskMessageSuffix: string;
+    }
+  | {
+      status: "error";
+      error: string;
+    };
+
+function isGrantHardeningRun(params: { label?: string; task?: string; agentId?: string }): boolean {
+  const normalizedLabel = normalizeOptionalLowercaseString(params.label);
+  if (normalizedLabel?.startsWith("grant")) {
+    return true;
+  }
+  const normalizedAgentId = normalizeOptionalLowercaseString(params.agentId);
+  if (normalizedAgentId === "grant") {
+    return true;
+  }
+  const task = normalizeOptionalLowercaseString(params.task);
+  if (!task) {
+    return false;
+  }
+  return (
+    task.includes("execution owner: `grant`") ||
+    task.includes("execution owner: grant") ||
+    task.includes("lawful next owner: grant") ||
+    task.includes("grant is the lawful") ||
+    task.includes("grant is the sole") ||
+    task.includes("grant-only")
+  );
+}
+
+async function loadGrantHardeningBundle(params: {
+  workspaceDir?: string;
+}): Promise<GrantHardeningBundle> {
+  const workspaceDir = normalizeOptionalString(params.workspaceDir);
+  if (!workspaceDir) {
+    return {
+      status: "error",
+      error:
+        "Grant hardening bundle could not be loaded because the agent workspace directory is unavailable.",
+    };
+  }
+  try {
+    const rulebook = await loadGrantHardeningRulebook({
+      workspaceDir,
+      includeRunArtifacts: true,
+    });
+    const injection = buildGrantRunInjection(rulebook);
+    return {
+      status: "ok",
+      systemPromptSuffix: injection.systemPromptSuffix,
+      taskMessageSuffix: injection.taskMessageSuffix,
+    };
+  } catch (err) {
+    return {
+      status: "error",
+      error: err instanceof Error ? err.message : typeof err === "string" ? err : "error",
+    };
+  }
+}
+
+async function applyGrantHardeningContext(params: {
+  childSystemPrompt: string;
+  childTaskMessage: string;
+  label?: string;
+  task?: string;
+  agentId?: string;
+  workspaceDir?: string;
+}): Promise<
+  | {
+      status: "ok";
+      childSystemPrompt: string;
+      childTaskMessage: string;
+    }
+  | {
+      status: "error";
+      error: string;
+    }
+> {
+  if (!isGrantHardeningRun({ label: params.label, task: params.task, agentId: params.agentId })) {
+    return {
+      status: "ok",
+      childSystemPrompt: params.childSystemPrompt,
+      childTaskMessage: params.childTaskMessage,
+    };
+  }
+  const grantHardeningBundle = await loadGrantHardeningBundle({
+    workspaceDir: params.workspaceDir,
+  });
+  if (grantHardeningBundle.status === "error") {
+    return {
+      status: "error",
+      error: `Grant hardening bundle required for this run but unavailable: ${grantHardeningBundle.error}`,
+    };
+  }
+  return {
+    status: "ok",
+    childSystemPrompt: `${params.childSystemPrompt}\n\n${grantHardeningBundle.systemPromptSuffix}`,
+    childTaskMessage: `${params.childTaskMessage}\n\n${grantHardeningBundle.taskMessageSuffix}`,
+  };
+}
+
 function resolveConfiguredAgentIds(cfg: OpenClawConfig): string[] {
   return listAgentIds(cfg);
 }
@@ -209,6 +315,15 @@ export type SpawnSubagentResult = {
   /** Provider prefix parsed from resolvedModel when the ref includes one. */
   resolvedProvider?: string;
   modelApplied?: boolean;
+  runningNow?: boolean;
+  runningNowAnswer?: "yes" | "no";
+  runningNowProofSummary?: string;
+  spawnExecutionTruth?: {
+    runningNow: boolean;
+    liveExecutionState: "accepted_not_yet_proven_active";
+    proofSummary: string;
+    source: "spawn_acceptance";
+  };
   error?: string;
   attachments?: {
     count: number;
@@ -713,6 +828,22 @@ function summarizeError(err: unknown): string {
     return err;
   }
   return "error";
+}
+
+function buildSpawnAcceptanceExecutionTruthReceipt() {
+  const proofSummary =
+    "Spawn was accepted, but active child execution is not yet proven from this tool result alone.";
+  return {
+    runningNow: false as const,
+    runningNowAnswer: "no" as const,
+    runningNowProofSummary: proofSummary,
+    spawnExecutionTruth: {
+      runningNow: false,
+      liveExecutionState: "accepted_not_yet_proven_active" as const,
+      proofSummary,
+      source: "spawn_acceptance" as const,
+    },
+  };
 }
 
 function buildThreadBindingUnavailableError(mode: SpawnSubagentMode): string {
@@ -1455,12 +1586,36 @@ export async function spawnSubagentDirect(
     ? "lightweight"
     : undefined;
 
-  const childTaskMessage = buildSubagentInitialUserMessage({
+  let childTaskMessage = buildSubagentInitialUserMessage({
     childDepth,
     maxSpawnDepth,
     persistentSession: spawnMode === "session",
     task,
   });
+
+  const grantHardeningContext = await applyGrantHardeningContext({
+    childSystemPrompt,
+    childTaskMessage,
+    label,
+    task,
+    agentId: targetAgentId,
+    workspaceDir: spawnedWorkspaceDir ?? ctx.workspaceDir,
+  });
+  if (grantHardeningContext.status === "error") {
+    await cleanupFailedSpawnBeforeAgentStart({
+      childSessionKey,
+      attachmentAbsDir,
+      emitLifecycleHooks: threadBindingReady,
+      deleteTranscript: true,
+    });
+    return {
+      status: "error",
+      error: grantHardeningContext.error,
+      childSessionKey,
+    };
+  }
+  childSystemPrompt = grantHardeningContext.childSystemPrompt;
+  childTaskMessage = grantHardeningContext.childTaskMessage;
 
   const spawnedMetadata = normalizeSpawnedRunMetadata({
     spawnedBy: spawnedByKey,
@@ -1725,11 +1880,15 @@ export async function spawnSubagentDirect(
       : acceptedNote,
     ...resolvedModelMetadata,
     modelApplied: resolvedModel ? modelApplied : undefined,
+    ...buildSpawnAcceptanceExecutionTruthReceipt(),
     attachments: attachmentsReceipt,
   };
 }
 
 export const testing = {
+  applyGrantHardeningContext,
+  isGrantHardeningRun,
+  loadGrantHardeningBundle,
   setDepsForTest(overrides?: Partial<SubagentSpawnDeps>) {
     subagentSpawnDeps = overrides
       ? {

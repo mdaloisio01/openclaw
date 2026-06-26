@@ -236,6 +236,63 @@ function subagentRunRecordToSqliteInsert(entry: SubagentRunRecord): SubagentRunS
   };
 }
 
+function shouldPreservePersistedDeliveryState(params: {
+  current: SubagentRunRecord;
+  persisted: SubagentRunRecord;
+}): boolean {
+  const currentDelivery = params.current.delivery;
+  const persistedDelivery = params.persisted.delivery;
+  if (!currentDelivery || !persistedDelivery) {
+    return false;
+  }
+  const persistedHasReplayRepair = Boolean(
+    (persistedDelivery as SubagentCompletionDeliveryState & { replayRepair?: unknown })
+      .replayRepair ??
+    (params.persisted.delivery as SubagentCompletionDeliveryState & { replayRepair?: unknown })
+      .replayRepair ??
+    (
+      params.persisted as SubagentRunRecord & {
+        delivery?: SubagentCompletionDeliveryState & { replayRepair?: unknown };
+      }
+    ).delivery?.replayRepair,
+  );
+  const currentHasReplayRepair = Boolean(
+    (
+      params.current as SubagentRunRecord & {
+        delivery?: SubagentCompletionDeliveryState & { replayRepair?: unknown };
+      }
+    ).delivery?.replayRepair,
+  );
+  const persistedDelivered =
+    persistedDelivery.status === "delivered" ||
+    typeof persistedDelivery.announcedAt === "number" ||
+    typeof persistedDelivery.deliveredAt === "number";
+  const currentPendingOrSuspended =
+    currentDelivery.status === "pending" || currentDelivery.status === "suspended";
+  const persistedClearedPending = !persistedDelivery.payload;
+  const currentStillCarriesPendingPayload = Boolean(currentDelivery.payload);
+  return Boolean(
+    persistedDelivered &&
+    persistedClearedPending &&
+    (persistedHasReplayRepair || typeof persistedDelivery.announcedAt === "number") &&
+    currentPendingOrSuspended &&
+    (currentStillCarriesPendingPayload || !currentHasReplayRepair),
+  );
+}
+
+function mergePersistedDeliveryAhead(params: {
+  current: SubagentRunRecord;
+  persisted: SubagentRunRecord;
+}): SubagentRunRecord {
+  const merged = normalizeSubagentRunState(structuredClone(params.current));
+  const persisted = normalizeSubagentRunState(structuredClone(params.persisted));
+  merged.delivery = persisted.delivery ? structuredClone(persisted.delivery) : merged.delivery;
+  if (typeof persisted.delivery?.announcedAt === "number") {
+    merged.completion ??= { required: merged.expectsCompletionMessage === true };
+  }
+  return normalizeSubagentRunState(merged);
+}
+
 function subagentRunRecordToSqliteUpdate(values: SubagentRunSqliteInsert): SubagentRunSqliteUpdate {
   const { run_id: _runId, ...update } = values;
   return update;
@@ -292,9 +349,25 @@ export function loadSubagentRegistryFromSqlite(): Map<string, SubagentRunRecord>
 export function saveSubagentRegistryToSqlite(runs: Map<string, SubagentRunRecord>): void {
   runOpenClawStateWriteTransaction(({ db }) => {
     const stateDb = getNodeSqliteKysely<SubagentRegistryDatabase>(db);
+    const persistedByRunId = new Map<string, SubagentRunRecord>();
+    for (const row of executeSqliteQuerySync(db, stateDb.selectFrom("subagent_runs").selectAll())
+      .rows) {
+      const entry = rowToSubagentRunRecord(row);
+      if (entry?.runId) {
+        persistedByRunId.set(entry.runId, entry);
+      }
+    }
     const runIds: string[] = [];
     for (const entry of runs.values()) {
-      const values = subagentRunRecordToSqliteInsert(entry);
+      const persisted = persistedByRunId.get(entry.runId);
+      const nextEntry =
+        persisted && shouldPreservePersistedDeliveryState({ current: entry, persisted })
+          ? mergePersistedDeliveryAhead({ current: entry, persisted })
+          : entry;
+      if (nextEntry !== entry) {
+        runs.set(nextEntry.runId, nextEntry);
+      }
+      const values = subagentRunRecordToSqliteInsert(nextEntry);
       runIds.push(values.run_id);
       executeSqliteQuerySync(
         db,

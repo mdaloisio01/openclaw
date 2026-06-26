@@ -287,6 +287,25 @@ describe("buildAgentSystemPrompt", () => {
     expect(prompt).toContain("Runtime-generated completion events may ask for a user update.");
     expect(prompt).toContain("Rewrite those in your normal assistant voice");
     expect(prompt).toContain("do not forward raw internal metadata");
+    expect(prompt).toContain(
+      `If a runtime completion event is stale, duplicate, superseded, or arrives after you already resolved that user-facing turn, reply ONLY with ${SILENT_REPLY_TOKEN}.`,
+    );
+  });
+
+  it("hardens active mission lock and continue binding in execution bias guidance", () => {
+    const prompt = buildAgentSystemPrompt({
+      workspaceDir: "/tmp/openclaw",
+    });
+
+    expect(prompt).toContain(
+      "Treat the latest directly confirmed user task as the active mission; do not let nearby plans, prior subtasks, or structured artifacts silently replace it.",
+    );
+    expect(prompt).toContain(
+      "Interpret `continue`, `yes`, and similar follow-ups against the current active mission, not an older drifted frame.",
+    );
+    expect(prompt).toContain(
+      "If the active mission changed, abandon the old frame immediately; do not use local progress on the old frame as permission to keep going.",
+    );
   });
 
   it("does not include embed guidance in the default global prompt", () => {
@@ -361,6 +380,9 @@ describe("buildAgentSystemPrompt", () => {
     expect(prompt).toContain("sessions_list");
     expect(prompt).toContain("sessions_history");
     expect(prompt).toContain("sessions_send");
+    expect(prompt).toContain(
+      'When `sessions_send` returns `runningNowAnswer: "no"` or `followupExecutionTruth.runningNow=false`, do not claim the target is actively running now; report `no` unless a later proof surface explicitly flips it to yes.',
+    );
   });
 
   it("uses provider-neutral web_search prompt metadata", () => {

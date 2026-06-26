@@ -3,6 +3,13 @@ import path from "node:path";
 import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { readAcpSessionEntry } from "../acp/runtime/session-meta.js";
+import {
+  markReplyPayloadAsProgressHeartbeat,
+  type ReplyPayload,
+} from "../auto-reply/reply-payload.js";
+import { routeReply } from "../auto-reply/reply/route-reply.js";
+import type { OriginatingChannelType } from "../auto-reply/templating.js";
+import { getRuntimeConfig } from "../config/config.js";
 import { resolveSessionFilePath, resolveSessionFilePathOptions } from "../config/sessions/paths.js";
 import { onAgentEvent } from "../infra/agent-events.js";
 import {
@@ -45,11 +52,48 @@ function normalizeStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string" && item.length > 0);
 }
 
+function resolveRoutableDeliveryContext(
+  context: DeliveryContext | undefined,
+): (DeliveryContext & { channel: OriginatingChannelType; to: string }) | undefined {
+  const channel = normalizeOptionalString(context?.channel);
+  const to = normalizeOptionalString(context?.to);
+  if (!context || !channel || !to) {
+    return undefined;
+  }
+  return {
+    ...context,
+    channel: channel as OriginatingChannelType,
+    to,
+  };
+}
+
 function formatProxyEnvSummary(keys: string[]): string {
   if (keys.length === 0) {
     return "proxy env: none";
   }
   return `proxy env: ${keys.join(", ")}`;
+}
+
+function buildRelayHeartbeatText(params: { progress?: string; currentStep: string }): string {
+  return [
+    "Status: still working.",
+    ...(params.progress ? [`Progress: ${params.progress}`] : []),
+    `Current step: ${params.currentStep}`,
+  ].join("\n");
+}
+
+function buildRelayStatusPayload(text: string): ReplyPayload {
+  const payload: ReplyPayload = {
+    text,
+    isStatusNotice: true,
+  };
+  if (text.startsWith("Status: still working.")) {
+    return markReplyPayloadAsProgressHeartbeat(payload, {
+      category: "working",
+      activeRunContinues: true,
+    });
+  }
+  return payload;
 }
 
 function resolveAcpStreamLogPathFromSessionFile(sessionFile: string, sessionId: string): string {
@@ -210,6 +254,12 @@ export function startAcpSpawnParentStreamRelay(params: {
     mainKey: params.mainKey,
     sessionScope: params.sessionScope,
   };
+  const routedDeliveryContext =
+    shouldSurfaceUpdates && params.deliveryContext?.channel && params.deliveryContext?.to
+      ? params.deliveryContext
+      : undefined;
+  const runtimeConfig = routedDeliveryContext ? getRuntimeConfig() : undefined;
+  let routedDeliveryChain: Promise<void> = Promise.resolve();
   const wake = () => {
     if (!shouldSurfaceUpdates) {
       return;
@@ -226,6 +276,14 @@ export function startAcpSpawnParentStreamRelay(params: {
       ),
     );
   };
+  const enqueueFallbackSystemEvent = (text: string, contextKey: string) => {
+    enqueueSystemEvent(text, {
+      sessionKey: resolveEventSessionKeyForPolicy(parentSessionKey, eventRouting),
+      contextKey,
+      deliveryContext: params.deliveryContext,
+    });
+    wake();
+  };
   const emit = (text: string, contextKey: string) => {
     const cleaned = text.trim();
     if (!cleaned) {
@@ -235,12 +293,36 @@ export function startAcpSpawnParentStreamRelay(params: {
     if (!shouldSurfaceUpdates) {
       return;
     }
-    enqueueSystemEvent(cleaned, {
-      sessionKey: resolveEventSessionKeyForPolicy(parentSessionKey, eventRouting),
-      contextKey,
-      deliveryContext: params.deliveryContext,
-    });
-    wake();
+    const deliveryRoute = resolveRoutableDeliveryContext(routedDeliveryContext);
+    if (deliveryRoute && runtimeConfig) {
+      const payload = buildRelayStatusPayload(cleaned);
+      routedDeliveryChain = routedDeliveryChain
+        .then(async () => {
+          const routed = await routeReply({
+            payload,
+            channel: deliveryRoute.channel,
+            to: deliveryRoute.to,
+            accountId: deliveryRoute.accountId,
+            threadId: deliveryRoute.threadId,
+            cfg: runtimeConfig,
+            sessionKey: parentSessionKey,
+            policySessionKey: parentSessionKey,
+            replyKind: "block",
+          });
+          if (!routed.ok) {
+            logEvent("routed_delivery_fallback", {
+              contextKey,
+              reason: routed.error ?? "route-reply-failed",
+            });
+            enqueueFallbackSystemEvent(cleaned, contextKey);
+          }
+        })
+        .catch(() => {
+          enqueueFallbackSystemEvent(cleaned, contextKey);
+        });
+      return;
+    }
+    enqueueFallbackSystemEvent(cleaned, contextKey);
   };
   const emitStartNotice = () => {
     recordTaskRunProgressByRunId({
@@ -251,7 +333,10 @@ export function startAcpSpawnParentStreamRelay(params: {
       eventSummary: "Started.",
     });
     emit(
-      `Started ${relayLabel} session ${params.childSessionKey}. Streaming progress updates to parent session.`,
+      buildRelayHeartbeatText({
+        progress: `${relayLabel} child run started.`,
+        currentStep: `Streaming ${relayLabel} progress from ${params.childSessionKey}`,
+      }),
       `${contextPrefix}:start`,
     );
   };
@@ -293,7 +378,12 @@ export function startAcpSpawnParentStreamRelay(params: {
     if (!snippet) {
       return;
     }
-    emit(`${relayLabel}: ${snippet}`, `${contextPrefix}:progress`);
+    emit(
+      buildRelayHeartbeatText({
+        currentStep: `${relayLabel}: ${snippet}`,
+      }),
+      `${contextPrefix}:progress`,
+    );
   };
 
   const scheduleFlush = () => {
@@ -311,26 +401,34 @@ export function startAcpSpawnParentStreamRelay(params: {
     if (!promptSubmittedAt) {
       return {
         summary: `No prompt submission observed for ${seconds}s after child start.`,
-        text: `${relayLabel} session started but no prompt submission was observed for ${seconds}s.`,
+        text: buildRelayHeartbeatText({
+          currentStep: `${relayLabel} started but no prompt submission was observed for ${seconds}s`,
+        }),
       };
     }
     if (!firstRuntimeEventAt) {
       const proxySummary = formatProxyEnvSummary(proxyEnvKeysAtPrompt);
       return {
         summary: `Prompt submitted but no ACP runtime event for ${seconds}s (${proxySummary}).`,
-        text: `${relayLabel} prompt was submitted but no ACP runtime event arrived for ${seconds}s (${proxySummary}). Check upstream connectivity, auth, or proxy/network access in the gateway child environment.`,
+        text: buildRelayHeartbeatText({
+          currentStep: `${relayLabel} prompt was submitted but no ACP runtime event arrived for ${seconds}s (${proxySummary}). Check upstream connectivity, auth, or proxy/network access in the gateway child environment.`,
+        }),
       };
     }
     if (!firstVisibleOutputAt) {
       const lastEvent = lastRuntimeEventType ? ` Last ACP event: ${lastRuntimeEventType}.` : "";
       return {
         summary: `ACP runtime active but no visible assistant output for ${seconds}s.${lastEvent}`,
-        text: `${relayLabel} has ACP runtime activity but no visible assistant output for ${seconds}s.${lastEvent} It may be working, blocked on a tool, or failing before visible output.`,
+        text: buildRelayHeartbeatText({
+          currentStep: `${relayLabel} has ACP runtime activity but no visible assistant output for ${seconds}s.${lastEvent} It may be working, blocked on a tool, or failing before visible output.`,
+        }),
       };
     }
     return {
       summary: `No visible output for ${seconds}s. It may be waiting for input.`,
-      text: `${relayLabel} has produced no visible output for ${seconds}s. It may be waiting for interactive input.`,
+      text: buildRelayHeartbeatText({
+        currentStep: `${relayLabel} has produced no visible output for ${seconds}s. It may be waiting for interactive input.`,
+      }),
     };
   };
 
@@ -409,7 +507,13 @@ export function startAcpSpawnParentStreamRelay(params: {
           lastEventAt: Date.now(),
           eventSummary: "Resumed output.",
         });
-        emit(`${relayLabel} resumed output.`, `${contextPrefix}:resumed`);
+        emit(
+          buildRelayHeartbeatText({
+            progress: `${relayLabel} resumed output.`,
+            currentStep: "Processing fresh child output",
+          }),
+          `${contextPrefix}:resumed`,
+        );
       }
 
       lastProgressAt = Date.now();
@@ -472,11 +576,11 @@ export function startAcpSpawnParentStreamRelay(params: {
           : undefined;
       if (durationMs != null) {
         emit(
-          `${relayLabel} run completed in ${Math.max(1, Math.round(durationMs / 1000))}s.`,
+          `Status: ${relayLabel} run completed in ${Math.max(1, Math.round(durationMs / 1000))}s.`,
           `${contextPrefix}:done`,
         );
       } else {
-        emit(`${relayLabel} run completed.`, `${contextPrefix}:done`);
+        emit(`Status: ${relayLabel} run completed.`, `${contextPrefix}:done`);
       }
       dispose();
       return;
@@ -488,9 +592,9 @@ export function startAcpSpawnParentStreamRelay(params: {
         (event.data as { error?: unknown } | undefined)?.error,
       );
       if (errorText) {
-        emit(`${relayLabel} run failed: ${errorText}`, `${contextPrefix}:error`);
+        emit(`Status: ${relayLabel} run failed: ${errorText}`, `${contextPrefix}:error`);
       } else {
-        emit(`${relayLabel} run failed.`, `${contextPrefix}:error`);
+        emit(`Status: ${relayLabel} run failed.`, `${contextPrefix}:error`);
       }
       dispose();
     }

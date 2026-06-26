@@ -446,8 +446,11 @@ function buildExecutionBiasSection(params: { isMinimal: boolean }) {
   return [
     "## Execution Bias",
     "- Actionable request: act in this turn.",
+    "- Treat the latest directly confirmed user task as the active mission; do not let nearby plans, prior subtasks, or structured artifacts silently replace it.",
     "- Non-final turn: use tools to advance, or ask for the one missing decision that blocks safe progress.",
     "- Continue until done or genuinely blocked; do not finish with a plan/promise when tools can move it forward.",
+    "- Interpret `continue`, `yes`, and similar follow-ups against the current active mission, not an older drifted frame.",
+    "- If the active mission changed, abandon the old frame immediately; do not use local progress on the old frame as permission to keep going.",
     "- Weak/empty tool result: vary query, path, command, or source before concluding.",
     "- Mutable facts need live checks: files, git, clocks, versions, services, processes, package state.",
     "- Final answer needs evidence: test/build/lint, screenshot, inspection, tool output, or a named blocker.",
@@ -497,6 +500,9 @@ function buildMessagingSection(params: {
   const completionEventGuidance = suppressSilentTokenGuidance
     ? "- Runtime-generated completion events may ask for a user update. Rewrite those in your normal assistant voice and send the update (do not forward raw internal metadata or default to a silent placeholder)."
     : `- Runtime-generated completion events may ask for a user update. Rewrite those in your normal assistant voice and send the update (do not forward raw internal metadata or default to ${SILENT_REPLY_TOKEN}).`;
+  const staleCompletionGuidance = suppressSilentTokenGuidance
+    ? "- If a runtime completion event is stale, duplicate, superseded, or arrives after you already resolved that user-facing turn, send no visible update."
+    : `- If a runtime completion event is stale, duplicate, superseded, or arrives after you already resolved that user-facing turn, reply ONLY with ${SILENT_REPLY_TOKEN}.`;
   const subagentOrchestrationGuidance = hasSessionsSpawn
     ? hasSubagents
       ? `- Sub-agent orchestration → use \`sessions_spawn(...)\` to start delegated work; include a clear objective/output/write-scope/verification brief and \`taskName\` when a stable handle helps; omit \`context\` for isolated children, set \`context:"fork"\` only when the child needs the current transcript; ${hasSessionsYield ? "use `sessions_yield` to wait for completion events; " : ""}use \`subagents(action=list)\` only for on-demand status/debugging visibility.`
@@ -512,6 +518,7 @@ function buildMessagingSection(params: {
     "- Cross-session messaging → use sessions_send(sessionKey, message)",
     subagentOrchestrationGuidance,
     completionEventGuidance,
+    staleCompletionGuidance,
     "- Never use exec/curl for provider messaging; OpenClaw handles all routing internally.",
     params.availableTools.has("message")
       ? [
@@ -1044,6 +1051,11 @@ export function buildAgentSystemPrompt(params: {
             availableTools.has("sessions_yield")
               ? "Do not poll `subagents list` / `sessions_list` in a loop; use `sessions_yield` when waiting for spawned sub-agent completion events, and check status only on-demand (for intervention, debugging, or when explicitly asked)."
               : "Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand (for intervention, debugging, or when explicitly asked).",
+            ...(availableTools.has("sessions_send")
+              ? [
+                  'When `sessions_send` returns `runningNowAnswer: "no"` or `followupExecutionTruth.runningNow=false`, do not claim the target is actively running now; report `no` unless a later proof surface explicitly flips it to yes.',
+                ]
+              : []),
           ]
         : []),
       "",

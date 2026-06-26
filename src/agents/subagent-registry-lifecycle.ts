@@ -1,3 +1,5 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
@@ -12,19 +14,34 @@ import {
   failTaskRunByRunId,
   setDetachedTaskDeliveryStatusByRunId,
 } from "../tasks/detached-task-runtime.js";
+import { markTaskRunningByRunId } from "../tasks/runtime-internal.js";
 import {
   resolveRequiredCompletionDeliveryFailureTerminalResult,
   resolveRequiredCompletionTerminalResult,
 } from "../tasks/task-completion-contract.js";
+import {
+  getTaskFlowProductionContinuation,
+  getTaskFlowById,
+  recordFlowLawfulStop,
+  recordFlowNextExecutableLaunch,
+  recordBlindTestCloseoutFailure,
+  updateFlowRecordByIdExpectedRevision,
+} from "../tasks/task-flow-runtime-internal.js";
+import { createTaskRecord, findTaskByRunId } from "../tasks/task-registry.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import { retireSessionMcpRuntimeForSessionKey } from "./agent-bundle-mcp-tools.js";
 import {
   buildAnnounceIdFromChildRun,
   buildAnnounceIdempotencyKey,
 } from "./announce-idempotency.js";
+import {
+  attachGrantRulebookMetadata,
+  loadGrantHardeningRulebook,
+} from "./grant-hardening-rulebook.js";
 import { removeInternalSessionEffectsTranscript } from "./internal-session-effects.js";
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
 import { type SubagentRunOutcome, withSubagentOutcomeTiming } from "./subagent-announce-output.js";
+import type { GrantCloseoutGateResult } from "./subagent-announce.js";
 import {
   clearDeliveryState,
   ensureCompletionState,
@@ -52,6 +69,7 @@ import {
   resolveAnnounceRetryDelayMs,
   safeRemoveAttachmentsDir,
 } from "./subagent-registry-helpers.js";
+import { replaceSubagentRunAfterSteer as replaceSubagentRunAfterSteerDefault } from "./subagent-registry-steer-runtime.js";
 import type { PendingFinalDeliveryPayload, SubagentRunRecord } from "./subagent-registry.types.js";
 import { resolveSubagentRunDeadlineMs } from "./subagent-run-timeout.js";
 import { deleteSubagentSessionForCleanup } from "./subagent-session-cleanup.js";
@@ -65,6 +83,124 @@ type BrowserCleanupModule = Pick<
 >;
 
 const DELIVERY_MIRROR_HISTORY_MAX_CHARS = 128 * 1024;
+const GRANT_AUDIT_RELATIVE_DIR = path.join("var", "grant", "after_action_audits");
+const GRANT_CORRECTION_QUEUE_RELATIVE_PATH = path.join(
+  "var",
+  "grant",
+  "grant_correction_candidates.jsonl",
+);
+const REL002_CHILD_RESULT_REJECTED = "CHILD_RESULT_REJECTED";
+const REL002_SAME_SLICE_REWORK_REQUIRED = "SAME_SLICE_REWORK_REQUIRED";
+const REL002_REWORK_PACKET_CREATED = "REWORK_PACKET_CREATED";
+const REL002_REWORK_PACKET_QUEUED = "REWORK_PACKET_QUEUED";
+const REL002_REWORK_EXECUTOR_LAUNCH_REQUIRED = "REWORK_EXECUTOR_LAUNCH_REQUIRED";
+const REL002_REWORK_EXECUTOR_LAUNCHED = "REWORK_EXECUTOR_LAUNCHED";
+const REL002_REWORK_EXECUTOR_RUNNING = "REWORK_EXECUTOR_RUNNING";
+const REL002_REWORK_FOLLOW_THROUGH_VIOLATION = "REWORK_FOLLOW_THROUGH_VIOLATION";
+const REL002_LAWFUL_BLOCKED_CLOSEOUT = "LAWFUL_BLOCKED_CLOSEOUT";
+
+function buildGrantCorrectionSummary(result: GrantCloseoutGateResult): string {
+  const outcome = result.assessment.outcomeCode ?? "grant_closeout_gate_failed";
+  const missingFields = result.assessment.missingFields ?? [];
+  const missingProofPaths = result.assessment.missingProofPaths ?? [];
+  const fixes: string[] = [];
+  if (missingFields.length > 0) {
+    fixes.push(`add the missing Grant closeout fields: ${missingFields.join(", ")}`);
+  }
+  if (missingProofPaths.length > 0) {
+    fixes.push(
+      `replace unreadable proof with concrete readable proof paths: ${missingProofPaths.join(", ")}`,
+    );
+  }
+  if (fixes.length === 0) {
+    fixes.push(`correct the closeout so it truthfully passes ${outcome}`);
+  }
+  return `Grant closeout failed (${outcome}). What was wrong: ${fixes.join(
+    "; ",
+  )}. Fix it and retry the same slice now. Do not advance to adjacent work.`;
+}
+
+function buildRel002QueueSummary(correctionSummary: string): string {
+  return [
+    REL002_CHILD_RESULT_REJECTED,
+    REL002_SAME_SLICE_REWORK_REQUIRED,
+    REL002_REWORK_PACKET_CREATED,
+    REL002_REWORK_PACKET_QUEUED,
+    REL002_REWORK_EXECUTOR_LAUNCH_REQUIRED,
+    correctionSummary,
+  ].join(" :: ");
+}
+
+function buildRel002RunningSummary(correctionSummary: string, runId: string): string {
+  return [
+    REL002_REWORK_EXECUTOR_LAUNCHED,
+    REL002_REWORK_EXECUTOR_RUNNING,
+    `run ${runId}`,
+    correctionSummary,
+  ].join(" :: ");
+}
+
+function buildRel002BlockedReason(reason: string): string {
+  return [REL002_REWORK_FOLLOW_THROUGH_VIOLATION, REL002_LAWFUL_BLOCKED_CLOSEOUT, reason].join(
+    " :: ",
+  );
+}
+
+function continuationRequiresImmediateReworkLaunch(
+  continuation: ReturnType<typeof getTaskFlowProductionContinuation> | null | undefined,
+): continuation is NonNullable<ReturnType<typeof getTaskFlowProductionContinuation>> {
+  return (
+    continuation?.activeProductionRun === true &&
+    continuation.parentRunOpen === true &&
+    continuation.blockerPresent !== true &&
+    continuation.ownerDecisionRequired !== true &&
+    continuation.restartOrReloadRequired !== true &&
+    continuation.hardStopPresent !== true &&
+    continuation.safetyStopPresent !== true &&
+    continuation.lawfulWholeRunCompletion !== true
+  );
+}
+const GRANT_CORRECTION_ARCHIVE_RELATIVE_PATH = path.join(
+  "var",
+  "grant",
+  "grant_correction_candidates.archive.jsonl",
+);
+const GRANT_CORRECTION_RETIREMENT_QUEUE_RELATIVE_PATH = path.join(
+  "var",
+  "grant",
+  "grant_correction_retirements.jsonl",
+);
+const GRANT_CORRECTION_RETIREMENT_REQUESTS_RELATIVE_DIR = path.join(
+  "var",
+  "grant",
+  "retirement_requests",
+);
+const GRANT_CORRECTION_RETIREMENT_ARCHIVE_RELATIVE_PATH = path.join(
+  "var",
+  "grant",
+  "grant_correction_retirements.archive.jsonl",
+);
+const GRANT_CORRECTION_RETIREMENT_REJECTED_ARCHIVE_RELATIVE_PATH = path.join(
+  "var",
+  "grant",
+  "grant_correction_retirements.rejected.jsonl",
+);
+const GRANT_CORRECTIONS_MATRIX_RELATIVE_PATH = path.join(
+  "docs",
+  "grant",
+  "grant_corrections_matrix.md",
+);
+const GRANT_CORRECTION_RETIREMENT_REQUEST_TEMPLATE_RELATIVE_PATH = path.join(
+  "templates",
+  "grant",
+  "grant_correction_retirement_request_template.json",
+);
+const ALLOWED_GRANT_RETIREMENT_REASONS = new Set([
+  "obsolete_rule",
+  "superseded_by_higher_quality_rule",
+  "false_positive_pattern",
+  "capability_materially_fixed",
+]);
 
 const browserCleanupLoader = createLazyImportLoader<BrowserCleanupModule>(
   () => import("../browser-lifecycle-cleanup.js"),
@@ -137,6 +273,14 @@ export function createSubagentRegistryLifecycleController(params: {
     workspaceDir?: string;
   }): Promise<void>;
   resumeSubagentRun(runId: string): void;
+  replaceSubagentRunAfterSteer?(params: {
+    previousRunId: string;
+    nextRunId: string;
+    fallback?: SubagentRunRecord;
+    runTimeoutSeconds?: number;
+    preserveFrozenResultFallback?: boolean;
+    transcriptFile?: string;
+  }): boolean;
   callGateway: typeof defaultCallGateway;
   captureSubagentCompletionReply: CaptureSubagentCompletionReply;
   cleanupBrowserSessionsForLifecycleEnd?: typeof cleanupBrowserSessionsForLifecycleEnd;
@@ -382,6 +526,1098 @@ export function createSubagentRegistryLifecycleController(params: {
         childSessionKey: maskSessionKey(args.entry.childSessionKey),
       });
     }
+  };
+
+  const sanitizeGrantAuditSlug = (value: string): string => {
+    const trimmed = value.trim().toLowerCase();
+    if (!trimmed) {
+      return "grant-run";
+    }
+    return (
+      trimmed
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 80) || "grant-run"
+    );
+  };
+
+  const countQueuedGrantCorrectionCandidates = async (queuePath: string, outcomeCode: string) => {
+    try {
+      const raw = await fs.readFile(queuePath, "utf8");
+      let count = 0;
+      for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(trimmed) as { outcomeCode?: unknown };
+          if (parsed.outcomeCode === outcomeCode) {
+            count += 1;
+          }
+        } catch {
+          continue;
+        }
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  };
+
+  const countGrantAuditReceiptsForOutcome = async (auditDir: string, outcomeCode: string) => {
+    try {
+      const entries = await fs.readdir(auditDir);
+      let count = 0;
+      for (const name of entries) {
+        if (!name.endsWith(".md")) {
+          continue;
+        }
+        try {
+          const raw = await fs.readFile(path.join(auditDir, name), "utf8");
+          if (raw.includes(`[Grant Closeout Gate Result] ${outcomeCode}`)) {
+            count += 1;
+          }
+        } catch {
+          continue;
+        }
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  };
+
+  const buildGrantGatePreventiveRule = (outcomeCode?: string): string => {
+    switch (outcomeCode) {
+      case "rejected_closeout_missing_truth":
+        return "Every meaningful Grant closeout must include the mandatory truth fields before it can be treated as complete.";
+      case "rejected_proof_missing":
+        return "Grant must cite readable proof paths for material claims or keep the item open.";
+      default:
+        return "Grant must satisfy the closeout gate truthfully before a closeout can pass.";
+    }
+  };
+
+  const buildGrantGeneratedCorrectionBlock = (outcomeCode: string): string | null => {
+    switch (outcomeCode) {
+      case "rejected_closeout_missing_truth":
+        return [
+          `<!-- grant-generated-correction:${outcomeCode} -->`,
+          "",
+          "### GC-005: Do not close out without the full truth fields",
+          "",
+          "- Trigger:",
+          "  - meaningful Grant closeout omits required truth fields",
+          "- Required behavior:",
+          "  - include run label",
+          "  - include target handled",
+          "  - include artifact path(s)",
+          "  - include proof path(s)",
+          "  - include what is materially real now",
+          "  - include what is still not real yet",
+          "  - include who lawfully owns the next step",
+          "  - include open/closed truth",
+          "  - include exact next action",
+          "- Reason:",
+          "  - partial closeout truth is a fake-completion vector",
+          "",
+        ].join("\n");
+      case "rejected_proof_missing":
+        return [
+          `<!-- grant-generated-correction:${outcomeCode} -->`,
+          "",
+          "### GC-006: Do not cite proof that is not materially there",
+          "",
+          "- Trigger:",
+          "  - Grant cites proof paths that are missing, unreadable, or not concretely named",
+          "- Required behavior:",
+          "  - cite readable proof paths for material claims",
+          "  - if proof is missing, keep the item open",
+          "  - do not imply proof exists because the artifact sounds plausible",
+          "- Reason:",
+          "  - unsupported proof claims make clean closeouts untrustworthy",
+          "",
+        ].join("\n");
+      default:
+        return null;
+    }
+  };
+
+  const loadGrantCorrectionQueueEntries = async (queuePath: string) => {
+    try {
+      const raw = await fs.readFile(queuePath, "utf8");
+      return raw
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .flatMap((line) => {
+          try {
+            return [JSON.parse(line) as Record<string, unknown>];
+          } catch {
+            return [];
+          }
+        });
+    } catch {
+      return [];
+    }
+  };
+
+  const loadGrantRetirementQueueEntries = async (queuePath: string) => {
+    return await loadGrantCorrectionQueueEntries(queuePath);
+  };
+
+  const persistGrantRetirementQueueEntries = async (
+    queuePath: string,
+    entries: Record<string, unknown>[],
+  ) => {
+    if (entries.length === 0) {
+      await fs.rm(queuePath, { force: true });
+      return;
+    }
+    await fs.writeFile(
+      queuePath,
+      `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+      "utf8",
+    );
+  };
+
+  const appendGrantCorrectionToMatrix = async (matrixPath: string, block: string) => {
+    const raw = await fs.readFile(matrixPath, "utf8");
+    if (raw.includes(block.split("\n")[0] ?? "")) {
+      return false;
+    }
+    const anchor = "## Active corrections";
+    const insertAt = raw.includes(anchor) ? raw.indexOf(anchor) + anchor.length : raw.length;
+    const next =
+      raw.slice(0, insertAt) +
+      "\n\n" +
+      block.trimEnd() +
+      "\n" +
+      raw.slice(insertAt).replace(/^\n*/, "\n");
+    await fs.writeFile(matrixPath, next, "utf8");
+    return true;
+  };
+
+  const hasGrantGeneratedCorrectionBlock = async (matrixPath: string, outcomeCode: string) => {
+    try {
+      const raw = await fs.readFile(matrixPath, "utf8");
+      return raw.includes(`<!-- grant-generated-correction:${outcomeCode} -->`);
+    } catch {
+      return false;
+    }
+  };
+
+  const removeGrantGeneratedCorrectionBlock = async (matrixPath: string, outcomeCode: string) => {
+    const raw = await fs.readFile(matrixPath, "utf8");
+    const marker = `<!-- grant-generated-correction:${outcomeCode} -->`;
+    const start = raw.indexOf(marker);
+    if (start < 0) {
+      return false;
+    }
+    const nextMarker = raw.indexOf("<!-- grant-generated-correction:", start + marker.length);
+    const nextHeading = raw.indexOf("\n### GC-", start + marker.length);
+    const candidates = [nextMarker, nextHeading].filter((value) => value >= 0);
+    const end = candidates.length > 0 ? Math.min(...candidates) : raw.length;
+    const next = `${raw.slice(0, start).replace(/\n*$/, "\n\n")}${raw.slice(end).replace(/^\n+/, "")}`;
+    await fs.writeFile(matrixPath, next, "utf8");
+    return true;
+  };
+
+  const archivePromotedGrantQueueEntries = async (args: {
+    queuePath: string;
+    archivePath: string;
+    entries: Record<string, unknown>[];
+    promotedOutcomeCode: string;
+  }) => {
+    const allEntries = await loadGrantCorrectionQueueEntries(args.queuePath);
+    const promoted = allEntries.filter((entry) => entry.outcomeCode === args.promotedOutcomeCode);
+    const remaining = allEntries.filter((entry) => entry.outcomeCode !== args.promotedOutcomeCode);
+    if (promoted.length === 0) {
+      return false;
+    }
+    await fs.mkdir(path.dirname(args.archivePath), { recursive: true });
+    const archiveLines = promoted.map((entry) =>
+      JSON.stringify({
+        ...entry,
+        archivedAt: new Date().toISOString(),
+        archiveReason: "promoted_to_corrections_matrix",
+      }),
+    );
+    await fs.appendFile(args.archivePath, `${archiveLines.join("\n")}\n`, "utf8");
+    if (remaining.length > 0) {
+      await fs.writeFile(
+        args.queuePath,
+        `${remaining.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+        "utf8",
+      );
+    } else {
+      await fs.rm(args.queuePath, { force: true });
+    }
+    return true;
+  };
+
+  const archiveGrantRetirementEntries = async (args: {
+    queuePath: string;
+    archivePath: string;
+    retiredOutcomeCode: string;
+    archiveReason?: string;
+  }) => {
+    const allEntries = await loadGrantRetirementQueueEntries(args.queuePath);
+    const retired = allEntries.filter((entry) => entry.outcomeCode === args.retiredOutcomeCode);
+    const remaining = allEntries.filter((entry) => entry.outcomeCode !== args.retiredOutcomeCode);
+    if (retired.length === 0) {
+      return false;
+    }
+    await fs.mkdir(path.dirname(args.archivePath), { recursive: true });
+    const archiveLines = retired.map((entry) =>
+      JSON.stringify({
+        ...entry,
+        archivedAt: new Date().toISOString(),
+        archiveReason: args.archiveReason ?? "retired_from_corrections_matrix",
+      }),
+    );
+    await fs.appendFile(args.archivePath, `${archiveLines.join("\n")}\n`, "utf8");
+    if (remaining.length > 0) {
+      await fs.writeFile(
+        args.queuePath,
+        `${remaining.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+        "utf8",
+      );
+    } else {
+      await fs.rm(args.queuePath, { force: true });
+    }
+    return true;
+  };
+
+  const validateGrantRetirementEntry = (
+    entry: Record<string, unknown>,
+  ):
+    | {
+        valid: true;
+        outcomeCode: string;
+        requestPath: string;
+        requestedBy: string;
+        approvedBy: string;
+        reason: string;
+        evidence: string;
+        resolutionProofPaths: string[];
+        notes: string;
+        requestedAt?: string;
+        approvedAt?: string;
+      }
+    | { valid: false; error: string; outcomeCode?: string } => {
+    const outcomeCode =
+      typeof entry.outcomeCode === "string" && entry.outcomeCode.trim()
+        ? entry.outcomeCode.trim()
+        : "";
+    if (!outcomeCode) {
+      return { valid: false, error: "missing outcomeCode" };
+    }
+    const requestedBy =
+      typeof entry.requestedBy === "string" && entry.requestedBy.trim()
+        ? entry.requestedBy.trim()
+        : "";
+    if (requestedBy !== "Will") {
+      return { valid: false, error: "requestedBy must be Will", outcomeCode };
+    }
+    const approvedBy =
+      typeof entry.approvedBy === "string" && entry.approvedBy.trim()
+        ? entry.approvedBy.trim()
+        : "";
+    if (approvedBy !== "Will") {
+      return { valid: false, error: "approvedBy must be Will", outcomeCode };
+    }
+    const reason =
+      typeof entry.reason === "string" && entry.reason.trim() ? entry.reason.trim() : "";
+    if (!ALLOWED_GRANT_RETIREMENT_REASONS.has(reason)) {
+      return {
+        valid: false,
+        error: `reason must be one of: ${Array.from(ALLOWED_GRANT_RETIREMENT_REASONS).join(", ")}`,
+        outcomeCode,
+      };
+    }
+    const evidence =
+      typeof entry.evidence === "string" && entry.evidence.trim() ? entry.evidence.trim() : "";
+    const resolutionProofPaths = Array.isArray(entry.resolutionProofPaths)
+      ? entry.resolutionProofPaths.filter(
+          (value): value is string => typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
+    const requestPath =
+      typeof entry.requestPath === "string" && entry.requestPath.trim()
+        ? entry.requestPath.trim()
+        : "";
+    if (!requestPath) {
+      return {
+        valid: false,
+        error: "retirement request requires requestPath",
+        outcomeCode,
+      };
+    }
+    if (!evidence && resolutionProofPaths.length === 0) {
+      return {
+        valid: false,
+        error: "retirement request requires evidence or resolutionProofPaths",
+        outcomeCode,
+      };
+    }
+    const notes = typeof entry.notes === "string" ? entry.notes : "";
+    const requestedAt =
+      typeof entry.requestedAt === "string" && entry.requestedAt.trim()
+        ? entry.requestedAt.trim()
+        : undefined;
+    const approvedAt =
+      typeof entry.approvedAt === "string" && entry.approvedAt.trim()
+        ? entry.approvedAt.trim()
+        : undefined;
+    return {
+      valid: true,
+      outcomeCode,
+      requestPath,
+      requestedBy,
+      approvedBy,
+      reason,
+      evidence,
+      resolutionProofPaths,
+      notes,
+      requestedAt,
+      approvedAt,
+    };
+  };
+
+  const materializeGrantRetirementRequestArtifactIfNeeded = async (args: {
+    workspaceDir: string;
+    entry: Record<string, unknown>;
+  }): Promise<
+    | {
+        valid: true;
+        entry: Record<string, unknown>;
+      }
+    | {
+        valid: false;
+        error: string;
+        outcomeCode?: string;
+      }
+  > => {
+    const validation = validateGrantRetirementEntry(args.entry);
+    if (validation.valid) {
+      return { valid: true, entry: args.entry };
+    }
+    if (validation.error !== "retirement request requires requestPath") {
+      return validation;
+    }
+
+    const outcomeCode =
+      typeof args.entry.outcomeCode === "string" && args.entry.outcomeCode.trim()
+        ? args.entry.outcomeCode.trim()
+        : undefined;
+    const requestedBy =
+      typeof args.entry.requestedBy === "string" && args.entry.requestedBy.trim()
+        ? args.entry.requestedBy.trim()
+        : "";
+    if (requestedBy !== "Will") {
+      return { valid: false, error: "requestedBy must be Will", outcomeCode };
+    }
+    const approvedBy =
+      typeof args.entry.approvedBy === "string" && args.entry.approvedBy.trim()
+        ? args.entry.approvedBy.trim()
+        : "";
+    if (approvedBy !== "Will") {
+      return { valid: false, error: "approvedBy must be Will", outcomeCode };
+    }
+    const reason =
+      typeof args.entry.reason === "string" && args.entry.reason.trim()
+        ? args.entry.reason.trim()
+        : "";
+    if (!ALLOWED_GRANT_RETIREMENT_REASONS.has(reason)) {
+      return {
+        valid: false,
+        error: `reason must be one of: ${Array.from(ALLOWED_GRANT_RETIREMENT_REASONS).join(", ")}`,
+        outcomeCode,
+      };
+    }
+    const evidence =
+      typeof args.entry.evidence === "string" && args.entry.evidence.trim()
+        ? args.entry.evidence.trim()
+        : "";
+    const resolutionProofPaths = Array.isArray(args.entry.resolutionProofPaths)
+      ? args.entry.resolutionProofPaths.filter(
+          (value): value is string => typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
+    if (!evidence && resolutionProofPaths.length === 0) {
+      return {
+        valid: false,
+        error: "retirement request requires evidence or resolutionProofPaths",
+        outcomeCode,
+      };
+    }
+    if (!outcomeCode) {
+      return { valid: false, error: "missing outcomeCode" };
+    }
+
+    let rulebook;
+    try {
+      rulebook = await loadGrantHardeningRulebook({ workspaceDir: args.workspaceDir });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : typeof err === "string" ? err : "error";
+      return {
+        valid: false,
+        error,
+        outcomeCode,
+      };
+    }
+
+    const templatePath = path.join(
+      args.workspaceDir,
+      GRANT_CORRECTION_RETIREMENT_REQUEST_TEMPLATE_RELATIVE_PATH,
+    );
+    let templateRecord: Record<string, unknown>;
+    try {
+      templateRecord = JSON.parse(await fs.readFile(templatePath, "utf8")) as Record<
+        string,
+        unknown
+      >;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : typeof err === "string" ? err : "error";
+      return {
+        valid: false,
+        error: `retirement request template missing or unreadable at ${templatePath}: ${error}`,
+        outcomeCode,
+      };
+    }
+
+    const timestamp =
+      (typeof args.entry.requestedAt === "string" && args.entry.requestedAt.trim()) ||
+      (typeof args.entry.approvedAt === "string" && args.entry.approvedAt.trim()) ||
+      (typeof args.entry.queuedAt === "string" && args.entry.queuedAt.trim()) ||
+      new Date().toISOString();
+    const requestDir = path.join(
+      args.workspaceDir,
+      GRANT_CORRECTION_RETIREMENT_REQUESTS_RELATIVE_DIR,
+    );
+    const requestPath = path.join(
+      requestDir,
+      `${timestamp.replace(/[:.]/g, "").replace(/Z$/, "Z")}_${sanitizeGrantAuditSlug(outcomeCode)}.json`,
+    );
+    const requestArtifact = attachGrantRulebookMetadata(
+      {
+        ...templateRecord,
+        requestedBy,
+        approvedBy,
+        outcomeCode,
+        reason,
+        evidence,
+        resolutionProofPaths,
+        notes: typeof args.entry.notes === "string" ? args.entry.notes : "",
+        requestedAt:
+          (typeof args.entry.requestedAt === "string" && args.entry.requestedAt.trim()) ||
+          timestamp,
+        approvedAt:
+          (typeof args.entry.approvedAt === "string" && args.entry.approvedAt.trim()) || timestamp,
+      },
+      rulebook.verification,
+    );
+    await fs.mkdir(requestDir, { recursive: true });
+    await fs.writeFile(requestPath, `${JSON.stringify(requestArtifact, null, 2)}\n`, "utf8");
+    return {
+      valid: true,
+      entry: {
+        ...attachGrantRulebookMetadata(args.entry, rulebook.verification),
+        requestPath,
+      },
+    };
+  };
+
+  const archiveRejectedGrantRetirementEntry = async (args: {
+    queuePath: string;
+    archivePath: string;
+    outcomeCode: string;
+    rejectionReason: string;
+  }) => {
+    return await archiveGrantRetirementEntries({
+      queuePath: args.queuePath,
+      archivePath: args.archivePath,
+      retiredOutcomeCode: args.outcomeCode,
+      archiveReason: `rejected_retirement_request:${args.rejectionReason}`,
+    });
+  };
+
+  const promoteGrantCorrectionCandidatesIfReady = async (workspaceDir: string) => {
+    const queuePath = path.join(workspaceDir, GRANT_CORRECTION_QUEUE_RELATIVE_PATH);
+    const archivePath = path.join(workspaceDir, GRANT_CORRECTION_ARCHIVE_RELATIVE_PATH);
+    const matrixPath = path.join(workspaceDir, GRANT_CORRECTIONS_MATRIX_RELATIVE_PATH);
+    const entries = await loadGrantCorrectionQueueEntries(queuePath);
+    if (entries.length === 0) {
+      return;
+    }
+    let matrixExists = true;
+    try {
+      await fs.access(matrixPath);
+    } catch {
+      matrixExists = false;
+    }
+    if (!matrixExists) {
+      return;
+    }
+    const promotedOutcomeCodes = new Set<string>();
+    for (const entry of entries) {
+      const outcomeCode =
+        typeof entry.outcomeCode === "string" && entry.outcomeCode.trim()
+          ? entry.outcomeCode.trim()
+          : "";
+      if (!outcomeCode || promotedOutcomeCodes.has(outcomeCode)) {
+        continue;
+      }
+      const block = buildGrantGeneratedCorrectionBlock(outcomeCode);
+      if (!block) {
+        continue;
+      }
+      const didAppend = await appendGrantCorrectionToMatrix(matrixPath, block);
+      await archivePromotedGrantQueueEntries({
+        queuePath,
+        archivePath,
+        entries,
+        promotedOutcomeCode: outcomeCode,
+      });
+      if (didAppend) {
+        promotedOutcomeCodes.add(outcomeCode);
+      }
+    }
+  };
+
+  const processGrantCorrectionRetirementsIfReady = async (workspaceDir: string) => {
+    const queuePath = path.join(workspaceDir, GRANT_CORRECTION_RETIREMENT_QUEUE_RELATIVE_PATH);
+    const archivePath = path.join(workspaceDir, GRANT_CORRECTION_RETIREMENT_ARCHIVE_RELATIVE_PATH);
+    const rejectedArchivePath = path.join(
+      workspaceDir,
+      GRANT_CORRECTION_RETIREMENT_REJECTED_ARCHIVE_RELATIVE_PATH,
+    );
+    const matrixPath = path.join(workspaceDir, GRANT_CORRECTIONS_MATRIX_RELATIVE_PATH);
+    const entries = await loadGrantRetirementQueueEntries(queuePath);
+    if (entries.length === 0) {
+      return;
+    }
+    try {
+      await fs.access(matrixPath);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const materialized = await materializeGrantRetirementRequestArtifactIfNeeded({
+        workspaceDir,
+        entry,
+      });
+      if (!materialized.valid) {
+        if (materialized.outcomeCode) {
+          await archiveRejectedGrantRetirementEntry({
+            queuePath,
+            archivePath: rejectedArchivePath,
+            outcomeCode: materialized.outcomeCode,
+            rejectionReason: materialized.error,
+          });
+        }
+        continue;
+      }
+      if (
+        materialized.entry.requestPath !== entry.requestPath &&
+        typeof materialized.entry.requestPath === "string" &&
+        materialized.entry.requestPath.trim()
+      ) {
+        Object.assign(entry, materialized.entry);
+        await persistGrantRetirementQueueEntries(queuePath, entries);
+      }
+      const validation = validateGrantRetirementEntry(materialized.entry);
+      if (!validation.valid) {
+        if (validation.outcomeCode) {
+          await archiveRejectedGrantRetirementEntry({
+            queuePath,
+            archivePath: rejectedArchivePath,
+            outcomeCode: validation.outcomeCode,
+            rejectionReason: validation.error,
+          });
+        }
+        continue;
+      }
+      const outcomeCode = validation.outcomeCode;
+      try {
+        await fs.access(validation.requestPath);
+      } catch {
+        await archiveRejectedGrantRetirementEntry({
+          queuePath,
+          archivePath: rejectedArchivePath,
+          outcomeCode,
+          rejectionReason: "requestPath unreadable",
+        });
+        continue;
+      }
+      const removed = await removeGrantGeneratedCorrectionBlock(matrixPath, outcomeCode);
+      if (!removed) {
+        continue;
+      }
+      await archiveGrantRetirementEntries({
+        queuePath,
+        archivePath,
+        retiredOutcomeCode: outcomeCode,
+      });
+    }
+  };
+
+  const launchGrantSameSliceRework = async (args: {
+    entry: SubagentRunRecord;
+    linkedTask: NonNullable<ReturnType<typeof findTaskByRunId>>;
+    linkedFlowId: string;
+    expectedFlowRevision: number;
+    correctionSummary: string;
+    assessedAt: number;
+  }): Promise<{ launched: boolean; blockedReason?: string }> => {
+    const childSessionKey = args.entry.childSessionKey?.trim();
+    if (!childSessionKey) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          "same-slice rework launch requires a child session key, but none is available",
+        ),
+      };
+    }
+    let launchResponse: { runId?: string } | undefined;
+    try {
+      launchResponse = await params.callGateway<{ runId?: string }>({
+        method: "agent",
+        params: {
+          sessionKey: childSessionKey,
+          message: `Grant closeout rework handback. ${args.correctionSummary}`,
+          deliver: false,
+          timeout: 0,
+        },
+        timeoutMs: 10_000,
+      });
+    } catch (error) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          `same-slice rework launch failed before acceptance: ${formatErrorMessage(error)}`,
+        ),
+      };
+    }
+    const nextRunId = typeof launchResponse?.runId === "string" ? launchResponse.runId.trim() : "";
+    if (!nextRunId) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          "same-slice rework launch returned no accepted run id, so running proof is missing",
+        ),
+      };
+    }
+    const replaceAfterSteer =
+      params.replaceSubagentRunAfterSteer ?? replaceSubagentRunAfterSteerDefault;
+    if (
+      !replaceAfterSteer({
+        previousRunId: args.entry.runId,
+        nextRunId,
+        preserveFrozenResultFallback: true,
+      })
+    ) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          `same-slice rework launch accepted ${nextRunId}, but the subagent registry could not bind the new run`,
+        ),
+      };
+    }
+    const queuedTask = createTaskRecord({
+      runtime: "subagent",
+      requesterSessionKey: args.linkedTask.ownerKey,
+      ownerKey: args.linkedTask.ownerKey,
+      scopeKind: args.linkedTask.scopeKind,
+      childSessionKey,
+      parentFlowId: args.linkedTask.parentFlowId,
+      parentTaskId: args.linkedTask.taskId,
+      runId: nextRunId,
+      task: `${args.linkedTask.task} rework`,
+      missionId: args.linkedTask.missionId,
+      missionSummary: args.linkedTask.missionSummary ?? args.correctionSummary,
+      missionState: "active",
+      status: "queued",
+      deliveryStatus: "pending",
+      notifyPolicy: "state_changes",
+      progressSummary: buildRel002QueueSummary(args.correctionSummary),
+      preferMetadata: true,
+    });
+    if (!queuedTask) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          `same-slice rework launch accepted ${nextRunId}, but the queued rework packet could not be persisted`,
+        ),
+      };
+    }
+    const runningRecords = markTaskRunningByRunId({
+      runId: nextRunId,
+      runtime: "subagent",
+      sessionKey: childSessionKey,
+      startedAt: args.assessedAt,
+      lastEventAt: args.assessedAt,
+      progressSummary: buildRel002RunningSummary(args.correctionSummary, nextRunId),
+      eventSummary: REL002_REWORK_EXECUTOR_RUNNING,
+    });
+    if (!runningRecords.some((task) => task.runId === nextRunId && task.status === "running")) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          `same-slice rework launch accepted ${nextRunId}, but no running task proof was persisted`,
+        ),
+      };
+    }
+    const launchedFlow = recordFlowNextExecutableLaunch({
+      flowId: args.linkedFlowId,
+      expectedRevision: args.expectedFlowRevision,
+      detail: `${REL002_REWORK_EXECUTOR_LAUNCHED}: accepted same-slice rework run ${nextRunId}`,
+      currentStep: "closeout_rework_running",
+      updatedAt: args.assessedAt,
+    });
+    if (!launchedFlow.applied) {
+      return {
+        launched: false,
+        blockedReason: buildRel002BlockedReason(
+          `same-slice rework run ${nextRunId} started, but parent flow launch proof could not be recorded`,
+        ),
+      };
+    }
+    const stateJson = launchedFlow.flow.stateJson as {
+      rework?: { handbackStatus?: string };
+    } | null;
+    if (stateJson?.rework?.handbackStatus === "required") {
+      updateFlowRecordByIdExpectedRevision({
+        flowId: launchedFlow.flow.flowId,
+        expectedRevision: launchedFlow.flow.revision,
+        patch: {
+          stateJson: {
+            ...(stateJson ?? {}),
+            rework: {
+              ...stateJson.rework,
+              handbackStatus: "completed",
+            },
+          },
+          updatedAt: args.assessedAt,
+        },
+      });
+    }
+    return { launched: true };
+  };
+
+  const persistGrantCloseoutGateAudit = async (args: {
+    entry: SubagentRunRecord;
+    result: GrantCloseoutGateResult;
+  }) => {
+    const completion = ensureCompletionState(args.entry);
+    const assessedAt = Date.now();
+    const previousGate = completion.grantCloseoutGate;
+    const reviewStatus = !args.result.assessment.applies
+      ? "not_applicable"
+      : args.result.assessment.passed
+        ? "passed"
+        : "rejected";
+    completion.grantCloseoutGate = {
+      applies: args.result.assessment.applies,
+      passed: args.result.assessment.passed,
+      reviewStatus,
+      outcomeCode: args.result.assessment.outcomeCode,
+      assessedAt,
+      missingFields: args.result.assessment.missingFields,
+      missingProofPaths: args.result.assessment.missingProofPaths,
+      requiresCorrectedCloseout: args.result.assessment.applies && !args.result.assessment.passed,
+      materialProgressState: args.result.assessment.applies
+        ? args.result.assessment.passed
+          ? "closeout_review_passed"
+          : "closeout_rejected"
+        : "closeout_not_applicable",
+      auditReceiptPath: previousGate?.auditReceiptPath,
+      correctionCandidateQueuePath: previousGate?.correctionCandidateQueuePath,
+      correctionCandidateQueuedAt: previousGate?.correctionCandidateQueuedAt,
+    };
+
+    const workspaceDir = args.entry.workspaceDir?.trim();
+    if (workspaceDir) {
+      await processGrantCorrectionRetirementsIfReady(workspaceDir);
+    }
+
+    if (!args.result.assessment.applies) {
+      params.persist();
+      return;
+    }
+
+    const linkedTask = findTaskByRunId(args.entry.runId);
+    const linkedFlowId = linkedTask?.parentFlowId?.trim();
+    const linkedFlow = linkedFlowId ? getTaskFlowById(linkedFlowId) : undefined;
+    const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;
+    if (linkedContinuation && linkedFlowId) {
+      args.entry.productionContinuation = {
+        activeProductionRun: linkedContinuation.activeProductionRun,
+        continuationRequiredAfterLocalSuccess:
+          linkedContinuation.continuationRequiredAfterLocalSuccess,
+        nextExecutableUnitIdentified: linkedContinuation.nextExecutableUnitIdentified,
+        nextExecutableUnitLaunched: linkedContinuation.nextExecutableUnitLaunched,
+        continuationViolation: linkedContinuation.continuationViolation,
+        lawfulStopReason: linkedContinuation.lawfulStopReason,
+        parentFlowId: linkedFlowId,
+      };
+    }
+
+    if (args.result.assessment.passed) {
+      params.persist();
+      return;
+    }
+
+    const correctionSummary = buildGrantCorrectionSummary(args.result);
+    if (linkedTask) {
+      completeTaskRunByRunId({
+        runId: args.entry.runId,
+        runtime: "subagent",
+        sessionKey: args.entry.childSessionKey,
+        endedAt: assessedAt,
+        lastEventAt: assessedAt,
+        terminalOutcome: "blocked",
+        terminalSummary: `${REL002_CHILD_RESULT_REJECTED} :: ${correctionSummary}`,
+      });
+      let postFailureFlow = linkedFlow;
+      if (linkedFlowId) {
+        const flow = getTaskFlowById(linkedFlowId);
+        if (flow) {
+          const reworkUpdate = recordBlindTestCloseoutFailure({
+            flowId: linkedFlowId,
+            expectedRevision: flow.revision,
+            summary: correctionSummary,
+            outcomeCode: args.result.assessment.outcomeCode,
+            reviewedAt: assessedAt,
+            updatedAt: assessedAt,
+          });
+          if (reworkUpdate.applied) {
+            postFailureFlow = reworkUpdate.flow;
+          }
+        }
+      }
+      const postFailureContinuation = postFailureFlow
+        ? getTaskFlowProductionContinuation(postFailureFlow)
+        : null;
+      const handbackState =
+        (
+          postFailureFlow?.stateJson as {
+            rework?: { handbackStatus?: string; transferOwner?: string };
+          } | null
+        )?.rework ?? null;
+      const canAttemptImmediateFollowThrough =
+        Boolean(
+          handbackState?.handbackStatus === "required" && handbackState.transferOwner !== "Will",
+        ) &&
+        continuationRequiresImmediateReworkLaunch(postFailureContinuation) &&
+        Boolean(linkedFlowId);
+      if (canAttemptImmediateFollowThrough && linkedFlowId && postFailureFlow) {
+        const followThrough = await launchGrantSameSliceRework({
+          entry: args.entry,
+          linkedTask,
+          linkedFlowId,
+          expectedFlowRevision: postFailureFlow.revision,
+          correctionSummary,
+          assessedAt,
+        });
+        if (!followThrough.launched) {
+          const blockedReason =
+            followThrough.blockedReason ??
+            buildRel002BlockedReason("same-slice rework launch failed without an exact reason");
+          recordFlowLawfulStop({
+            flowId: linkedFlowId,
+            expectedRevision: postFailureFlow.revision,
+            reason: "blocker",
+            detail: blockedReason,
+            currentStep: "rework_launch_blocked",
+            updatedAt: assessedAt,
+          });
+          if (linkedTask.missionId?.trim() || linkedTask.missionSummary?.trim()) {
+            createTaskRecord({
+              runtime: "subagent",
+              requesterSessionKey: linkedTask.ownerKey,
+              ownerKey: linkedTask.ownerKey,
+              scopeKind: linkedTask.scopeKind,
+              parentFlowId: linkedTask.parentFlowId,
+              parentTaskId: linkedTask.taskId,
+              task: `${linkedTask.task} rework blocked`,
+              missionId: linkedTask.missionId,
+              missionSummary: linkedTask.missionSummary ?? correctionSummary,
+              missionState: "active",
+              status: "failed",
+              deliveryStatus: "pending",
+              notifyPolicy: "state_changes",
+              error: blockedReason,
+              terminalSummary: blockedReason,
+              endedAt: assessedAt,
+              lastEventAt: assessedAt,
+              preferMetadata: true,
+            });
+          }
+        }
+      } else if (linkedTask.missionId?.trim() || linkedTask.missionSummary?.trim()) {
+        createTaskRecord({
+          runtime: "subagent",
+          requesterSessionKey: linkedTask.ownerKey,
+          ownerKey: linkedTask.ownerKey,
+          scopeKind: linkedTask.scopeKind,
+          childSessionKey: linkedTask.childSessionKey,
+          parentFlowId: linkedTask.parentFlowId,
+          parentTaskId: linkedTask.taskId,
+          task: `${linkedTask.task} rework`,
+          missionId: linkedTask.missionId,
+          missionSummary: linkedTask.missionSummary ?? correctionSummary,
+          missionState: "active",
+          status: "queued",
+          deliveryStatus: "pending",
+          notifyPolicy: "state_changes",
+          progressSummary: buildRel002QueueSummary(correctionSummary),
+          preferMetadata: true,
+        });
+      }
+      const latestFlow = linkedFlowId ? getTaskFlowById(linkedFlowId) : undefined;
+      const latestContinuation = latestFlow ? getTaskFlowProductionContinuation(latestFlow) : null;
+      if (latestContinuation && linkedFlowId) {
+        args.entry.productionContinuation = {
+          activeProductionRun: latestContinuation.activeProductionRun,
+          continuationRequiredAfterLocalSuccess:
+            latestContinuation.continuationRequiredAfterLocalSuccess,
+          nextExecutableUnitIdentified: latestContinuation.nextExecutableUnitIdentified,
+          nextExecutableUnitLaunched: latestContinuation.nextExecutableUnitLaunched,
+          continuationViolation: latestContinuation.continuationViolation,
+          lawfulStopReason: latestContinuation.lawfulStopReason,
+          parentFlowId: linkedFlowId,
+        };
+      }
+    }
+
+    if (!workspaceDir) {
+      params.persist();
+      return;
+    }
+
+    const prior = previousGate;
+    if (
+      prior?.outcomeCode === args.result.assessment.outcomeCode &&
+      typeof prior?.auditReceiptPath === "string" &&
+      prior.auditReceiptPath.trim()
+    ) {
+      params.persist();
+      return;
+    }
+
+    const auditDir = path.join(workspaceDir, GRANT_AUDIT_RELATIVE_DIR);
+    const queuePath = path.join(workspaceDir, GRANT_CORRECTION_QUEUE_RELATIVE_PATH);
+    const matrixPath = path.join(workspaceDir, GRANT_CORRECTIONS_MATRIX_RELATIVE_PATH);
+    await fs.mkdir(auditDir, { recursive: true });
+    await fs.mkdir(path.dirname(queuePath), { recursive: true });
+
+    const timestamp = new Date(assessedAt).toISOString();
+    const auditFileName = `${timestamp.replace(/[:.]/g, "").replace(/Z$/, "Z")}_${sanitizeGrantAuditSlug(args.entry.label || args.result.taskLabel || args.entry.runId)}_${sanitizeGrantAuditSlug(args.entry.runId)}.md`;
+    const auditPath = path.join(auditDir, auditFileName);
+    const priorAuditCount = args.result.assessment.outcomeCode
+      ? await countGrantAuditReceiptsForOutcome(auditDir, args.result.assessment.outcomeCode)
+      : 0;
+    const priorCandidateCount = args.result.assessment.outcomeCode
+      ? await countQueuedGrantCorrectionCandidates(queuePath, args.result.assessment.outcomeCode)
+      : 0;
+    const correctionAlreadyActive = args.result.assessment.outcomeCode
+      ? await hasGrantGeneratedCorrectionBlock(matrixPath, args.result.assessment.outcomeCode)
+      : false;
+    const shouldQueueCandidate =
+      priorAuditCount >= 1 && priorCandidateCount === 0 && !correctionAlreadyActive;
+    const candidateLabel = args.result.assessment.outcomeCode
+      ? `grant-${args.result.assessment.outcomeCode}`
+      : "grant-closeout-gate";
+
+    const auditLines = [
+      "# Grant After-Action Audit",
+      "",
+      "## Run identity",
+      `- Run label: ${args.entry.label || args.result.taskLabel || "unknown"}`,
+      `- Date: ${timestamp}`,
+      "- Work-order path: unknown",
+      "- Reviewer: Will",
+      "",
+      "## What Grant got right",
+      `- Gate applied: ${args.result.assessment.applies ? "yes" : "no"}`,
+      `- Outcome captured: ${args.result.assessment.outcomeCode ?? "unknown"}`,
+      "",
+      "## What Grant missed",
+      ...(args.result.assessment.missingFields.length > 0
+        ? args.result.assessment.missingFields.map(
+            (field: string) => `- missing closeout field: ${field}`,
+          )
+        : ["- none recorded"]),
+      ...(args.result.assessment.missingProofPaths &&
+      args.result.assessment.missingProofPaths.length > 0
+        ? args.result.assessment.missingProofPaths.map(
+            (proofPath: string) => `- missing or unreadable proof path: ${proofPath}`,
+          )
+        : []),
+      "",
+      "## What contradiction Grant failed to catch",
+      "- none explicitly proven in this gate result",
+      "",
+      "## What ambiguity was still present",
+      `- ${args.result.assessment.outcomeCode === "rejected_closeout_missing_truth" ? "closeout truth remained incomplete" : "proof claim was not materially supported"}`,
+      "",
+      "## Did Grant preserve owner truth",
+      "- yes/no: yes",
+      "- notes: owner truth was not disproven by this gate result",
+      "",
+      "## Did Grant drift into fake completion",
+      `- yes/no: ${args.result.assessment.passed ? "no" : "yes"}`,
+      `- notes: ${args.result.assessment.passed ? "gate passed review-required state" : "closeout attempted to pass without satisfying the Grant gate"}`,
+      "",
+      "## Did Will have to rescue the packet",
+      "- yes/no: yes",
+      "- where: live Grant completion review gate",
+      "",
+      "## Correction candidate",
+      `- ${shouldQueueCandidate ? "new candidate" : "none"}`,
+      `- candidate label: ${shouldQueueCandidate ? candidateLabel : "n/a"}`,
+      `- why: ${args.result.assessment.outcomeCode ?? "Grant closeout gate failure"}`,
+      "",
+      "## Promotion decision",
+      `- ${shouldQueueCandidate ? "correction candidate" : "audit note only"}`,
+      "",
+      "## Exact rule that would have prevented the miss",
+      `- ${buildGrantGatePreventiveRule(args.result.assessment.outcomeCode)}`,
+      "",
+      "## Next training move",
+      `- Re-run this slice with a corrected closeout that satisfies ${args.result.assessment.outcomeCode ?? "the Grant closeout gate"}.`,
+      "",
+      "## Evidence",
+      "```text",
+      args.result.findings,
+      "```",
+      "",
+    ];
+    await fs.writeFile(auditPath, auditLines.join("\n"), "utf8");
+
+    completion.grantCloseoutGate.auditReceiptPath = auditPath;
+
+    if (shouldQueueCandidate) {
+      const queueEntry = {
+        queuedAt: timestamp,
+        runId: args.entry.runId,
+        label: args.entry.label ?? args.result.taskLabel,
+        outcomeCode: args.result.assessment.outcomeCode,
+        candidateLabel,
+        auditReceiptPath: auditPath,
+        missingFields: args.result.assessment.missingFields,
+        missingProofPaths: args.result.assessment.missingProofPaths ?? [],
+      };
+      await fs.appendFile(queuePath, `${JSON.stringify(queueEntry)}\n`, "utf8");
+      completion.grantCloseoutGate.correctionCandidateQueuePath = queuePath;
+      completion.grantCloseoutGate.correctionCandidateQueuedAt = assessedAt;
+      await promoteGrantCorrectionCandidatesIfReady(workspaceDir);
+    }
+
+    params.persist();
   };
 
   const freezeRunResultAtCompletion = async (
@@ -1056,6 +2292,12 @@ export function createSubagentRegistryLifecycleController(params: {
         spawnMode: pendingPayload.spawnMode,
         expectsCompletionMessage: pendingPayload.expectsCompletionMessage,
         wakeOnDescendantSettle: pendingPayload.wakeOnDescendantSettle === true,
+        onGrantCloseoutGateResult: async (result) => {
+          await persistGrantCloseoutGateAudit({
+            entry,
+            result,
+          });
+        },
         onDeliveryResult: (delivery) => {
           recordAnnounceDeliveryResult(entry, delivery);
           if (delivery.delivered) {
@@ -1300,5 +2542,8 @@ export function createSubagentRegistryLifecycleController(params: {
     finalizeResumedAnnounceGiveUp,
     refreshFrozenResultFromSession,
     startSubagentAnnounceCleanupFlow,
+    testing: {
+      persistGrantCloseoutGateAudit,
+    },
   };
 }

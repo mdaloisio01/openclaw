@@ -12,6 +12,12 @@ import {
   type SessionBindingPlacement,
   type SessionBindingRecord,
 } from "../infra/outbound/session-binding-service.js";
+import {
+  createManagedTaskFlow,
+  finishFlow,
+  resetTaskFlowRegistryForTests,
+} from "../tasks/task-flow-runtime-internal.js";
+import { createTaskRecord, resetTaskRegistryForTests } from "../tasks/task-registry.js";
 
 function createDefaultSpawnConfig(): OpenClawConfig {
   return {
@@ -761,6 +767,8 @@ describe("spawnAcpDirect", () => {
 
   afterEach(() => {
     sessionBindingServiceTesting.resetSessionBindingAdaptersForTests();
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests();
   });
 
   it("spawns ACP session, binds a new thread, and dispatches initial task", async () => {
@@ -1247,6 +1255,85 @@ describe("spawnAcpDirect", () => {
       subagentRole: "leaf",
       subagentControlScope: "none",
     });
+  });
+
+  it("inherits parent continuation linkage for ACP spawn when an active mission-linked production flow exists", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-acp-continuation-"));
+    process.env.OPENCLAW_STATE_DIR = root;
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests();
+    try {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:telegram:direct:6098642967",
+        controllerId: "tests/acp-production-parent",
+        goal: "Continue ACP production parent",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const blockedClose = finishFlow({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        endedAt: 200,
+      });
+      if (blockedClose.applied || !blockedClose.current) {
+        throw new Error("Expected continuation-required parent flow");
+      }
+
+      const missionTask = createTaskRecord({
+        runtime: "cli",
+        ownerKey: "agent:main:telegram:direct:6098642967",
+        requesterSessionKey: "agent:main:telegram:direct:6098642967",
+        scopeKind: "session",
+        parentFlowId: blockedClose.current.flowId,
+        task: "ACP parent production run",
+        missionId: "mission-acp-production-parent",
+        missionSummary: "Launch the next ACP bounded unit before pause",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      if (!missionTask) {
+        throw new Error("Expected mission task");
+      }
+
+      const result = await spawnAcpDirect(createSpawnRequest(), createRequesterContext());
+      expectAcceptedSpawn(result);
+
+      const taskArgs = firstMockCall(hoisted.createRunningTaskRunMock, "createRunningTaskRun")[0];
+      expectRecordFields(taskArgs, {
+        runtime: "acp",
+        ownerKey: "agent:main:telegram:direct:6098642967",
+        parentFlowId: blockedClose.current.flowId,
+        parentTaskId: missionTask.taskId,
+      });
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invent ACP parent continuation linkage for standalone spawned work", async () => {
+    const result = await spawnAcpDirect(createSpawnRequest(), createRequesterContext());
+    expectAcceptedSpawn(result);
+
+    const taskArgs = firstMockCall(hoisted.createRunningTaskRunMock, "createRunningTaskRun")[0];
+    const taskRecord = expectRecordFields(taskArgs, {
+      runtime: "acp",
+      ownerKey: "agent:main:telegram:direct:6098642967",
+    });
+    expect(taskRecord.parentFlowId).toBeUndefined();
+    expect(taskRecord.parentTaskId).toBeUndefined();
   });
 
   it("rejects ACP spawns that exceed subagent max depth", async () => {

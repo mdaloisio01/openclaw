@@ -131,4 +131,61 @@ describe("subagent registry sqlite store", () => {
       openOpenClawStateDatabase().db.prepare("SELECT COUNT(*) AS count FROM subagent_runs").get(),
     ).toEqual({ count: 1 });
   });
+
+  it("does not let a stale in-memory run overwrite newer persisted replay proof", () => {
+    const staleRun = createRun({
+      runId: "run-stale",
+      childSessionKey: "agent:main:subagent:stale",
+      delivery: {
+        status: "suspended",
+        createdAt: 270,
+        lastAttemptAt: 280,
+        attemptCount: 2,
+        lastError: "retry later",
+        suspendedAt: 280,
+        suspendedReason: "retry-limit",
+        payload: {
+          requesterSessionKey: "agent:main:main",
+          requesterDisplayKey: "main",
+          childSessionKey: "agent:main:subagent:stale",
+          childRunId: "run-stale",
+          task: "check sqlite persistence",
+          startedAt: 110,
+          endedAt: 250,
+          outcome: { status: "ok" },
+          expectsCompletionMessage: true,
+          frozenResultText: "done",
+        },
+      },
+    });
+    const repairedRun = createRun({
+      runId: "run-stale",
+      childSessionKey: "agent:main:subagent:stale",
+      delivery: {
+        status: "delivered",
+        announcedAt: 400,
+        deliveredAt: 400,
+        replayRepair: {
+          repairedAt: 400,
+          reason: "owner-approved replay repair",
+        },
+      } as SubagentRunRecord["delivery"] & {
+        replayRepair: { repairedAt: number; reason: string };
+      },
+    });
+
+    saveSubagentRegistryToSqlite(new Map([[repairedRun.runId, repairedRun]]));
+    saveSubagentRegistryToSqlite(new Map([[staleRun.runId, staleRun]]));
+
+    const restored = loadSubagentRegistryFromSqlite().get(staleRun.runId);
+    expect(restored?.delivery).toMatchObject({
+      status: "delivered",
+      announcedAt: 400,
+      deliveredAt: 400,
+      replayRepair: {
+        repairedAt: 400,
+        reason: "owner-approved replay repair",
+      },
+    });
+  });
 });

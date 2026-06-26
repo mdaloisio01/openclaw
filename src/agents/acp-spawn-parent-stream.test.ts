@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { getReplyPayloadProgressHeartbeat } from "../auto-reply/reply-payload.js";
 import { mergeMockedModule } from "../test-utils/vitest-module-mocks.js";
 
 const enqueueSystemEventMock = vi.fn();
@@ -6,6 +7,7 @@ const requestHeartbeatMock = vi.fn();
 const readAcpSessionEntryMock = vi.fn();
 const resolveSessionFilePathMock = vi.fn();
 const resolveSessionFilePathOptionsMock = vi.fn();
+const routeReplyMock = vi.fn();
 
 vi.mock("../infra/system-events.js", () => ({
   enqueueSystemEvent: (...args: unknown[]) => enqueueSystemEventMock(...args),
@@ -45,6 +47,10 @@ vi.mock("../config/sessions/paths.js", async () => {
     }),
   );
 });
+
+vi.mock("../auto-reply/reply/route-reply.js", () => ({
+  routeReply: (...args: unknown[]) => routeReplyMock(...args),
+}));
 
 let emitAgentEvent: typeof import("../infra/agent-events.js").emitAgentEvent;
 let resolveAcpSpawnStreamLogPath: typeof import("./acp-spawn-parent-stream.js").resolveAcpSpawnStreamLogPath;
@@ -89,6 +95,11 @@ describe("startAcpSpawnParentStreamRelay", () => {
     resolveSessionFilePathMock.mockReset();
     resolveSessionFilePathOptionsMock.mockReset();
     resolveSessionFilePathOptionsMock.mockImplementation((value: unknown) => value);
+    routeReplyMock.mockReset();
+    routeReplyMock.mockResolvedValue({
+      ok: false,
+      error: "route unavailable",
+    });
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-04T01:00:00.000Z"));
   });
@@ -97,7 +108,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
     vi.useRealTimers();
   });
 
-  it("relays assistant progress and completion to the parent session", () => {
+  it("relays assistant progress and completion to the parent session", async () => {
     const deliveryContext = {
       channel: "forum",
       to: "-1001234567890",
@@ -121,7 +132,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
         delta: "hello from child",
       },
     });
-    vi.advanceTimersByTime(15);
+    await vi.advanceTimersByTimeAsync(15);
 
     emitAgentEvent({
       runId: "run-1",
@@ -132,11 +143,14 @@ describe("startAcpSpawnParentStreamRelay", () => {
         endedAt: 3_100,
       },
     });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
 
     expect(collectedTexts()).toEqual([
-      "Started codex session agent:codex:acp:child-1. Streaming progress updates to parent session.",
-      "codex: hello from child",
-      "codex run completed in 2s.",
+      "Status: still working.\nProgress: codex child run started.\nCurrent step: Streaming codex progress from agent:codex:acp:child-1",
+      "Status: still working.\nCurrent step: codex: hello from child",
+      "Status: codex run completed in 2s.",
     ]);
     const systemEventCalls = enqueueSystemEventMock.mock.calls as Array<
       [
@@ -197,6 +211,66 @@ describe("startAcpSpawnParentStreamRelay", () => {
     relay.dispose();
   });
 
+  it("routes surfaced relay heartbeats as direct block replies when reply routing succeeds", async () => {
+    routeReplyMock.mockResolvedValue({
+      ok: true,
+    });
+
+    const relay = startAcpSpawnParentStreamRelay({
+      runId: "run-route",
+      parentSessionKey: "agent:main:main",
+      childSessionKey: "agent:codex:acp:child-route",
+      agentId: "codex",
+      deliveryContext: {
+        channel: "forum",
+        to: "-1001234567890",
+        accountId: "default",
+        threadId: 1122,
+      },
+      emitStartNotice: false,
+      streamFlushMs: 10,
+      noOutputNoticeMs: 120_000,
+    });
+
+    emitAgentEvent({
+      runId: "run-route",
+      stream: "assistant",
+      data: {
+        delta: "hello from child",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(15);
+    await Promise.resolve();
+
+    expect(routeReplyMock).toHaveBeenCalledTimes(1);
+    const routeCall = routeReplyMock.mock.calls[0]?.[0] as
+      | {
+          replyKind?: string;
+          sessionKey?: string;
+          policySessionKey?: string;
+          payload?: {
+            text?: string;
+            isStatusNotice?: boolean;
+          };
+        }
+      | undefined;
+    expect(routeCall?.replyKind).toBe("block");
+    expect(routeCall?.sessionKey).toBe("agent:main:main");
+    expect(routeCall?.policySessionKey).toBe("agent:main:main");
+    expect(routeCall?.payload?.text).toBe(
+      "Status: still working.\nCurrent step: codex: hello from child",
+    );
+    expect(routeCall?.payload?.isStatusNotice).toBe(true);
+    expect(getReplyPayloadProgressHeartbeat(routeCall?.payload ?? {})).toEqual({
+      category: "working",
+      activeRunContinues: true,
+    });
+    expect(enqueueSystemEventMock).not.toHaveBeenCalled();
+    expect(requestHeartbeatMock).not.toHaveBeenCalled();
+
+    relay.dispose();
+  });
+
   it("remaps cron-run parent session keys while relaying stream events", () => {
     const relay = startAcpSpawnParentStreamRelay({
       runId: "run-cron",
@@ -248,7 +322,10 @@ describe("startAcpSpawnParentStreamRelay", () => {
     });
 
     vi.advanceTimersByTime(1_500);
-    expectTextWithFragment(collectedTexts(), "no prompt submission was observed for 1s");
+    expectTextWithFragment(
+      collectedTexts(),
+      "Current step: codex started but no prompt submission was observed for 1s",
+    );
 
     emitAgentEvent({
       runId: "run-2",
@@ -260,8 +337,8 @@ describe("startAcpSpawnParentStreamRelay", () => {
     vi.advanceTimersByTime(5);
 
     const texts = collectedTexts();
-    expectTextWithFragment(texts, "resumed output.");
-    expectTextWithFragment(texts, "codex: resumed output");
+    expectTextWithFragment(texts, "Progress: codex resumed output.");
+    expectTextWithFragment(texts, "Current step: Processing fresh child output");
 
     emitAgentEvent({
       runId: "run-2",
@@ -298,7 +375,10 @@ describe("startAcpSpawnParentStreamRelay", () => {
     vi.advanceTimersByTime(1_500);
 
     const texts = collectedTexts();
-    expectTextWithFragment(texts, "prompt was submitted but no ACP runtime event arrived for 1s");
+    expectTextWithFragment(
+      texts,
+      "Current step: codex prompt was submitted but no ACP runtime event arrived for 1s",
+    );
     expectTextWithFragment(texts, "proxy env: HTTPS_PROXY");
     expectNoTextWithFragment(texts, "waiting for interactive input");
     relay.dispose();
@@ -342,7 +422,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
     const texts = collectedTexts();
     expectTextWithFragment(
       texts,
-      "has ACP runtime activity but no visible assistant output for 1s",
+      "Current step: codex has ACP runtime activity but no visible assistant output for 1s",
     );
     expectTextWithFragment(texts, "Last ACP event: status");
     expectNoTextWithFragment(texts, "waiting for interactive input");
@@ -386,11 +466,11 @@ describe("startAcpSpawnParentStreamRelay", () => {
       emitStartNotice: false,
     });
 
-    expectNoTextWithFragment(collectedTexts(), "Started codex session");
+    expectNoTextWithFragment(collectedTexts(), "codex child run started");
 
     relay.notifyStarted();
 
-    expectTextWithFragment(collectedTexts(), "Started codex session");
+    expectTextWithFragment(collectedTexts(), "codex child run started");
     relay.dispose();
   });
 
@@ -454,7 +534,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
     vi.advanceTimersByTime(15);
 
     const texts = collectedTexts();
-    expectTextWithFragment(texts, "codex: hello world");
+    expectTextWithFragment(texts, "Current step: codex: hello world");
     relay.dispose();
   });
 
@@ -514,7 +594,7 @@ describe("startAcpSpawnParentStreamRelay", () => {
 
     const texts = collectedTexts();
     expectNoTextWithFragment(texts, "checking thread context");
-    expectTextWithFragment(texts, "codex: final answer ready");
+    expectTextWithFragment(texts, "Current step: codex: final answer ready");
     relay.dispose();
   });
 

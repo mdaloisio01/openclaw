@@ -65,6 +65,11 @@ import {
 import { createRunningTaskRun } from "../tasks/detached-task-runtime.js";
 import { listTasksForOwnerKey } from "../tasks/runtime-internal.js";
 import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "../tasks/task-flow-runtime-internal.js";
+import { findLatestActiveMissionForOwnerKey } from "../tasks/task-registry.js";
+import {
   deliveryContextFromSession,
   formatConversationTarget,
   normalizeDeliveryContext,
@@ -195,6 +200,15 @@ type SpawnAcpResultFields = {
   inlineDelivery?: boolean;
   streamLogPath?: string;
   note?: string;
+  runningNow?: boolean;
+  runningNowAnswer?: "yes" | "no";
+  runningNowProofSummary?: string;
+  spawnExecutionTruth?: {
+    runningNow: boolean;
+    liveExecutionState: "accepted_not_yet_proven_active";
+    proofSummary: string;
+    source: "spawn_acceptance";
+  };
 };
 
 type SpawnAcpAcceptedResult = SpawnAcpResultFields & {
@@ -220,6 +234,22 @@ export const ACP_SPAWN_ACCEPTED_NOTE =
   "initial ACP task queued in isolated session; follow-ups continue in the bound thread.";
 export const ACP_SPAWN_SESSION_ACCEPTED_NOTE =
   "thread-bound ACP session stays active after this task; continue in-thread for follow-ups.";
+
+function buildSpawnAcceptanceExecutionTruthReceipt() {
+  const proofSummary =
+    "Spawn was accepted, but active child execution is not yet proven from this tool result alone.";
+  return {
+    runningNow: false as const,
+    runningNowAnswer: "no" as const,
+    runningNowProofSummary: proofSummary,
+    spawnExecutionTruth: {
+      runningNow: false,
+      liveExecutionState: "accepted_not_yet_proven_active" as const,
+      proofSummary,
+      source: "spawn_acceptance" as const,
+    },
+  };
+}
 
 export function resolveAcpSpawnRuntimePolicyError(params: {
   cfg: OpenClawConfig;
@@ -322,6 +352,30 @@ function countUntrackedActiveAcpRunsForOwner(ownerKey: string | undefined): numb
     }),
   );
   return activeAcpChildSessionKeys.size;
+}
+
+function resolveAcpSpawnParentContinuationLink(ownerKey: string | undefined): {
+  parentFlowId?: string;
+  parentTaskId?: string;
+} {
+  const normalizedOwnerKey = normalizeOptionalString(ownerKey);
+  if (!normalizedOwnerKey) {
+    return {};
+  }
+  const activeMission = findLatestActiveMissionForOwnerKey(normalizedOwnerKey);
+  const parentFlowId = activeMission?.parentFlowId?.trim();
+  if (!parentFlowId) {
+    return {};
+  }
+  const linkedFlow = getTaskFlowById(parentFlowId);
+  const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;
+  if (!linkedContinuation?.activeProductionRun) {
+    return {};
+  }
+  return {
+    parentFlowId,
+    ...(activeMission?.taskId?.trim() ? { parentTaskId: activeMission.taskId.trim() } : {}),
+  };
 }
 
 type AcpSpawnBootstrapDeliveryPlan = {
@@ -1608,6 +1662,7 @@ export async function spawnAcpDirect(
     }
     parentRelay?.notifyStarted();
     try {
+      const parentContinuationLink = resolveAcpSpawnParentContinuationLink(requesterInternalKey);
       const task = createRunningTaskRun({
         runtime: "acp",
         sourceId: childRunId,
@@ -1616,6 +1671,12 @@ export async function spawnAcpDirect(
         requesterOrigin: requesterState.origin,
         childSessionKey: sessionKey,
         runId: childRunId,
+        ...(parentContinuationLink.parentFlowId
+          ? { parentFlowId: parentContinuationLink.parentFlowId }
+          : {}),
+        ...(parentContinuationLink.parentTaskId
+          ? { parentTaskId: parentContinuationLink.parentTaskId }
+          : {}),
         label: params.label,
         task: params.task,
         preferMetadata: true,
@@ -1640,12 +1701,14 @@ export async function spawnAcpDirect(
       childSessionKey: sessionKey,
       runId: childRunId,
       mode: spawnMode,
+      ...buildSpawnAcceptanceExecutionTruthReceipt(),
       ...(streamLogPath ? { streamLogPath } : {}),
       note: spawnMode === "session" ? ACP_SPAWN_SESSION_ACCEPTED_NOTE : ACP_SPAWN_ACCEPTED_NOTE,
     };
   }
 
   try {
+    const parentContinuationLink = resolveAcpSpawnParentContinuationLink(requesterInternalKey);
     const task = createRunningTaskRun({
       runtime: "acp",
       sourceId: childRunId,
@@ -1654,6 +1717,12 @@ export async function spawnAcpDirect(
       requesterOrigin: requesterState.origin,
       childSessionKey: sessionKey,
       runId: childRunId,
+      ...(parentContinuationLink.parentFlowId
+        ? { parentFlowId: parentContinuationLink.parentFlowId }
+        : {}),
+      ...(parentContinuationLink.parentTaskId
+        ? { parentTaskId: parentContinuationLink.parentTaskId }
+        : {}),
       label: params.label,
       task: params.task,
       preferMetadata: true,
@@ -1679,6 +1748,7 @@ export async function spawnAcpDirect(
     childSessionKey: sessionKey,
     runId: childRunId,
     mode: spawnMode,
+    ...buildSpawnAcceptanceExecutionTruthReceipt(),
     ...(deliveryPlan.useInlineDelivery ? { inlineDelivery: true } : {}),
     note: spawnMode === "session" ? ACP_SPAWN_SESSION_ACCEPTED_NOTE : ACP_SPAWN_ACCEPTED_NOTE,
   };

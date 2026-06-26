@@ -1,3 +1,4 @@
+import { promises as fs } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/runs.js";
 import { createSubagentAnnounceDeliveryRuntimeMock } from "./subagent-announce.test-support.js";
@@ -46,6 +47,7 @@ const { subagentRegistryRuntimeMock } = vi.hoisted(() => ({
     countActiveDescendantRuns: vi.fn(() => 0),
     countPendingDescendantRuns: vi.fn(() => 0),
     countPendingDescendantRunsExcludingRun: vi.fn(() => 0),
+    getLatestSubagentRunByChildSessionKey: vi.fn(() => undefined),
     listSubagentRunsForRequester: vi.fn(() => []),
     replaceSubagentRunAfterSteer: vi.fn(() => true),
     resolveRequesterForChildSession: vi.fn(() => null),
@@ -295,6 +297,8 @@ describe("subagent announce seam flow", () => {
     subagentRegistryRuntimeMock.countPendingDescendantRuns.mockReturnValue(0);
     subagentRegistryRuntimeMock.countPendingDescendantRunsExcludingRun.mockReset();
     subagentRegistryRuntimeMock.countPendingDescendantRunsExcludingRun.mockReturnValue(0);
+    subagentRegistryRuntimeMock.getLatestSubagentRunByChildSessionKey.mockReset();
+    subagentRegistryRuntimeMock.getLatestSubagentRunByChildSessionKey.mockReturnValue(undefined);
     subagentRegistryRuntimeMock.listSubagentRunsForRequester.mockReset();
     subagentRegistryRuntimeMock.listSubagentRunsForRequester.mockReturnValue([]);
     subagentRegistryRuntimeMock.replaceSubagentRunAfterSteer.mockReset();
@@ -331,6 +335,97 @@ describe("subagent announce seam flow", () => {
       },
       timeoutMs: 10_000,
     });
+  });
+
+  it("ignores stale completion announces after the child session has advanced to a newer run", async () => {
+    subagentRegistryRuntimeMock.getLatestSubagentRunByChildSessionKey.mockReturnValue({
+      runId: "run-newer",
+    });
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-older",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "do thing",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "old completion that should be ignored",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(agentSpy).not.toHaveBeenCalled();
+    expect(sessionsDeleteSpy).not.toHaveBeenCalled();
+  });
+
+  it("ignores late top-level completion announces after the parent session already advanced", async () => {
+    loadSessionStoreMock.mockImplementation(() => ({
+      "agent:main:main": {
+        sessionId: "session-main",
+        updatedAt: 50,
+      },
+    }));
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-late-top-level-completion",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      requesterOrigin: {
+        channel: "webchat",
+        to: "chat:main",
+      },
+      task: "do thing",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "late completion that should be ignored",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(agentSpy).not.toHaveBeenCalled();
+    expect(sessionsDeleteSpy).not.toHaveBeenCalled();
+  });
+
+  it("still delivers top-level completion announces when the parent session has not advanced", async () => {
+    loadSessionStoreMock.mockImplementation(() => ({
+      "agent:main:main": {
+        sessionId: "session-main",
+        updatedAt: 15,
+      },
+    }));
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:test",
+      childRunId: "run-current-top-level-completion",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      requesterOrigin: {
+        channel: "webchat",
+        to: "chat:main",
+      },
+      task: "do thing",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "current completion that should still deliver",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    expect(agentSpy).toHaveBeenCalledTimes(1);
   });
 
   it("keeps lifecycle hooks enabled when deleting a completed session-mode child session", async () => {
@@ -550,5 +645,230 @@ describe("subagent announce seam flow", () => {
       "[warn] Subagent completion direct announce failed for run run-direct-failure-log: Outbound not configured for slack",
     );
     logSpy.mockRestore();
+  });
+
+  it("marks Grant closeouts still open when mandatory truth fields are missing", async () => {
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:grant",
+      childRunId: "run-grant-closeout-missing",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Grant - hardening slice",
+      task: "Grant is the lawful owner for this execution slice.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: "Implemented the file updates and proof is attached.",
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("[Grant Closeout Gate Result] rejected_closeout_missing_truth");
+    expect(msg).toContain("This run does not count as truthfully complete yet.");
+    expect(msg).toContain("Keep the item open and require a corrected Grant closeout.");
+    expect(msg).toContain("Grant closeout gate failed: rejected_closeout_missing_truth");
+    expect(msg).toContain(
+      "This is a Grant-labeled governed execution completion and it already failed the Grant closeout field check",
+    );
+    expect(msg).toContain("Missing required closeout fields:");
+  });
+
+  it("flags Grant closeouts for review when mandatory truth fields are present", async () => {
+    const proofPath = "/tmp/grant-closeout-proof.txt";
+    await fs.writeFile(proofPath, "proof");
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:grant",
+      childRunId: "run-grant-closeout-present",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Grant - hardening slice",
+      task: "Grant is the sole execution owner for this slice.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: [
+        "Run label: Grant - hardening slice",
+        "Target handled: live Grant announce review path",
+        "Artifact path(s): /tmp/artifact.md",
+        `Proof path(s): ${proofPath}`,
+        "What is materially real now: announce review now checks Grant closeout truth fields",
+        "What is still not real yet: downstream automation remains open",
+        "Who lawfully owns the next step: Will",
+        "Open/closed truth: still open",
+        "Exact next action: wire the next enforcement layer",
+      ].join("\n"),
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("[Grant Closeout Gate Result] accepted_closeout_fields_present");
+    expect(msg).toContain("Grant closeout gate review required");
+    expect(msg).toContain(
+      "Apply the Grant closeout gate before treating the original task as done.",
+    );
+    expect(msg).not.toContain("rejected_closeout_missing_truth");
+  });
+
+  it("forces explicit owner-boundary stop truth for routed open completions", async () => {
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:routing",
+      childRunId: "run-owner-boundary-stop",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Routing closeout seam",
+      task: "Route the remaining work lawfully.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: [
+        "Run label: Routing closeout seam",
+        "What is materially real now: the route artifact exists",
+        "What is still not real yet: the build is not materially complete",
+        "Who lawfully owns the next step: Fleet Command",
+        "Open/closed truth: routed to lawful owner, build still open.",
+        "Exact next action: route Fleet Command to the remaining lane work",
+      ].join("\n"),
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("The result says the build is still open.");
+    expect(msg).toContain("Lead the user-facing update with that open truth.");
+    expect(msg).toContain(
+      "Do not let a closeout, route artifact, or local slice result masquerade as build completion.",
+    );
+    expect(msg).toContain("stop_reason: owner_boundary_stop");
+    expect(msg).toContain("stop_allowed: yes");
+    expect(msg).toContain("next_owner: Fleet Command");
+    expect(msg).toContain("open_truth: routed to lawful owner, build still open.");
+    expect(msg).toContain("Name the lawful next owner exactly as Fleet Command.");
+    expect(msg).toContain(
+      "say plainly that SOP forbids you from continuing that owner's substantive lane without override",
+    );
+    expect(msg).toContain(
+      "do not imply active execution has started unless the result explicitly says it has",
+    );
+  });
+
+  it("accepts multiline markdown proof sections in Grant closeouts", async () => {
+    const proofPathA = "/tmp/grant-closeout-proof-a.txt";
+    const proofPathB = "/tmp/grant-closeout-proof-b.txt";
+    await fs.writeFile(proofPathA, "proof-a");
+    await fs.writeFile(proofPathB, "proof-b");
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:grant",
+      childRunId: "run-grant-closeout-multiline-proof",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Grant - hardening slice",
+      task: "Grant is the sole execution owner for this slice.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: [
+        "Run label",
+        "",
+        "`Grant - hardening slice`",
+        "",
+        "Target handled",
+        "",
+        "`live Grant announce review path`",
+        "",
+        "Artifact path(s)",
+        "",
+        "- `/tmp/artifact.md`",
+        "",
+        "Proof path(s)",
+        "",
+        `- \`${proofPathA}\``,
+        `- [proof-b](${proofPathB}:12)`,
+        "",
+        "What is materially real now",
+        "",
+        "- announce review now checks Grant closeout truth fields",
+        "",
+        "What is still not real yet",
+        "",
+        "- downstream automation remains open",
+        "",
+        "Who lawfully owns the next step",
+        "",
+        "`Will`",
+        "",
+        "Open/closed truth",
+        "",
+        "`still open`",
+        "",
+        "Exact next action",
+        "",
+        "- wire the next enforcement layer",
+      ].join("\n"),
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("[Grant Closeout Gate Result] accepted_closeout_fields_present");
+    expect(msg).not.toContain("rejected_proof_missing");
+  });
+
+  it("accepts proof-supporting-this-claim as a multiline Grant proof section alias", async () => {
+    const proofPathA = "/tmp/grant-closeout-proof-alias-a.txt";
+    const proofPathB = "/tmp/grant-closeout-proof-alias-b.txt";
+    await fs.writeFile(proofPathA, "proof-a");
+    await fs.writeFile(proofPathB, "proof-b");
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:grant",
+      childRunId: "run-grant-closeout-proof-alias",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Grant - hardening slice",
+      task: "Grant is the sole execution owner for this slice.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: [
+        "Run label: Grant - hardening slice",
+        "Target handled: live Grant announce review path",
+        "Artifact path(s): /tmp/artifact.md",
+        "Proof supporting this claim",
+        "",
+        `- \`${proofPathA}\``,
+        `- [proof-b](${proofPathB}:8)`,
+        "",
+        "What is materially real now: announce review now checks Grant closeout truth fields",
+        "What is still not real yet: downstream automation remains open",
+        "Who lawfully owns the next step: Will",
+        "Open/closed truth: still open",
+        "Exact next action: wire the next enforcement layer",
+      ].join("\n"),
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("[Grant Closeout Gate Result] accepted_closeout_fields_present");
+    expect(msg).not.toContain("rejected_proof_missing");
   });
 });

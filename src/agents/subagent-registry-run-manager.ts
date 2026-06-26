@@ -4,6 +4,11 @@ import { callGateway } from "../gateway/call.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import { createRunningTaskRun } from "../tasks/detached-task-runtime.js";
+import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "../tasks/task-flow-runtime-internal.js";
+import { findLatestActiveMissionForOwnerKey } from "../tasks/task-registry.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 import { buildAgentRunTerminalOutcomeFromWaitResult } from "./agent-run-terminal-outcome.js";
@@ -150,10 +155,56 @@ export type RegisterSubagentRunParams = {
   runTimeoutSeconds?: number;
   expectsCompletionMessage?: boolean;
   spawnMode?: "run" | "session";
+  parentFlowId?: string;
+  parentTaskId?: string;
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;
 };
+
+function resolveParentContinuationLink(params: {
+  requesterSessionKey: string;
+  parentFlowId?: string;
+  parentTaskId?: string;
+}): {
+  parentFlowId?: string;
+  parentTaskId?: string;
+  productionContinuation?: SubagentRunRecord["productionContinuation"];
+} {
+  const explicitParentFlowId = params.parentFlowId?.trim();
+  const explicitParentTaskId = params.parentTaskId?.trim();
+  const activeMission =
+    explicitParentFlowId || explicitParentTaskId
+      ? undefined
+      : findLatestActiveMissionForOwnerKey(params.requesterSessionKey);
+  const parentFlowId = explicitParentFlowId ?? activeMission?.parentFlowId?.trim();
+  const parentTaskId = explicitParentTaskId ?? activeMission?.taskId?.trim();
+  if (!parentFlowId) {
+    return {
+      ...(parentTaskId ? { parentTaskId } : {}),
+    };
+  }
+  const linkedFlow = getTaskFlowById(parentFlowId);
+  const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;
+  return {
+    parentFlowId,
+    ...(parentTaskId ? { parentTaskId } : {}),
+    ...(linkedContinuation?.activeProductionRun
+      ? {
+          productionContinuation: {
+            activeProductionRun: linkedContinuation.activeProductionRun,
+            continuationRequiredAfterLocalSuccess:
+              linkedContinuation.continuationRequiredAfterLocalSuccess,
+            nextExecutableUnitIdentified: linkedContinuation.nextExecutableUnitIdentified,
+            nextExecutableUnitLaunched: linkedContinuation.nextExecutableUnitLaunched,
+            continuationViolation: linkedContinuation.continuationViolation,
+            lawfulStopReason: linkedContinuation.lawfulStopReason,
+            parentFlowId,
+          },
+        }
+      : {}),
+  };
+}
 
 export function createSubagentRunManager(params: {
   runs: Map<string, SubagentRunRecord>;
@@ -626,6 +677,11 @@ export function createSubagentRunManager(params: {
     const runTimeoutSeconds = registerParams.runTimeoutSeconds ?? 0;
     const waitTimeoutMs = params.resolveSubagentWaitTimeoutMs(cfg, runTimeoutSeconds);
     const requesterOrigin = normalizeDeliveryContext(registerParams.requesterOrigin);
+    const parentContinuationLink = resolveParentContinuationLink({
+      requesterSessionKey,
+      parentFlowId: registerParams.parentFlowId,
+      parentTaskId: registerParams.parentTaskId,
+    });
     const entry: SubagentRunRecord = normalizeSubagentRunState({
       runId,
       childSessionKey,
@@ -660,6 +716,9 @@ export function createSubagentRunManager(params: {
       archiveAtMs,
       cleanupHandled: false,
       wakeOnDescendantSettle: undefined,
+      ...(parentContinuationLink.productionContinuation
+        ? { productionContinuation: parentContinuationLink.productionContinuation }
+        : {}),
       attachmentsDir: registerParams.attachmentsDir,
       attachmentsRootDir: registerParams.attachmentsRootDir,
       retainAttachmentsOnKeep: registerParams.retainAttachmentsOnKeep,
@@ -680,6 +739,12 @@ export function createSubagentRunManager(params: {
         requesterOrigin,
         childSessionKey,
         runId,
+        ...(parentContinuationLink.parentFlowId
+          ? { parentFlowId: parentContinuationLink.parentFlowId }
+          : {}),
+        ...(parentContinuationLink.parentTaskId
+          ? { parentTaskId: parentContinuationLink.parentTaskId }
+          : {}),
         label: registerParams.label,
         task: registerParams.task,
         deliveryStatus:

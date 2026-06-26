@@ -1,5 +1,8 @@
 import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
-import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import {
   normalizeStringEntries,
   uniqueStrings,
@@ -44,6 +47,7 @@ import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/r
 import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
 import type { AgentInternalEvent } from "./internal-events.js";
 import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
+import { buildExplicitStopExplanation } from "./stop-contract.js";
 import {
   callGateway,
   createBoundDeliveryRouter,
@@ -878,12 +882,46 @@ function resolveTextCompletionDirectFallback(events: readonly AgentInternalEvent
     if (event.status !== "ok") {
       continue;
     }
+    const openTruth = normalizeOptionalString(event.openTruth);
+    if (openTruth) {
+      if (event.stopAllowed === false) {
+        return undefined;
+      }
+      return buildExplicitStopExplanation({
+        stopReason: normalizeOptionalString(event.stopReason),
+        stopAllowed: typeof event.stopAllowed === "boolean" ? event.stopAllowed : undefined,
+        nextOwner: normalizeOptionalString(event.nextOwner),
+        openTruth,
+      });
+    }
     const result = typeof event.result === "string" ? event.result.trim() : "";
     if (result && result !== "(no output)") {
       return result;
     }
   }
   return undefined;
+}
+
+function hasNonTerminalStillOpenCompletion(
+  events: readonly AgentInternalEvent[] | undefined,
+): boolean {
+  for (let index = (events?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const event = events?.[index];
+    if (event?.type !== "task_completion" || event.source !== "subagent") {
+      continue;
+    }
+    if (event.status !== "ok") {
+      continue;
+    }
+    if (
+      normalizeOptionalString(event.openTruth) &&
+      normalizeOptionalString(event.stopReason) &&
+      event.stopAllowed === false
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function hasFailedSubagentNoOutputCompletion(events: readonly AgentInternalEvent[] | undefined) {
@@ -951,6 +989,16 @@ async function deliverTextCompletionDirect(params: {
       error: `text completion direct delivery failed: ${summarizeDeliveryError(err)}`,
     };
   }
+}
+
+function buildStillOpenCompletionHandoffFailure(): SubagentAnnounceDeliveryResult {
+  return {
+    delivered: false,
+    path: "direct",
+    reason: "completion_handoff_pending",
+    error:
+      "still-open completion requires active continuation or lawful handoff; direct terminal fallback is forbidden",
+  };
 }
 
 function resolveGeneratedMediaDirectFallbackUrls(params: {
@@ -1449,6 +1497,9 @@ async function sendSubagentAnnounceDirectly(params: {
         if (textDelivery) {
           return textDelivery;
         }
+        if (hasNonTerminalStillOpenCompletion(params.internalEvents)) {
+          return buildStillOpenCompletionHandoffFailure();
+        }
       }
       if (
         activeRequesterWakeFailed &&
@@ -1545,6 +1596,9 @@ async function sendSubagentAnnounceDirectly(params: {
       if (textDelivery) {
         return textDelivery;
       }
+      if (hasNonTerminalStillOpenCompletion(params.internalEvents)) {
+        return buildStillOpenCompletionHandoffFailure();
+      }
       if (hasFailedSubagentNoOutputCompletion(params.internalEvents)) {
         return {
           delivered: false,
@@ -1578,6 +1632,9 @@ async function sendSubagentAnnounceDirectly(params: {
         });
         if (textDelivery) {
           return textDelivery;
+        }
+        if (hasNonTerminalStillOpenCompletion(params.internalEvents)) {
+          return buildStillOpenCompletionHandoffFailure();
         }
       }
       return {

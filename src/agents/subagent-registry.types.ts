@@ -31,12 +31,31 @@ export type SubagentExecutionState = {
   transcriptFile?: string;
 };
 
+export type GrantCloseoutGateState = {
+  applies: boolean;
+  passed: boolean;
+  reviewStatus?: "not_applicable" | "passed" | "rejected";
+  outcomeCode?: string;
+  assessedAt?: number;
+  missingFields?: string[];
+  missingProofPaths?: string[];
+  requiresCorrectedCloseout?: boolean;
+  materialProgressState?:
+    | "closeout_not_applicable"
+    | "closeout_review_passed"
+    | "closeout_rejected";
+  auditReceiptPath?: string;
+  correctionCandidateQueuePath?: string;
+  correctionCandidateQueuedAt?: number;
+};
+
 export type SubagentCompletionState = {
   required: boolean;
   resultText?: string | null;
   capturedAt?: number;
   fallbackResultText?: string | null;
   fallbackCapturedAt?: number;
+  grantCloseoutGate?: GrantCloseoutGateState;
 };
 
 export type SubagentCompletionDeliveryState = {
@@ -79,6 +98,16 @@ export type SubagentCompletionDeliveryState = {
     | "waiting_for_requester_turn";
 };
 
+export type SubagentProductionContinuationState = {
+  activeProductionRun?: boolean;
+  continuationRequiredAfterLocalSuccess?: boolean;
+  nextExecutableUnitIdentified?: boolean;
+  nextExecutableUnitLaunched?: boolean;
+  continuationViolation?: boolean;
+  lawfulStopReason?: string;
+  parentFlowId?: string;
+};
+
 export type SubagentRunRecord = {
   runId: string;
   childSessionKey: string;
@@ -117,6 +146,7 @@ export type SubagentRunRecord = {
   browserCleanupDispatchedAt?: number;
   /** Durable outbox marker for parent/external completion delivery. */
   delivery?: SubagentCompletionDeliveryState;
+  productionContinuation?: SubagentProductionContinuationState;
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;

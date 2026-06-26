@@ -1,5 +1,19 @@
+import { spawnSync } from "node:child_process";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CallGatewayOptions } from "../gateway/call.js";
+import { createTaskRecord, resetTaskRegistryForTests } from "../tasks/runtime-internal.js";
+import { listTaskFlowAuditFindings } from "../tasks/task-flow-registry.audit.js";
+import {
+  createBlindTestSliceFlow,
+  createManagedTaskFlow,
+  getTaskFlowById,
+  resetTaskFlowRegistryForTests,
+} from "../tasks/task-flow-runtime-internal.js";
+import { listTaskAuditFindings } from "../tasks/task-registry.audit.js";
+import { findLatestTaskForSessionKey } from "../tasks/task-registry.js";
 import {
   buildAnnounceIdFromChildRun,
   buildAnnounceIdempotencyKey,
@@ -14,6 +28,12 @@ import { createSubagentRegistryLifecycleController } from "./subagent-registry-l
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 type LifecycleControllerParams = Parameters<typeof createSubagentRegistryLifecycleController>[0];
+const repoRoot = path.resolve(import.meta.dirname, "../..");
+const grantRetirementRequestScriptPath = path.join(
+  repoRoot,
+  "scripts",
+  "grant-retirement-request.mjs",
+);
 
 const taskExecutorMocks = vi.hoisted(() => ({
   completeTaskRunByRunId: vi.fn(),
@@ -187,6 +207,7 @@ function createLifecycleController({
     emitSubagentEndedHookForRun: vi.fn(async () => {}),
     notifyContextEngineSubagentEnded: vi.fn(async () => {}),
     resumeSubagentRun: vi.fn(),
+    replaceSubagentRunAfterSteer: vi.fn(() => true),
     callGateway: async <T = Record<string, unknown>>(opts: CallGatewayOptions): Promise<T> =>
       (await gatewayMocks.callGateway(opts)) as T,
     captureSubagentCompletionReply: vi.fn(async () => "final completion reply"),
@@ -985,7 +1006,7 @@ describe("subagent registry lifecycle hardening", () => {
       runtime: "subagent",
       sessionKey: entry.childSessionKey,
       progressSummary: "final answer",
-      terminalOutcome: "blocked",
+      terminalOutcome: "succeeded",
       terminalSummary:
         "Required completion delivery failed before reaching the requester: gateway request timeout for agent.",
     });
@@ -1167,13 +1188,15 @@ describe("subagent registry lifecycle hardening", () => {
     expectFields(
       findCallArg(
         taskExecutorMocks.completeTaskRunByRunId,
-        (arg) => arg.terminalOutcome === "blocked",
+        (arg) =>
+          arg.terminalSummary ===
+          "Required completion delivery failed before reaching the requester: UNAVAILABLE: requester wake failed; direct-primary: UNAVAILABLE: requester wake failed.",
       ),
       {
         runId: entry.runId,
         runtime: "subagent",
         sessionKey: entry.childSessionKey,
-        terminalOutcome: "blocked",
+        terminalOutcome: "succeeded",
         terminalSummary:
           "Required completion delivery failed before reaching the requester: UNAVAILABLE: requester wake failed; direct-primary: UNAVAILABLE: requester wake failed.",
       },
@@ -1400,5 +1423,1013 @@ describe("subagent registry lifecycle hardening", () => {
     // Release the held first cleanup so the first caller can settle too.
     releaseFirstCleanup?.();
     await expect(firstCompletion).resolves.toBeUndefined();
+  });
+
+  it("materializes a Grant retirement request artifact from the canonical template", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-retirement-helper-"));
+    await fs.mkdir(path.join(workspaceDir, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "templates", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "var", "grant"), { recursive: true });
+    const proofPath = path.join(workspaceDir, "proof.txt");
+    await fs.writeFile(proofPath, "proof", "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+      [
+        "# Grant Doctrine",
+        "",
+        "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+        "Grant remains a bounded governed execution owner under Will.",
+        "Will remains the packet-sharpening and top command layer.",
+        "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+        "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      [
+        "# Grant Corrections Matrix",
+        "",
+        "## Active corrections",
+        "",
+        "<!-- grant-generated-correction:rejected_proof_missing -->",
+        "",
+        "### GC-006: Do not cite proof that is not materially there",
+        "",
+        "- Trigger:",
+        "  - Grant cites proof paths that are missing, unreadable, or not concretely named",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(
+        workspaceDir,
+        "templates",
+        "grant",
+        "grant_correction_retirement_request_template.json",
+      ),
+      JSON.stringify(
+        {
+          schema_version: "0.1.0",
+          artifact_type: "grant_correction_retirement_request",
+          requestedBy: "Will",
+          approvedBy: "Will",
+          outcomeCode: "",
+          reason: "obsolete_rule",
+          evidence: "",
+          resolutionProofPaths: [],
+          notes: "",
+          requestedAt: "",
+          approvedAt: "",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "var", "grant", "grant_correction_retirements.jsonl"),
+      `${JSON.stringify({
+        queuedAt: "2026-06-06T05:02:00.000Z",
+        requestedBy: "Will",
+        approvedBy: "Will",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "Runtime gate now has stronger proof handling.",
+        resolutionProofPaths: [proofPath],
+        notes: "generated during test",
+      })}\n`,
+      "utf8",
+    );
+    const entry = createRunEntry({
+      label: "Grant - retirement helper",
+      task: "execution owner: Grant",
+      workspaceDir,
+    });
+    const completionText = [
+      "Run label: Grant - retirement helper",
+      "Target handled: retire generated correction",
+      `Artifact path(s): ${path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md")}`,
+      `Proof path(s): ${proofPath}`,
+      "What is materially real now: the retirement helper path is active",
+      "What is still not real yet: broader end-to-end proof",
+      "Who lawfully owns the next step: Will",
+      "Open/closed truth: owner execution in progress, build still open.",
+      "Exact next action: continue hardening",
+    ].join("\n");
+    const controller = createLifecycleController({ entry });
+    await controller.testing.persistGrantCloseoutGateAudit({
+      entry,
+      result: {
+        assessment: {
+          applies: true,
+          passed: true,
+          outcomeCode: "accepted_closeout_fields_present",
+          missingFields: [],
+          missingProofPaths: [],
+        },
+        findings: completionText,
+        rawFindings: completionText,
+        taskLabel: "Grant - retirement helper",
+        statusLabel: "passed",
+      },
+    });
+
+    const requestDir = path.join(workspaceDir, "var", "grant", "retirement_requests");
+    await vi.waitFor(async () => {
+      const matrixAfter = await fs.readFile(
+        path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+        "utf8",
+      );
+      expect(matrixAfter).not.toContain("grant-generated-correction:rejected_proof_missing");
+    });
+    const requestDirEntries = await vi.waitFor(async () => {
+      const entries = await fs.readdir(requestDir);
+      expect(entries).toHaveLength(1);
+      return entries;
+    });
+    const requestArtifact = JSON.parse(
+      await fs.readFile(path.join(requestDir, requestDirEntries[0] ?? ""), "utf8"),
+    ) as Record<string, unknown>;
+    expect(requestArtifact.artifact_type).toBe("grant_correction_retirement_request");
+    expect(requestArtifact.outcomeCode).toBe("rejected_proof_missing");
+    expect(requestArtifact.reason).toBe("capability_materially_fixed");
+    expect(requestArtifact.grantRulebook).toMatchObject({
+      doctrinePath: path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+      correctionsPath: path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+    });
+
+    const archiveRaw = await fs.readFile(
+      path.join(workspaceDir, "var", "grant", "grant_correction_retirements.archive.jsonl"),
+      "utf8",
+    );
+    expect(archiveRaw).toContain('"archiveReason":"retired_from_corrections_matrix"');
+    expect(archiveRaw).toContain('"requestPath"');
+  });
+
+  it("fails closed when retirement request materialization cannot load the canonical template", async () => {
+    const workspaceDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "grant-retirement-helper-missing-"),
+    );
+    await fs.mkdir(path.join(workspaceDir, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "var", "grant"), { recursive: true });
+    const proofPath = path.join(workspaceDir, "proof.txt");
+    await fs.writeFile(proofPath, "proof", "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+      [
+        "# Grant Doctrine",
+        "",
+        "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+        "Grant remains a bounded governed execution owner under Will.",
+        "Will remains the packet-sharpening and top command layer.",
+        "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+        "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      [
+        "# Grant Corrections Matrix",
+        "",
+        "## Active corrections",
+        "",
+        "<!-- grant-generated-correction:rejected_proof_missing -->",
+        "",
+        "### GC-006: Do not cite proof that is not materially there",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "var", "grant", "grant_correction_retirements.jsonl"),
+      `${JSON.stringify({
+        queuedAt: "2026-06-06T05:02:00.000Z",
+        requestedBy: "Will",
+        approvedBy: "Will",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "Runtime gate now has stronger proof handling.",
+        resolutionProofPaths: [proofPath],
+      })}\n`,
+      "utf8",
+    );
+    const entry = createRunEntry({
+      label: "Grant - retirement helper missing template",
+      task: "execution owner: Grant",
+      workspaceDir,
+    });
+    const completionText = [
+      "Run label: Grant - retirement helper missing template",
+      "Target handled: retire generated correction",
+      `Artifact path(s): ${path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md")}`,
+      `Proof path(s): ${proofPath}`,
+      "What is materially real now: the runtime evaluated the retirement queue",
+      "What is still not real yet: the canonical template file is missing",
+      "Who lawfully owns the next step: Will",
+      "Open/closed truth: owner execution in progress, build still open.",
+      "Exact next action: restore the template",
+    ].join("\n");
+    const controller = createLifecycleController({ entry });
+    await controller.testing.persistGrantCloseoutGateAudit({
+      entry,
+      result: {
+        assessment: {
+          applies: true,
+          passed: true,
+          outcomeCode: "accepted_closeout_fields_present",
+          missingFields: [],
+          missingProofPaths: [],
+        },
+        findings: completionText,
+        rawFindings: completionText,
+        taskLabel: "Grant - retirement helper missing template",
+        statusLabel: "passed",
+      },
+    });
+
+    await vi.waitFor(async () => {
+      const matrixAfter = await fs.readFile(
+        path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+        "utf8",
+      );
+      expect(matrixAfter).toContain("grant-generated-correction:rejected_proof_missing");
+    });
+
+    const rejectedArchiveRaw = await vi.waitFor(
+      async () =>
+        await fs.readFile(
+          path.join(workspaceDir, "var", "grant", "grant_correction_retirements.rejected.jsonl"),
+          "utf8",
+        ),
+    );
+    expect(rejectedArchiveRaw).toContain("retirement request template missing or unreadable");
+  });
+
+  it("fails closed when the lifecycle helper path sees a stale Grant doctrine without the boundary rule", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-retirement-helper-stale-"));
+    await fs.mkdir(path.join(workspaceDir, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "templates", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "var", "grant"), { recursive: true });
+    const proofPath = path.join(workspaceDir, "proof.txt");
+    await fs.writeFile(proofPath, "proof", "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+      "# Grant Doctrine\nOld doctrine body only.\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      [
+        "# Grant Corrections Matrix",
+        "",
+        "## Active corrections",
+        "",
+        "<!-- grant-generated-correction:rejected_proof_missing -->",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(
+        workspaceDir,
+        "templates",
+        "grant",
+        "grant_correction_retirement_request_template.json",
+      ),
+      JSON.stringify(
+        {
+          schema_version: "0.1.0",
+          artifact_type: "grant_correction_retirement_request",
+          requestedBy: "Will",
+          approvedBy: "Will",
+          outcomeCode: "",
+          reason: "obsolete_rule",
+          evidence: "",
+          resolutionProofPaths: [],
+          notes: "",
+          requestedAt: "",
+          approvedAt: "",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "var", "grant", "grant_correction_retirements.jsonl"),
+      `${JSON.stringify({
+        queuedAt: "2026-06-06T05:02:00.000Z",
+        requestedBy: "Will",
+        approvedBy: "Will",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "Runtime gate now has stronger proof handling.",
+        resolutionProofPaths: [proofPath],
+      })}\n`,
+      "utf8",
+    );
+    const entry = createRunEntry({
+      label: "Grant - stale doctrine helper",
+      task: "execution owner: Grant",
+      workspaceDir,
+    });
+    const completionText = [
+      "Run label: Grant - stale doctrine helper",
+      "Target handled: retire generated correction",
+      `Artifact path(s): ${path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md")}`,
+      `Proof path(s): ${proofPath}`,
+      "What is materially real now: the runtime evaluated the retirement queue",
+      "What is still not real yet: the doctrine boundary lock is stale",
+      "Who lawfully owns the next step: Will",
+      "Open/closed truth: owner execution in progress, build still open.",
+      "Exact next action: restore the Grant doctrine boundary lock",
+    ].join("\n");
+    const controller = createLifecycleController({ entry });
+    await controller.testing.persistGrantCloseoutGateAudit({
+      entry,
+      result: {
+        assessment: {
+          applies: true,
+          passed: true,
+          outcomeCode: "accepted_closeout_fields_present",
+          missingFields: [],
+          missingProofPaths: [],
+        },
+        findings: completionText,
+        rawFindings: completionText,
+        taskLabel: "Grant - stale doctrine helper",
+        statusLabel: "passed",
+      },
+    });
+
+    const rejectedArchiveRaw = await vi.waitFor(
+      async () =>
+        await fs.readFile(
+          path.join(workspaceDir, "var", "grant", "grant_correction_retirements.rejected.jsonl"),
+          "utf8",
+        ),
+    );
+    expect(rejectedArchiveRaw).toContain("Grant doctrine missing required boundary rule");
+  });
+
+  it("does not queue a duplicate Grant correction candidate when that generated correction is already active", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-correction-dedupe-"));
+    await fs.mkdir(path.join(workspaceDir, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "var", "grant"), { recursive: true });
+    const proofPath = path.join(workspaceDir, "proof.txt");
+    await fs.writeFile(proofPath, "proof", "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      [
+        "# Grant Corrections Matrix",
+        "",
+        "## Active corrections",
+        "",
+        "<!-- grant-generated-correction:rejected_proof_missing -->",
+        "",
+        "### GC-006: Do not cite proof that is not materially there",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.mkdir(path.join(workspaceDir, "var", "grant", "audits"), { recursive: true });
+    await fs.writeFile(
+      path.join(
+        workspaceDir,
+        "var",
+        "grant",
+        "audits",
+        "2026-06-10T000000Z_prior-grant-audit_run-old.md",
+      ),
+      [
+        "# Grant After-Action Audit",
+        "",
+        "[Grant Closeout Gate Result] rejected_proof_missing",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const entry = createRunEntry({
+      label: "Grant - duplicate correction guard",
+      task: "execution owner: Grant",
+      workspaceDir,
+    });
+    const completionText = [
+      "Run label: Grant - duplicate correction guard",
+      "Target handled: do not queue duplicate Grant correction candidates",
+      `Artifact path(s): ${path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md")}`,
+      `Proof path(s): ${proofPath}`,
+      "What is materially real now: the Grant gate failure was captured",
+      "What is still not real yet: broader live proof",
+      "Who lawfully owns the next step: Will",
+      "Open/closed truth: owner execution in progress, build still open.",
+      "Exact next action: keep the active correction and avoid duplicate queue churn",
+    ].join("\n");
+    const controller = createLifecycleController({ entry });
+
+    await controller.testing.persistGrantCloseoutGateAudit({
+      entry,
+      result: {
+        assessment: {
+          applies: true,
+          passed: false,
+          outcomeCode: "rejected_proof_missing",
+          missingFields: [],
+          missingProofPaths: ["no readable proof path found"],
+        },
+        findings: completionText,
+        rawFindings: completionText,
+        taskLabel: "Grant - duplicate correction guard",
+        statusLabel: "failed",
+      },
+    });
+
+    await vi.waitFor(async () => {
+      const auditPath = entry.completion?.grantCloseoutGate?.auditReceiptPath;
+      expect(auditPath).toBeTruthy();
+      const raw = await fs.readFile(auditPath!, "utf8");
+      expect(raw).toContain("- none");
+      expect(raw).toContain("- candidate label: n/a");
+      expect(raw).toContain("- audit note only");
+    });
+
+    await expect(
+      fs.readFile(
+        path.join(workspaceDir, "var", "grant", "grant_correction_candidates.jsonl"),
+        "utf8",
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("retires a generated correction from a real operator-created retirement request", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-retirement-end-to-end-"));
+    await fs.mkdir(path.join(workspaceDir, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "templates", "grant"), { recursive: true });
+    const proofPath = path.join(workspaceDir, "proof.txt");
+    await fs.writeFile(proofPath, "proof", "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+      [
+        "# Grant Doctrine",
+        "",
+        "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+        "Grant remains a bounded governed execution owner under Will.",
+        "Will remains the packet-sharpening and top command layer.",
+        "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+        "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      [
+        "# Grant Corrections Matrix",
+        "",
+        "## Active corrections",
+        "",
+        "<!-- grant-generated-correction:rejected_proof_missing -->",
+        "",
+        "### GC-006: Do not cite proof that is not materially there",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(
+        workspaceDir,
+        "templates",
+        "grant",
+        "grant_correction_retirement_request_template.json",
+      ),
+      JSON.stringify(
+        {
+          schema_version: "0.1.0",
+          artifact_type: "grant_correction_retirement_request",
+          requestedBy: "Will",
+          approvedBy: "Will",
+          outcomeCode: "",
+          reason: "obsolete_rule",
+          evidence: "",
+          resolutionProofPaths: [],
+          notes: "",
+          requestedAt: "",
+          approvedAt: "",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const commandResult = spawnSync(
+      process.execPath,
+      [
+        grantRetirementRequestScriptPath,
+        "--workspace",
+        workspaceDir,
+        "--outcome-code",
+        "rejected_proof_missing",
+        "--reason",
+        "capability_materially_fixed",
+        "--evidence",
+        "Integrated end-to-end retirement proof.",
+        "--proof-path",
+        proofPath,
+      ],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+      },
+    );
+
+    expect(commandResult.status).toBe(0);
+    const commandStdout = JSON.parse(commandResult.stdout) as {
+      requestPath: string;
+      queuePath: string;
+    };
+    expect(commandStdout.requestPath).toContain(path.join("var", "grant", "retirement_requests"));
+    expect(commandStdout.queuePath).toContain(
+      path.join("var", "grant", "grant_correction_retirements.jsonl"),
+    );
+
+    const entry = createRunEntry({
+      label: "Grant - operator request end to end",
+      task: "execution owner: Grant",
+      workspaceDir,
+    });
+    const completionText = [
+      "Run label: Grant - operator request end to end",
+      "Target handled: retire generated correction via real operator command",
+      `Artifact path(s): ${path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md")}`,
+      `Proof path(s): ${proofPath}`,
+      "What is materially real now: the operator command and runtime path both executed",
+      "What is still not real yet: broader live runtime proof beyond focused tests",
+      "Who lawfully owns the next step: Will",
+      "Open/closed truth: owner execution in progress, build still open.",
+      "Exact next action: continue hardening",
+    ].join("\n");
+    const controller = createLifecycleController({ entry });
+    await controller.testing.persistGrantCloseoutGateAudit({
+      entry,
+      result: {
+        assessment: {
+          applies: true,
+          passed: true,
+          outcomeCode: "accepted_closeout_fields_present",
+          missingFields: [],
+          missingProofPaths: [],
+        },
+        findings: completionText,
+        rawFindings: completionText,
+        taskLabel: "Grant - operator request end to end",
+        statusLabel: "passed",
+      },
+    });
+
+    const matrixAfter = await fs.readFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      "utf8",
+    );
+    expect(matrixAfter).not.toContain("grant-generated-correction:rejected_proof_missing");
+
+    const archiveRaw = await fs.readFile(
+      path.join(workspaceDir, "var", "grant", "grant_correction_retirements.archive.jsonl"),
+      "utf8",
+    );
+    expect(archiveRaw).toContain('"archiveReason":"retired_from_corrections_matrix"');
+    expect(archiveRaw).toContain(commandStdout.requestPath);
+  });
+
+  it("forces Grant gate failures into blocked same-slice follow-up and flow rework state", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-closeout-flow-"));
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = workspaceDir;
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    try {
+      const entry = createRunEntry({
+        label: "Grant closeout continuity",
+        task: "Grant blind-test slice continuity",
+        workspaceDir,
+      });
+      const flow = createBlindTestSliceFlow({
+        ownerKey: entry.requesterSessionKey,
+        goal: "Grant blind-test slice continuity",
+        sliceKey: "grant-slice-9",
+        subjectAgent: "Grant",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: entry.requesterSessionKey,
+        requesterSessionKey: entry.requesterSessionKey,
+        scopeKind: "session",
+        childSessionKey: entry.childSessionKey,
+        parentFlowId: flow.flowId,
+        runId: entry.runId,
+        task: "Grant slice closeout",
+        missionId: "mission-grant-slice-9",
+        missionSummary: "Correct the same Grant blind-test slice 9 closeout",
+        missionState: "active",
+        status: "succeeded",
+        deliveryStatus: "pending",
+      });
+      const controller = createLifecycleController({
+        entry,
+        callGateway: async <T = Record<string, unknown>>(): Promise<T> =>
+          ({ runId: "run-grant-slice-9-rework" }) as T,
+      });
+      const completionText = [
+        "Run label: Grant closeout continuity",
+        "What is materially real now: slice output exists",
+        "What is still not real yet: proof packet is not readable",
+        "Who lawfully owns the next step: Will",
+        "Open/closed truth: owner execution in progress, build still open.",
+        "Exact next action: retry the same slice with readable proof",
+      ].join("\n");
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: false,
+            outcomeCode: "rejected_proof_missing",
+            missingFields: [],
+            missingProofPaths: ["no readable proof path found"],
+          },
+          findings: completionText,
+          rawFindings: completionText,
+          taskLabel: entry.label,
+          statusLabel: "completed",
+        },
+      });
+
+      expectFields(
+        findCallArg(
+          taskExecutorMocks.completeTaskRunByRunId,
+          (arg) => arg.runId === entry.runId && arg.terminalOutcome === "blocked",
+        ),
+        {
+          runId: entry.runId,
+          runtime: "subagent",
+          sessionKey: entry.childSessionKey,
+          terminalOutcome: "blocked",
+        },
+      );
+      const updatedFlow = getTaskFlowById(flow.flowId);
+      expect(updatedFlow?.currentStep).toBe("closeout_rework_running");
+      expect(updatedFlow?.blockedSummary ?? null).toBeNull();
+      expect(entry.productionContinuation).toMatchObject({
+        activeProductionRun: true,
+        parentFlowId: flow.flowId,
+        nextExecutableUnitIdentified: true,
+        nextExecutableUnitLaunched: true,
+      });
+      expect(findLatestTaskForSessionKey(entry.childSessionKey)).toMatchObject({
+        task: "Grant slice closeout rework",
+        missionId: "mission-grant-slice-9",
+        missionState: "active",
+        runId: "run-grant-slice-9-rework",
+        status: "running",
+      });
+      expect(
+        listTaskAuditFindings({
+          now: Date.now(),
+          tasks: [findLatestTaskForSessionKey(entry.childSessionKey)!],
+        }).map((finding) => finding.code),
+      ).not.toContain("rework_follow_through_violation");
+      expect(
+        listTaskFlowAuditFindings({ now: Date.now() }).some(
+          (finding) =>
+            finding.code === "continuation_required_not_launched" &&
+            finding.flow?.flowId === flow.flowId,
+        ),
+      ).toBe(false);
+    } finally {
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+      process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records a lawful blocked closeout when same-slice rework cannot be relaunched", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-closeout-blocked-"));
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = workspaceDir;
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    try {
+      const entry = createRunEntry({
+        label: "Grant closeout blocked",
+        task: "Grant blind-test slice blocked",
+        workspaceDir,
+      });
+      const flow = createBlindTestSliceFlow({
+        ownerKey: entry.requesterSessionKey,
+        goal: "Grant blind-test slice blocked",
+        sliceKey: "grant-slice-blocked",
+        subjectAgent: "Grant",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: entry.requesterSessionKey,
+        requesterSessionKey: entry.requesterSessionKey,
+        scopeKind: "session",
+        childSessionKey: entry.childSessionKey,
+        parentFlowId: flow.flowId,
+        runId: entry.runId,
+        task: "Grant slice closeout",
+        missionId: "mission-grant-slice-blocked",
+        missionSummary: "Correct the same Grant blind-test slice blocked closeout",
+        missionState: "active",
+        status: "succeeded",
+        deliveryStatus: "pending",
+      });
+      const controller = createLifecycleController({
+        entry,
+        callGateway: async <T = Record<string, unknown>>(): Promise<T> => ({}) as T,
+      });
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: false,
+            outcomeCode: "rejected_proof_missing",
+            missingFields: [],
+            missingProofPaths: ["no readable proof path found"],
+          },
+          findings:
+            "Run label: Grant closeout blocked\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof",
+          rawFindings:
+            "Run label: Grant closeout blocked\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof",
+          taskLabel: entry.label,
+          statusLabel: "completed",
+        },
+      });
+
+      const blockedFlow = getTaskFlowById(flow.flowId);
+      expect(blockedFlow?.currentStep).toBe("rework_launch_blocked");
+      expect(blockedFlow?.blockedSummary).toContain("REWORK_FOLLOW_THROUGH_VIOLATION");
+      expect(entry.productionContinuation).toMatchObject({
+        activeProductionRun: true,
+        lawfulStopReason: "blocker",
+      });
+      expect(findLatestTaskForSessionKey(entry.childSessionKey)?.status).not.toBe("running");
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not create a rework launch requirement when the Grant closeout gate passes", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-closeout-pass-"));
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = workspaceDir;
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    try {
+      const entry = createRunEntry({
+        label: "Grant closeout passed",
+        task: "Grant blind-test slice passed",
+        workspaceDir,
+      });
+      const flow = createBlindTestSliceFlow({
+        ownerKey: entry.requesterSessionKey,
+        goal: "Grant blind-test slice passed",
+        sliceKey: "grant-slice-passed",
+        subjectAgent: "Grant",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: entry.requesterSessionKey,
+        requesterSessionKey: entry.requesterSessionKey,
+        scopeKind: "session",
+        childSessionKey: entry.childSessionKey,
+        parentFlowId: flow.flowId,
+        runId: entry.runId,
+        task: "Grant slice closeout",
+        missionId: "mission-grant-slice-passed",
+        missionSummary: "Pass the same Grant blind-test slice closeout",
+        missionState: "active",
+        status: "succeeded",
+        deliveryStatus: "pending",
+      });
+      const controller = createLifecycleController({ entry });
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: true,
+            outcomeCode: "accepted_closeout_fields_present",
+            missingFields: [],
+            missingProofPaths: [],
+          },
+          findings:
+            "Run label: Grant closeout passed\nWhat is materially real now: proof packet is readable\nWhat is still not real yet: broader build remains open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: continue to the next lawful step",
+          rawFindings:
+            "Run label: Grant closeout passed\nWhat is materially real now: proof packet is readable\nWhat is still not real yet: broader build remains open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: continue to the next lawful step",
+          taskLabel: entry.label,
+          statusLabel: "passed",
+        },
+      });
+
+      expect(findLatestTaskForSessionKey(entry.childSessionKey)?.runId).toBe(entry.runId);
+      expect(listTaskFlowAuditFindings({ now: Date.now() })).toStrictEqual([]);
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("mirrors generic managed production continuation proof into the persisted subagent record", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-generic-continuation-"));
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = workspaceDir;
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests({ persist: false });
+    try {
+      const entry = createRunEntry({
+        label: "Grant managed continuation mirror",
+        task: "Grant bounded managed controller",
+        workspaceDir,
+      });
+      const flow = createManagedTaskFlow({
+        ownerKey: entry.requesterSessionKey,
+        controllerId: "tests/managed-flow",
+        goal: "Mirror generic continuation proof",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+          continuationRequiredAfterLocalSuccess: true,
+          currentUnitStatus: "passed",
+        },
+      });
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: entry.requesterSessionKey,
+        requesterSessionKey: entry.requesterSessionKey,
+        scopeKind: "session",
+        childSessionKey: entry.childSessionKey,
+        parentFlowId: flow.flowId,
+        runId: entry.runId,
+        task: "Grant managed continuation closeout",
+        missionId: "mission-managed-continuation",
+        missionSummary: "Mirror generic continuation proof",
+        missionState: "active",
+        status: "succeeded",
+        deliveryStatus: "pending",
+      });
+      const controller = createLifecycleController({ entry });
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: true,
+            missingFields: [],
+            missingProofPaths: [],
+          },
+          findings:
+            "Run label: Grant managed continuation mirror\nWhat is materially real now: proof mirrored\nWhat is still not real yet: broader build open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: launch the next bounded unit.",
+          rawFindings:
+            "Run label: Grant managed continuation mirror\nWhat is materially real now: proof mirrored\nWhat is still not real yet: broader build open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: launch the next bounded unit.",
+          taskLabel: entry.label,
+          statusLabel: "passed",
+        },
+      });
+
+      expect(entry.productionContinuation).toMatchObject({
+        activeProductionRun: true,
+        continuationRequiredAfterLocalSuccess: true,
+        nextExecutableUnitLaunched: false,
+        parentFlowId: flow.flowId,
+      });
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+    }
   });
 });

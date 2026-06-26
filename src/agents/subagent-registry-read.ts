@@ -14,6 +14,7 @@ import type { SubagentRunRecord } from "./subagent-registry.types.js";
 export {
   getSubagentSessionRuntimeMs,
   getSubagentSessionStartedAt,
+  resolveSubagentMaterialProgressState,
   resolveSubagentSessionStatus,
 } from "./subagent-session-metrics.js";
 

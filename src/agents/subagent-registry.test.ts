@@ -2,6 +2,19 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { getReplyPayloadProgressHeartbeat } from "../auto-reply/reply-payload.js";
+import type { getAgentRunContext as getAgentRunContextFn } from "../infra/agent-events.js";
+import type { requestHeartbeat as requestHeartbeatFn } from "../infra/heartbeat-wake.js";
+import {
+  createManagedTaskFlow,
+  finishFlow,
+  resetTaskFlowRegistryForTests,
+} from "../tasks/task-flow-runtime-internal.js";
+import {
+  createTaskRecord,
+  findTaskByRunId,
+  resetTaskRegistryForTests,
+} from "../tasks/task-registry.js";
 
 const noop = () => {};
 const waitForFast = <T>(callback: () => T | Promise<T>) =>
@@ -71,7 +84,10 @@ async function expectPathMissing(targetPath: string): Promise<void> {
 const mocks = vi.hoisted(() => ({
   callGateway: vi.fn(),
   onAgentEvent: vi.fn(() => noop),
-  getAgentRunContext: vi.fn(() => undefined),
+  getAgentRunContext: vi.fn(
+    (_: Parameters<typeof getAgentRunContextFn>[0]): ReturnType<typeof getAgentRunContextFn> =>
+      undefined,
+  ),
   getRuntimeConfig: vi.fn(() => ({
     agents: { defaults: { subagents: { archiveAfterMinutes: 0 } } },
     session: { mainKey: "main", scope: "per-sender" as const },
@@ -100,6 +116,9 @@ const mocks = vi.hoisted(() => ({
   runSubagentEnded: vi.fn(async () => {}),
   resolveAgentTimeoutMs: vi.fn(() => 1_000),
   scheduleOrphanRecovery: vi.fn(),
+  enqueueSystemEvent: vi.fn(),
+  requestHeartbeat: vi.fn((_: Parameters<typeof requestHeartbeatFn>[0]) => undefined),
+  routeReply: vi.fn(),
 }));
 
 vi.mock("../gateway/call.js", () => ({
@@ -109,6 +128,18 @@ vi.mock("../gateway/call.js", () => ({
 vi.mock("../infra/agent-events.js", () => ({
   getAgentRunContext: mocks.getAgentRunContext,
   onAgentEvent: mocks.onAgentEvent,
+}));
+
+vi.mock("../infra/heartbeat-wake.js", () => ({
+  requestHeartbeat: mocks.requestHeartbeat,
+}));
+
+vi.mock("../infra/system-events.js", () => ({
+  enqueueSystemEvent: mocks.enqueueSystemEvent,
+}));
+
+vi.mock("../auto-reply/reply/route-reply.js", () => ({
+  routeReply: mocks.routeReply,
 }));
 
 vi.mock("../config/config.js", () => {
@@ -167,6 +198,26 @@ vi.mock("./subagent-orphan-recovery.js", () => ({
 describe("subagent registry seam flow", () => {
   let mod: typeof import("./subagent-registry.js");
 
+  function getAgentEventListener(): (evt: {
+    runId: string;
+    stream: string;
+    ts?: number;
+    data?: Record<string, unknown>;
+    sessionKey?: string;
+  }) => void {
+    const listener = getMockCallArg(mocks.onAgentEvent, 0, 0, "agent event listener");
+    if (typeof listener !== "function") {
+      throw new Error("expected agent event listener");
+    }
+    return listener as (evt: {
+      runId: string;
+      stream: string;
+      ts?: number;
+      data?: Record<string, unknown>;
+      sessionKey?: string;
+    }) => void;
+  }
+
   beforeAll(async () => {
     mod = await import("./subagent-registry.js");
   });
@@ -199,6 +250,10 @@ describe("subagent registry seam flow", () => {
     mocks.scheduleOrphanRecovery.mockReset();
     mocks.resolveAgentTimeoutMs.mockReturnValue(1_000);
     mocks.restoreSubagentRunsFromDisk.mockReturnValue(0);
+    mocks.routeReply.mockResolvedValue({
+      ok: false,
+      error: "route unavailable",
+    });
     mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
       if (request.method === "agent.wait") {
         return {
@@ -275,6 +330,122 @@ describe("subagent registry seam flow", () => {
       "agent:main:subagent:active",
       "agent:main:subagent:pending",
     ]);
+  });
+
+  it("inherits active production continuation from the requester's active mission-linked parent flow", async () => {
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "subagent-production-continuation-"));
+    process.env.OPENCLAW_STATE_DIR = root;
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests();
+    mod.resetSubagentRegistryForTests({ persist: false });
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return await new Promise<never>(() => undefined);
+      }
+      return {};
+    });
+    try {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/subagent-wrapper",
+        goal: "Continue the active production run",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+
+      const blockedClose = finishFlow({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        endedAt: 200,
+      });
+      if (blockedClose.applied || !blockedClose.current) {
+        throw new Error("Expected continuation-required parent flow");
+      }
+
+      const missionTask = createTaskRecord({
+        runtime: "cli",
+        ownerKey: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+        scopeKind: "session",
+        parentFlowId: blockedClose.current.flowId,
+        task: "Parent bounded production run",
+        missionId: "mission-production-parent",
+        missionSummary: "Launch the next bounded unit before pause",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      if (!missionTask) {
+        throw new Error("Expected mission task");
+      }
+
+      mod.registerSubagentRun({
+        runId: "run-linked-production",
+        childSessionKey: "agent:main:subagent:linked-production",
+        requesterSessionKey: "agent:main:main",
+        requesterDisplayKey: "main",
+        task: "Run the next bounded unit",
+        cleanup: "keep",
+      });
+
+      const linkedTask = findTaskByRunId("run-linked-production");
+      expect(linkedTask).toMatchObject({
+        runId: "run-linked-production",
+        parentFlowId: blockedClose.current.flowId,
+        parentTaskId: missionTask.taskId,
+      });
+      const entry = mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((candidate) => candidate.runId === "run-linked-production");
+      expect(entry?.productionContinuation).toMatchObject({
+        activeProductionRun: true,
+        continuationRequiredAfterLocalSuccess: true,
+        nextExecutableUnitLaunched: false,
+        continuationViolation: true,
+        parentFlowId: blockedClose.current.flowId,
+      });
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests();
+      mod.resetSubagentRegistryForTests({ persist: false });
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invent parent continuation linkage when no active mission-linked parent flow exists", () => {
+    resetTaskRegistryForTests({ persist: false });
+    resetTaskFlowRegistryForTests();
+    mod.resetSubagentRegistryForTests({ persist: false });
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return await new Promise<never>(() => undefined);
+      }
+      return {};
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-standalone",
+      childSessionKey: "agent:main:subagent:standalone",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "Standalone detached work",
+      cleanup: "keep",
+    });
+
+    expect(
+      mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((candidate) => candidate.runId === "run-standalone")?.productionContinuation,
+    ).toBeUndefined();
   });
 
   it("uses the disk-aware run snapshot for maintenance preservation", () => {
@@ -3112,6 +3283,255 @@ describe("subagent registry seam flow", () => {
     );
   });
 
+  it("emits a visible start update when a subagent run is registered", async () => {
+    mod.registerSubagentRun({
+      runId: "run-start-update",
+      childSessionKey: "agent:main:subagent:start-update",
+      requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "quietchat", to: "quietchat:123", accountId: "acct-1" },
+      requesterDisplayKey: "main",
+      label: "Grant blind test",
+      task: "run the blind test",
+      cleanup: "keep",
+    });
+
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith("Subagent started: Grant blind test.", {
+        sessionKey: "agent:main:main",
+        contextKey: "subagent:run-start-update:start",
+        deliveryContext: { channel: "quietchat", to: "quietchat:123", accountId: "acct-1" },
+      });
+    });
+    expect(mocks.requestHeartbeat).toHaveBeenCalledWith({
+      source: "subagent-progress",
+      intent: "event",
+      reason: "subagent:progress",
+      sessionKey: "agent:main:main",
+    });
+  });
+
+  it("emits concise phase updates for item-start progress and suppresses duplicates", async () => {
+    mod.registerSubagentRun({
+      runId: "run-phase-update",
+      childSessionKey: "agent:main:subagent:phase-update",
+      requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "quietchat", to: "quietchat:123" },
+      requesterDisplayKey: "main",
+      label: "Grant slice",
+      task: "build the slice",
+      cleanup: "keep",
+    });
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+        "Subagent started: Grant slice.",
+        expect.objectContaining({
+          sessionKey: "agent:main:main",
+          contextKey: "subagent:run-phase-update:start",
+        }),
+      );
+    });
+    const listener = getAgentEventListener();
+    mocks.enqueueSystemEvent.mockClear();
+    mocks.requestHeartbeat.mockClear();
+
+    listener({
+      runId: "run-phase-update",
+      stream: "item",
+      ts: Date.now(),
+      data: {
+        phase: "start",
+        kind: "command",
+        status: "running",
+        title: "Running tests",
+      },
+    });
+    listener({
+      runId: "run-phase-update",
+      stream: "item",
+      ts: Date.now() + 1,
+      data: {
+        phase: "start",
+        kind: "command",
+        status: "running",
+        title: "Running tests",
+      },
+    });
+
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    });
+    expect(getMockCallArg(mocks.enqueueSystemEvent, 0, 0, "phase update")).toBe(
+      "Subagent update: Grant slice. Running tests",
+    );
+  });
+
+  it("routes visible subagent progress as direct block replies when requester delivery context is routable", async () => {
+    mocks.routeReply.mockResolvedValue({
+      ok: true,
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-direct-progress",
+      childSessionKey: "agent:main:subagent:direct-progress",
+      requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "quietchat", to: "quietchat:123", accountId: "acct-1" },
+      requesterDisplayKey: "main",
+      label: "Grant slice",
+      task: "build the slice",
+      cleanup: "keep",
+    });
+    mocks.routeReply.mockClear();
+    mocks.enqueueSystemEvent.mockClear();
+    mocks.requestHeartbeat.mockClear();
+
+    const listener = getAgentEventListener();
+    listener({
+      runId: "run-direct-progress",
+      stream: "item",
+      ts: Date.now(),
+      data: {
+        phase: "start",
+        kind: "command",
+        status: "running",
+        title: "Running tests",
+      },
+    });
+
+    await waitForFast(() => {
+      expect(mocks.routeReply).toHaveBeenCalledTimes(1);
+    });
+    const routeParams = getMockCallArg(mocks.routeReply, 0, 0, "direct progress route") as
+      | {
+          replyKind?: string;
+          sessionKey?: string;
+          policySessionKey?: string;
+          payload?: { text?: string; isStatusNotice?: boolean };
+        }
+      | undefined;
+    expect(routeParams?.replyKind).toBe("block");
+    expect(routeParams?.sessionKey).toBe("agent:main:main");
+    expect(routeParams?.policySessionKey).toBe("agent:main:main");
+    expect(routeParams?.payload?.text).toBe("Subagent update: Grant slice. Running tests");
+    expect(routeParams?.payload?.isStatusNotice).toBe(true);
+    expect(getReplyPayloadProgressHeartbeat(routeParams?.payload ?? {})).toEqual({
+      category: "working",
+      activeRunContinues: true,
+    });
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(mocks.requestHeartbeat).not.toHaveBeenCalled();
+  });
+
+  it("surfaces stall updates and escalates repeated stalls into reclaim guidance", async () => {
+    mocks.getAgentRunContext.mockReturnValue({ sessionKey: "agent:main:subagent:stall" });
+
+    mod.registerSubagentRun({
+      runId: "run-stall",
+      childSessionKey: "agent:main:subagent:stall",
+      requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "quietchat", to: "quietchat:123" },
+      requesterDisplayKey: "main",
+      label: "Grant runtime slice",
+      task: "build runtime slice",
+      cleanup: "keep",
+    });
+    mocks.enqueueSystemEvent.mockClear();
+    const fastMode = process.env.OPENCLAW_TEST_FAST === "1";
+    const firstExpectedSeconds = fastMode ? 60 : 180;
+    const secondExpectedSeconds = fastMode ? 120 : 360;
+
+    vi.advanceTimersByTime(3 * 60_000);
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+        `Subagent stalled: Grant runtime slice. No visible progress for ${firstExpectedSeconds}s.`,
+        expect.objectContaining({
+          sessionKey: "agent:main:main",
+          contextKey: "subagent:run-stall:stall-1",
+        }),
+      );
+    });
+
+    vi.advanceTimersByTime(3 * 60_000);
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+        `Subagent stalled again: Grant runtime slice. No visible progress for ${secondExpectedSeconds}s. Reclaim locally instead of letting it keep burning time.`,
+        expect.objectContaining({
+          sessionKey: "agent:main:main",
+          contextKey: "subagent:run-stall:stall-2",
+        }),
+      );
+    });
+  });
+
+  it("reports first subagent failure and escalates repeated failures into reclaim guidance", async () => {
+    mod.registerSubagentRun({
+      runId: "run-fail-one",
+      childSessionKey: "agent:main:subagent:fail-one",
+      requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "quietchat", to: "quietchat:123" },
+      requesterDisplayKey: "main",
+      label: "Grant build slice",
+      task: "build slice",
+      cleanup: "keep",
+    });
+    let listener = getAgentEventListener();
+    mocks.enqueueSystemEvent.mockClear();
+
+    listener({
+      runId: "run-fail-one",
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: {
+        phase: "error",
+        endedAt: Date.now(),
+        error: "proof missing",
+      },
+    });
+    vi.advanceTimersByTime(15_000);
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+        "Subagent failed: Grant build slice. proof missing",
+        expect.objectContaining({
+          sessionKey: "agent:main:main",
+          contextKey: "subagent:run-fail-one:failure",
+        }),
+      );
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-fail-two",
+      childSessionKey: "agent:main:subagent:fail-two",
+      requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "quietchat", to: "quietchat:123" },
+      requesterDisplayKey: "main",
+      label: "Grant build slice",
+      task: "build slice",
+      cleanup: "keep",
+    });
+    listener = getAgentEventListener();
+    mocks.enqueueSystemEvent.mockClear();
+
+    listener({
+      runId: "run-fail-two",
+      stream: "lifecycle",
+      ts: Date.now(),
+      data: {
+        phase: "error",
+        endedAt: Date.now(),
+        error: "proof missing",
+      },
+    });
+    vi.advanceTimersByTime(15_000);
+    await waitForFast(() => {
+      expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+        "Subagent failed again: Grant build slice. Reclaim locally instead of letting it keep burning time. proof missing",
+        expect.objectContaining({
+          sessionKey: "agent:main:main",
+          contextKey: "subagent:run-fail-two:failure-repeat",
+        }),
+      );
+    });
+  });
+
   it("deletes killed delete-mode runs and notifies deleted cleanup", async () => {
     mod.registerSubagentRun({
       runId: "run-killed-delete",
@@ -3420,7 +3840,7 @@ describe("subagent registry seam flow", () => {
     });
   });
 
-  it("expires suspended cron final deliveries into compact tombstones", async () => {
+  it("refuses to discard suspended cron final deliveries when frozen output still exists without replay proof", async () => {
     const now = Date.parse("2026-03-24T12:00:00Z");
     const runId = "run-suspended-cron-expired";
     mod.addSubagentRunForTests({
@@ -3465,35 +3885,18 @@ describe("subagent registry seam flow", () => {
     expect(run).toMatchObject({
       runId,
       delivery: {
-        status: "discarded",
-        payload: undefined,
-        suspendedAt: undefined,
-        suspendedReason: undefined,
-        discardedAt: now,
-        discardReason: "expired",
+        status: "suspended",
+        suspendedReason: "retry-limit",
       },
-      cleanupHandled: true,
-      cleanupCompletedAt: now,
     });
-    expect(run?.delivery?.discardedPayloadSummary).toEqual({
-      requesterSessionKey: "agent:main:cron:cron-1:run:parent",
-      childSessionKey: "agent:main:subagent:suspended-cron",
-      childRunId: runId,
-      endedAt: now - 3 * 60 * 60_000,
-      status: "ok",
-      lastError: "gateway request timeout for agent",
-    });
-    await waitForFast(() => {
-      expect(mocks.onSubagentEnded).toHaveBeenCalledWith({
-        childSessionKey: "agent:main:subagent:suspended-cron",
-        reason: "completed",
-        workspaceDir: undefined,
-      });
-    });
-    expect(mocks.persistSubagentRunsToDisk).toHaveBeenCalled();
+    expect(run?.delivery?.discardReason).toBeUndefined();
+    expect(run?.cleanupHandled).not.toBe(true);
+    expect(run?.cleanupCompletedAt).toBeUndefined();
+    expect(mocks.onSubagentEnded).not.toHaveBeenCalled();
+    expect(mocks.persistSubagentRunsToDisk).not.toHaveBeenCalled();
   });
 
-  it("pressure-prunes oldest suspended final deliveries when backlog exceeds hard cap", async () => {
+  it("refuses to pressure-prune suspended final deliveries when frozen output still exists without replay proof", async () => {
     const now = Date.parse("2026-03-24T12:00:00Z");
     for (let i = 0; i < 51; i += 1) {
       const runId = `run-suspended-pressure-${i}`;
@@ -3544,11 +3947,10 @@ describe("subagent registry seam flow", () => {
       (run) =>
         run?.delivery?.status === "suspended" && typeof run.delivery.suspendedAt === "number",
     );
-    expect(discarded).toHaveLength(41);
-    expect(stillSuspended).toHaveLength(10);
-    expect(discarded[0]?.runId).toBe("run-suspended-pressure-0");
-    expect(runs[40]?.delivery?.discardReason).toBe("pressure-pruned");
+    expect(discarded).toHaveLength(0);
+    expect(stillSuspended).toHaveLength(51);
+    expect(runs[40]?.delivery?.discardReason).toBeUndefined();
     expect(runs[41]?.delivery?.status).toBe("suspended");
-    expect(mocks.persistSubagentRunsToDisk).toHaveBeenCalled();
+    expect(mocks.persistSubagentRunsToDisk).not.toHaveBeenCalled();
   });
 });

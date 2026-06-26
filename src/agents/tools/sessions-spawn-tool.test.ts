@@ -43,11 +43,33 @@ describe("sessions_spawn tool", () => {
       status: "accepted",
       childSessionKey: "agent:main:subagent:1",
       runId: "run-subagent",
+      runningNow: false,
+      runningNowAnswer: "no",
+      runningNowProofSummary:
+        "Spawn was accepted, but active child execution is not yet proven from this tool result alone.",
+      spawnExecutionTruth: {
+        runningNow: false,
+        liveExecutionState: "accepted_not_yet_proven_active",
+        proofSummary:
+          "Spawn was accepted, but active child execution is not yet proven from this tool result alone.",
+        source: "spawn_acceptance",
+      },
     });
     hoisted.spawnAcpDirectMock.mockReset().mockResolvedValue({
       status: "accepted",
       childSessionKey: "agent:codex:acp:1",
       runId: "run-acp",
+      runningNow: false,
+      runningNowAnswer: "no",
+      runningNowProofSummary:
+        "Spawn was accepted, but active child execution is not yet proven from this tool result alone.",
+      spawnExecutionTruth: {
+        runningNow: false,
+        liveExecutionState: "accepted_not_yet_proven_active",
+        proofSummary:
+          "Spawn was accepted, but active child execution is not yet proven from this tool result alone.",
+        source: "spawn_acceptance",
+      },
     });
     hoisted.registerSubagentRunMock.mockReset();
   });
@@ -296,6 +318,8 @@ describe("sessions_spawn tool", () => {
       status: "accepted",
       childSessionKey: "agent:main:subagent:1",
       runId: "run-subagent",
+      runningNow: false,
+      runningNowAnswer: "no",
     });
     expect(result.details).not.toHaveProperty("role");
     const spawnArgs = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 0, "spawnSubagentDirect");
@@ -914,6 +938,15 @@ describe("sessions_spawn tool", () => {
 
     expect(result.details).toMatchObject({
       status: "accepted",
+      runningNow: false,
+      runningNowAnswer: "no",
+      runningNowProofSummary:
+        "Spawn was accepted, but active child execution is not yet proven from this tool result alone.",
+      spawnExecutionTruth: {
+        runningNow: false,
+        liveExecutionState: "accepted_not_yet_proven_active",
+        source: "spawn_acceptance",
+      },
     });
     expect(hoisted.spawnAcpDirectMock).toHaveBeenCalledWith(
       expect.objectContaining({
