@@ -305,6 +305,181 @@ describe("openclaw launcher", () => {
     expect(envResult.stdout).toBe("RUNTIME ENTRY\n");
   });
 
+  it("passes the full Grant retirement argv through the real launcher boundary", async () => {
+    const fixtureRoot = await makeLauncherFixture(fixtureRoots);
+    await fs.writeFile(
+      path.join(fixtureRoot, "dist", "entry.js"),
+      "process.stdout.write(`${JSON.stringify(process.argv.slice(2))}\\n`);\n",
+      "utf8",
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.join(fixtureRoot, "openclaw.mjs"),
+        "system",
+        "grant",
+        "retirement-request",
+        "--workspace",
+        "/tmp/grant-proof",
+        "--outcome-code",
+        "rejected_proof_missing",
+        "--reason",
+        "capability_materially_fixed",
+        "--evidence",
+        "launcher proof",
+      ],
+      {
+        cwd: fixtureRoot,
+        env: launcherEnv(),
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([
+      "system",
+      "grant",
+      "retirement-request",
+      "--workspace",
+      "/tmp/grant-proof",
+      "--outcome-code",
+      "rejected_proof_missing",
+      "--reason",
+      "capability_materially_fixed",
+      "--evidence",
+      "launcher proof",
+    ]);
+    expect(result.stderr).toBe("");
+  });
+
+  it("executes the real Grant retirement command through the built launcher", async () => {
+    const workspaceDir = makeTempDir(fixtureRoots, "openclaw-grant-runtime-");
+    const stateDir = path.join(workspaceDir, "state");
+    await fs.mkdir(path.join(workspaceDir, "docs", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "contracts", "grant"), { recursive: true });
+    await fs.mkdir(path.join(workspaceDir, "templates", "grant"), { recursive: true });
+    const proofPath = path.join(workspaceDir, "proof.txt");
+    await fs.writeFile(proofPath, "proof\n", "utf8");
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+      [
+        "# Grant Doctrine",
+        "",
+        "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+        "Grant remains a bounded governed execution owner under Will.",
+        "Will remains the packet-sharpening and top command layer.",
+        "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+        "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      "# Grant Corrections Matrix\n\n## Active corrections\n\n### GC-001: Do not smooth over ambiguity\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(workspaceDir, "contracts", "grant", "grant_hardening_operating_contract.json"),
+      `${JSON.stringify(
+        {
+          boundary_lock: {
+            scoped_closeout_rule:
+              "Grant hardening v1 may be called closed only for the current scoped hardening build.",
+            owner_rule: "Grant remains a bounded governed execution owner under Will.",
+            command_rule: "Will remains the packet-sharpening and top command layer.",
+            ambiguity_rule:
+              "Grant may stop on ambiguity, but Grant is not the lawful default owner for unresolved messy ambiguity.",
+            promotion_rule:
+              "Grant is not low-review, not broadly autonomous, and not promoted into Will-level judgment unless separate future proof exists.",
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(
+        workspaceDir,
+        "templates",
+        "grant",
+        "grant_correction_retirement_request_template.json",
+      ),
+      `${JSON.stringify(
+        {
+          schema_version: "0.1.0",
+          artifact_type: "grant_correction_retirement_request",
+          requestedBy: "Will",
+          approvedBy: "Will",
+          outcomeCode: "",
+          reason: "obsolete_rule",
+          evidence: "",
+          resolutionProofPaths: [],
+          notes: "",
+          requestedAt: "",
+          approvedAt: "",
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [
+        path.resolve(process.cwd(), "openclaw.mjs"),
+        "system",
+        "grant",
+        "retirement-request",
+        "--workspace",
+        workspaceDir,
+        "--outcome-code",
+        "rejected_proof_missing",
+        "--reason",
+        "capability_materially_fixed",
+        "--evidence",
+        "launcher runtime proof",
+        "--proof-path",
+        proofPath,
+      ],
+      {
+        cwd: process.cwd(),
+        env: launcherEnv({
+          HOME: stateDir,
+          OPENCLAW_STATE_DIR: stateDir,
+          OPENCLAW_CONFIG_PATH: path.join(stateDir, "openclaw.json"),
+        }),
+        encoding: "utf8",
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+
+    const requestsDir = path.join(workspaceDir, "var", "grant", "retirement_requests");
+    const queuePath = path.join(workspaceDir, "var", "grant", "grant_correction_retirements.jsonl");
+    const requestFiles = await fs.readdir(requestsDir);
+
+    expect(requestFiles).toHaveLength(1);
+    expect(
+      JSON.parse(await fs.readFile(path.join(requestsDir, requestFiles[0] ?? ""), "utf8")),
+    ).toMatchObject({
+      outcomeCode: "rejected_proof_missing",
+      reason: "capability_materially_fixed",
+      evidence: "launcher runtime proof",
+      grantRulebook: {
+        doctrinePath: path.join(workspaceDir, "docs", "grant", "grant_doctrine.md"),
+        correctionsPath: path.join(workspaceDir, "docs", "grant", "grant_corrections_matrix.md"),
+      },
+      resolutionProofPaths: [proofPath],
+    });
+    expect(await fs.readFile(queuePath, "utf8")).toContain(
+      '"outcomeCode":"rejected_proof_missing"',
+    );
+  });
+
   it("treats Bun direct optional import misses as direct launcher misses", async () => {
     const fixtureRoot = await makeLauncherProbeFixture(
       fixtureRoots,

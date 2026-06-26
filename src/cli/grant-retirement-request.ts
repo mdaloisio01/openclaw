@@ -1,7 +1,10 @@
-const grantRetirementRequestModuleUrl = new URL(
-  "../../scripts/lib/grant-retirement-request.mjs",
-  import.meta.url,
-).href;
+function resolveGrantRetirementRequestModuleUrl(): string {
+  const currentUrl = new URL(import.meta.url);
+  const relativeModulePath = currentUrl.pathname.includes("/dist/")
+    ? "../scripts/lib/grant-retirement-request.mjs"
+    : "../../scripts/lib/grant-retirement-request.mjs";
+  return new URL(relativeModulePath, currentUrl).href;
+}
 
 type GrantRetirementRequestModule = {
   createGrantRetirementRequest(
@@ -36,7 +39,7 @@ export type CreateGrantRetirementRequestResult = {
 };
 
 const grantRetirementRequestModule = (await import(
-  grantRetirementRequestModuleUrl
+  resolveGrantRetirementRequestModuleUrl()
 )) as GrantRetirementRequestModule;
 
 export const GRANT_RETIREMENT_ALLOWED_REASONS =
