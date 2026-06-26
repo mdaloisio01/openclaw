@@ -392,4 +392,60 @@ describe("Crestodian rescue message", () => {
     expect(audit.details?.agentId).toBe("work");
     expect(audit.details?.workspace).toBe("/tmp/work");
   });
+
+  it("queues and applies Grant retirement requests through conversational approval", async () => {
+    const tempDir = await makeStateDir("grant-retirement-");
+    vi.stubEnv("OPENCLAW_STATE_DIR", tempDir);
+    const cfg: OpenClawConfig = { crestodian: { rescue: { enabled: true } } };
+    const deps = {
+      runGrantRetirementRequest: vi.fn(async () => ({
+        ok: true as const,
+        dryRun: false,
+        requestPath: "/tmp/work/var/grant/retirement_requests/request.json",
+        queuePath: "/tmp/work/var/grant/grant_correction_retirements.jsonl",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+      })),
+    };
+
+    await expect(
+      runRescue(
+        '/crestodian grant retirement request workspace /tmp/work outcome rejected_proof_missing reason capability_materially_fixed evidence "fixed live path" proof /tmp/proof.txt',
+        cfg,
+        commandContext(),
+        deps,
+      ),
+    ).resolves.toContain("Reply /crestodian yes to apply");
+    await expect(runRescue("/crestodian yes", cfg, commandContext(), deps)).resolves.toContain(
+      "[crestodian] done: grant.retirement-request",
+    );
+
+    expect(deps.runGrantRetirementRequest).toHaveBeenCalledTimes(1);
+    expect(deps.runGrantRetirementRequest).toHaveBeenCalledWith(
+      {
+        workspace: "/tmp/work",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "fixed live path",
+        proofPaths: ["/tmp/proof.txt"],
+        notes: undefined,
+      },
+      expect.any(Object),
+    );
+    const auditPath = path.join(tempDir, "audit", "crestodian.jsonl");
+    const audit = JSON.parse((await fs.readFile(auditPath, "utf8")).trim()) as {
+      operation?: string;
+      details?: {
+        rescue?: boolean;
+        channel?: string;
+        senderId?: string;
+        outcomeCode?: string;
+      };
+    };
+    expect(audit.operation).toBe("grant.retirement-request");
+    expect(audit.details?.rescue).toBe(true);
+    expect(audit.details?.channel).toBe("whatsapp");
+    expect(audit.details?.senderId).toBe("user:owner");
+    expect(audit.details?.outcomeCode).toBe("rejected_proof_missing");
+  });
 });

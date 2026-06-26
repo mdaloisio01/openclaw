@@ -268,6 +268,22 @@ describe("parseCrestodianOperation", () => {
     });
   });
 
+  it("parses Grant retirement request operations", () => {
+    expect(
+      parseCrestodianOperation(
+        'grant retirement request workspace /tmp/work outcome rejected_proof_missing reason capability_materially_fixed evidence "fixed live path" proof /tmp/proof-1.txt,/tmp/proof-2.txt notes "operator note"',
+      ),
+    ).toEqual({
+      kind: "grant-retirement-request",
+      workspace: "/tmp/work",
+      outcomeCode: "rejected_proof_missing",
+      reason: "capability_materially_fixed",
+      evidence: "fixed live path",
+      proofPaths: ["/tmp/proof-1.txt", "/tmp/proof-2.txt"],
+      notes: "operator note",
+    });
+  });
+
   it("parses agent creation requests", () => {
     expect(
       parseCrestodianOperation("create agent Work workspace /tmp/work model openai/gpt-5.2"),
@@ -521,6 +537,86 @@ describe("parseCrestodianOperation", () => {
         summary: "Uninstalled plugin openclaw-demo",
       },
       { rescue: true, pluginId: "openclaw-demo" },
+    );
+  });
+
+  it("creates Grant retirement requests only after approval and audits the write", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "crestodian-grant-retirement-"));
+    vi.stubEnv("OPENCLAW_STATE_DIR", tempDir);
+    const { runtime, lines } = createCrestodianTestRuntime();
+    const runGrantRetirementRequest = vi.fn(async () => ({
+      ok: true as const,
+      dryRun: false,
+      requestPath: "/tmp/work/var/grant/retirement_requests/request.json",
+      queuePath: "/tmp/work/var/grant/grant_correction_retirements.jsonl",
+      outcomeCode: "rejected_proof_missing",
+      reason: "capability_materially_fixed",
+    }));
+
+    const plan = await executeCrestodianOperation(
+      {
+        kind: "grant-retirement-request",
+        workspace: "/tmp/work",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "fixed live path",
+        proofPaths: ["/tmp/proof.txt"],
+      },
+      runtime,
+      { deps: { runGrantRetirementRequest } },
+    );
+    expectRecordFields(plan as unknown as Record<string, unknown>, {
+      applied: false,
+      message:
+        "Plan: create Grant retirement request for rejected_proof_missing in /tmp/work. Say yes to apply.",
+    });
+    expect(runGrantRetirementRequest).not.toHaveBeenCalled();
+
+    const result = await executeCrestodianOperation(
+      {
+        kind: "grant-retirement-request",
+        workspace: "/tmp/work",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "fixed live path",
+        proofPaths: ["/tmp/proof.txt"],
+      },
+      runtime,
+      {
+        approved: true,
+        deps: { runGrantRetirementRequest },
+        auditDetails: { rescue: true },
+      },
+    );
+    expect(result.applied).toBe(true);
+
+    expect(runGrantRetirementRequest).toHaveBeenCalledWith(
+      {
+        workspace: "/tmp/work",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        evidence: "fixed live path",
+        proofPaths: ["/tmp/proof.txt"],
+        notes: undefined,
+      },
+      runtime,
+    );
+    expect(lines.join("\n")).toContain("[crestodian] done: grant.retirement-request");
+    const auditPath = path.join(tempDir, "audit", "crestodian.jsonl");
+    const audit = JSON.parse((await fs.readFile(auditPath, "utf8")).trim());
+    expectAuditRecord(
+      audit,
+      {
+        operation: "grant.retirement-request",
+        summary: "Created Grant retirement request for rejected_proof_missing",
+      },
+      {
+        rescue: true,
+        workspace: "/tmp/work",
+        outcomeCode: "rejected_proof_missing",
+        reason: "capability_materially_fixed",
+        proofPaths: ["/tmp/proof.txt"],
+      },
     );
   });
 

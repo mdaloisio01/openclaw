@@ -1,5 +1,10 @@
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import type { ConfigSetOptions } from "../cli/config-set-input.js";
+import {
+  createGrantRetirementRequest,
+  GRANT_RETIREMENT_ALLOWED_REASONS,
+  type CreateGrantRetirementRequestResult,
+} from "../cli/grant-retirement-request.js";
 import type { DoctorOptions } from "../commands/doctor.types.js";
 import { buildAgentMainSessionKey, normalizeAgentId } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -46,6 +51,15 @@ export type CrestodianOperation =
   | { kind: "plugin-search"; query: string }
   | { kind: "plugin-install"; spec: string }
   | { kind: "plugin-uninstall"; pluginId: string }
+  | {
+      kind: "grant-retirement-request";
+      workspace: string;
+      outcomeCode: string;
+      reason: string;
+      evidence?: string;
+      proofPaths?: string[];
+      notes?: string;
+    }
   | { kind: "audit" }
   | { kind: "create-agent"; agentId: string; workspace?: string; model?: string }
   | { kind: "open-tui"; agentId?: string; workspace?: string }
@@ -81,6 +95,17 @@ export type CrestodianCommandDeps = {
   runGatewayRestart?: () => Promise<void>;
   runGatewayStart?: () => Promise<void>;
   runGatewayStop?: () => Promise<void>;
+  runGrantRetirementRequest?: (
+    params: {
+      workspace: string;
+      outcomeCode: string;
+      reason: string;
+      evidence?: string;
+      proofPaths?: string[];
+      notes?: string;
+    },
+    runtime: RuntimeEnv,
+  ) => Promise<CreateGrantRetirementRequestResult>;
   runPluginInstall?: (spec: string, runtime: RuntimeEnv) => Promise<void>;
   runPluginUninstall?: (pluginId: string, runtime: RuntimeEnv) => Promise<void>;
   runPluginsList?: (runtime: RuntimeEnv) => Promise<void>;
@@ -114,11 +139,39 @@ const PLUGIN_INSTALL_RE =
   /^(?:(?:plugins?)\s+install|install\s+(?:(?<source>npm|clawhub)\s+)?plugins?)\s+(?<spec>\S+)$/i;
 const PLUGIN_UNINSTALL_RE =
   /^(?:(?:plugins?)\s+(?:uninstall|remove)|(?:uninstall|remove)\s+plugins?)\s+(?<pluginId>[A-Za-z0-9_.@/-]+)$/i;
+const GRANT_RETIREMENT_PREFIX_RE =
+  /^(?:grant\s+retirement\s+request|grant\s+retire(?:ment)?|retire\s+grant\s+correction)\b/i;
 
 const OPENAI_API_DEFAULT_MODEL_REF = `${DEFAULT_PROVIDER}/${DEFAULT_MODEL}`;
 const ANTHROPIC_API_DEFAULT_MODEL_REF = "anthropic/claude-opus-4-8";
 const CLAUDE_CLI_DEFAULT_MODEL_REF = "claude-cli/claude-opus-4-8";
 const CODEX_APP_SERVER_DEFAULT_MODEL_REF = "openai/gpt-5.5";
+
+type GrantRetirementFieldKey =
+  | "workspace"
+  | "outcomeCode"
+  | "reason"
+  | "evidence"
+  | "proofPaths"
+  | "notes";
+
+type GrantRetirementFieldMatch = {
+  end: number;
+  key: GrantRetirementFieldKey;
+  start: number;
+};
+
+const GRANT_RETIREMENT_FIELD_PATTERNS: ReadonlyArray<{
+  key: GrantRetirementFieldKey;
+  pattern: RegExp;
+}> = [
+  { key: "workspace", pattern: /(^|\s)(workspace)(?=\s)/gi },
+  { key: "outcomeCode", pattern: /(^|\s)(outcome|outcome-code|code)(?=\s)/gi },
+  { key: "reason", pattern: /(^|\s)(reason)(?=\s)/gi },
+  { key: "evidence", pattern: /(^|\s)(evidence)(?=\s)/gi },
+  { key: "proofPaths", pattern: /(^|\s)(proof|proof-path|proofs)(?=\s)/gi },
+  { key: "notes", pattern: /(^|\s)(notes?)(?=\s)/gi },
+];
 
 export function parseCrestodianOperation(input: string): CrestodianOperation {
   const trimmed = input.trim();
@@ -181,6 +234,10 @@ export function parseCrestodianOperation(input: string): CrestodianOperation {
   const pluginUninstallMatch = trimmed.match(PLUGIN_UNINSTALL_RE);
   if (pluginUninstallMatch?.groups?.pluginId?.trim()) {
     return { kind: "plugin-uninstall", pluginId: pluginUninstallMatch.groups.pluginId.trim() };
+  }
+  const grantRetirementOperation = parseGrantRetirementOperation(trimmed);
+  if (grantRetirementOperation) {
+    return grantRetirementOperation;
   }
   if (SETUP_RE.test(lower)) {
     const workspace = trimShellishToken(trimmed.match(WORKSPACE_RE)?.groups?.workspace);
@@ -260,6 +317,53 @@ export function parseCrestodianOperation(input: string): CrestodianOperation {
   };
 }
 
+function parseGrantRetirementOperation(input: string): CrestodianOperation | null {
+  const prefixMatch = input.match(GRANT_RETIREMENT_PREFIX_RE);
+  if (!prefixMatch) {
+    return null;
+  }
+  const tail = input.slice(prefixMatch[0].length).trim();
+  if (!tail) {
+    return { kind: "none", message: formatGrantRetirementUsage() };
+  }
+
+  const markers = findGrantRetirementFieldMarkers(tail);
+  if (markers.length === 0) {
+    return { kind: "none", message: formatGrantRetirementUsage() };
+  }
+
+  const values = new Map<GrantRetirementFieldKey, string>();
+  for (let index = 0; index < markers.length; index += 1) {
+    const marker = markers[index];
+    const nextStart = markers[index + 1]?.start ?? tail.length;
+    const value = tail.slice(marker.end, nextStart).trim();
+    if (value) {
+      values.set(marker.key, value);
+    }
+  }
+
+  const workspace = trimShellishToken(values.get("workspace"));
+  const outcomeCode = trimShellishToken(values.get("outcomeCode"));
+  const reason = trimShellishToken(values.get("reason"));
+  if (!workspace || !outcomeCode || !reason) {
+    return { kind: "none", message: formatGrantRetirementUsage() };
+  }
+
+  const evidence = trimShellishToken(values.get("evidence"));
+  const proofPaths = parseGrantRetirementProofPaths(values.get("proofPaths"));
+  const notes = trimShellishToken(values.get("notes"));
+
+  return {
+    kind: "grant-retirement-request",
+    workspace,
+    outcomeCode,
+    reason,
+    ...(evidence ? { evidence } : {}),
+    ...(proofPaths.length > 0 ? { proofPaths } : {}),
+    ...(notes ? { notes } : {}),
+  };
+}
+
 function trimShellishToken(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -272,6 +376,43 @@ function trimShellishToken(value: string | undefined): string | undefined {
     return trimmed.slice(1, -1).trim() || undefined;
   }
   return trimmed;
+}
+
+function findGrantRetirementFieldMarkers(input: string): GrantRetirementFieldMatch[] {
+  const matches: GrantRetirementFieldMatch[] = [];
+  for (const field of GRANT_RETIREMENT_FIELD_PATTERNS) {
+    field.pattern.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = field.pattern.exec(input)) !== null) {
+      const prefix = match[1] ?? "";
+      const label = match[2] ?? "";
+      const start = match.index + prefix.length;
+      matches.push({
+        key: field.key,
+        start,
+        end: start + label.length,
+      });
+    }
+  }
+  return matches.toSorted((left, right) => left.start - right.start);
+}
+
+function parseGrantRetirementProofPaths(raw: string | undefined): string[] {
+  if (!raw?.trim()) {
+    return [];
+  }
+  return raw
+    .split(",")
+    .map((item) => trimShellishToken(item))
+    .filter((item): item is string => Boolean(item));
+}
+
+function formatGrantRetirementUsage(): string {
+  return [
+    "Grant retirement request format:",
+    "grant retirement request workspace <path> outcome <code> reason <reason> evidence <text> [proof <path[,path]>] [notes <text>]",
+    `Allowed reasons: ${GRANT_RETIREMENT_ALLOWED_REASONS.join(", ")}`,
+  ].join("\n");
 }
 
 function normalizePluginInstallSpec(spec: string, source: string | undefined): string {
@@ -309,6 +450,7 @@ export function isPersistentCrestodianOperation(operation: CrestodianOperation):
     operation.kind === "doctor-fix" ||
     operation.kind === "plugin-install" ||
     operation.kind === "plugin-uninstall" ||
+    operation.kind === "grant-retirement-request" ||
     operation.kind === "create-agent" ||
     operation.kind === "gateway-start" ||
     operation.kind === "gateway-stop" ||
@@ -332,6 +474,8 @@ export function describeCrestodianPersistentOperation(operation: CrestodianOpera
       return `install plugin ${operation.spec}`;
     case "plugin-uninstall":
       return `uninstall plugin ${operation.pluginId}`;
+    case "grant-retirement-request":
+      return `create Grant retirement request for ${operation.outcomeCode} in ${shortenHomePath(resolveUserPath(operation.workspace))}`;
     case "create-agent":
       return `create agent ${operation.agentId} with workspace ${formatCreateAgentWorkspace(operation.workspace)}`;
     case "gateway-start":
@@ -820,6 +964,59 @@ export async function executeCrestodianOperation(
     });
     runtime.log("[crestodian] done: plugin.uninstall");
     runtime.log("Restart the Gateway to apply plugin changes.");
+    return { applied: true };
+  }
+  if (operation.kind === "grant-retirement-request") {
+    if (!opts.approved) {
+      const message = formatCrestodianPersistentPlan(operation);
+      runtime.log(message);
+      runtime.log(`Reason: ${operation.reason}`);
+      if (operation.evidence) {
+        runtime.log(`Evidence: ${operation.evidence}`);
+      }
+      if (operation.proofPaths?.length) {
+        runtime.log(`Proof: ${operation.proofPaths.join(", ")}`);
+      }
+      return { applied: false, message };
+    }
+    logQueued(runtime, "grant.retirement-request");
+    const runGrantRetirementRequest =
+      opts.deps?.runGrantRetirementRequest ??
+      (async (params: {
+        workspace: string;
+        outcomeCode: string;
+        reason: string;
+        evidence?: string;
+        proofPaths?: string[];
+        notes?: string;
+      }) => {
+        return await createGrantRetirementRequest(params);
+      });
+    const result = await runGrantRetirementRequest(
+      {
+        workspace: operation.workspace,
+        outcomeCode: operation.outcomeCode,
+        reason: operation.reason,
+        evidence: operation.evidence,
+        proofPaths: operation.proofPaths,
+        notes: operation.notes,
+      },
+      runtime,
+    );
+    await appendCrestodianAuditEntry({
+      operation: "grant.retirement-request",
+      summary: `Created Grant retirement request for ${operation.outcomeCode}`,
+      details: {
+        ...opts.auditDetails,
+        workspace: operation.workspace,
+        outcomeCode: operation.outcomeCode,
+        reason: operation.reason,
+        ...(operation.proofPaths?.length ? { proofPaths: operation.proofPaths } : {}),
+      },
+    });
+    runtime.log(`request: ${result.requestPath}`);
+    runtime.log(`queue: ${result.queuePath}`);
+    runtime.log("[crestodian] done: grant.retirement-request");
     return { applied: true };
   }
   if (operation.kind === "create-agent") {
