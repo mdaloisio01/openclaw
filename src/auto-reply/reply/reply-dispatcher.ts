@@ -5,6 +5,7 @@ import { generateSecureInt } from "../../infra/secure-random.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { SilentReplyConversationType } from "../../shared/silent-reply-policy.js";
 import { sleep } from "../../utils.js";
+import { getReplyPayloadProgressHeartbeat } from "../reply-payload.js";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../tokens.js";
 import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import { registerDispatcher } from "./dispatcher-registry.js";
@@ -126,6 +127,20 @@ function normalizeReplyPayloadInternal(
   });
 }
 
+function resolveEffectiveDeliveryKind(
+  requestedKind: ReplyDispatchKind,
+  payload: ReplyPayload,
+): ReplyDispatchKind {
+  if (requestedKind !== "tool") {
+    return requestedKind;
+  }
+  const heartbeat = getReplyPayloadProgressHeartbeat(payload);
+  if (heartbeat?.activeRunContinues === true) {
+    return "block";
+  }
+  return requestedKind;
+}
+
 export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDispatcher {
   let beforeDeliver = options.beforeDeliver;
   let sendChain: Promise<void> = Promise.resolve();
@@ -205,7 +220,8 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
             return;
           }
         }
-        await options.deliver(deliverPayload, { kind });
+        const effectiveKind = resolveEffectiveDeliveryKind(kind, deliverPayload);
+        await options.deliver(deliverPayload, { kind: effectiveKind });
       })
       .catch((err: unknown) => {
         failedCounts[kind] += 1;

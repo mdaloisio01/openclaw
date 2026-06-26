@@ -1,9 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { prefixSystemMessage } from "../../infra/system-message.js";
+import { getReplyPayloadProgressHeartbeat } from "../reply-payload.js";
 import { createAcpReplyProjector } from "./acp-projector.js";
 import { createAcpTestConfig as createCfg } from "./test-fixtures/acp-runtime.js";
 
-type Delivery = { kind: string; text?: string };
+type Delivery = {
+  kind: string;
+  text?: string;
+  isStatusNotice?: boolean;
+  progressHeartbeat?: {
+    category: "plan" | "working";
+    activeRunContinues?: boolean;
+  };
+};
 
 function countMatching<T>(items: readonly T[], predicate: (item: T) => boolean): number {
   let count = 0;
@@ -24,7 +33,12 @@ function createProjectorHarness(
     cfg: createCfg(cfgOverrides),
     shouldSendToolSummaries: true,
     deliver: async (kind, payload) => {
-      deliveries.push({ kind, text: payload.text });
+      deliveries.push({
+        kind,
+        text: payload.text,
+        isStatusNotice: payload.isStatusNotice,
+        progressHeartbeat: getReplyPayloadProgressHeartbeat(payload),
+      });
       return true;
     },
     onProgress: opts?.onProgress,
@@ -504,6 +518,8 @@ describe("createAcpReplyProjector", () => {
     expect(deliveries[0]).toEqual({
       kind: "tool",
       text: prefixSystemMessage("available commands updated (7)"),
+      isStatusNotice: true,
+      progressHeartbeat: undefined,
     });
     expectToolCallSummary(deliveries[1]);
     expect(deliveries[2]).toEqual({ kind: "final", text: "What now?" });
@@ -532,8 +548,66 @@ describe("createAcpReplyProjector", () => {
     expect(deliveries[0]).toEqual({
       kind: "tool",
       text: prefixSystemMessage("available commands updated (7)"),
+      isStatusNotice: true,
+      progressHeartbeat: undefined,
     });
     expectToolCallSummary(deliveries[1]);
+  });
+
+  it("projects visible untagged ACP status events as active-run working heartbeats", async () => {
+    const { deliveries, projector } = createProjectorHarness(
+      createLiveCfgOverrides({
+        coalesceIdleMs: 0,
+        maxChunkChars: 256,
+      }),
+    );
+
+    await projector.onEvent({
+      type: "status",
+      text: "warming up runtime",
+    });
+
+    expect(deliveries).toEqual([
+      {
+        kind: "tool",
+        text: "Status: still working.\nCurrent step: warming up runtime",
+        isStatusNotice: true,
+        progressHeartbeat: {
+          category: "working",
+          activeRunContinues: true,
+        },
+      },
+    ]);
+  });
+
+  it("projects visible ACP plan status events as active-run plan heartbeats", async () => {
+    const { deliveries, projector } = createProjectorHarness(
+      createLiveCfgOverrides({
+        coalesceIdleMs: 0,
+        maxChunkChars: 256,
+        tagVisibility: {
+          plan: true,
+        },
+      }),
+    );
+
+    await projector.onEvent({
+      type: "status",
+      text: "Inspect code",
+      tag: "plan",
+    });
+
+    expect(deliveries).toEqual([
+      {
+        kind: "tool",
+        text: "Status: still working.\nCurrent step: Inspect code",
+        isStatusNotice: true,
+        progressHeartbeat: {
+          category: "plan",
+          activeRunContinues: true,
+        },
+      },
+    ]);
   });
 
   it("suppresses usage_update by default and allows deduped usage when tag-visible", async () => {
@@ -580,8 +654,18 @@ describe("createAcpReplyProjector", () => {
     });
 
     expect(shown).toEqual([
-      { kind: "tool", text: prefixSystemMessage("usage updated: 10/100") },
-      { kind: "tool", text: prefixSystemMessage("usage updated: 11/100") },
+      {
+        kind: "tool",
+        text: prefixSystemMessage("usage updated: 10/100"),
+        isStatusNotice: true,
+        progressHeartbeat: undefined,
+      },
+      {
+        kind: "tool",
+        text: prefixSystemMessage("usage updated: 11/100"),
+        isStatusNotice: true,
+        progressHeartbeat: undefined,
+      },
     ]);
   });
 
@@ -717,10 +801,14 @@ describe("createAcpReplyProjector", () => {
     expect(deliveries[0]).toEqual({
       kind: "tool",
       text: prefixSystemMessage("available commands updated"),
+      isStatusNotice: true,
+      progressHeartbeat: undefined,
     });
     expect(deliveries[1]).toEqual({
       kind: "tool",
       text: prefixSystemMessage("available commands updated"),
+      isStatusNotice: true,
+      progressHeartbeat: undefined,
     });
     expectToolCallSummary(deliveries[2]);
     expectToolCallSummary(deliveries[3]);
@@ -755,8 +843,18 @@ describe("createAcpReplyProjector", () => {
     });
 
     expect(deliveries).toEqual([
-      { kind: "tool", text: prefixSystemMessage("available commands updated (7)") },
-      { kind: "tool", text: prefixSystemMessage("available commands updated (8)") },
+      {
+        kind: "tool",
+        text: prefixSystemMessage("available commands updated (7)"),
+        isStatusNotice: true,
+        progressHeartbeat: undefined,
+      },
+      {
+        kind: "tool",
+        text: prefixSystemMessage("available commands updated (8)"),
+        isStatusNotice: true,
+        progressHeartbeat: undefined,
+      },
     ]);
   });
 
@@ -790,6 +888,8 @@ describe("createAcpReplyProjector", () => {
       {
         kind: "tool",
         text: prefixSystemMessage("output truncated"),
+        isStatusNotice: true,
+        progressHeartbeat: undefined,
       },
     ]);
   });

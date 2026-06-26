@@ -21,6 +21,7 @@ import type {
   PluginTargetedInboundClaimOutcome,
 } from "../../plugins/hooks.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import { createTaskRecord, resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import {
   createChannelTestPluginBase,
   createTestRegistry,
@@ -2683,7 +2684,7 @@ describe("dispatchReplyFromConfig", () => {
     expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(notice);
   });
 
-  it("renders the first plan update as a status notice without generic working statuses", async () => {
+  it("renders the first plan update as a status notice and rejects terminal closeout without a next step", async () => {
     setNoAbort();
     const cfg = {
       ...emptyConfig,
@@ -2720,14 +2721,37 @@ describe("dispatchReplyFromConfig", () => {
     await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
 
     expect(firstToolResultPayload(dispatcher)).toMatchObject({
-      text: "1. Inspect code\n2. Patch code\n3. Run tests",
+      text: "Status: still working.\nProgress: 3 planned steps locked.\nCurrent step: Inspect code",
       isStatusNotice: true,
     });
-    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(1);
-    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "done" });
+    expect(getReplyPayloadMetadata(firstToolResultPayload(dispatcher) as object)).toMatchObject({
+      progressHeartbeat: {
+        category: "plan",
+        activeRunContinues: true,
+      },
+    });
+    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(2);
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+        isStatusNotice: true,
+        isError: true,
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
   });
 
-  it("sends only one plan status notice per reply run", async () => {
+  it("sends only one plan status notice per reply run before blocking terminal closeout", async () => {
     setNoAbort();
     const cfg = {
       ...emptyConfig,
@@ -2757,12 +2781,247 @@ describe("dispatchReplyFromConfig", () => {
 
     await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
 
-    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(1);
+    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(2);
     expect(firstToolResultPayload(dispatcher)).toMatchObject({
-      text: "1. Inspect code",
+      text: "Status: still working.\nCurrent step: Inspect code",
       isStatusNotice: true,
     });
+    expect(getReplyPayloadMetadata(firstToolResultPayload(dispatcher) as object)).toMatchObject({
+      progressHeartbeat: {
+        category: "plan",
+        activeRunContinues: true,
+      },
+    });
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+  });
+
+  it("allows terminal closeout after a next executable step starts", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+      _cfg?: OpenClawConfig,
+    ) => {
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Inspect code"],
+      });
+      await opts?.onToolStart?.({ name: "exec" });
+      await opts?.onToolResult?.({ text: "tool output" });
+      return { text: "done" } satisfies ReplyPayload;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
     expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "done" });
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        expect.objectContaining({ type: "NEXT_EXECUTABLE_STEP_STARTED" }),
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
+  it("rejects terminal closeout when the final payload itself carries open-build continuation truth", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async () =>
+      setReplyPayloadMetadata(
+        {
+          text: "What is materially real now: gateway slice passed.\nWhat is still not real yet: broader continuation build remains open.\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: identify and launch the next executable unit.",
+        } satisfies ReplyPayload,
+        {
+          activeRunContinuation: {
+            stopAllowed: false,
+            stopReason: "owner_execution_in_progress",
+            openTruth: "owner execution in progress, build still open.",
+            executionRunningNow: false,
+          },
+        },
+      );
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+        isStatusNotice: true,
+        isError: true,
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({
+          type: "NON_TERMINAL_BUILD_UPDATE_EMITTED",
+          detail: "stop_contract:owner execution in progress, build still open.",
+        }),
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
+  it("allows terminal closeout when final payload continuation truth carries a lawful blocker stop", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async () =>
+      setReplyPayloadMetadata(
+        {
+          text: "Blocked waiting on approval. Open/closed truth: owner execution in progress, build still open.",
+        } satisfies ReplyPayload,
+        {
+          activeRunContinuation: {
+            stopAllowed: true,
+            stopReason: "blocker",
+            openTruth: "owner execution in progress, build still open.",
+          },
+        },
+      );
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Blocked waiting on approval. Open/closed truth: owner execution in progress, build still open.",
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "BLOCKER_STATE", detail: "true:blocker" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
+  it("rejects terminal closeout when the final payload says the local slice is complete but the broader mission is still open", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async () =>
+      ({
+        text: "Background task local slice complete: package updated.\nOpen/closed truth: local slice complete; broader mission still open.\nExact next action: continue the active halt-build repair path.",
+      }) satisfies ReplyPayload;
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+        isStatusNotice: true,
+        isError: true,
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({
+          type: "NON_TERMINAL_BUILD_UPDATE_EMITTED",
+          detail: "stop_contract:local slice complete; broader mission still open",
+        }),
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
+  it("allows blocked closeout after a lawful blocker is recorded", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+      _cfg?: OpenClawConfig,
+    ) => {
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Inspect code"],
+      });
+      await opts?.onApprovalEvent?.({
+        phase: "requested",
+        status: "unavailable",
+        message: "approval unavailable",
+      });
+      return {
+        text: "BLOCKED_CLOSEOUT: approval unavailable",
+        isError: true,
+      } satisfies ReplyPayload;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "BLOCKED_CLOSEOUT: approval unavailable",
+      isError: true,
+    });
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        { type: "BLOCKER_STATE", detail: "true:approval_unavailable" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
   });
 
   it("suppresses generic patch working statuses when verbose is enabled", async () => {
@@ -2948,10 +3207,23 @@ describe("dispatchReplyFromConfig", () => {
     expect(sessionStoreMocks.loadSessionStore).not.toHaveBeenCalled();
     expect(sessionStoreMocks.resolveSessionStoreEntry).not.toHaveBeenCalled();
     expect(firstToolResultPayload(dispatcher)).toMatchObject({
-      text: "1. Inspect code\n2. Patch code\n3. Run tests",
+      text: "Status: still working.\nProgress: 3 planned steps locked.\nCurrent step: Inspect code",
       isStatusNotice: true,
     });
-    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "done" });
+    expect(getReplyPayloadMetadata(firstToolResultPayload(dispatcher) as object)).toMatchObject({
+      progressHeartbeat: {
+        category: "plan",
+        activeRunContinues: true,
+      },
+    });
+    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(2);
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
   });
 
   it("suppresses text-only tool summaries when preview tool-progress suppression is enabled", async () => {
@@ -3479,11 +3751,23 @@ describe("dispatchReplyFromConfig", () => {
     });
 
     expect(dispatcher.sendToolResult).toHaveBeenNthCalledWith(1, {
-      text: "1. Patch code",
+      text: "Status: still working.\nCurrent step: Patch code",
       isStatusNotice: true,
     });
-    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(1);
-    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "done" });
+    expect(getReplyPayloadMetadata(firstToolResultPayload(dispatcher) as object)).toMatchObject({
+      progressHeartbeat: {
+        category: "plan",
+        activeRunContinues: true,
+      },
+    });
+    expect(dispatcher.sendToolResult).toHaveBeenCalledTimes(2);
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
   });
 
   it("delivers verbose tool summaries despite message-tool-only source suppression", async () => {
@@ -4294,6 +4578,176 @@ describe("dispatchReplyFromConfig", () => {
     expect(blockTexts).toEqual(["What do you want to work on?"]);
     const finalPayload = firstFinalReplyPayload(dispatcher);
     expect(finalPayload?.text).toBe("What do you want to work on?");
+  });
+
+  describe("mission-bound followup rebinding", () => {
+    beforeEach(() => {
+      resetTaskRegistryForTests({ persist: false });
+    });
+
+    it("rebinds bare continue to the active mission before reply resolution", async () => {
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:discord:C123",
+        requesterSessionKey: "agent:main:discord:C123",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:grant-followup",
+        runId: "run-grant-followup",
+        task: "Fix the Grant blind-test hang path",
+        missionId: "mission-grant-hang",
+        missionSummary: "Fix the Grant blind-test hang path",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "discord",
+        Surface: "discord",
+        OriginatingChannel: "discord",
+        OriginatingTo: "discord:C123",
+        To: "discord:C123",
+        AccountId: "default",
+        SessionKey: "agent:main:discord:C123",
+        BodyForAgent: "continue",
+      });
+      const replyResolver = vi.fn(async (resolverCtx: MsgContext) => {
+        expect(resolverCtx.BodyForAgent).toBe(
+          "Continue the active mission (mission-grant-hang): Fix the Grant blind-test hang path",
+        );
+        return { text: "ok" } satisfies ReplyPayload;
+      });
+
+      await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "ok" });
+    });
+
+    it("injects active mission context into ordinary turns before reply resolution", async () => {
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:discord:C789",
+        requesterSessionKey: "agent:main:discord:C789",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:grant-context",
+        runId: "run-grant-context",
+        task: "Fix the Grant blind-test hang path",
+        missionId: "mission-grant-hang",
+        missionSummary: "Fix the Grant blind-test hang path",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "discord",
+        Surface: "discord",
+        OriginatingChannel: "discord",
+        OriginatingTo: "discord:C789",
+        To: "discord:C789",
+        AccountId: "default",
+        SessionKey: "agent:main:discord:C789",
+        BodyForAgent: "what have you found so far?",
+      });
+      const replyResolver = vi.fn(async (resolverCtx: MsgContext) => {
+        expect(resolverCtx.BodyForAgent).toBe(
+          "<active_mission>\n<mission_id>mission-grant-hang</mission_id>\n<mission_summary>Fix the Grant blind-test hang path</mission_summary>\n<authority>task-registry</authority>\n<legacy_label>Active mission (mission-grant-hang): Fix the Grant blind-test hang path</legacy_label>\n</active_mission>\n\nCurrent user turn:\nwhat have you found so far?",
+        );
+        return { text: "status" } satisfies ReplyPayload;
+      });
+
+      await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "status" });
+    });
+
+    it("injects active mission context into ordinary turns when only Body is present", async () => {
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:discord:C790",
+        requesterSessionKey: "agent:main:discord:C790",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:grant-context-body",
+        runId: "run-grant-context-body",
+        task: "Fix the Grant blind-test hang path",
+        missionId: "mission-grant-hang",
+        missionSummary: "Fix the Grant blind-test hang path",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "discord",
+        Surface: "discord",
+        OriginatingChannel: "discord",
+        OriginatingTo: "discord:C790",
+        To: "discord:C790",
+        AccountId: "default",
+        SessionKey: "agent:main:discord:C790",
+        Body: "what have you found so far?",
+        BodyForAgent: undefined,
+      });
+      const replyResolver = vi.fn(async (resolverCtx: MsgContext) => {
+        expect(resolverCtx.BodyForAgent).toBe(
+          "<active_mission>\n<mission_id>mission-grant-hang</mission_id>\n<mission_summary>Fix the Grant blind-test hang path</mission_summary>\n<authority>task-registry</authority>\n<legacy_label>Active mission (mission-grant-hang): Fix the Grant blind-test hang path</legacy_label>\n</active_mission>\n\nCurrent user turn:\nwhat have you found so far?",
+        );
+        return { text: "status" } satisfies ReplyPayload;
+      });
+
+      await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "status" });
+    });
+
+    it("fails closed when continue arrives after mission history but no active mission remains", async () => {
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:discord:C456",
+        requesterSessionKey: "agent:main:discord:C456",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:grant-stale",
+        runId: "run-grant-stale",
+        task: "Old drifted mission",
+        missionId: "mission-old",
+        missionSummary: "Old drifted frame",
+        missionState: "abandoned",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "discord",
+        Surface: "discord",
+        OriginatingChannel: "discord",
+        OriginatingTo: "discord:C456",
+        To: "discord:C456",
+        AccountId: "default",
+        SessionKey: "agent:main:discord:C456",
+        BodyForAgent: "continue",
+      });
+      const replyResolver = vi.fn(async () => ({ text: "should not run" }) satisfies ReplyPayload);
+
+      const result = await dispatchReplyFromConfig({
+        ctx,
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver,
+      });
+
+      expect(replyResolver).not.toHaveBeenCalled();
+      expect(result.queuedFinal).toBe(true);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+        text: "There is mission history for this owner but no single active mission, so I will not bind `continue` or `yes` to a stale frame. Re-state the exact task.",
+      });
+    });
   });
 
   it("generates final-mode TTS audio after ACP block streaming completes", async () => {

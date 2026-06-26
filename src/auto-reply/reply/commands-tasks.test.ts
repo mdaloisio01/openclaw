@@ -77,7 +77,9 @@ describe("buildTasksReply", () => {
     const reply = await buildTasksReplyForTest();
 
     expect(reply.text).toContain("📋 Tasks");
-    expect(reply.text).toContain("Current session: 2 active · 3 total");
+    expect(reply.text).toContain(
+      "Current session: 1 running · 1 accepted/not yet proven active · 3 total",
+    );
     expect(reply.text).toContain("🟢 active background task");
     expect(reply.text).toContain("🟡 queued background task");
     expect(reply.text).toContain("🔴 failed background task");
@@ -101,7 +103,7 @@ describe("buildTasksReply", () => {
 
     const reply = await buildTasksReplyForTest();
 
-    expect(reply.text).toContain("Current session: 1 active · 1 total");
+    expect(reply.text).toContain("Current session: 1 running · 1 total");
     expect(reply.text).toContain("🟢 Video generation");
     expect(reply.text).toContain("CLI · running");
     expect(reply.text).toContain("Queued video generation");
@@ -124,7 +126,7 @@ describe("buildTasksReply", () => {
 
     const reply = await buildTasksReplyForTest();
 
-    expect(reply.text).toContain("Current session: 1 active · 1 total");
+    expect(reply.text).toContain("Current session: 1 running · 1 total");
     expect(reply.text).toContain("🟢 Image generation");
     expect(reply.text).toContain("CLI · running");
     expect(reply.text).toContain("Queued image generation");
@@ -225,7 +227,7 @@ describe("buildTasksReply", () => {
     });
 
     expect(reply.text).toContain("All clear - nothing linked to this session right now.");
-    expect(reply.text).toContain("Agent-local: 1 active · 1 total");
+    expect(reply.text).toContain("Agent-local: 1 running · 1 total");
     expect(reply.text).not.toContain("hidden background task");
     expect(reply.text).not.toContain("hidden progress detail");
   });
@@ -250,7 +252,7 @@ describe("buildTasksReply", () => {
     });
 
     expect(reply.text).toContain("All clear - nothing linked to this session right now.");
-    expect(reply.text).toContain("Agent-local: 1 active · 1 total");
+    expect(reply.text).toContain("Agent-local: 1 running · 1 total");
     expect(reply.text).not.toContain("hidden video background task");
     expect(reply.text).not.toContain("Queued video generation");
   });
@@ -275,7 +277,7 @@ describe("buildTasksReply", () => {
     });
 
     expect(reply.text).toContain("All clear - nothing linked to this session right now.");
-    expect(reply.text).toContain("Agent-local: 1 active · 1 total");
+    expect(reply.text).toContain("Agent-local: 1 running · 1 total");
     expect(reply.text).not.toContain("target hidden background task");
   });
 });

@@ -1,5 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { markReplyPayloadAsProgressHeartbeat } from "../reply-payload.js";
+import {
+  allowTerminalCloseout,
+  flushBlockedCloseoutIfNeeded,
+  installActiveRunContinuationGuard,
+  recordActiveRunStarted,
+  recordNextExecutableStepStarted,
+  recordNonTerminalBuildUpdateEmitted,
+  testing as activeRunContinuationGuardTesting,
+} from "./active-run-continuation-guard.js";
 import { createAcpDispatchDeliveryCoordinator } from "./dispatch-acp-delivery.js";
 import { createReplyDispatcher, type ReplyDispatcher } from "./reply-dispatcher.js";
 import { buildTestCtx } from "./test-ctx.js";
@@ -79,6 +89,39 @@ function createDispatcher(): ReplyDispatcher {
     getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
     markComplete: vi.fn(),
   };
+}
+
+function createGuardedDispatcherHarness(): {
+  dispatcher: ReplyDispatcher;
+  deliveredFinalPayloads: Array<{ text?: string }>;
+  deliveredToolPayloads: Array<{ text?: string }>;
+} {
+  const deliveredFinalPayloads: Array<{ text?: string }> = [];
+  const deliveredToolPayloads: Array<{ text?: string }> = [];
+  const dispatcher: ReplyDispatcher = {
+    sendToolResult: vi.fn((payload) => {
+      deliveredToolPayloads.push({ text: payload.text });
+      return true;
+    }),
+    sendBlockReply: vi.fn(() => true),
+    sendFinalReply: vi.fn((payload) => {
+      const decision = allowTerminalCloseout(dispatcher, "sendFinalReply");
+      if (!decision.allowed) {
+        return false;
+      }
+      deliveredFinalPayloads.push({ text: payload.text });
+      return true;
+    }),
+    waitForIdle: vi.fn(async () => {}),
+    getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+    getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+    markComplete: vi.fn(() => {
+      void allowTerminalCloseout(dispatcher, "markComplete");
+    }),
+  };
+
+  installActiveRunContinuationGuard(dispatcher);
+  return { dispatcher, deliveredFinalPayloads, deliveredToolPayloads };
 }
 
 function createCoordinator(onReplyStart?: (...args: unknown[]) => Promise<void>) {
@@ -247,6 +290,44 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     expect(coordinator.hasDeliveredVisibleText()).toBe(true);
     expect(coordinator.hasFailedVisibleTextDelivery()).toBe(false);
     expect(coordinator.getRoutedCounts().block).toBe(0);
+  });
+
+  it("treats active-run progress heartbeats as visible direct block delivery even when queued as tool", async () => {
+    const dispatcher = createDispatcher();
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      inboundAudio: false,
+      shouldRouteToOriginating: false,
+    });
+
+    await coordinator.deliver(
+      "tool",
+      markReplyPayloadAsProgressHeartbeat(
+        {
+          text: "Status: still working.\nCurrent step: Inspect code",
+          isStatusNotice: true,
+        },
+        {
+          category: "working",
+          activeRunContinues: true,
+        },
+      ),
+      { skipTts: true },
+    );
+    await coordinator.settleVisibleText();
+
+    expect(coordinator.hasDeliveredVisibleText()).toBe(true);
+    expect(dispatcher.sendToolResult).not.toHaveBeenCalled();
+    expect(dispatcher.sendBlockReply).toHaveBeenCalledWith({
+      text: "Status: still working.\nCurrent step: Inspect code",
+      isStatusNotice: true,
+    });
   });
 
   it("does not wait for direct block dispatcher delivery before resolving block delivery", async () => {
@@ -832,6 +913,46 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     expect(coordinator.getRoutedCounts().block).toBe(1);
   });
 
+  it("routes active-run progress heartbeats with block reply kind even when queued as tool", async () => {
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher: createDispatcher(),
+      inboundAudio: false,
+      shouldRouteToOriginating: true,
+      originatingChannel: "visiblechat",
+      originatingTo: "channel:thread-1",
+    });
+
+    await coordinator.deliver(
+      "tool",
+      markReplyPayloadAsProgressHeartbeat(
+        {
+          text: "Status: still working.\nCurrent step: Inspect code",
+          isStatusNotice: true,
+        },
+        {
+          category: "working",
+          activeRunContinues: true,
+        },
+      ),
+      { skipTts: true },
+    );
+
+    expect(deliveryMocks.routeReply).toHaveBeenCalledTimes(1);
+    const [[routeParams]] = deliveryMocks.routeReply.mock.calls as unknown as Array<
+      [{ replyKind?: string; payload?: { text?: string } }]
+    >;
+    expect(routeParams.replyKind).toBe("block");
+    expect(routeParams.payload?.text).toBe("Status: still working.\nCurrent step: Inspect code");
+    expect(coordinator.hasDeliveredVisibleText()).toBe(true);
+    expect(coordinator.getRoutedCounts().block).toBe(1);
+  });
+
   it("treats hook-suppressed routed ACP block text as handled", async () => {
     deliveryMocks.routeReply.mockResolvedValueOnce({
       ok: true,
@@ -858,5 +979,88 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     expect(coordinator.hasDeliveredVisibleText()).toBe(true);
     expect(coordinator.hasFailedVisibleTextDelivery()).toBe(false);
     expect(coordinator.getRoutedCounts().block).toBe(0);
+  });
+
+  it("rejects ACP final delivery after a non-terminal update when no next step started", async () => {
+    const { dispatcher, deliveredFinalPayloads, deliveredToolPayloads } =
+      createGuardedDispatcherHarness();
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      inboundAudio: false,
+      shouldRouteToOriginating: false,
+    });
+
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "acp_progress_update");
+
+    const delivered = await coordinator.deliver("final", { text: "done" }, { skipTts: true });
+
+    expect(delivered).toBe(false);
+    expect(deliveredFinalPayloads).toEqual([]);
+    expect(deliveredToolPayloads).toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(deliveredFinalPayloads).toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining("BLOCKED_CLOSEOUT"),
+      }),
+    );
+    expect(activeRunContinuationGuardTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "acp_progress_update" },
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "BLOCKED_CLOSEOUT" },
+      ]),
+    );
+  });
+
+  it("allows ACP final delivery after the next executable step starts", async () => {
+    const { dispatcher, deliveredFinalPayloads, deliveredToolPayloads } =
+      createGuardedDispatcherHarness();
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      inboundAudio: false,
+      shouldRouteToOriginating: false,
+    });
+
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "acp_progress_update");
+    recordNextExecutableStepStarted(dispatcher, "acp_next_step");
+
+    const delivered = await coordinator.deliver("final", { text: "done" }, { skipTts: true });
+
+    expect(delivered).toBe(true);
+    expect(deliveredFinalPayloads).toEqual([{ text: "done" }]);
+    expect(deliveredToolPayloads).toEqual([]);
+    expect(activeRunContinuationGuardTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "acp_progress_update" },
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "NEXT_EXECUTABLE_STEP_STARTED", detail: "acp_next_step" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
   });
 });

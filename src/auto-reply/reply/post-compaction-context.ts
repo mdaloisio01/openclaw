@@ -6,6 +6,7 @@ import { resolveCronStyleNow } from "../../agents/current-time.js";
 import { formatDateStamp, resolveUserTimezone } from "../../agents/date-time.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { openRootFile } from "../../infra/boundary-file-read.js";
+import { buildActiveMissionContextBlockForOwnerKey } from "../../tasks/task-registry.js";
 
 const MAX_CONTEXT_CHARS = 1800;
 const DEFAULT_POST_COMPACTION_SECTIONS = ["Session Startup", "Red Lines"];
@@ -50,7 +51,20 @@ export type PostCompactionContextOptions = {
   cfg?: OpenClawConfig;
   agentId?: string;
   nowMs?: number;
+  sessionKey?: string;
 };
+
+function buildActiveMissionRefresh(sessionKey?: string): string | null {
+  const missionBlock = sessionKey ? buildActiveMissionContextBlockForOwnerKey(sessionKey) : null;
+  if (!missionBlock) {
+    return null;
+  }
+  return (
+    "[Active mission refresh]\n\n" +
+    `${missionBlock}\n` +
+    "Treat this as the current mission unless the user explicitly changes the target."
+  );
+}
 
 export async function readPostCompactionContext(
   workspaceDir: string,
@@ -59,6 +73,7 @@ export async function readPostCompactionContext(
   const cfg = options?.cfg;
   const agentId = options?.agentId;
   const effectiveNowMs = options?.nowMs;
+  const activeMissionRefresh = buildActiveMissionRefresh(options?.sessionKey);
   const agentsPath = path.join(workspaceDir, "AGENTS.md");
 
   try {
@@ -68,7 +83,7 @@ export async function readPostCompactionContext(
       boundaryLabel: "workspace root",
     });
     if (!opened.ok) {
-      return null;
+      return activeMissionRefresh;
     }
     const content = (() => {
       try {
@@ -80,7 +95,7 @@ export async function readPostCompactionContext(
 
     const configuredSections = cfg?.agents?.defaults?.compaction?.postCompactionSections;
     if (!Array.isArray(configuredSections) || configuredSections.length === 0) {
-      return null;
+      return activeMissionRefresh;
     }
     const sectionNames = configuredSections;
 
@@ -98,7 +113,7 @@ export async function readPostCompactionContext(
     }
 
     if (sections.length === 0) {
-      return null;
+      return activeMissionRefresh;
     }
 
     // Only reference section names that were actually found and injected.
@@ -133,13 +148,13 @@ export async function readPostCompactionContext(
       ? "Critical rules from AGENTS.md:"
       : `Injected sections from AGENTS.md (${displayNames.join(", ")}):`;
 
-    return (
+    const baseContext =
       "[Post-compaction context refresh]\n\n" +
       `${prose}\n\n` +
-      `${sectionLabel}\n\n${safeContent}\n\n${timeLine}`
-    );
+      `${sectionLabel}\n\n${safeContent}\n\n${timeLine}`;
+    return activeMissionRefresh ? `${activeMissionRefresh}\n\n${baseContext}` : baseContext;
   } catch {
-    return null;
+    return activeMissionRefresh;
   }
 }
 

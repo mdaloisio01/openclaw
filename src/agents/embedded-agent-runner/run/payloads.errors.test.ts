@@ -488,6 +488,30 @@ describe("buildEmbeddedRunPayloads", () => {
     },
   );
 
+  it("suppresses harmless no-match search warnings so they do not look like runtime breakage", () => {
+    expectNoPayloads({
+      lastToolError: {
+        toolName: "grep",
+        meta: 'search "~" -> search "GIE Self improvment update.md|GIE Improvment Planning Task.md"',
+        error: "ripgrep exited with code 1",
+      },
+    });
+  });
+
+  it("keeps real search tool failures visible when the error is not a simple no-match exit", () => {
+    const payloads = buildPayloads({
+      lastToolError: {
+        toolName: "grep",
+        meta: 'search "~" -> search "GIE Self improvment update.md"',
+        error: "permission denied",
+      },
+    });
+    expectSingleToolErrorPayload(payloads, {
+      title: "Grep",
+      absentDetail: "exited with code 1",
+    });
+  });
+
   it("suppresses non-mutating non-recoverable tool errors when messages.suppressToolErrors is enabled", () => {
     expectNoPayloads({
       lastToolError: { toolName: "browser", error: "connection timeout" },

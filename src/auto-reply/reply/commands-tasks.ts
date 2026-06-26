@@ -38,7 +38,17 @@ function formatTaskHeadline(snapshot: ReturnType<typeof buildTaskStatusSnapshot>
   if (snapshot.totalCount === 0) {
     return "All clear - nothing linked to this session right now.";
   }
-  return `Current session: ${snapshot.activeCount} active · ${snapshot.totalCount} total`;
+  const activeLabel =
+    snapshot.runningCount > 0
+      ? `${snapshot.runningCount} running`
+      : snapshot.acceptedCount > 0
+        ? `${snapshot.acceptedCount} accepted/not yet proven active`
+        : "0 running";
+  const acceptedSuffix =
+    snapshot.runningCount > 0 && snapshot.acceptedCount > 0
+      ? ` · ${snapshot.acceptedCount} accepted/not yet proven active`
+      : "";
+  return `Current session: ${activeLabel}${acceptedSuffix} · ${snapshot.totalCount} total`;
 }
 
 function formatAgentFallbackLine(agentId: string): string | undefined {
@@ -46,7 +56,17 @@ function formatAgentFallbackLine(agentId: string): string | undefined {
   if (snapshot.totalCount === 0) {
     return undefined;
   }
-  return `Agent-local: ${snapshot.activeCount} active · ${snapshot.totalCount} total`;
+  const activeLabel =
+    snapshot.runningCount > 0
+      ? `${snapshot.runningCount} running`
+      : snapshot.acceptedCount > 0
+        ? `${snapshot.acceptedCount} accepted/not yet proven active`
+        : "0 running";
+  const acceptedSuffix =
+    snapshot.runningCount > 0 && snapshot.acceptedCount > 0
+      ? ` · ${snapshot.acceptedCount} accepted/not yet proven active`
+      : "";
+  return `Agent-local: ${activeLabel}${acceptedSuffix} · ${snapshot.totalCount} total`;
 }
 
 function formatTaskTiming(task: TaskRecord): string | undefined {

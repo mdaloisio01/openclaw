@@ -7,6 +7,7 @@ import { EmbeddedBlockChunker } from "../../agents/embedded-agent-block-chunker.
 import { formatToolSummary, resolveToolDisplay } from "../../agents/tool-display.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { prefixSystemMessage } from "../../infra/system-message.js";
+import { markReplyPayloadAsProgressHeartbeat } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
 import {
   type AcpHiddenBoundarySeparator,
@@ -158,6 +159,58 @@ function renderToolSummaryText(event: Extract<AcpRuntimeEvent, { type: "tool_cal
     meta: detailParts.join(" · ") || "tool call",
   });
   return formatToolSummary(display);
+}
+
+function isInfrastructureStatusTag(tag: AcpSessionUpdateTag | undefined): boolean {
+  return (
+    tag === "available_commands_update" ||
+    tag === "usage_update" ||
+    tag === "current_mode_update" ||
+    tag === "config_option_update" ||
+    tag === "session_info_update"
+  );
+}
+
+function buildStatusHeartbeatText(text: string): string {
+  return ["Status: still working.", `Current step: ${text}`].join("\n");
+}
+
+function buildProjectedStatusPayload(params: {
+  text: string;
+  tag: AcpSessionUpdateTag | undefined;
+}): ReplyPayload {
+  const bounded = params.text.trim();
+  if (!bounded) {
+    return { isStatusNotice: true };
+  }
+  if (!params.tag || params.tag === "plan") {
+    return markReplyPayloadAsProgressHeartbeat(
+      {
+        text: buildStatusHeartbeatText(bounded),
+        isStatusNotice: true,
+      },
+      {
+        category: params.tag === "plan" ? "plan" : "working",
+        activeRunContinues: true,
+      },
+    );
+  }
+  if (isInfrastructureStatusTag(params.tag)) {
+    return {
+      text: prefixSystemMessage(bounded),
+      isStatusNotice: true,
+    };
+  }
+  return markReplyPayloadAsProgressHeartbeat(
+    {
+      text: buildStatusHeartbeatText(bounded),
+      isStatusNotice: true,
+    },
+    {
+      category: "working",
+      activeRunContinues: true,
+    },
+  );
 }
 
 export type AcpReplyProjector = {
@@ -325,7 +378,11 @@ export function createAcpReplyProjector(params: {
     if (!bounded) {
       return;
     }
-    const formatted = prefixSystemMessage(bounded);
+    const payload = buildProjectedStatusPayload({
+      text: bounded,
+      tag: meta?.tag,
+    });
+    const formatted = payload.text ?? "";
     const hash = hashText(formatted);
     const shouldDedupe = settings.repeatSuppression && opts?.dedupe !== false;
     if (shouldDedupe && lastStatusHash === hash) {
@@ -333,12 +390,12 @@ export function createAcpReplyProjector(params: {
     }
     if (settings.deliveryMode === "final_only") {
       pendingToolDeliveries.push({
-        payload: { text: formatted },
+        payload,
         meta,
       });
     } else {
       await flush(true);
-      await params.deliver("tool", { text: formatted }, meta);
+      await params.deliver("tool", payload, meta);
     }
     lastStatusHash = hash;
   };

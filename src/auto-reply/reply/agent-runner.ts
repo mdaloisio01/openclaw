@@ -2124,6 +2124,7 @@ export async function runReplyAgent(params: {
         readPostCompactionContext(followupRun.run.workspaceDir, {
           cfg,
           agentId: resolveSessionAgentId({ sessionKey, config: cfg }),
+          sessionKey,
         })
           .then((contextContent) => {
             if (contextContent) {

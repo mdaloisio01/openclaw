@@ -38,6 +38,13 @@ import {
   extractAssistantThinking,
   extractAssistantVisibleText,
 } from "../../embedded-agent-utils.js";
+import type { AgentInternalEvent } from "../../internal-events.js";
+import {
+  applyStopContractToAnswerTexts,
+  extractLatestStopContract,
+  inferStopContractFromText,
+  type EmbeddedRunStopContract,
+} from "../../stop-contract.js";
 import { isExecLikeToolName, type ToolErrorSummary } from "../../tool-error-summary.js";
 import { isLikelyMutatingToolName } from "../../tool-mutation.js";
 
@@ -145,6 +152,31 @@ function shouldMarkNonTerminalToolErrorWarning(lastToolError: ToolErrorSummary):
   return lastToolError.middlewareError === true;
 }
 
+function isHarmlessSearchNoMatchToolError(lastToolError: ToolErrorSummary): boolean {
+  if (lastToolError.timedOut === true || lastToolError.middlewareError === true) {
+    return false;
+  }
+  const toolName = normalizeOptionalLowercaseString(lastToolError.toolName) ?? "";
+  const meta = normalizeOptionalLowercaseString(lastToolError.meta) ?? "";
+  const error = normalizeOptionalLowercaseString(lastToolError.error) ?? "";
+  const looksLikeSearch =
+    meta.startsWith("search ") ||
+    meta.includes(" -> search ") ||
+    meta.startsWith("find ") ||
+    meta.includes(" -> find ");
+  const searchToolLike =
+    toolName === "grep" ||
+    toolName === "find" ||
+    toolName === "search" ||
+    toolName === "exec" ||
+    toolName === "bash";
+  const noMatchError =
+    error.includes("exited with code 1") ||
+    error.includes("exit code 1") ||
+    error.includes("no matches found");
+  return looksLikeSearch && searchToolLike && noMatchError;
+}
+
 function resolveToolErrorWarningPolicy(params: {
   lastToolError: ToolErrorSummary;
   hasUserFacingReply: boolean;
@@ -182,6 +214,9 @@ function resolveToolErrorWarningPolicy(params: {
   if (params.suppressToolErrors) {
     return { showWarning: false, includeDetails };
   }
+  if (isHarmlessSearchNoMatchToolError(params.lastToolError)) {
+    return { showWarning: false, includeDetails: false };
+  }
   const isMutatingToolError =
     params.lastToolError.mutatingAction ?? isLikelyMutatingToolName(params.lastToolError.toolName);
   if (isMutatingToolError) {
@@ -204,6 +239,7 @@ export function buildEmbeddedRunPayloads(params: {
   toolMetas: ToolMetaEntry[];
   lastAssistant: AssistantMessage | undefined;
   currentAssistant?: AssistantMessage | null;
+  internalEvents?: AgentInternalEvent[];
   lastToolError?: ToolErrorSummary;
   config?: OpenClawConfig;
   isCronTrigger?: boolean;
@@ -451,7 +487,7 @@ export function buildEmbeddedRunPayloads(params: {
     fallbackAnswerSourceText.length > 0 &&
     normalizedFallbackAnswerSourceText.length > 0;
   const hasAssistantTextPayload = nonEmptyAssistantTexts.length > 0;
-  const answerTexts =
+  const baseAnswerTexts =
     suppressAssistantArtifacts || runAborted
       ? []
       : (shouldUseCanonicalFinalAnswer
@@ -464,6 +500,10 @@ export function buildEmbeddedRunPayloads(params: {
                 ? [fallbackAnswerText]
                 : []
         ).filter((text) => !shouldSuppressRawErrorText(text));
+  const latestStopContract =
+    extractLatestStopContract(params.internalEvents) ??
+    inferStopContractFromText(fallbackAnswerSourceText);
+  const answerTexts = applyStopContractToAnswerTexts(baseAnswerTexts, latestStopContract);
 
   let hasUserFacingAssistantReply = hasSourceReplyPayload;
   const hasUserFacingErrorReply = replyItems.some((item) => item.isError === true);
@@ -561,6 +601,28 @@ export function buildEmbeddedRunPayloads(params: {
       if (item.nonTerminalToolErrorWarning) {
         setReplyPayloadMetadata(payload, {
           nonTerminalToolErrorWarning: true,
+        });
+      }
+      if (
+        latestStopContract &&
+        (typeof latestStopContract.stopAllowed === "boolean" ||
+          latestStopContract.stopReason ||
+          latestStopContract.openTruth ||
+          latestStopContract.nextOwner ||
+          typeof latestStopContract.executionRunningNow === "boolean")
+      ) {
+        setReplyPayloadMetadata(payload, {
+          activeRunContinuation: {
+            ...(typeof latestStopContract.stopAllowed === "boolean"
+              ? { stopAllowed: latestStopContract.stopAllowed }
+              : {}),
+            ...(latestStopContract.stopReason ? { stopReason: latestStopContract.stopReason } : {}),
+            ...(latestStopContract.openTruth ? { openTruth: latestStopContract.openTruth } : {}),
+            ...(latestStopContract.nextOwner ? { nextOwner: latestStopContract.nextOwner } : {}),
+            ...(typeof latestStopContract.executionRunningNow === "boolean"
+              ? { executionRunningNow: latestStopContract.executionRunningNow }
+              : {}),
+          },
         });
       }
       if (item.replyToId) {

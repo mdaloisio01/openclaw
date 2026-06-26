@@ -139,11 +139,13 @@ function formatSessionTaskLine(sessionKey: string): string | undefined {
     return undefined;
   }
   const headline =
-    snapshot.activeCount > 0
-      ? `${snapshot.activeCount} active · ${snapshot.totalCount} total`
-      : snapshot.recentFailureCount > 0
-        ? `${snapshot.recentFailureCount} recent failure${snapshot.recentFailureCount === 1 ? "" : "s"}`
-        : "recently finished";
+    snapshot.runningCount > 0
+      ? `${snapshot.runningCount} running${snapshot.acceptedCount > 0 ? ` · ${snapshot.acceptedCount} accepted/not yet proven active` : ""} · ${snapshot.totalCount} total`
+      : snapshot.acceptedCount > 0
+        ? `${snapshot.acceptedCount} accepted/not yet proven active · ${snapshot.totalCount} total`
+        : snapshot.recentFailureCount > 0
+          ? `${snapshot.recentFailureCount} recent failure${snapshot.recentFailureCount === 1 ? "" : "s"}`
+          : "recently finished";
   const title = formatTaskStatusTitle(task);
   const detail = formatTaskStatusDetail(task);
   const parts = [headline, task.runtime, title, detail].filter(Boolean);
@@ -195,7 +197,13 @@ function formatAgentTaskCountsLine(agentId: string): string | undefined {
   if (snapshot.totalCount === 0) {
     return undefined;
   }
-  return `📌 Tasks: ${snapshot.activeCount} active · ${snapshot.totalCount} total · agent-local`;
+  const headline =
+    snapshot.runningCount > 0
+      ? `${snapshot.runningCount} running${snapshot.acceptedCount > 0 ? ` · ${snapshot.acceptedCount} accepted/not yet proven active` : ""} · ${snapshot.totalCount} total`
+      : snapshot.acceptedCount > 0
+        ? `${snapshot.acceptedCount} accepted/not yet proven active · ${snapshot.totalCount} total`
+        : `${snapshot.totalCount} total`;
+  return `📌 Tasks: ${headline} · agent-local`;
 }
 
 function formatStatusUptimeDuration(ms: number): string {

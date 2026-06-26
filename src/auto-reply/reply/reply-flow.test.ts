@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { markReplyPayloadAsProgressHeartbeat } from "../reply-payload.js";
 import { HEARTBEAT_TOKEN, SILENT_REPLY_TOKEN } from "../tokens.js";
+import {
+  allowTerminalCloseout,
+  flushBlockedCloseoutIfNeeded,
+  installActiveRunContinuationGuard,
+  recordActiveRunStarted,
+  recordLawfulBlocker,
+  recordNonTerminalBuildUpdateEmitted,
+  testing as activeRunContinuationTesting,
+} from "./active-run-continuation-guard.js";
 import { createReplyDispatcher, waitForReplyDispatcherIdle } from "./reply-dispatcher.js";
 import { createReplyToModeFilter } from "./reply-threading.js";
 
@@ -151,6 +161,116 @@ describe("createReplyDispatcher", () => {
 
     await dispatcher.waitForIdle();
     expect(delivered).toEqual(["tool", "block", "final"]);
+  });
+
+  it("delivers active-run progress heartbeats through block semantics even when queued as tool results", async () => {
+    const delivered: string[] = [];
+    const deliver = vi.fn(async (_payload, info) => {
+      delivered.push(info.kind);
+    });
+    const dispatcher = createReplyDispatcher({ deliver });
+
+    dispatcher.sendToolResult(
+      markReplyPayloadAsProgressHeartbeat(
+        {
+          text: "Status: still working.\nCurrent step: Inspect code",
+          isStatusNotice: true,
+        },
+        {
+          category: "working",
+          activeRunContinues: true,
+        },
+      ),
+    );
+
+    await dispatcher.waitForIdle();
+    expect(delivered).toEqual(["block"]);
+    expect(dispatcher.getQueuedCounts()).toEqual({ tool: 1, block: 0, final: 0 });
+  });
+
+  it("rejects markComplete-style terminal closeout when no next step followed a non-terminal update", async () => {
+    const dispatcher = {
+      sendToolResult: vi.fn(() => true),
+      sendBlockReply: vi.fn(() => true),
+      sendFinalReply: vi.fn(() => true),
+      waitForIdle: vi.fn(async () => {}),
+      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      markComplete: vi.fn(),
+    };
+    installActiveRunContinuationGuard(dispatcher);
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "plan:Inspect code");
+
+    expect(allowTerminalCloseout(dispatcher, "markComplete").allowed).toBe(false);
+    expect(dispatcher.markComplete).not.toHaveBeenCalled();
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "plan:Inspect code" },
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "markComplete" },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
+  it("allows blocked closeout after a lawful blocker is recorded", async () => {
+    const dispatcher = {
+      sendToolResult: vi.fn(() => true),
+      sendBlockReply: vi.fn(() => true),
+      sendFinalReply: vi.fn(() => true),
+      waitForIdle: vi.fn(async () => {}),
+      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      markComplete: vi.fn(),
+    };
+    installActiveRunContinuationGuard(dispatcher);
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "plan:Inspect code");
+    recordLawfulBlocker(dispatcher, "approval_unavailable");
+
+    expect(allowTerminalCloseout(dispatcher, "sendFinalReply").allowed).toBe(true);
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "BLOCKER_STATE", detail: "true:approval_unavailable" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
+  it("emits a blocked closeout during settle when continuation is impossible", async () => {
+    const dispatcher = {
+      sendToolResult: vi.fn(() => true),
+      sendBlockReply: vi.fn(() => true),
+      sendFinalReply: vi.fn(() => true),
+      waitForIdle: vi.fn(async () => {}),
+      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      markComplete: vi.fn(),
+    };
+    installActiveRunContinuationGuard(dispatcher);
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "plan:Inspect code");
+
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("BLOCKED_CLOSEOUT"),
+      }),
+    );
   });
 
   it("fires onIdle when the queue drains", async () => {

@@ -1,9 +1,11 @@
+import { flushBlockedCloseoutIfNeeded } from "./reply/active-run-continuation-guard.js";
 import type { ReplyDispatcher } from "./reply/reply-dispatcher.types.js";
 
 export async function settleReplyDispatcher(params: {
   dispatcher: ReplyDispatcher;
   onSettled?: () => void | Promise<void>;
 }): Promise<void> {
+  await flushBlockedCloseoutIfNeeded(params.dispatcher);
   params.dispatcher.markComplete();
   try {
     await params.dispatcher.waitForIdle();

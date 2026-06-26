@@ -1,6 +1,8 @@
 import os from "node:os";
 import path from "node:path";
 import { addTimerTimeoutGraceMs } from "@openclaw/normalization-core/number-coercion";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import {
@@ -56,6 +58,7 @@ import {
   reconcileCodeModeExecBeforeHookParams,
 } from "./code-mode-control-tools.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
+import { applyStopContractToSingleText, type EmbeddedRunStopContract } from "./stop-contract.js";
 import { normalizeToolName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
 import { callGatewayTool } from "./tools/gateway.js";
@@ -92,6 +95,8 @@ export type HookContext = {
   /** Ephemeral session UUID — regenerated on /new and /reset. */
   sessionId?: string;
   runId?: string;
+  sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
+  stopContract?: EmbeddedRunStopContract;
   trace?: DiagnosticTraceContext;
   channelId?: string;
   loopDetection?: ToolLoopDetectionConfig;
@@ -246,6 +251,39 @@ function mergeParamsWithApprovalOverrides(
     return approvalParams;
   }
   return originalParams;
+}
+
+function applySourceReplyStopContractToToolParams(
+  toolName: string,
+  params: unknown,
+  ctx?: HookContext,
+): unknown {
+  if (
+    toolName !== "message" ||
+    ctx?.sourceReplyDeliveryMode !== "message_tool_only" ||
+    !ctx.stopContract ||
+    !isPlainObject(params)
+  ) {
+    return params;
+  }
+  const action = normalizeOptionalString(params.action) ?? "";
+  if (action !== "send") {
+    return params;
+  }
+  const textField = ["message", "content", "text"].find(
+    (field) => typeof params[field] === "string",
+  );
+  if (!textField) {
+    return params;
+  }
+  const adjustedText = applyStopContractToSingleText(params[textField] as string, ctx.stopContract);
+  if (!adjustedText || adjustedText === params[textField]) {
+    return params;
+  }
+  return {
+    ...params,
+    [textField]: adjustedText,
+  };
 }
 
 function unwrapErrorCause(err: unknown): unknown {
@@ -778,7 +816,7 @@ export async function runBeforeToolCallHook(args: {
   approvalMode?: "request" | "report" | "defer";
 }): Promise<HookOutcome> {
   const toolName = normalizeToolName(args.toolName || "tool");
-  const params = args.params;
+  const params = applySourceReplyStopContractToToolParams(toolName, args.params, args.ctx);
 
   if (args.ctx?.sessionKey) {
     const { getDiagnosticSessionState, logToolLoopAction, detectToolCallLoop, recordToolCall } =
@@ -989,7 +1027,7 @@ export async function runBeforeToolCallHook(args: {
       }
       const allowed: HookOutcome = {
         blocked: false as const,
-        params: policyAdjustedParams,
+        params: applySourceReplyStopContractToToolParams(toolName, policyAdjustedParams, args.ctx),
       };
       if (trustedApprovalResolution) {
         allowed.approvalResolution = trustedApprovalResolution;
@@ -1061,7 +1099,7 @@ export async function runBeforeToolCallHook(args: {
     }
     const allowed: HookOutcome = {
       blocked: false as const,
-      params: finalParams,
+      params: applySourceReplyStopContractToToolParams(toolName, finalParams, args.ctx),
     };
     if (finalApprovalResolution) {
       allowed.approvalResolution = finalApprovalResolution;

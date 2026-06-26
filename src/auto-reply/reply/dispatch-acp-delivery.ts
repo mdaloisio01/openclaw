@@ -11,7 +11,7 @@ import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
 import { resolveStatusTtsSnapshot } from "../../tts/status-config.js";
 import { resolveConfiguredTtsMode, shouldCleanTtsDirectiveText } from "../../tts/tts-config.js";
-import { isReplyPayloadStatusNotice } from "../reply-payload.js";
+import { getReplyPayloadProgressHeartbeat, isReplyPayloadStatusNotice } from "../reply-payload.js";
 import type { FinalizedMsgContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import { waitForReplyDispatcherIdle } from "./reply-dispatcher.js";
@@ -59,6 +59,20 @@ type ToolMessageHandle = {
   threadId?: string | number;
   messageId: string;
 };
+
+function resolveEffectiveReplyDispatchKind(
+  kind: ReplyDispatchKind,
+  payload: ReplyPayload,
+): ReplyDispatchKind {
+  if (kind !== "tool") {
+    return kind;
+  }
+  const heartbeat = getReplyPayloadProgressHeartbeat(payload);
+  if (heartbeat?.activeRunContinues === true) {
+    return "block";
+  }
+  return kind;
+}
 
 async function shouldTreatDeliveredTextAsVisible(params: {
   channel: string | undefined;
@@ -392,10 +406,11 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       ttsAuto: params.sessionTtsAuto,
       skipTts: meta?.skipTts,
     });
+    const effectiveKind = resolveEffectiveReplyDispatchKind(kind, ttsPayload);
 
     if (params.shouldRouteToOriginating && params.originatingChannel && params.originatingTo) {
       const toolCallId = normalizeOptionalString(meta?.toolCallId);
-      if (kind === "tool" && meta?.allowEdit === true && toolCallId) {
+      if (effectiveKind === "tool" && meta?.allowEdit === true && toolCallId) {
         const edited = await tryEditToolMessage(ttsPayload, toolCallId);
         if (edited) {
           return true;
@@ -404,7 +419,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
 
       const tracksVisibleText = await shouldTreatDeliveredTextAsVisible({
         channel: routedChannel,
-        kind,
+        kind: effectiveKind,
         text: ttsPayload.text,
         routed: true,
       });
@@ -431,7 +446,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         threadId,
         cfg: params.cfg,
         mirror: false,
-        replyKind: kind,
+        replyKind: effectiveKind,
         runId: params.runId,
       });
       if (!result.ok) {
@@ -452,7 +467,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         }
         return true;
       }
-      if (kind === "tool" && meta?.toolCallId && result.messageId) {
+      if (effectiveKind === "tool" && meta?.toolCallId && result.messageId) {
         state.toolMessageByCallId.set(meta.toolCallId, {
           channel: params.originatingChannel,
           accountId: resolvedAccountId,
@@ -461,33 +476,33 @@ export function createAcpDispatchDeliveryCoordinator(params: {
           messageId: result.messageId,
         });
       }
-      if (kind === "final") {
+      if (effectiveKind === "final") {
         state.deliveredFinalReply = true;
       }
       if (tracksVisibleText) {
         state.deliveredVisibleText = true;
       }
-      state.routedCounts[kind] += 1;
+      state.routedCounts[effectiveKind] += 1;
       return true;
     }
 
-    if (kind === "tool") {
+    if (effectiveKind === "tool") {
       await waitForPendingDirectBlockReplyDelivery();
     }
 
     const tracksVisibleText = await shouldTreatDeliveredTextAsVisible({
       channel: directChannel,
-      kind,
+      kind: effectiveKind,
       text: ttsPayload.text,
       routed: false,
     });
     const delivered =
-      kind === "tool"
+      effectiveKind === "tool"
         ? params.dispatcher.sendToolResult(ttsPayload)
-        : kind === "block"
+        : effectiveKind === "block"
           ? params.dispatcher.sendBlockReply(ttsPayload)
           : params.dispatcher.sendFinalReply(ttsPayload);
-    if (kind === "final" && delivered) {
+    if (effectiveKind === "final" && delivered) {
       state.deliveredFinalReply = true;
     }
     if (delivered && tracksVisibleText) {
@@ -496,7 +511,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     } else if (!delivered && tracksVisibleText) {
       state.failedVisibleTextDelivery = true;
     }
-    if (kind === "block" && delivered) {
+    if (effectiveKind === "block" && delivered) {
       hasPendingDirectBlockReplyDelivery = true;
     }
     return delivered;

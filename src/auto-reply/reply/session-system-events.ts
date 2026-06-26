@@ -47,7 +47,10 @@ function compactSystemEvent(line: string): string | null {
 function resolveSystemEventTimezone(cfg: OpenClawConfig) {
   const raw = normalizeOptionalString(cfg.agents?.defaults?.envelopeTimezone);
   if (!raw) {
-    return { mode: "local" as const };
+    return {
+      mode: "iana" as const,
+      timeZone: resolveUserTimezone(cfg.agents?.defaults?.userTimezone),
+    };
   }
   const lowered = normalizeLowercaseStringOrEmpty(raw);
   if (lowered === "utc" || lowered === "gmt") {

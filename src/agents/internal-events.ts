@@ -27,6 +27,12 @@ type AgentTaskCompletionInternalEvent = {
   attachments?: AgentGeneratedAttachment[];
   mediaUrls?: string[];
   statsLine?: string;
+  stopReason?: string;
+  stopAllowed?: boolean;
+  nextOwner?: string;
+  openTruth?: string;
+  executionRunningNow?: boolean;
+  executionProofSummary?: string;
   replyInstruction: string;
 };
 
@@ -71,6 +77,24 @@ function formatTaskCompletionEvent(event: AgentTaskCompletionInternalEvent): str
     `type: ${announceType}`,
     `task: ${taskLabel}`,
     `status: ${statusLabel}`,
+    ...(event.stopReason
+      ? [`stop_reason: ${sanitizeSingleLineField(event.stopReason, "unknown")}`]
+      : []),
+    ...(typeof event.stopAllowed === "boolean"
+      ? [`stop_allowed: ${event.stopAllowed ? "yes" : "no"}`]
+      : []),
+    ...(event.nextOwner
+      ? [`next_owner: ${sanitizeSingleLineField(event.nextOwner, "unknown")}`]
+      : []),
+    ...(event.openTruth
+      ? [`open_truth: ${sanitizeSingleLineField(event.openTruth, "unknown")}`]
+      : []),
+    ...(typeof event.executionRunningNow === "boolean"
+      ? [`execution_running_now: ${event.executionRunningNow ? "yes" : "no"}`]
+      : []),
+    ...(event.executionProofSummary
+      ? [`execution_proof: ${sanitizeSingleLineField(event.executionProofSummary, "unknown")}`]
+      : []),
     "",
     result,
   ];
@@ -101,6 +125,24 @@ function formatTaskCompletionEventForPlainPrompt(event: AgentTaskCompletionInter
     `type: ${announceType}`,
     `task: ${taskLabel}`,
     `status: ${statusLabel}`,
+    ...(event.stopReason
+      ? [`stop_reason: ${sanitizeSingleLineField(event.stopReason, "unknown")}`]
+      : []),
+    ...(typeof event.stopAllowed === "boolean"
+      ? [`stop_allowed: ${event.stopAllowed ? "yes" : "no"}`]
+      : []),
+    ...(event.nextOwner
+      ? [`next_owner: ${sanitizeSingleLineField(event.nextOwner, "unknown")}`]
+      : []),
+    ...(event.openTruth
+      ? [`open_truth: ${sanitizeSingleLineField(event.openTruth, "unknown")}`]
+      : []),
+    ...(typeof event.executionRunningNow === "boolean"
+      ? [`execution_running_now: ${event.executionRunningNow ? "yes" : "no"}`]
+      : []),
+    ...(event.executionProofSummary
+      ? [`execution_proof: ${sanitizeSingleLineField(event.executionProofSummary, "unknown")}`]
+      : []),
     "",
     result,
   ];

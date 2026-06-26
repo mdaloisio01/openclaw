@@ -435,6 +435,7 @@ async function appendPostCompactionRefreshPrompt(params: {
   const refreshPrompt = await readPostCompactionContext(params.followupRun.run.workspaceDir, {
     cfg: params.cfg,
     agentId: params.followupRun.run.agentId,
+    sessionKey: params.followupRun.run.sessionKey,
   });
   if (!refreshPrompt) {
     return;

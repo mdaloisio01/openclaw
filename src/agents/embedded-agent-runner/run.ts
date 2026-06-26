@@ -20,7 +20,6 @@ import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
 import { resolveProviderAuthProfileId } from "../../plugins/provider-runtime.js";
 import { enqueueCommandInLane } from "../../process/command-queue.js";
 import type { CommandQueueEnqueueOptions } from "../../process/command-queue.types.js";
-import { createAgentHarnessTaskRuntimeScope } from "../../tasks/agent-harness-task-runtime-scope.js";
 import { resolveUserPath } from "../../utils.js";
 import { isMarkdownCapableMessageChannel } from "../../utils/message-channel.js";
 import {
@@ -123,6 +122,7 @@ import {
   type PostCompactionGuardObservation,
 } from "./post-compaction-loop-guard.js";
 import { createEmbeddedRunReplayState, observeReplayMetadata } from "./replay-state.js";
+import { resolveAgentHarnessTaskRuntimeScope } from "./run/agent-harness-task-runtime-scope.js";
 import { handleAssistantFailover } from "./run/assistant-failover.js";
 import {
   createEmbeddedRunStageTracker,
@@ -1596,7 +1596,7 @@ export async function runEmbeddedAgent(
             agentHarnessId: agentHarness.id,
             ...(params.sessionKey
               ? {
-                  agentHarnessTaskRuntimeScope: createAgentHarnessTaskRuntimeScope({
+                  agentHarnessTaskRuntimeScope: resolveAgentHarnessTaskRuntimeScope({
                     requesterSessionKey: params.sessionKey,
                   }),
                 }
@@ -2913,6 +2913,7 @@ export async function runEmbeddedAgent(
             toolMetas: attempt.toolMetas,
             lastAssistant: attempt.lastAssistant,
             currentAssistant: currentAttemptAssistant ?? null,
+            internalEvents: params.internalEvents,
             lastToolError: attempt.lastToolError,
             config: params.config,
             isCronTrigger: params.trigger === "cron",

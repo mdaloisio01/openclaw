@@ -2,6 +2,7 @@ import type { AssistantMessage } from "openclaw/plugin-sdk/llm";
 import { describe, expect, it } from "vitest";
 import { getReplyPayloadMetadata } from "../../../auto-reply/reply-payload.js";
 import type { InteractiveReply, MessagePresentation } from "../../../interactive/payload.js";
+import type { AgentInternalEvent } from "../../internal-events.js";
 import {
   buildPayloads,
   expectSinglePayloadText,
@@ -9,6 +10,23 @@ import {
 } from "./payloads.test-helpers.js";
 
 describe("buildEmbeddedRunPayloads tool-error warnings", () => {
+  function makeTaskCompletionEvent(
+    overrides: Partial<Extract<AgentInternalEvent, { type: "task_completion" }>>,
+  ): AgentInternalEvent {
+    return {
+      type: "task_completion",
+      source: "runtime",
+      childSessionKey: "agent:main:child",
+      announceType: "subagent task",
+      taskLabel: "child task",
+      status: "ok",
+      statusLabel: "completed; ready for parent review",
+      result: "child complete",
+      replyInstruction: "reply to the user",
+      ...overrides,
+    };
+  }
+
   function expectNoPayloads(params: Parameters<typeof buildPayloads>[0]) {
     const payloads = buildPayloads(params);
     expect(payloads).toHaveLength(0);
@@ -219,6 +237,118 @@ describe("buildEmbeddedRunPayloads tool-error warnings", () => {
     });
 
     expectSinglePayloadText(payloads, "The schema export is fixed.");
+  });
+
+  it("fails closed to an explicit owner-boundary stop explanation when the assistant reply is blank", () => {
+    const payloads = buildPayloads({
+      assistantTexts: [],
+      lastAssistant: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [],
+      } as AssistantMessage,
+      internalEvents: [
+        makeTaskCompletionEvent({
+          stopReason: "owner_boundary_stop",
+          stopAllowed: true,
+          nextOwner: "Fleet Command",
+          openTruth: "routed to lawful owner, build still open.",
+        }),
+      ],
+    });
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.text).toContain("routed to lawful owner, build still open.");
+    expect(payloads[0]?.text).toContain(
+      "I am stopping here because this reached a lawful owner boundary.",
+    );
+    expect(payloads[0]?.text).toContain("The remaining substantive work belongs to Fleet Command.");
+    expect(payloads[0]?.text).toContain(
+      "SOP forbids me from continuing that owner's lane without override.",
+    );
+  });
+
+  it("prepends an explicit still-open explanation when a non-eligible stop tries to end on vague text", () => {
+    const payloads = buildPayloads({
+      assistantTexts: ["Route artifact recorded."],
+      lastAssistant: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "Route artifact recorded." }],
+      } as AssistantMessage,
+      internalEvents: [
+        makeTaskCompletionEvent({
+          stopReason: "owner_execution_in_progress",
+          stopAllowed: false,
+          nextOwner: "Grant",
+          openTruth: "owner execution in progress, build still open.",
+        }),
+      ],
+    });
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.text).toContain("owner execution in progress, build still open.");
+    expect(payloads[0]?.text).toContain(
+      "This turn is ending without live proof that active owner execution is underway",
+    );
+    expect(payloads[0]?.text).toContain("Route artifact recorded.");
+    expect(getReplyPayloadMetadata(payloads[0] as object)).toMatchObject({
+      activeRunContinuation: {
+        stopAllowed: false,
+        stopReason: "owner_execution_in_progress",
+        openTruth: "owner execution in progress, build still open.",
+        nextOwner: "Grant",
+      },
+    });
+  });
+
+  it("infers still-open continuation truth from final assistant text when internal events are absent", () => {
+    const payloads = buildPayloads({
+      assistantTexts: ["Open/closed truth: owner execution in progress, build still open."],
+      lastAssistant: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [
+          {
+            type: "text",
+            text: "Open/closed truth: owner execution in progress, build still open.",
+          },
+        ],
+      } as AssistantMessage,
+    });
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.text).toContain("owner execution in progress, build still open.");
+    expect(getReplyPayloadMetadata(payloads[0] as object)).toMatchObject({
+      activeRunContinuation: {
+        stopAllowed: false,
+        stopReason: "owner_execution_in_progress",
+        openTruth: "owner execution in progress, build still open.",
+      },
+    });
+  });
+
+  it("does not duplicate a reply that already satisfies the explicit owner-boundary stop contract", () => {
+    const explicitReply =
+      "routed to lawful owner, build still open. I am stopping here because this reached a lawful owner boundary. The remaining substantive work belongs to Fleet Command. SOP forbids me from continuing that owner's lane without override.";
+    const payloads = buildPayloads({
+      assistantTexts: [explicitReply],
+      lastAssistant: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: explicitReply }],
+      } as AssistantMessage,
+      internalEvents: [
+        makeTaskCompletionEvent({
+          stopReason: "owner_boundary_stop",
+          stopAllowed: true,
+          nextOwner: "Fleet Command",
+          openTruth: "routed to lawful owner, build still open.",
+        }),
+      ],
+    });
+
+    expectSinglePayloadText(payloads, explicitReply);
   });
 
   it("turns internal message-tool source replies into suppression-safe final payloads", () => {

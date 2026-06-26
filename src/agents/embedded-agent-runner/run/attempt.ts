@@ -176,6 +176,7 @@ import { sanitizeToolUseResultPairing } from "../../session-transcript-repair.js
 import { acquireSessionWriteLock } from "../../session-write-lock.js";
 import { createAgentSession, SessionManager } from "../../sessions/index.js";
 import { detectRuntimeShell } from "../../shell-utils.js";
+import { extractLatestStopContract } from "../../stop-contract.js";
 import { buildActiveSubagentSystemPromptAddition } from "../../subagent-active-context.js";
 import {
   isSubagentEnvelopeSession,
@@ -1537,6 +1538,7 @@ export async function runEmbeddedAttempt(
     });
     const uncompactedEffectiveTools = [...uncompactedToolSchemaProjection.tools];
     let effectiveTools = uncompactedEffectiveTools;
+    const stopContract = extractLatestStopContract(params.internalEvents);
     const catalogToolHookContext = {
       agentId: sessionAgentId,
       config: params.config,
@@ -1544,6 +1546,8 @@ export async function runEmbeddedAttempt(
       sessionKey: sandboxSessionKey,
       sessionId: params.sessionId,
       runId: params.runId,
+      sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
+      stopContract,
       channelId: params.currentChannelId,
       trace: runTrace,
       loopDetection: resolveToolLoopDetectionConfig({
@@ -2052,6 +2056,7 @@ export async function runEmbeddedAttempt(
       const extensionFactories = buildEmbeddedExtensionFactories({
         cfg: params.config,
         sessionManager,
+        sessionKey: params.sessionKey,
         provider: params.provider,
         modelId: params.modelId,
         model: params.model,

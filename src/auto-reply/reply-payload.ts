@@ -169,6 +169,27 @@ export type ReplyPayloadMetadata = {
   beforeAgentRunBlocked?: boolean;
   /** Warning synthesized from an observed tool error after the run produced assistant output. */
   nonTerminalToolErrorWarning?: boolean;
+  /**
+   * Marks a visible payload as a non-terminal progress heartbeat emitted while
+   * a run is still active, so downstream delivery can keep it distinct from
+   * closeout or final-answer semantics.
+   */
+  progressHeartbeat?: {
+    category: "plan" | "working";
+    activeRunContinues?: boolean;
+  };
+  /**
+   * Carries bounded open-build continuation truth from runtime stop-contract
+   * surfaces into dispatch so terminal closeout can be blocked even when no
+   * separate progress heartbeat was emitted first.
+   */
+  activeRunContinuation?: {
+    stopAllowed?: boolean;
+    stopReason?: string;
+    openTruth?: string;
+    nextOwner?: string;
+    executionRunningNow?: boolean;
+  };
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();
@@ -188,6 +209,27 @@ export function getReplyPayloadMetadata(payload: object): ReplyPayloadMetadata |
 
 export function isReplyPayloadNonTerminalToolErrorWarning(payload: object): boolean {
   return getReplyPayloadMetadata(payload)?.nonTerminalToolErrorWarning === true;
+}
+
+export function markReplyPayloadAsProgressHeartbeat<T extends object>(
+  payload: T,
+  params: {
+    category: "plan" | "working";
+    activeRunContinues?: boolean;
+  },
+): T {
+  return setReplyPayloadMetadata(payload, {
+    progressHeartbeat: {
+      category: params.category,
+      ...(params.activeRunContinues === true ? { activeRunContinues: true } : {}),
+    },
+  });
+}
+
+export function getReplyPayloadProgressHeartbeat(
+  payload: object,
+): ReplyPayloadMetadata["progressHeartbeat"] | undefined {
+  return getReplyPayloadMetadata(payload)?.progressHeartbeat;
 }
 
 export function copyReplyPayloadMetadata<T extends object>(source: object, payload: T): T {

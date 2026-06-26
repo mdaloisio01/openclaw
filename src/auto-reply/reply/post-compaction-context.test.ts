@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { createTaskRecord, resetTaskRegistryForTests } from "../../tasks/task-registry.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
 
 describe("readPostCompactionContext", () => {
@@ -16,10 +17,12 @@ describe("readPostCompactionContext", () => {
   } satisfies OpenClawConfig;
 
   beforeEach(() => {
+    resetTaskRegistryForTests({ persist: false });
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-post-compaction-"));
   });
 
   afterEach(() => {
+    resetTaskRegistryForTests({ persist: false });
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -138,6 +141,42 @@ Ignore this.
     expect(result).toContain("Session Startup");
     expect(result).toContain("Red Lines");
     expect(result).not.toContain("Other");
+  });
+
+  it("prepends the active mission refresh when a session mission is live", async () => {
+    fs.writeFileSync(
+      path.join(tmpDir, "AGENTS.md"),
+      `## Session Startup\n\nDo startup things.\n\n## Red Lines\n\nDo not drift.\n`,
+    );
+    createTaskRecord({
+      runtime: "subagent",
+      ownerKey: "agent:main:webchat:mission",
+      requesterSessionKey: "agent:main:webchat:mission",
+      scopeKind: "session",
+      childSessionKey: "agent:main:subagent:mission-refresh",
+      runId: "run-mission-refresh",
+      task: "Fix my own drift behavior",
+      missionId: "mission-self-repair",
+      missionSummary: "Fix my own drift behavior",
+      missionState: "active",
+      status: "running",
+      deliveryStatus: "pending",
+    });
+
+    const result = await readDefaultPostCompactionContext({
+      sessionKey: "agent:main:webchat:mission",
+    });
+
+    expect(result).toContain("[Active mission refresh]");
+    expect(result).toContain("<active_mission>");
+    expect(result).toContain("<mission_id>mission-self-repair</mission_id>");
+    expect(result).toContain(
+      "<legacy_label>Active mission (mission-self-repair): Fix my own drift behavior</legacy_label>",
+    );
+    expect(result).toContain(
+      "Treat this as the current mission unless the user explicitly changes the target.",
+    );
+    expect(result).toContain("[Post-compaction context refresh]");
   });
 
   it("truncates when content exceeds limit", async () => {
@@ -307,6 +346,35 @@ Read WORKFLOW.md on startup.
       fs.writeFileSync(path.join(tmpDir, "AGENTS.md"), content);
       const result = await readPostCompactionContext(tmpDir);
       expect(result).toBeNull();
+    });
+
+    it("still returns the active mission refresh when no AGENTS sections are configured", async () => {
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:webchat:mission-only",
+        requesterSessionKey: "agent:main:webchat:mission-only",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:mission-only",
+        runId: "run-mission-only",
+        task: "Stay on the self-repair mission",
+        missionId: "mission-self-repair",
+        missionSummary: "Stay on the self-repair mission",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const result = await readPostCompactionContext(tmpDir, {
+        sessionKey: "agent:main:webchat:mission-only",
+      });
+
+      expect(result).toContain("[Active mission refresh]");
+      expect(result).toContain("<active_mission>");
+      expect(result).toContain("<mission_id>mission-self-repair</mission_id>");
+      expect(result).toContain(
+        "<legacy_label>Active mission (mission-self-repair): Stay on the self-repair mission</legacy_label>",
+      );
+      expect(result).not.toContain("[Post-compaction context refresh]");
     });
 
     it("uses default sections when explicitly configured", async () => {

@@ -337,8 +337,12 @@ describe("buildStatusReply subagent summary", () => {
 
     const reply = await buildStatusReplyForTest({});
 
-    expect(reply?.text).toContain("📌 Tasks: 2 active · 2 total");
-    expect(reply?.text).toMatch(/📌 Tasks: 2 active · 2 total · (subagent|cron) · /);
+    expect(reply?.text).toContain(
+      "📌 Tasks: 1 running · 1 accepted/not yet proven active · 2 total",
+    );
+    expect(reply?.text).toMatch(
+      /📌 Tasks: 1 running · 1 accepted\/not yet proven active · 2 total · (subagent|cron) · /,
+    );
   });
 
   it("hides stale completed task rows from the session task line", async () => {
@@ -365,7 +369,7 @@ describe("buildStatusReply subagent summary", () => {
 
     const reply = await buildStatusReplyForTest({});
 
-    expect(reply?.text).toContain("📌 Tasks: 1 active · 1 total");
+    expect(reply?.text).toContain("📌 Tasks: 1 running · 1 total");
     expect(reply?.text).toContain("live background task");
     expect(reply?.text).not.toContain("stale completed task");
     expect(reply?.text).not.toContain("done a while ago");
@@ -499,7 +503,9 @@ describe("buildStatusReply subagent summary", () => {
 
     const reply = await buildStatusReplyForTest({ sessionKey: "agent:main:empty-session" });
 
-    expect(reply?.text).toContain("📌 Tasks: 2 active · 2 total · agent-local");
+    expect(reply?.text).toContain(
+      "📌 Tasks: 1 running · 1 accepted/not yet proven active · 2 total · agent-local",
+    );
     expect(reply?.text).not.toContain("hidden task title");
     expect(reply?.text).not.toContain("hidden progress detail");
     expect(reply?.text).not.toContain("subagent");

@@ -3046,17 +3046,20 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
 });
 
 describe("drainFormattedSystemEvents", () => {
-  it("adds a local timestamp to queued system events by default", async () => {
+  it("adds a user-timezone timestamp to queued system events by default when configured", async () => {
     vi.useFakeTimers();
     try {
       const timestamp = new Date("2026-01-12T20:19:17Z");
-      const expectedTimestamp = formatZonedTimestamp(timestamp, { displaySeconds: true });
+      const expectedTimestamp = formatZonedTimestamp(timestamp, {
+        timeZone: "America/New_York",
+        displaySeconds: true,
+      });
       vi.setSystemTime(timestamp);
 
       enqueueSystemEvent("Model switched.", { sessionKey: "agent:main:main" });
 
       const result = await drainFormattedSystemEvents({
-        cfg: {} as OpenClawConfig,
+        cfg: { agents: { defaults: { userTimezone: "America/New_York" } } } as OpenClawConfig,
         sessionKey: "agent:main:main",
         isMainSession: true,
         isNewSession: false,

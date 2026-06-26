@@ -527,4 +527,65 @@ describe("runBeforeToolCallHook — embedded mode approvals", () => {
       expect(result.params).toEqual({ file: "/etc/hosts" });
     }
   });
+
+  it("prepends explicit owner-boundary stop truth to message-tool-only sends", async () => {
+    mockGetGlobalHookRunner.mockReturnValue(undefined as unknown as HookRunner);
+
+    const result = await runBeforeToolCallHook({
+      toolName: "message",
+      params: {
+        action: "send",
+        message: "Route artifact recorded.",
+      },
+      ctx: {
+        sourceReplyDeliveryMode: "message_tool_only",
+        stopContract: {
+          stopReason: "owner_boundary_stop",
+          stopAllowed: true,
+          nextOwner: "Fleet Command",
+          openTruth: "routed to lawful owner, build still open.",
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      blocked: false,
+      params: {
+        action: "send",
+        message:
+          "routed to lawful owner, build still open. I am stopping here because this reached a lawful owner boundary. The remaining substantive work belongs to Fleet Command. SOP forbids me from continuing that owner's lane without override.\n\nRoute artifact recorded.",
+      },
+    });
+  });
+
+  it("does not duplicate message-tool-only text that already satisfies the stop contract", async () => {
+    mockGetGlobalHookRunner.mockReturnValue(undefined as unknown as HookRunner);
+    const explicitReply =
+      "routed to lawful owner, build still open. I am stopping here because this reached a lawful owner boundary. The remaining substantive work belongs to Fleet Command. SOP forbids me from continuing that owner's lane without override.";
+
+    const result = await runBeforeToolCallHook({
+      toolName: "message",
+      params: {
+        action: "send",
+        message: explicitReply,
+      },
+      ctx: {
+        sourceReplyDeliveryMode: "message_tool_only",
+        stopContract: {
+          stopReason: "owner_boundary_stop",
+          stopAllowed: true,
+          nextOwner: "Fleet Command",
+          openTruth: "routed to lawful owner, build still open.",
+        },
+      },
+    });
+
+    expect(result).toEqual({
+      blocked: false,
+      params: {
+        action: "send",
+        message: explicitReply,
+      },
+    });
+  });
 });
