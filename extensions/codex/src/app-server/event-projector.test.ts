@@ -845,6 +845,31 @@ describe("CodexAppServerEventProjector", () => {
     expect(result.lastAssistant?.errorMessage).toBeUndefined();
   });
 
+  it("tags still-open foreground final replies with active-run continuation truth", async () => {
+    const projector = await createProjector();
+
+    await projector.handleNotification(
+      turnCompleted([
+        {
+          type: "agentMessage",
+          id: "msg-1",
+          text: "Open/closed truth: owner execution in progress, build still open.",
+        },
+      ]),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.lastAssistant?.stopReason).toBe("stop");
+    expect(result.lastAssistant).toMatchObject({
+      activeRunContinuation: {
+        stopAllowed: false,
+        stopReason: "owner_execution_in_progress",
+        openTruth: "owner execution in progress, build still open.",
+      },
+    });
+  });
+
   it("uses nested app-server error messages for terminal errors", async () => {
     const projector = await createProjector();
 

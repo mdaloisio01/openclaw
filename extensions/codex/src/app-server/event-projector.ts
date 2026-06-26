@@ -76,6 +76,12 @@ type ReasoningTextGroup = {
   text: string;
 };
 
+type CodexActiveRunContinuation = {
+  stopReason?: string;
+  stopAllowed?: boolean;
+  openTruth?: string;
+};
+
 const ZERO_USAGE: Usage = {
   input: 0,
   output: 0,
@@ -124,6 +130,62 @@ const TRANSCRIPT_PROGRESS_SUPPRESSED_TOOL_NAMES = new Set([
   "react",
   "typing",
 ]);
+
+function normalizeContinuationText(text: string | undefined): string {
+  return (text ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function inferCodexActiveRunContinuation(
+  text: string | undefined,
+): CodexActiveRunContinuation | undefined {
+  const normalized = normalizeContinuationText(text);
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized.includes("routed to lawful owner, build still open")) {
+    return {
+      stopAllowed: true,
+      stopReason: "owner_boundary_stop",
+      openTruth: "routed to lawful owner, build still open.",
+    };
+  }
+  if (normalized.includes("owner execution in progress, build still open")) {
+    return {
+      stopAllowed: false,
+      stopReason: "owner_execution_in_progress",
+      openTruth: "owner execution in progress, build still open.",
+    };
+  }
+  if (normalized.includes("paperwork/setup done, build still open")) {
+    return {
+      stopAllowed: false,
+      stopReason: "paperwork_only_still_open",
+      openTruth: "paperwork/setup done, build still open.",
+    };
+  }
+  if (normalized.includes("local slice complete; broader mission still open")) {
+    return {
+      stopAllowed: false,
+      stopReason: "local_slice_complete_broader_mission_open",
+      openTruth: "local slice complete; broader mission still open",
+    };
+  }
+  if (normalized.includes("broader mission still open")) {
+    return {
+      stopAllowed: false,
+      stopReason: "broader_mission_still_open",
+      openTruth: "broader mission still open",
+    };
+  }
+  if (normalized.includes("build still open")) {
+    return {
+      stopAllowed: false,
+      stopReason: "explicit_open_build_state",
+      openTruth: "build still open",
+    };
+  }
+  return undefined;
+}
 
 export function shouldEmitTranscriptToolProgress(toolName: unknown, _args?: unknown): boolean {
   const normalized = typeof toolName === "string" ? toolName.trim().toLowerCase() : "";
@@ -1644,7 +1706,8 @@ export class CodexAppServerEventProjector {
           cost: ZERO_USAGE.cost,
         }
       : ZERO_USAGE;
-    return {
+    const inferredContinuation = inferCodexActiveRunContinuation(text);
+    const message: AssistantMessage & { activeRunContinuation?: CodexActiveRunContinuation } = {
       role: "assistant",
       content: [{ type: "text", text }],
       api: attribution.api ?? "openai-chatgpt-responses",
@@ -1655,6 +1718,10 @@ export class CodexAppServerEventProjector {
       errorMessage: this.promptError ? formatErrorMessage(this.promptError) : undefined,
       timestamp: Date.now(),
     };
+    if (inferredContinuation) {
+      message.activeRunContinuation = inferredContinuation;
+    }
+    return message;
   }
 
   private createAssistantMirrorMessage(title: string, text: string): AssistantMessage {
