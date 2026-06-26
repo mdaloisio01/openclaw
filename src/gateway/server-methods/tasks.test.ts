@@ -12,6 +12,7 @@ import {
 } from "../../tasks/active-production-watchdog-lifecycle.js";
 import {
   createTaskRecord as createTaskRecordOrNull,
+  getTaskById,
   markTaskTerminalById,
   recordTaskProgressByRunId,
   resetTaskRegistryForTests,
@@ -655,6 +656,114 @@ describe("tasks gateway handlers", () => {
 
     expect(completed.calls[0]?.[0]).toBe(false);
     expect(completed.calls[0]?.[2]?.message).toContain("child_task_backing_session_missing");
+  });
+
+  it("blocks production child success without continuation launch proof", async () => {
+    const authorityPath = await writeTestBuildPlan("phase1-sadb-continuation-required.md");
+    const started = await runTaskHandler("tasks.startProductionFlow", {
+      ownerKey: "gie-phase1-sadb-runtime",
+      controllerId: "will-orchestrator/gie",
+      goal: "Dispatch Phase 1 SADB runtime implementation",
+      sliceId: "gie-phase1-sadb-runtime",
+      sliceOwner: "SADB",
+      authorityPath,
+      authorityBasis: "Phase 1 policy-law decision",
+      buildItem: "Phase 1 - Hard-Rule Policy Engine",
+      requiredOwnerLane: "sadb_decomposition_review",
+      attemptedOwnerLane: "sadb_decomposition_review",
+      attemptedExecutor: "sadb_decomposition_review",
+      executorRole: "sadb_lane_execution",
+      lawfulRouteRequired: "SADB executes through governed lane path",
+    });
+    const flowId = String(started.payload?.flow?.flowId);
+    const task = createTaskRecord({
+      runtime: "cli",
+      ownerKey: "gie-phase1-sadb-runtime",
+      requesterSessionKey: "gie-phase1-sadb-runtime",
+      scopeKind: "session",
+      childSessionKey: "agent:sadb:phase1-child",
+      parentFlowId: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      label: "Phase 1 SADB runtime implementation",
+      task: "Run SADB decomposition",
+      status: "running",
+      deliveryStatus: "session_queued",
+      notifyPolicy: "done_only",
+      createdAt: Date.now(),
+      startedAt: Date.now(),
+      lastEventAt: Date.now(),
+    });
+
+    const completed = await runTaskHandler("tasks.completeTaskInFlow", {
+      lookup: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      runtime: "cli",
+      status: "succeeded",
+      terminalSummary: "SADB completed",
+    });
+
+    expect(completed.calls[0]?.[0]).toBe(false);
+    expect(completed.calls[0]?.[2]?.message).toContain(
+      "child_task_completion_requires_continuation_proof",
+    );
+    expect(getTaskFlowById(flowId)?.status).toBe("running");
+    expect(getTaskById(task.taskId)?.status).toBe("running");
+  });
+
+  it("records next executable launch proof when completing a production child", async () => {
+    const authorityPath = await writeTestBuildPlan("phase1-sadb-continuation-launched.md");
+    const started = await runTaskHandler("tasks.startProductionFlow", {
+      ownerKey: "gie-phase1-sadb-runtime",
+      controllerId: "will-orchestrator/gie",
+      goal: "Dispatch Phase 1 SADB runtime implementation",
+      sliceId: "gie-phase1-sadb-runtime",
+      sliceOwner: "SADB",
+      authorityPath,
+      authorityBasis: "Phase 1 policy-law decision",
+      buildItem: "Phase 1 - Hard-Rule Policy Engine",
+      requiredOwnerLane: "sadb_decomposition_review",
+      attemptedOwnerLane: "sadb_decomposition_review",
+      attemptedExecutor: "sadb_decomposition_review",
+      executorRole: "sadb_lane_execution",
+      lawfulRouteRequired: "SADB executes through governed lane path",
+    });
+    const flowId = String(started.payload?.flow?.flowId);
+    createTaskRecord({
+      runtime: "cli",
+      ownerKey: "gie-phase1-sadb-runtime",
+      requesterSessionKey: "gie-phase1-sadb-runtime",
+      scopeKind: "session",
+      childSessionKey: "agent:sadb:phase1-child",
+      parentFlowId: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      label: "Phase 1 SADB runtime implementation",
+      task: "Run SADB decomposition",
+      status: "running",
+      deliveryStatus: "session_queued",
+      notifyPolicy: "done_only",
+      createdAt: Date.now(),
+      startedAt: Date.now(),
+      lastEventAt: Date.now(),
+    });
+
+    const completed = await runTaskHandler("tasks.completeTaskInFlow", {
+      lookup: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      runtime: "cli",
+      status: "succeeded",
+      terminalSummary: "SADB completed",
+      nextExecutableLaunch: {
+        detail: "Launch Phase 1 Security safety audit",
+        currentStep: "phase1_security_safety_audit_running",
+      },
+    });
+
+    expect(completed.calls[0]?.[0]).toBe(true);
+    expect(completed.payload?.task?.status).toBe("completed");
+    expect(completed.payload?.flow?.currentStep).toBe("phase1_security_safety_audit_running");
+    const continuation = getTaskFlowProductionContinuation(getTaskFlowById(flowId)!);
+    expect(continuation?.continuationRequiredAfterLocalSuccess).toBe(true);
+    expect(continuation?.nextExecutableUnitLaunched).toBe(true);
   });
 
   it("runs a lawful SADB child task and emits executor identity proof", async () => {

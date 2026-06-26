@@ -1,5 +1,8 @@
 import { resolveTaskBuildExecutionTruth } from "./task-build-execution-truth.js";
-import { getTaskFlowById } from "./task-flow-runtime-internal.js";
+import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "./task-flow-runtime-internal.js";
 import {
   compareTaskAuditFindingSortKeys,
   createEmptyTaskAuditSummary,
@@ -137,6 +140,31 @@ function taskHasQueuedSameSliceReworkWithoutLaunchProof(task: TaskRecord): boole
     rework.transferOwner !== "Will" &&
     typeof task.progressSummary === "string" &&
     task.progressSummary.includes("REWORK_EXECUTOR_LAUNCH_REQUIRED")
+  );
+}
+
+function taskFlowReferenceAt(tasks: TaskRecord[]): number {
+  return Math.max(
+    ...tasks.map((task) => task.lastEventAt ?? task.endedAt ?? task.startedAt ?? task.createdAt),
+  );
+}
+
+function hasActiveProductionParentFlow(parentFlowId: string): boolean {
+  const flow = getTaskFlowById(parentFlowId);
+  if (!flow || flow.status !== "running") {
+    return false;
+  }
+  const continuation = getTaskFlowProductionContinuation(flow);
+  if (!continuation?.activeProductionRun) {
+    return false;
+  }
+  return (
+    continuation.lawfulWholeRunCompletion !== true &&
+    continuation.blockerPresent !== true &&
+    continuation.ownerDecisionRequired !== true &&
+    continuation.restartOrReloadRequired !== true &&
+    continuation.hardStopPresent !== true &&
+    continuation.safetyStopPresent !== true
   );
 }
 
@@ -371,6 +399,64 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
         }),
       );
     }
+  }
+
+  const tasksByParentFlowId = new Map<string, TaskRecord[]>();
+  for (const task of tasks) {
+    const parentFlowId = task.parentFlowId?.trim();
+    if (!parentFlowId) {
+      continue;
+    }
+    const current = tasksByParentFlowId.get(parentFlowId);
+    if (current) {
+      current.push(task);
+    } else {
+      tasksByParentFlowId.set(parentFlowId, [task]);
+    }
+  }
+
+  for (const [parentFlowId, flowTasks] of tasksByParentFlowId.entries()) {
+    if (!hasActiveProductionParentFlow(parentFlowId)) {
+      continue;
+    }
+    const hasActiveExecutor = flowTasks.some(
+      (task) => task.status === "queued" || task.status === "running",
+    );
+    const hasLostChild = flowTasks.some((task) => task.status === "lost");
+    if (hasActiveExecutor || !hasLostChild) {
+      continue;
+    }
+    const latestTask = [...flowTasks].sort((left, right) => {
+      const diff = taskFlowReferenceAt([right]) - taskFlowReferenceAt([left]);
+      if (diff !== 0) {
+        return diff;
+      }
+      return right.createdAt - left.createdAt;
+    })[0];
+    if (!latestTask) {
+      continue;
+    }
+    const latestAgeMs = Math.max(0, now - taskFlowReferenceAt(flowTasks));
+    findings.push(
+      createFinding({
+        severity: "error",
+        code: "open_build_no_active_owner",
+        task: latestTask,
+        ageMs: latestAgeMs,
+        detail:
+          "active production parent TaskFlow has a lost terminal child and no active child owner",
+      }),
+    );
+    findings.push(
+      createFinding({
+        severity: "error",
+        code: "build_open_all_related_sessions_terminal",
+        task: latestTask,
+        ageMs: latestAgeMs,
+        detail:
+          "active production parent TaskFlow is still open, but every linked child task is terminal",
+      }),
+    );
   }
 
   return findings.toSorted(compareFindings);

@@ -34,6 +34,7 @@ import {
   getTaskFlowById,
   getTaskFlowProductionContinuation,
   recordFlowLawfulStop,
+  recordFlowNextExecutableLaunch,
   resolveTaskFlowForLookupToken,
   resumeFlow,
 } from "../../tasks/task-flow-runtime-internal.js";
@@ -202,6 +203,24 @@ function readProductionStopReason(value: unknown): ProductionContinuationStopRea
     : undefined;
 }
 
+function readNextExecutableLaunchProof(
+  value: unknown,
+): { detail: string; currentStep?: string } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+  const input = value as Record<string, unknown>;
+  const detail = optionalStringField(input.detail);
+  if (!detail) {
+    return undefined;
+  }
+  const currentStep = optionalStringField(input.currentStep);
+  return {
+    detail,
+    ...(currentStep ? { currentStep } : {}),
+  };
+}
+
 function readOwnerLaneOverride(value: unknown): ProductionOwnerLaneOverride | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return undefined;
@@ -286,9 +305,7 @@ function validateProductionChildBackingSession(
   return { ok: true, childSessionKey };
 }
 
-function resolveProductionChildTaskForMutation(
-  input: Record<string, unknown>,
-):
+function resolveProductionChildTaskForMutation(input: Record<string, unknown>):
   | {
       ok: true;
       flow: NonNullable<ReturnType<typeof getTaskFlowById>>;
@@ -889,6 +906,29 @@ export const tasksHandlers: GatewayRequestHandlers = {
     }
     const status = optionalStringField(input.status) ?? "succeeded";
     const now = Date.now();
+    const parentContinuation = getTaskFlowProductionContinuation(resolved.flow);
+    const nextExecutableLaunch = readNextExecutableLaunchProof(input.nextExecutableLaunch);
+    const requiresContinuationProof =
+      status === "succeeded" &&
+      parentContinuation?.activeProductionRun === true &&
+      parentContinuation.lawfulWholeRunCompletion !== true &&
+      parentContinuation.blockerPresent !== true &&
+      parentContinuation.ownerDecisionRequired !== true &&
+      parentContinuation.restartOrReloadRequired !== true &&
+      parentContinuation.hardStopPresent !== true &&
+      parentContinuation.safetyStopPresent !== true &&
+      parentContinuation.nextExecutableUnitLaunched !== true;
+    if (requiresContinuationProof && !nextExecutableLaunch) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "child_task_completion_requires_continuation_proof: active production child success must include nextExecutableLaunch proof or record a lawful production stop before local success can be accepted",
+        ),
+      );
+      return;
+    }
     const common = {
       runId: resolved.runId,
       runtime: readTaskRuntime(input.runtime),
@@ -930,8 +970,30 @@ export const tasksHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    let flow = getTaskFlowById(resolved.flow.flowId) ?? resolved.flow;
+    if (status === "succeeded" && nextExecutableLaunch) {
+      const launched = recordFlowNextExecutableLaunch({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        detail: nextExecutableLaunch.detail,
+        currentStep: nextExecutableLaunch.currentStep ?? flow.currentStep,
+        updatedAt: now,
+      });
+      if (!launched.applied) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            `child_task_completion_continuation_launch_failed: ${launched.reason}`,
+          ),
+        );
+        return;
+      }
+      flow = launched.flow;
+    }
     respond(true, {
-      flow: getTaskFlowById(resolved.flow.flowId) ?? resolved.flow,
+      flow,
       task: mapTaskSummary(task),
     });
   },

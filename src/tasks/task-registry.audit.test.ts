@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   createBlindTestSliceFlow,
+  createManagedTaskFlow,
   recordBlindTestCloseoutFailure,
   recordBlindTestDraftReview,
   recordBlindTestImplementationReview,
@@ -251,6 +252,49 @@ describe("task-registry audit", () => {
       ["missing_cleanup", "review-paused"],
       ["parent_review_state_without_active_executor", "review-paused"],
       ["owner_readout_finished_no_followthrough", "review-paused"],
+    ]);
+  });
+
+  it("flags active production parent flow with lost child and no active owner", () => {
+    const now = Date.parse("2026-03-30T01:00:00.000Z");
+    const flow = createManagedTaskFlow({
+      ownerKey: "gie-phase1-sadb-runtime",
+      controllerId: "will-orchestrator/gie",
+      goal: "Dispatch GIE Phase 1 SADB runtime implementation",
+      status: "running",
+      notifyPolicy: "done_only",
+      currentStep: "phase1_sadb_parent_flow_created",
+      createdAt: now - 5 * 60_000,
+      stateJson: { kind: "production_taskflow_slice" },
+      continuation: {
+        activeProductionRun: true,
+        parentRunOpen: true,
+      },
+    });
+    if (!flow) {
+      throw new Error("Expected active production TaskFlow creation");
+    }
+
+    const findings = listTaskAuditFindings({
+      now,
+      tasks: [
+        createTask({
+          taskId: "lost-sadb-child",
+          runtime: "cli",
+          parentFlowId: flow.flowId,
+          status: "lost",
+          error: "backing session missing",
+          endedAt: now - 60_000,
+          lastEventAt: now - 60_000,
+          cleanupAfter: now + 60_000,
+        }),
+      ],
+    });
+
+    expect(findings.map((finding) => [finding.code, finding.task.taskId])).toEqual([
+      ["open_build_no_active_owner", "lost-sadb-child"],
+      ["build_open_all_related_sessions_terminal", "lost-sadb-child"],
+      ["lost", "lost-sadb-child"],
     ]);
   });
 
