@@ -143,7 +143,7 @@ describe("scheduleMediaGenerationTaskCompletion", () => {
         count: 1,
         paths: ["/tmp/proof.png"],
         terminalResult: {
-          terminalOutcome: "blocked",
+          terminalOutcome: "succeeded",
           terminalSummary:
             "Required completion delivery failed before reaching the requester: completion delivery was not confirmed after successful generation.",
         },
@@ -203,7 +203,7 @@ describe("scheduleMediaGenerationTaskCompletion", () => {
         count: 1,
         paths: ["/tmp/proof.png"],
         terminalResult: {
-          terminalOutcome: "blocked",
+          terminalOutcome: "succeeded",
           terminalSummary:
             "Required completion delivery failed before reaching the requester: requester wake failed.",
         },

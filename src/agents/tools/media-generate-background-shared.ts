@@ -14,6 +14,11 @@ import {
   resolveRequiredCompletionDeliveryFailureTerminalResult,
   type RequiredCompletionTerminalResult,
 } from "../../tasks/task-completion-contract.js";
+import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "../../tasks/task-flow-runtime-internal.js";
+import { findLatestActiveMissionForOwnerKey } from "../../tasks/task-registry.js";
 import { normalizeDeliveryContext, type DeliveryContext } from "../../utils/delivery-context.js";
 import {
   INTERNAL_MESSAGE_CHANNEL,
@@ -115,6 +120,23 @@ function touchMediaGenerationTaskRunContext(handle: MediaGenerationTaskHandle) {
   });
 }
 
+function resolveMediaGenerationParentContinuationLink(sessionKey: string): {
+  parentFlowId?: string;
+  parentTaskId?: string;
+} {
+  const activeMission = findLatestActiveMissionForOwnerKey(sessionKey);
+  const parentFlowId = activeMission?.parentFlowId?.trim();
+  const linkedFlow = parentFlowId ? getTaskFlowById(parentFlowId) : undefined;
+  const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;
+  if (!linkedContinuation?.activeProductionRun || !parentFlowId) {
+    return {};
+  }
+  return {
+    parentFlowId,
+    ...(activeMission?.taskId?.trim() ? { parentTaskId: activeMission.taskId.trim() } : {}),
+  };
+}
+
 function createMediaGenerationTaskRun(params: {
   sessionKey?: string;
   requesterOrigin?: DeliveryContext;
@@ -131,6 +153,7 @@ function createMediaGenerationTaskRun(params: {
   }
   const runId = `tool:${params.toolName}:${crypto.randomUUID()}`;
   try {
+    const parentContinuationLink = resolveMediaGenerationParentContinuationLink(sessionKey);
     const task = createRunningTaskRun({
       runtime: "cli",
       taskKind: params.taskKind,
@@ -141,6 +164,12 @@ function createMediaGenerationTaskRun(params: {
       requesterOrigin: params.requesterOrigin,
       childSessionKey: sessionKey,
       runId,
+      ...(parentContinuationLink.parentFlowId
+        ? { parentFlowId: parentContinuationLink.parentFlowId }
+        : {}),
+      ...(parentContinuationLink.parentTaskId
+        ? { parentTaskId: parentContinuationLink.parentTaskId }
+        : {}),
       label: params.label,
       task: params.prompt,
       deliveryStatus: "not_applicable",
