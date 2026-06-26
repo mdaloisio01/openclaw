@@ -619,7 +619,11 @@ function applyImplicitSourceReplySendPolicy(
 function hasCurrentSourceReplyContext(input: RunMessageActionParams): boolean {
   const provider = normalizeOptionalLowercaseString(input.toolContext?.currentChannelProvider);
   if (!provider) {
-    return false;
+    return (
+      input.sourceReplyDeliveryMode === "message_tool_only" &&
+      typeof input.sessionKey === "string" &&
+      input.sessionKey.trim().length > 0
+    );
   }
   if (provider === INTERNAL_MESSAGE_CHANNEL) {
     return true;

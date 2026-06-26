@@ -15,7 +15,17 @@ import {
   resetDetachedTaskLifecycleRuntimeForTests,
   setDetachedTaskLifecycleRuntime,
 } from "../../tasks/detached-task-runtime.js";
+import { resolveTaskBuildExecutionTruth } from "../../tasks/task-build-execution-truth.js";
 import {
+  createManagedTaskFlow,
+  finishFlow,
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+  recordFlowLawfulStop,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-runtime-internal.js";
+import {
+  createTaskRecord,
   findTaskByRunId,
   listTaskRecords,
   markTaskTerminalById,
@@ -519,6 +529,7 @@ describe("gateway agent handler", () => {
     }
     resetDetachedTaskLifecycleRuntimeForTests();
     resetTaskRegistryForTests();
+    resetTaskFlowRegistryForTests({ persist: false });
     resetSubagentRegistryForTests({ persist: false });
     subagentRegistryTesting.setDepsForTest();
     mocks.loadConfigReturn = {};
@@ -2811,6 +2822,224 @@ describe("gateway agent handler", () => {
           terminalSummary: "completed",
         });
       });
+    });
+  });
+
+  it("inherits active mission-linked production continuation linkage for cli-tracked gateway background runs", async () => {
+    await withTempDir(
+      { prefix: "openclaw-gateway-agent-parent-continuation-link-" },
+      async (root) => {
+        process.env.OPENCLAW_STATE_DIR = root;
+        resetTaskRegistryForTests();
+        resetTaskFlowRegistryForTests({ persist: false });
+        primeMainAgentRun();
+
+        const flow = createManagedTaskFlow({
+          ownerKey: "agent:main:main",
+          controllerId: "tests/gateway-production-parent",
+          goal: "Continue gateway production parent",
+          status: "running",
+          continuation: {
+            activeProductionRun: true,
+            parentRunOpen: true,
+          },
+        });
+        const blockedClose = finishFlow({
+          flowId: flow.flowId,
+          expectedRevision: flow.revision,
+          endedAt: 200,
+        });
+        if (blockedClose.applied || !blockedClose.current) {
+          throw new Error("Expected continuation-required gateway parent flow");
+        }
+
+        const missionTask = createTaskRecord({
+          runtime: "cli",
+          ownerKey: "agent:main:main",
+          requesterSessionKey: "agent:main:main",
+          scopeKind: "session",
+          parentFlowId: blockedClose.current.flowId,
+          task: "Gateway production parent run",
+          missionId: "mission-gateway-production-parent",
+          missionSummary: "Launch the next gateway bounded unit before pause",
+          missionState: "active",
+          status: "running",
+          deliveryStatus: "pending",
+        });
+        if (!missionTask) {
+          throw new Error("Expected gateway mission task");
+        }
+
+        await invokeAgent(
+          {
+            message: "gateway continuation-linked background task",
+            sessionKey: "agent:main:main",
+            idempotencyKey: "gateway-parent-continuation-task",
+          },
+          { reqId: "gateway-parent-continuation-task" },
+        );
+
+        await waitForAssertion(() => {
+          expectRecordFields(findTaskByRunId("gateway-parent-continuation-task"), {
+            runtime: "cli",
+            childSessionKey: "agent:main:main",
+            parentFlowId: blockedClose.current?.flowId,
+            parentTaskId: missionTask.taskId,
+            status: "succeeded",
+          });
+        });
+
+        const task = requireValue(
+          findTaskByRunId("gateway-parent-continuation-task"),
+          "gateway continuation-linked task missing",
+        );
+        expect(resolveTaskBuildExecutionTruth(task)).toMatchObject({
+          state: "continuation_required_after_local_success",
+          broaderBuildOpen: true,
+        });
+
+        const linkedFlow = requireValue(
+          getTaskFlowById(blockedClose.current.flowId),
+          "gateway linked flow missing",
+        );
+        expect(
+          getTaskFlowProductionContinuation(linkedFlow)?.events.map((event) => event.type),
+        ).toEqual(
+          expect.arrayContaining([
+            "ACTIVE_PRODUCTION_RUN_STARTED",
+            "PARENT_RUN_STILL_OPEN",
+            "CONTINUATION_REQUIRED_AFTER_LOCAL_SUCCESS",
+            "PARENT_CONTINUITY_VIOLATION",
+          ]),
+        );
+      },
+    );
+  });
+
+  it("does not invent parent continuation linkage for standalone cli-tracked gateway background runs", async () => {
+    await withTempDir(
+      { prefix: "openclaw-gateway-agent-standalone-continuation-link-" },
+      async (root) => {
+        process.env.OPENCLAW_STATE_DIR = root;
+        resetTaskRegistryForTests();
+        resetTaskFlowRegistryForTests({ persist: false });
+        primeMainAgentRun();
+
+        await invokeAgent(
+          {
+            message: "gateway standalone background task",
+            sessionKey: "agent:main:main",
+            idempotencyKey: "gateway-standalone-task",
+          },
+          { reqId: "gateway-standalone-task" },
+        );
+
+        await waitForAssertion(() => {
+          expectRecordFields(findTaskByRunId("gateway-standalone-task"), {
+            runtime: "cli",
+            childSessionKey: "agent:main:main",
+            status: "succeeded",
+          });
+        });
+
+        const task = requireValue(
+          findTaskByRunId("gateway-standalone-task"),
+          "gateway standalone task missing",
+        );
+        expect(task.parentFlowId).toBeUndefined();
+        expect(task.parentTaskId).toBeUndefined();
+        expect(resolveTaskBuildExecutionTruth(task)).toMatchObject({
+          state: "completed",
+          broaderBuildOpen: false,
+        });
+      },
+    );
+  });
+
+  it("allows lawful production-stop parent state without forcing continuation-required gateway task truth", async () => {
+    await withTempDir({ prefix: "openclaw-gateway-agent-lawful-stop-link-" }, async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryForTests();
+      resetTaskFlowRegistryForTests({ persist: false });
+      primeMainAgentRun();
+
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/gateway-lawful-stop-parent",
+        goal: "Gateway parent blocked lawfully",
+        status: "running",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+      });
+      const blockedFlow = recordFlowLawfulStop({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        reason: "blocker",
+        detail: "Waiting on external blocker.",
+        updatedAt: 300,
+      });
+      if (!blockedFlow.applied) {
+        throw new Error("Expected lawful-stop gateway parent flow");
+      }
+
+      const missionTask = createTaskRecord({
+        runtime: "cli",
+        ownerKey: "agent:main:main",
+        requesterSessionKey: "agent:main:main",
+        scopeKind: "session",
+        parentFlowId: blockedFlow.flow.flowId,
+        task: "Gateway blocked production parent",
+        missionId: "mission-gateway-lawful-stop-parent",
+        missionSummary: "Hold at the blocker without inventing continuation debt",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+      if (!missionTask) {
+        throw new Error("Expected gateway lawful-stop mission task");
+      }
+
+      await invokeAgent(
+        {
+          message: "gateway lawful stop background task",
+          sessionKey: "agent:main:main",
+          idempotencyKey: "gateway-lawful-stop-task",
+        },
+        { reqId: "gateway-lawful-stop-task" },
+      );
+
+      await waitForAssertion(() => {
+        expectRecordFields(findTaskByRunId("gateway-lawful-stop-task"), {
+          runtime: "cli",
+          childSessionKey: "agent:main:main",
+          parentFlowId: blockedFlow.flow.flowId,
+          parentTaskId: missionTask.taskId,
+          status: "succeeded",
+        });
+      });
+
+      const task = requireValue(
+        findTaskByRunId("gateway-lawful-stop-task"),
+        "gateway lawful-stop task missing",
+      );
+      expect(resolveTaskBuildExecutionTruth(task)).toMatchObject({
+        state: "paused_pending_parent_review",
+        broaderBuildOpen: true,
+      });
+
+      const linkedFlow = requireValue(
+        getTaskFlowById(blockedFlow.flow.flowId),
+        "gateway lawful-stop linked flow missing",
+      );
+      expect(getTaskFlowProductionContinuation(linkedFlow)).toMatchObject({
+        lawfulStopReason: "blocker",
+        blockerPresent: true,
+      });
+      expect(
+        getTaskFlowProductionContinuation(linkedFlow)?.events.map((event) => event.type),
+      ).toEqual(expect.arrayContaining(["ACTIVE_PRODUCTION_RUN_STARTED", "LAWFUL_STOP_ALLOWED"]));
     });
   });
 

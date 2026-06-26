@@ -1,5 +1,8 @@
+import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
 import { readSessionEntry } from "../../config/sessions/store-load.js";
+import { appendExactAssistantMessageToSessionTranscript } from "../../config/sessions/transcript.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
@@ -89,6 +92,20 @@ const MIN_REFIRE_GAP_MS = 2_000;
 const DEFAULT_MISSED_JOB_STAGGER_MS = 5_000;
 const DEFAULT_MAX_MISSED_JOBS_PER_RESTART = 5;
 const DEFAULT_STARTUP_DEFERRED_MISSED_AGENT_JOB_DELAY_MS = 2 * 60_000;
+const WATCHDOG_RECEIPT_DIR =
+  "/home/will/.openclaw/workspace-orchestrator/var/system_wide_active_work_watchdog/receipts";
+const WATCHDOG_STATUS_JSON_PATH =
+  "/home/will/.openclaw/workspace-orchestrator/var/system_wide_active_work_watchdog/status.json";
+const WATCHDOG_REPORT_JSON_PATH =
+  "/home/will/.openclaw/workspace-orchestrator/var/system_wide_active_work_watchdog/report.json";
+const WATCHDOG_LATEST_JSON_PATH =
+  "/home/will/.openclaw/workspace-orchestrator/var/system_wide_active_work_watchdog/latest.json";
+const WATCHDOG_CHAT_DELIVERY_STATE_JSON_PATH =
+  "/home/will/.openclaw/workspace-orchestrator/var/system_wide_active_work_watchdog/chat_delivery_state.json";
+const WATCHDOG_PROOF_CAPTURE_REQUEST_JSON_PATH =
+  "/home/will/.openclaw/workspace-orchestrator/var/system_wide_active_work_watchdog/proof_capture_request.json";
+const WATCHDOG_PROOF_WAIT_MS = 5_000;
+const WATCHDOG_PROOF_POLL_MS = 250;
 
 type TimedCronRunOutcome = CronRunOutcome &
   CronRunTelemetry & {
@@ -115,6 +132,49 @@ type StartupCatchupPlan = {
   candidates: StartupCatchupCandidate[];
   deferredJobs: StartupDeferredJob[];
 };
+
+type WatchdogProofSurfaceSnapshot = {
+  receiptPath?: string;
+  receiptMtimeMs?: number;
+  statusMtimeMs?: number;
+  reportMtimeMs?: number;
+  latestMtimeMs?: number;
+};
+
+type WatchdogChatDeliveryRecord = {
+  [key: string]: unknown;
+  status?: string;
+  error?: string;
+  message?: string;
+  fingerprint?: string;
+  requested_agent_id?: string;
+  requested_session_key?: string;
+  target?: {
+    ok?: boolean;
+    agent_id?: string;
+    proof_path?: string;
+    session_file?: string;
+    session_key?: string;
+  };
+  proof_capture?: Record<string, unknown>;
+  command?: string[];
+  message_id?: string;
+  session_entry_id?: string;
+  proof_id?: string;
+  verified?: boolean;
+  session_file?: string;
+  transcript_line?: number;
+  state_path?: string;
+};
+
+type WatchdogReceiptRecord = {
+  checked_at?: string;
+  chat_delivery?: WatchdogChatDeliveryRecord;
+};
+
+type WatchdogDeliveryRecoveryResult =
+  | { ok: true; status: "delivered" | "suppressed" | "already-delivered" | "not-needed" }
+  | { ok: false; error: string };
 
 /** Executes cron job core logic with the configured wall-clock timeout and watchdog cleanup. */
 export async function executeJobCoreWithTimeout(
@@ -246,6 +306,347 @@ function resolveCronNextRunWithLowerBound(params: {
     return undefined;
   }
   return Math.max(params.naturalNext, params.lowerBoundMs);
+}
+
+function fileMtimeMsOrUndefined(filePath: string): number | undefined {
+  try {
+    return statSync(filePath).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveLatestWatchdogReceiptSnapshot(): Pick<
+  WatchdogProofSurfaceSnapshot,
+  "receiptPath" | "receiptMtimeMs"
+> {
+  try {
+    const latest = readdirSync(WATCHDOG_RECEIPT_DIR)
+      .filter((entry) => entry.endsWith(".json"))
+      .map((entry) => {
+        const filePath = path.join(WATCHDOG_RECEIPT_DIR, entry);
+        return { filePath, mtimeMs: statSync(filePath).mtimeMs };
+      })
+      .sort((left, right) => right.mtimeMs - left.mtimeMs)[0];
+    return latest ? { receiptPath: latest.filePath, receiptMtimeMs: latest.mtimeMs } : {};
+  } catch {
+    return {};
+  }
+}
+
+function captureWatchdogProofSurfaceSnapshot(): WatchdogProofSurfaceSnapshot {
+  const receipt = resolveLatestWatchdogReceiptSnapshot();
+  return {
+    ...receipt,
+    statusMtimeMs: fileMtimeMsOrUndefined(WATCHDOG_STATUS_JSON_PATH),
+    reportMtimeMs: fileMtimeMsOrUndefined(WATCHDOG_REPORT_JSON_PATH),
+    latestMtimeMs: fileMtimeMsOrUndefined(WATCHDOG_LATEST_JSON_PATH),
+  };
+}
+
+function isWatchdogReceiptProofJob(job: CronJob): boolean {
+  if (job.sessionTarget !== "main" || job.payload.kind !== "systemEvent") {
+    return false;
+  }
+  const text = job.payload.text;
+  return (
+    typeof text === "string" &&
+    text.includes("scripts/system_wide_active_work_watchdog.py") &&
+    text.includes("--write-receipt")
+  );
+}
+
+function watchdogProofSurfacesAdvanced(params: {
+  before: WatchdogProofSurfaceSnapshot;
+  after: WatchdogProofSurfaceSnapshot;
+  startedAtMs: number;
+}): boolean {
+  const receiptAdvanced =
+    typeof params.after.receiptMtimeMs === "number" &&
+    params.after.receiptMtimeMs >= params.startedAtMs &&
+    (params.after.receiptPath !== params.before.receiptPath ||
+      params.after.receiptMtimeMs !== params.before.receiptMtimeMs);
+  if (!receiptAdvanced) {
+    return false;
+  }
+  return (
+    typeof params.after.statusMtimeMs === "number" &&
+    params.after.statusMtimeMs >= params.startedAtMs &&
+    typeof params.after.reportMtimeMs === "number" &&
+    params.after.reportMtimeMs >= params.startedAtMs &&
+    typeof params.after.latestMtimeMs === "number" &&
+    params.after.latestMtimeMs >= params.startedAtMs
+  );
+}
+
+async function waitForWatchdogProofSurfaces(params: {
+  startedAtMs: number;
+  before: WatchdogProofSurfaceSnapshot;
+  abortSignal?: AbortSignal;
+  waitWithAbort: (ms: number) => Promise<void>;
+}): Promise<boolean> {
+  const deadline = Date.now() + WATCHDOG_PROOF_WAIT_MS;
+  for (;;) {
+    const after = captureWatchdogProofSurfaceSnapshot();
+    if (
+      watchdogProofSurfacesAdvanced({
+        before: params.before,
+        after,
+        startedAtMs: params.startedAtMs,
+      })
+    ) {
+      return true;
+    }
+    if (params.abortSignal?.aborted || Date.now() >= deadline) {
+      return false;
+    }
+    await params.waitWithAbort(WATCHDOG_PROOF_POLL_MS);
+  }
+}
+
+function loadJsonFile<T>(filePath: string): T | undefined {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8")) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeJsonFile(filePath: string, value: unknown): void {
+  writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function resolveWatchdogRelayPayload(
+  delivery: WatchdogChatDeliveryRecord | undefined,
+): { label?: string; message: string; idempotencyKey?: string } | null {
+  if (!delivery?.message || !Array.isArray(delivery.command) || delivery.command.length < 3) {
+    return null;
+  }
+  const raw = delivery.command[2];
+  if (typeof raw !== "string" || !raw.trim()) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as {
+      label?: unknown;
+      message?: unknown;
+      idempotencyKey?: unknown;
+    };
+    const message =
+      typeof parsed.message === "string" && parsed.message.trim()
+        ? parsed.message
+        : delivery.message;
+    if (!message.trim()) {
+      return null;
+    }
+    return {
+      ...(typeof parsed.label === "string" && parsed.label.trim()
+        ? { label: parsed.label.trim() }
+        : {}),
+      message,
+      ...(typeof parsed.idempotencyKey === "string" && parsed.idempotencyKey.trim()
+        ? { idempotencyKey: parsed.idempotencyKey.trim() }
+        : {}),
+    };
+  } catch {
+    return delivery.message.trim() ? { message: delivery.message } : null;
+  }
+}
+
+function buildWatchdogAssistantMirrorMessage(params: {
+  label?: string;
+  message: string;
+  now: number;
+  idempotencyKey?: string;
+}) {
+  const visibleText = params.label ? `[${params.label}]\n\n${params.message}` : params.message;
+  return {
+    role: "assistant" as const,
+    content: [{ type: "text" as const, text: visibleText }],
+    api: "openai-responses" as const,
+    provider: "openclaw" as const,
+    model: "gateway-injected" as const,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+      },
+    },
+    stopReason: "stop" as const,
+    timestamp: params.now,
+    ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+  };
+}
+
+function findTranscriptLineForMessageId(params: { transcriptPath?: string; messageId?: string }): {
+  verified: boolean;
+  transcriptLine?: number;
+} {
+  if (!params.transcriptPath || !params.messageId) {
+    return { verified: false };
+  }
+  try {
+    const lines = readFileSync(params.transcriptPath, "utf8").split(/\r?\n/);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index]?.trim();
+      if (!line) {
+        continue;
+      }
+      const parsed = JSON.parse(line) as { id?: unknown; type?: unknown };
+      if (parsed.id === params.messageId && parsed.type === "message") {
+        return { verified: true, transcriptLine: index + 1 };
+      }
+    }
+  } catch {
+    // Ignore verification failure; caller records the failed verification.
+  }
+  return { verified: false };
+}
+
+function updateWatchdogChatDeliverySurface(
+  filePath: string,
+  delivery: WatchdogChatDeliveryRecord,
+): void {
+  const payload = loadJsonFile<Record<string, unknown>>(filePath);
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+  payload.chat_delivery = delivery;
+  writeJsonFile(filePath, payload);
+}
+
+function finalizeWatchdogChatDeliveryState(params: {
+  receiptPath: string;
+  receipt: WatchdogReceiptRecord;
+  delivery: WatchdogChatDeliveryRecord;
+}): void {
+  const attemptedAt =
+    (typeof params.delivery.attempted_at === "string" && params.delivery.attempted_at) ||
+    (typeof params.receipt.checked_at === "string" && params.receipt.checked_at) ||
+    new Date().toISOString();
+  const state = {
+    last_attempted_at: attemptedAt,
+    last_delivered_at: attemptedAt,
+    last_delivered_fingerprint: params.delivery.fingerprint,
+    last_label: undefined,
+    last_suspicious_count: undefined,
+    last_recommendation_code: undefined,
+    last_scan_source: "cron",
+    last_receipt_path: params.receiptPath,
+    last_message_id: params.delivery.message_id,
+    last_session_entry_id: params.delivery.session_entry_id ?? params.delivery.message_id,
+  };
+  const latestPayload = loadJsonFile<Record<string, unknown>>(WATCHDOG_LATEST_JSON_PATH);
+  if (latestPayload) {
+    state.last_label = latestPayload.status;
+    state.last_suspicious_count = latestPayload.suspicious_count;
+    state.last_recommendation_code = latestPayload.recommendation_code;
+    state.last_scan_source = latestPayload.last_scan_source ?? "cron";
+  }
+  writeJsonFile(WATCHDOG_CHAT_DELIVERY_STATE_JSON_PATH, state);
+}
+
+function consumeWatchdogProofCaptureRequestIfNeeded(delivery: WatchdogChatDeliveryRecord): void {
+  const proofCapture = delivery.proof_capture;
+  if (!proofCapture || typeof proofCapture !== "object" || Array.isArray(proofCapture)) {
+    return;
+  }
+  (proofCapture as Record<string, unknown>).consumed = true;
+  (proofCapture as Record<string, unknown>).cleared_at = new Date().toISOString();
+  if (existsSync(WATCHDOG_PROOF_CAPTURE_REQUEST_JSON_PATH)) {
+    rmSync(WATCHDOG_PROOF_CAPTURE_REQUEST_JSON_PATH, { force: true });
+  }
+}
+
+async function maybeRecoverWatchdogChatDeliveryFromProofSurfaces(params: {
+  receiptPath?: string;
+}): Promise<WatchdogDeliveryRecoveryResult> {
+  if (!params.receiptPath) {
+    return { ok: true, status: "not-needed" };
+  }
+  const receipt = loadJsonFile<WatchdogReceiptRecord>(params.receiptPath);
+  if (!receipt?.chat_delivery) {
+    return { ok: true, status: "not-needed" };
+  }
+  const delivery = receipt.chat_delivery;
+  if (delivery.status === "delivered") {
+    return { ok: true, status: "already-delivered" };
+  }
+  if (delivery.status === "suppressed") {
+    return { ok: true, status: "suppressed" };
+  }
+  const target = delivery.target;
+  const relayPayload = resolveWatchdogRelayPayload(delivery);
+  if (
+    delivery.status !== "failed" ||
+    !target?.ok ||
+    !target.session_key ||
+    !target.proof_path ||
+    !relayPayload?.message
+  ) {
+    return { ok: false, error: "watchdog receipt contains no recoverable chat delivery payload" };
+  }
+
+  const appended = await appendExactAssistantMessageToSessionTranscript({
+    agentId: target.agent_id ?? delivery.requested_agent_id,
+    sessionKey: target.session_key ?? delivery.requested_session_key ?? "",
+    storePath: target.proof_path,
+    updateMode: "inline",
+    idempotencyKey: relayPayload.idempotencyKey,
+    message: buildWatchdogAssistantMirrorMessage({
+      label: relayPayload.label,
+      message: relayPayload.message,
+      now: Date.now(),
+      idempotencyKey: relayPayload.idempotencyKey,
+    }),
+  });
+  if (!appended.ok) {
+    return { ok: false, error: appended.reason };
+  }
+
+  const verification = findTranscriptLineForMessageId({
+    transcriptPath: target.session_file,
+    messageId: appended.messageId,
+  });
+  const recoveredDelivery: WatchdogChatDeliveryRecord = {
+    ...delivery,
+    status: "delivered",
+    delivery_mode: "cron-runtime-transcript-recovery",
+    message_id: appended.messageId,
+    session_entry_id: appended.messageId,
+    proof_id: appended.messageId,
+    verified: verification.verified,
+    session_file: target.session_file,
+    ...(verification.transcriptLine ? { transcript_line: verification.transcriptLine } : {}),
+    state_path: WATCHDOG_CHAT_DELIVERY_STATE_JSON_PATH,
+    recovery_by: "cron-runtime-transcript-recovery",
+    recovered_from_initial_failure: true,
+    initial_error: delivery.error,
+    initial_status: delivery.status,
+    error: undefined,
+    stderr: undefined,
+    returncode: 0,
+  };
+  receipt.chat_delivery = recoveredDelivery;
+  writeJsonFile(params.receiptPath, receipt);
+  updateWatchdogChatDeliverySurface(WATCHDOG_LATEST_JSON_PATH, recoveredDelivery);
+  updateWatchdogChatDeliverySurface(WATCHDOG_STATUS_JSON_PATH, recoveredDelivery);
+  updateWatchdogChatDeliverySurface(WATCHDOG_REPORT_JSON_PATH, recoveredDelivery);
+  finalizeWatchdogChatDeliveryState({
+    receiptPath: params.receiptPath,
+    receipt,
+    delivery: recoveredDelivery,
+  });
+  consumeWatchdogProofCaptureRequestIfNeeded(recoveredDelivery);
+  return { ok: true, status: "delivered" };
 }
 
 function resolveRetryConfig(cronConfig?: CronConfig) {
@@ -1395,6 +1796,10 @@ async function executeMainSessionCronJob(
   const cronStartedAt =
     typeof job.state.runningAtMs === "number" ? job.state.runningAtMs : state.deps.nowMs();
   const cronRunSessionKey = resolveMainSessionCronRunSessionKey(job, cronStartedAt);
+  const requiresWatchdogReceiptProof = isWatchdogReceiptProofJob(job);
+  const watchdogProofBefore = requiresWatchdogReceiptProof
+    ? captureWatchdogProofSurfaceSnapshot()
+    : undefined;
   const deliveryContext = resolveMainSessionCronDeliveryContext(state, job);
   state.deps.enqueueSystemEvent(text, {
     agentId: job.agentId,
@@ -1420,6 +1825,10 @@ async function executeMainSessionCronJob(
         agentId: job.agentId,
         sessionKey: cronRunSessionKey,
         heartbeat: { target: "last" },
+        // Watchdog proof jobs must be allowed to execute the same-tick wake;
+        // otherwise heartbeat self-blocks on the cron-active marker and the
+        // proof gate times out before the watchdog command can write receipts.
+        ...(requiresWatchdogReceiptProof ? { allowDuringCron: true } : {}),
       });
       if (
         heartbeatResult.status !== "skipped" ||
@@ -1437,7 +1846,15 @@ async function executeMainSessionCronJob(
           sessionKey: cronRunSessionKey,
           heartbeat: { target: "last" },
         });
-        return { status: "ok", summary: text, sessionKey: cronRunSessionKey };
+        return requiresWatchdogReceiptProof
+          ? {
+              status: "error",
+              error:
+                "cron: queued watchdog wake but no same-run proof was possible while cron remained in progress",
+              summary: text,
+              sessionKey: cronRunSessionKey,
+            }
+          : { status: "ok", summary: text, sessionKey: cronRunSessionKey };
       }
       if (abortSignal?.aborted) {
         return { status: "error", error: timeoutErrorMessage() };
@@ -1454,12 +1871,51 @@ async function executeMainSessionCronJob(
           sessionKey: cronRunSessionKey,
           heartbeat: { target: "last" },
         });
-        return { status: "ok", summary: text, sessionKey: cronRunSessionKey };
+        return requiresWatchdogReceiptProof
+          ? {
+              status: "error",
+              error:
+                "cron: queued watchdog wake after heartbeat wait timeout without fresh receipt proof",
+              summary: text,
+              sessionKey: cronRunSessionKey,
+            }
+          : { status: "ok", summary: text, sessionKey: cronRunSessionKey };
       }
       await waitWithAbort(retryDelayMs);
     }
 
     if (heartbeatResult.status === "ran") {
+      if (
+        requiresWatchdogReceiptProof &&
+        watchdogProofBefore &&
+        !(await waitForWatchdogProofSurfaces({
+          startedAtMs: cronStartedAt,
+          before: watchdogProofBefore,
+          abortSignal,
+          waitWithAbort,
+        }))
+      ) {
+        return {
+          status: "error",
+          error:
+            "cron: watchdog command path did not write fresh receipt/status/report/latest proof for this run",
+          summary: text,
+          sessionKey: cronRunSessionKey,
+        };
+      }
+      if (requiresWatchdogReceiptProof) {
+        const recovery = await maybeRecoverWatchdogChatDeliveryFromProofSurfaces({
+          receiptPath: captureWatchdogProofSurfaceSnapshot().receiptPath,
+        });
+        if (!recovery.ok) {
+          return {
+            status: "error",
+            error: `cron: fresh watchdog receipt written but transcript proof delivery failed: ${recovery.error}`,
+            summary: text,
+            sessionKey: cronRunSessionKey,
+          };
+        }
+      }
       return { status: "ok", summary: text, sessionKey: cronRunSessionKey };
     }
     if (heartbeatResult.status === "skipped") {
@@ -1489,6 +1945,14 @@ async function executeMainSessionCronJob(
     sessionKey: cronRunSessionKey,
     heartbeat: { target: "last" },
   });
+  if (requiresWatchdogReceiptProof) {
+    return {
+      status: "error",
+      error: "cron: watchdog proof job was queued without immediate same-run proof verification",
+      summary: text,
+      sessionKey: cronRunSessionKey,
+    };
+  }
   return { status: "ok", summary: text, sessionKey: cronRunSessionKey };
 }
 

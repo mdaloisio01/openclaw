@@ -98,6 +98,11 @@ import {
   parseThreadSessionSuffix,
 } from "../../sessions/session-key-utils.js";
 import { createRunningTaskRun, finalizeTaskRunByRunId } from "../../tasks/detached-task-runtime.js";
+import {
+  getTaskFlowById,
+  getTaskFlowProductionContinuation,
+} from "../../tasks/task-flow-runtime-internal.js";
+import { findLatestActiveMissionForOwnerKey } from "../../tasks/task-registry.js";
 import type { TaskStatus } from "../../tasks/task-registry.types.js";
 import {
   mergeDeliveryContext,
@@ -636,6 +641,30 @@ function resolveGatewayAgentTaskTrackingMode(params: {
     : "cli";
 }
 
+function resolveGatewayAgentParentContinuationLink(sessionKey?: string): {
+  parentFlowId?: string;
+  parentTaskId?: string;
+} {
+  const normalizedSessionKey = normalizeOptionalString(sessionKey);
+  if (!normalizedSessionKey) {
+    return {};
+  }
+  const activeMission = findLatestActiveMissionForOwnerKey(normalizedSessionKey);
+  const parentFlowId = activeMission?.parentFlowId?.trim();
+  if (!parentFlowId) {
+    return {};
+  }
+  const linkedFlow = getTaskFlowById(parentFlowId);
+  const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;
+  if (!linkedContinuation?.activeProductionRun) {
+    return {};
+  }
+  return {
+    parentFlowId,
+    ...(activeMission?.taskId?.trim() ? { parentTaskId: activeMission.taskId.trim() } : {}),
+  };
+}
+
 async function registerPluginSubagentRunFromGateway(params: {
   cfg: OpenClawConfig;
   runId: string;
@@ -882,6 +911,9 @@ function dispatchAgentRunFromGateway(params: {
 }) {
   const shouldTrackTask = params.taskTrackingMode === "cli";
   let taskTracked = false;
+  const parentContinuationLink = shouldTrackTask
+    ? resolveGatewayAgentParentContinuationLink(params.ingressOpts.sessionKey)
+    : {};
   if (shouldTrackTask) {
     try {
       taskTracked = Boolean(
@@ -898,6 +930,12 @@ function dispatchAgentRunFromGateway(params: {
           }),
           childSessionKey: params.ingressOpts.sessionKey,
           runId: params.runId,
+          ...(parentContinuationLink.parentFlowId
+            ? { parentFlowId: parentContinuationLink.parentFlowId }
+            : {}),
+          ...(parentContinuationLink.parentTaskId
+            ? { parentTaskId: parentContinuationLink.parentTaskId }
+            : {}),
           task: params.ingressOpts.message,
           deliveryStatus: "not_applicable",
           startedAt: Date.now(),

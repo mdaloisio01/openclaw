@@ -189,6 +189,23 @@ async function addWakeModeNowMainSystemEventJob(
   });
 }
 
+async function addWatchdogProofMainSystemEventJob(cron: CronService, options?: { name?: string }) {
+  return cron.add({
+    name: options?.name ?? "watchdog proof wakeMode now",
+    enabled: true,
+    schedule: { kind: "at", at: new Date(1).toISOString() },
+    sessionTarget: "main",
+    wakeMode: "now",
+    payload: {
+      kind: "systemEvent",
+      text:
+        "Run the system-wide active-work watchdog in report-only mode from /home/will/.openclaw/workspace-orchestrator. " +
+        "Use the local script at scripts/system_wide_active_work_watchdog.py " +
+        "--mode report-only --reason cron_tick --write-receipt --stdout-json.",
+    },
+  });
+}
+
 async function addMainOneShotHelloJob(
   cron: CronService,
   params: { atMs: number; name: string; deleteAfterRun?: boolean },
@@ -443,6 +460,34 @@ describe("CronService", () => {
     expectQueuedCronHeartbeat(requestHeartbeat, { jobId: job.id });
     expect(job.state.lastStatus).toBe("ok");
     expect(job.state.lastError).toBeUndefined();
+
+    await cron.list({ includeDisabled: true });
+    await stopCronAndCleanup(cron, store);
+  });
+
+  it("watchdog proof jobs pass allowDuringCron to the synchronous heartbeat wake", async () => {
+    const runHeartbeatOnce = vi.fn(async () => ({
+      status: "skipped" as const,
+      reason: "disabled",
+    }));
+
+    const { store, cron } = await createWakeModeNowMainHarness({
+      runHeartbeatOnce,
+    });
+
+    const job = await addWatchdogProofMainSystemEventJob(cron, {
+      name: "watchdog proof allowDuringCron",
+    });
+
+    await cron.run(job.id, "force");
+
+    expect(runHeartbeatOnce).toHaveBeenCalledTimes(1);
+    expect(runHeartbeatOnce.mock.calls[0]?.[0]).toMatchObject({
+      source: "cron",
+      intent: "immediate",
+      reason: `cron:${job.id}`,
+      allowDuringCron: true,
+    });
 
     await cron.list({ includeDisabled: true });
     await stopCronAndCleanup(cron, store);

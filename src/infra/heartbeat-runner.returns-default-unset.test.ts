@@ -976,6 +976,78 @@ describe("runHeartbeatOnce", () => {
     }
   });
 
+  it("preserves a forced cron-run session key so cron wakes drain the queued cron event", async () => {
+    const tmpDir = await createCaseDir("hb-cron-run-forced-session");
+    const storePath = path.join(tmpDir, "sessions.json");
+    const replySpy = vi.fn();
+    const cronRunSessionKey = "agent:main:cron:watchdog-job:run:1781536500015";
+    try {
+      const cfg: OpenClawConfig = {
+        agents: {
+          defaults: {
+            workspace: tmpDir,
+            heartbeat: {
+              every: "5m",
+              target: "last",
+            },
+          },
+        },
+        channels: { whatsapp: { allowFrom: ["*"] } },
+        session: { store: storePath },
+      };
+      const mainSessionKey = resolveMainSessionKey(cfg);
+      await fs.writeFile(
+        storePath,
+        JSON.stringify({
+          [mainSessionKey]: {
+            sessionId: "sid-main",
+            updatedAt: Date.now(),
+            lastChannel: "whatsapp",
+            lastTo: "120363401234567890@g.us",
+          },
+        }),
+      );
+
+      enqueueSystemEvent(
+        "[cron:test-watchdog watchdog] Execute python3 scripts/system_wide_active_work_watchdog.py --mode report-only --reason cron_tick --write-receipt --stdout-json",
+        {
+          sessionKey: cronRunSessionKey,
+          contextKey: "cron:test-watchdog",
+        },
+      );
+
+      replySpy.mockResolvedValue([{ text: "Cron handled" }]);
+      await runHeartbeatOnce({
+        cfg,
+        source: "cron",
+        reason: "cron:test-watchdog",
+        sessionKey: cronRunSessionKey,
+        heartbeat: { target: "last" },
+        deps: createHeartbeatDeps(
+          vi.fn(async () => ({
+            messageId: "m1",
+            toJid: "jid",
+          })),
+          { getReplyFromConfig: replySpy },
+        ),
+      });
+
+      expectReplyCall(
+        replySpy,
+        0,
+        {
+          SessionKey: cronRunSessionKey,
+          Provider: "cron-event",
+          Body: /\[cron:test-watchdog watchdog\][\s\S]*system_wide_active_work_watchdog\.py/,
+        },
+        { isHeartbeat: true, suppressToolErrorWarnings: false },
+        cfg,
+      );
+    } finally {
+      replySpy.mockReset();
+    }
+  });
+
   it.each([
     {
       name: "heartbeat.session",

@@ -87,6 +87,7 @@ import {
 } from "../process/command-queue.js";
 import { CommandLane } from "../process/lanes.js";
 import {
+  isCronRunSessionKey,
   isSubagentSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
@@ -585,6 +586,18 @@ function resolveHeartbeatSession(
       requestKey: forced,
       mainKey: cfg.session?.mainKey,
     });
+    // Cron main-session runs enqueue system events on a per-run session key.
+    // Preserve that exact forced key here so the heartbeat drains the same queue
+    // instead of remapping to agent main and missing the pending cron event.
+    if (isCronRunSessionKey(forcedCandidate)) {
+      return {
+        sessionKey: forcedCandidate,
+        storePath,
+        store,
+        entry: store[forcedCandidate],
+        suppressOriginatingContext: false,
+      };
+    }
     if (!isSubagentSessionKey(forcedCandidate)) {
       const forcedCanonical = canonicalizeMainSessionAlias({
         cfg,
@@ -1299,6 +1312,7 @@ export async function runHeartbeatOnce(opts: {
   source?: HeartbeatWakeSource;
   intent?: HeartbeatWakeIntent;
   reason?: string;
+  allowDuringCron?: boolean;
   deps?: HeartbeatDeps;
 }): Promise<HeartbeatRunResult> {
   const cfg = opts.cfg ?? getRuntimeConfig();
@@ -1332,11 +1346,20 @@ export async function runHeartbeatOnce(opts: {
 
   const getSize = opts.deps?.getQueueSize ?? getQueueSize;
   const getSnapshots = opts.deps?.getCommandLaneSnapshots ?? getCommandLaneSnapshots;
-  if (getSize(CommandLane.Main) > 0) {
+  const bypassCronBusyGuard = opts.allowDuringCron === true;
+  const bypassMainLaneBusyGuard =
+    bypassCronBusyGuard &&
+    opts.source === "cron" &&
+    opts.intent === "immediate" &&
+    isCronRunSessionKey(opts.sessionKey);
+  if (!bypassMainLaneBusyGuard && getSize(CommandLane.Main) > 0) {
     return { status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT };
   }
 
-  if (hasActiveCronJobs() || hasQueuedWorkInLanes(HEARTBEAT_ALWAYS_BUSY_LANES, getSize)) {
+  if (
+    !bypassCronBusyGuard &&
+    (hasActiveCronJobs() || hasQueuedWorkInLanes(HEARTBEAT_ALWAYS_BUSY_LANES, getSize))
+  ) {
     emitHeartbeatEvent({
       status: "skipped",
       reason: HEARTBEAT_SKIP_CRON_IN_PROGRESS,

@@ -1,5 +1,5 @@
-import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { retireSessionMcpRuntime } from "../agents/agent-bundle-mcp-tools.js";
+import { resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { abortAndDrainEmbeddedAgentRun } from "../agents/embedded-agent.js";
 import { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
 import type { CliDeps } from "../cli/deps.types.js";
@@ -39,6 +39,7 @@ import {
 } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
+import { installProductionWatchdogLifecycleGate } from "../tasks/active-production-watchdog-lifecycle.js";
 import {
   dispatchGatewayCronFinishedNotifications,
   sendGatewayCronFailureAlert,
@@ -347,6 +348,7 @@ export function buildGatewayCronService(params: {
           agentId,
           heartbeat: opts?.heartbeat,
         }),
+        allowDuringCron: opts?.allowDuringCron === true,
         deps: { ...params.deps, runtime: defaultRuntime },
       });
     },
@@ -510,6 +512,7 @@ export function buildGatewayCronService(params: {
       }
     },
   });
+  installProductionWatchdogLifecycleGate({ cron, log: cronLogger });
 
   return { cron, storePath, cronEnabled };
 }

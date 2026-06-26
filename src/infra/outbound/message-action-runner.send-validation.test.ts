@@ -141,6 +141,33 @@ describe("runMessageAction send validation", () => {
     expect(JSON.stringify(result.toolResult?.content)).not.toContain("hello from codex");
   });
 
+  it("uses the internal UI source sink when message-tool-only delivery loses channel context but keeps a session key", async () => {
+    const result = await runMessageAction({
+      cfg: emptyConfig,
+      action: "send",
+      params: {
+        message: "hello from cron",
+      },
+      sessionKey: "agent:orchestrator:cron:job:run:123",
+      sourceReplyDeliveryMode: "message_tool_only",
+    });
+
+    expect(result).toMatchObject({
+      kind: "send",
+      channel: "webchat",
+      to: "current-run",
+      handledBy: "internal-source",
+      payload: {
+        status: "ok",
+        deliveryStatus: "sent",
+        sourceReplySink: "internal-ui",
+        sourceReply: {
+          text: "hello from cron",
+        },
+      },
+    });
+  });
+
   it("uses non-webchat current source context as the message-tool-only send sink", async () => {
     const result = await runMessageAction({
       cfg: emptyConfig,

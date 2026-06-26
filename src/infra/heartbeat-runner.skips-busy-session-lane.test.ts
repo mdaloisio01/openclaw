@@ -108,6 +108,52 @@ describe("heartbeat runner skips when target session lane is busy", () => {
     });
   });
 
+  it("allows an explicit cron-proof wake to bypass the cron-in-progress guard", async () => {
+    await withTempHeartbeatSandbox(async ({ storePath, replySpy }) => {
+      const cfg = createHeartbeatTelegramConfig();
+      await seedHeartbeatTelegramSession(storePath, cfg);
+      markCronJobActive("watchdog-proof-job");
+
+      const result = await runHeartbeatOnce({
+        cfg,
+        source: "cron",
+        intent: "immediate",
+        allowDuringCron: true,
+        deps: {
+          getQueueSize: vi.fn((_lane?: string) => 0),
+          nowMs: () => Date.now(),
+          getReplyFromConfig: replySpy,
+        } as HeartbeatDeps,
+      });
+
+      expect(result.status).not.toBe("skipped");
+      expect(replySpy).toHaveBeenCalled();
+    });
+  });
+
+  it("allows an explicit cron-proof wake to bypass the main-lane busy guard", async () => {
+    await withTempHeartbeatSandbox(async ({ storePath, replySpy }) => {
+      const cfg = createHeartbeatTelegramConfig();
+      await seedHeartbeatTelegramSession(storePath, cfg);
+
+      const result = await runHeartbeatOnce({
+        cfg,
+        source: "cron",
+        intent: "immediate",
+        sessionKey: "agent:orchestrator:cron:watchdog-proof-job:run:123",
+        allowDuringCron: true,
+        deps: {
+          getQueueSize: vi.fn((lane?: string) => (lane === CommandLane.Main ? 1 : 0)),
+          nowMs: () => Date.now(),
+          getReplyFromConfig: replySpy,
+        } as HeartbeatDeps,
+      });
+
+      expect(result.status).not.toBe("skipped");
+      expect(replySpy).toHaveBeenCalled();
+    });
+  });
+
   it("returns cron-in-progress when cron lanes have queued work", async () => {
     await withTempHeartbeatSandbox(async ({ storePath, replySpy }) => {
       const cfg = createHeartbeatTelegramConfig();
