@@ -40,6 +40,7 @@ export type {
   RuntimeConfigSnapshotMetadata,
 } from "./runtime-snapshot.js";
 export type {
+  ConfigIO,
   ConfigSnapshotReadOptions,
   ConfigWriteNotification,
   ConfigWriteResult,
