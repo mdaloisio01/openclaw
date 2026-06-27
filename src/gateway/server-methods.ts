@@ -17,6 +17,7 @@ import {
   type GatewayMethodRegistry,
 } from "./methods/registry.js";
 import { isRoleAuthorizedForMethod, parseGatewayRole } from "./role-policy.js";
+import { restartHandlers } from "./server-methods/restart.js";
 import type {
   GatewayRequestHandler,
   GatewayRequestHandlerOptions,
@@ -146,10 +147,6 @@ const loadPluginHostHookHandlers = lazyHandlerModule(
 const loadPushHandlers = lazyHandlerModule(
   () => import("./server-methods/push.js"),
   (module) => module.pushHandlers,
-);
-const loadRestartHandlers = lazyHandlerModule(
-  () => import("./server-methods/restart.js"),
-  (module) => module.restartHandlers,
 );
 const loadSendHandlers = lazyHandlerModule(
   () => import("./server-methods/send.js"),
@@ -544,10 +541,7 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
     ],
     loadHandlers: loadPushHandlers,
   }),
-  ...createLazyCoreHandlers({
-    methods: ["gateway.restart.request", "gateway.restart.preflight"],
-    loadHandlers: loadRestartHandlers,
-  }),
+  ...restartHandlers,
   ...createLazyCoreHandlers({
     methods: ["message.action", "send", "poll"],
     loadHandlers: loadSendHandlers,
