@@ -1,5 +1,6 @@
 import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { resolveAgentWorkspaceDir } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
 import type { MemorySource } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
   asToolParamsRecord,
@@ -7,6 +8,7 @@ import {
   readFiniteNumberParam,
   readPositiveIntegerParam,
   readStringParam,
+  resolveMemorySearchConfig,
   type MemoryCorpusSearchResult,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
@@ -202,6 +204,42 @@ function queueShortTermRecallTracking(params: {
   }).catch(() => {
     // Recall tracking is best-effort and must never block memory recall.
   });
+}
+
+async function searchMemoryFilesLocallyForUnavailableMemory(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  query: string;
+  maxResults?: number;
+}): Promise<
+  | {
+      results: Array<MemorySearchResult & { corpus: MemorySource }>;
+      debug: {
+        used: boolean;
+        staleIndexSuspected: boolean;
+        scannedFiles: number;
+        scannedChunks: number;
+        matchedFiles: number;
+      };
+    }
+  | undefined
+> {
+  const settings = resolveMemorySearchConfig(params.cfg, params.agentId);
+  const localFallback = await searchMemoryFilesLocally({
+    cfg: params.cfg,
+    agentId: params.agentId,
+    workspaceDir: resolveAgentWorkspaceDir(params.cfg, params.agentId),
+    extraPaths: settings?.extraPaths,
+    query: params.query,
+    maxResults: params.maxResults,
+  });
+  if (localFallback.results.length === 0) {
+    return undefined;
+  }
+  return {
+    results: localFallback.results.map((result) => ({ ...result, corpus: result.source })),
+    debug: localFallback.debug,
+  };
 }
 
 function normalizeActiveMemoryQmdSearchMode(
@@ -793,6 +831,34 @@ export function createMemorySearchTool(options: {
         });
         if (outcome.status === "unavailable") {
           const unavailablePhase = failedUnavailablePhase ?? activeUnavailablePhase;
+          if (requestedCorpus !== "wiki" && requestedCorpus !== "sessions") {
+            const fallback = await searchMemoryFilesLocallyForUnavailableMemory({
+              cfg,
+              agentId,
+              query,
+              maxResults,
+            }).catch(() => undefined);
+            if (fallback) {
+              return jsonResult({
+                results: fallback.results,
+                provider: "local-fallback",
+                model: "memory-files",
+                citations: resolveMemoryCitationsMode(cfg),
+                mode: "local-fallback",
+                degraded: true,
+                warning:
+                  "Indexed memory search did not respond before the tool deadline; returned local memory-file matches.",
+                debug: {
+                  backend: "local-fallback",
+                  effectiveMode: "local-fallback",
+                  searchMs: MEMORY_SEARCH_TOOL_TIMEOUT_MS,
+                  hits: fallback.results.length,
+                  timeoutError: outcome.error,
+                  localFallback: fallback.debug,
+                },
+              });
+            }
+          }
           const shouldRecordCooldown =
             requestedCorpus !== "wiki" &&
             (requestedCorpus !== "all" || unavailablePhase === "memory");

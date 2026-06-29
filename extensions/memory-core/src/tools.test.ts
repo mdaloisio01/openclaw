@@ -132,20 +132,50 @@ describe("memory_search unavailable payloads", () => {
     });
   });
 
-  it("returns unavailable metadata when manager setup does not settle", async () => {
+  it("returns local memory fallback results when manager setup does not settle", async () => {
     vi.useFakeTimers();
     try {
       setMemorySearchManagerImpl(async () => await new Promise(() => {}));
+      setMemoryFileList(["/workspace/MEMORY.md"]);
+      setMemoryReadFileImpl(async (params) => ({
+        path: params.relPath,
+        from: params.from ?? 1,
+        lines: 120,
+        text: "Durable cleanup memory hygiene note.",
+      }));
       const tool = createMemorySearchToolOrThrow();
 
-      const resultPromise = tool.execute("manager-timeout", { query: "hello" });
+      const resultPromise = tool.execute("manager-timeout", { query: "cleanup memory hygiene" });
       await vi.advanceTimersByTimeAsync(15_000);
 
       const result = await resultPromise;
-      expectUnavailableMemorySearchDetails(result.details, {
-        error: "memory_search timed out after 15s",
-        warning: "Memory search is unavailable due to an embedding/provider error.",
-        action: "Check embedding provider configuration and retry memory_search.",
+      expect(result.details).toMatchObject({
+        provider: "local-fallback",
+        model: "memory-files",
+        degraded: true,
+        mode: "local-fallback",
+        results: [
+          {
+            corpus: "memory",
+            path: "../../../../workspace/MEMORY.md",
+            score: expect.any(Number),
+            snippet: "Durable cleanup memory hygiene note.",
+            source: "memory",
+          },
+        ],
+        debug: {
+          backend: "local-fallback",
+          effectiveMode: "local-fallback",
+          hits: 1,
+          timeoutError: "memory_search timed out after 15s",
+          localFallback: {
+            used: true,
+            staleIndexSuspected: true,
+            scannedFiles: 1,
+            scannedChunks: 1,
+            matchedFiles: 1,
+          },
+        },
       });
     } finally {
       vi.useRealTimers();
