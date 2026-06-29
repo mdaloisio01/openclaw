@@ -183,6 +183,7 @@ type NativeHookRelayProviderAdapter = {
 
 const DEFAULT_RELAY_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_RELAY_TIMEOUT_MS = 5_000;
+const DEFAULT_RELAY_NICE = 10;
 const DEFAULT_PERMISSION_TIMEOUT_MS = 120_000;
 const PERMISSION_ALLOW_ALWAYS_TTL_MS = 30 * 60 * 1000;
 const MAX_NATIVE_HOOK_RELAY_INVOCATIONS = 200;
@@ -506,10 +507,10 @@ function normalizeRelayGeneration(value: string | undefined): string | undefined
 }
 
 function resolveNativeHookRelayNicePrefix(value: number | false | undefined): string[] {
-  if (process.platform === "win32" || value === false || value === undefined) {
+  if (process.platform === "win32" || value === false) {
     return [];
   }
-  const nice = normalizePositiveInteger(value, 0);
+  const nice = normalizePositiveInteger(value, DEFAULT_RELAY_NICE);
   if (nice <= 0) {
     return [];
   }

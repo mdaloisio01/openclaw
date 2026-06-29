@@ -14,6 +14,7 @@ import { createMockPluginRegistry } from "../../plugins/hooks.test-helpers.js";
 import { patchPluginSessionExtension } from "../../plugins/host-hook-state.js";
 import { createEmptyPluginRegistry } from "../../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../../plugins/runtime.js";
+import { setDirtyTreeHygieneStatusReaderForTest } from "../agent-tools.before-tool-call.js";
 import {
   testing,
   buildNativeHookRelayCommand,
@@ -29,6 +30,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   resetGlobalHookRunner();
   setActivePluginRegistry(createEmptyPluginRegistry());
+  setDirtyTreeHygieneStatusReaderForTest();
   testing.clearNativeHookRelaysForTests();
 });
 
@@ -111,6 +113,10 @@ async function writeForeignNativeHookRelayBridgeRecordForTests(
 
 function uniqueNativeHookRelayIdForTests(prefix: string): string {
   return `${prefix}-${randomUUID()}`;
+}
+
+function useCleanDirtyTreeHygieneForTests(): void {
+  setDirtyTreeHygieneStatusReaderForTest(async () => "");
 }
 
 function openDeferredNativeHookRelayBridgeRequest(
@@ -239,7 +245,7 @@ describe("native hook relay registry", () => {
       },
     );
     expect(relay.commandForEvent("pre_tool_use")).toBe(
-      "/usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
+      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
         `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --timeout 1234`,
     );
   });
@@ -526,7 +532,7 @@ describe("native hook relay registry", () => {
     expect(relay.shouldRelayEvent("before_agent_finalize")).toBe(false);
     expect(relay.shouldRelayEvent("permission_request")).toBe(true);
     expect(relay.commandForEvent("pre_tool_use")).toBe(
-      "/usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
+      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
         `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --pre-tool-use-unavailable noop --timeout 1234`,
     );
   });
@@ -548,7 +554,7 @@ describe("native hook relay registry", () => {
 
     expect(relay.shouldRelayEvent("pre_tool_use")).toBe(true);
     expect(relay.commandForEvent("pre_tool_use")).toBe(
-      "/usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
+      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
         `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --timeout 1234`,
     );
   });
@@ -568,7 +574,7 @@ describe("native hook relay registry", () => {
 
     expect(relay.shouldRelayEvent("pre_tool_use")).toBe(true);
     expect(relay.commandForEvent("pre_tool_use")).toBe(
-      "/usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
+      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
         `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --timeout 1234`,
     );
   });
@@ -604,7 +610,7 @@ describe("native hook relay registry", () => {
     expect(relay.shouldRelayEvent("post_tool_use")).toBe(true);
     expect(relay.shouldRelayEvent("before_agent_finalize")).toBe(false);
     expect(relay.commandForEvent("post_tool_use")).toBe(
-      "/usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
+      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
         `${relay.relayId} --generation ${relay.generation} --event post_tool_use --timeout 1234`,
     );
   });
@@ -626,7 +632,7 @@ describe("native hook relay registry", () => {
 
     expect(relay.shouldRelayEvent("before_agent_finalize")).toBe(true);
     expect(relay.commandForEvent("before_agent_finalize")).toBe(
-      "/usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
+      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
         `${relay.relayId} --generation ${relay.generation} --event before_agent_finalize --timeout 1234`,
     );
   });
@@ -1025,7 +1031,7 @@ describe("native hook relay registry", () => {
       allowedEvents: ["pre_tool_use"],
     });
 
-    expect(kill).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalledWith(9_999_992, 0);
     await expect(fs.stat(stalePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -1608,6 +1614,7 @@ describe("native hook relay registry", () => {
   });
 
   it("maps Codex PreToolUse to OpenClaw before_tool_call and blocks before execution", async () => {
+    useCleanDirtyTreeHygieneForTests();
     const beforeToolCall = vi.fn(async () => ({
       block: true,
       blockReason: "repo policy blocks this command",
@@ -1716,6 +1723,7 @@ describe("native hook relay registry", () => {
   });
 
   it("prefers Codex exec_command cmd over a stale command field", async () => {
+    useCleanDirtyTreeHygieneForTests();
     const beforeToolCall = vi.fn(async (event: unknown) => {
       const command = (event as { params?: { command?: string } }).params?.command;
       return command === "rm -rf dist"
@@ -2045,6 +2053,7 @@ describe("native hook relay registry", () => {
   });
 
   it("passes config to trusted policies for native pre-tool session extension reads", async () => {
+    useCleanDirtyTreeHygieneForTests();
     const stateDir = await fs.mkdtemp(path.join(tmpdir(), "openclaw-native-relay-policy-"));
     const storePath = path.join(stateDir, "sessions.json");
     const config = { session: { store: storePath } };
@@ -2133,6 +2142,7 @@ describe("native hook relay registry", () => {
   });
 
   it("uses the Codex cwd when deriving apply_patch paths for PreToolUse", async () => {
+    useCleanDirtyTreeHygieneForTests();
     const beforeToolCall = vi.fn();
     initializeGlobalHookRunner(
       createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
@@ -2179,6 +2189,7 @@ describe("native hook relay registry", () => {
   });
 
   it("blocks Codex native Bash pre-tool calls when policy rewrites params", async () => {
+    useCleanDirtyTreeHygieneForTests();
     const beforeToolCall = vi.fn(async () => ({
       params: { command: "echo replaced" },
     }));
@@ -3197,6 +3208,21 @@ describe("native hook relay command builder", () => {
         executable: "openclaw",
       }),
     ).toBe(
+      "nice -n 10 openclaw hooks relay --provider codex --relay-id relay-1 --generation generation-1 --event permission_request --timeout 5000",
+    );
+  });
+
+  it("allows native hook relay command priority lowering to be disabled", () => {
+    expect(
+      buildNativeHookRelayCommand({
+        provider: "codex",
+        relayId: "relay-1",
+        generation: "generation-1",
+        event: "permission_request",
+        executable: "openclaw",
+        nice: false,
+      }),
+    ).toBe(
       "openclaw hooks relay --provider codex --relay-id relay-1 --generation generation-1 --event permission_request --timeout 5000",
     );
   });
@@ -3212,7 +3238,7 @@ describe("native hook relay command builder", () => {
         executable: "openclaw",
       }),
     ).toBe(
-      "openclaw hooks relay --provider codex --relay-id relay-1 --generation generation-1 --event pre_tool_use --pre-tool-use-unavailable noop --timeout 5000",
+      "nice -n 10 openclaw hooks relay --provider codex --relay-id relay-1 --generation generation-1 --event pre_tool_use --pre-tool-use-unavailable noop --timeout 5000",
     );
   });
 });
