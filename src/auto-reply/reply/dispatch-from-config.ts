@@ -216,18 +216,6 @@ function formatActiveMissionContextPrefix(params: {
   return `${missionBlock}\n\nCurrent user turn:\n${bodyText}`;
 }
 
-function isLawfulActiveRunStopReason(stopReason?: string): stopReason is string {
-  return (
-    stopReason === "blocker" ||
-    stopReason === "approval_blocked" ||
-    stopReason === "approval_unavailable" ||
-    stopReason === "owner_boundary_stop" ||
-    stopReason === "restart_or_reload" ||
-    stopReason === "hard_stop" ||
-    stopReason === "safety_stop"
-  );
-}
-
 function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
   | {
       stopAllowed?: boolean;
@@ -244,36 +232,6 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
     return undefined;
   }
   const normalized = text.toLowerCase();
-  const hasApprovalWait =
-    normalized.includes("approval required") ||
-    normalized.includes("operator approval required") ||
-    normalized.includes("user approval required") ||
-    normalized.includes("waiting on approval") ||
-    normalized.includes("waiting on operator approval") ||
-    normalized.includes("waiting on user approval") ||
-    normalized.includes("blocked waiting on approval") ||
-    normalized.includes("awaiting approval");
-  const hasRestartWait =
-    normalized.includes("restart/reload authorization") ||
-    normalized.includes("restart or reload authorization") ||
-    normalized.includes("restart authorization") ||
-    normalized.includes("reload authorization") ||
-    normalized.includes("waiting on restart") ||
-    normalized.includes("waiting on reload");
-  if (hasApprovalWait && normalized.includes("build still open")) {
-    return {
-      stopAllowed: true,
-      stopReason: "approval_blocked",
-      openTruth: "build still open; waiting on approval.",
-    };
-  }
-  if (hasRestartWait && normalized.includes("build still open")) {
-    return {
-      stopAllowed: true,
-      stopReason: "restart_or_reload",
-      openTruth: "build still open; waiting on restart/reload authorization.",
-    };
-  }
   if (normalized.includes("routed to lawful owner, build still open")) {
     return {
       stopAllowed: true,
@@ -1089,7 +1047,13 @@ function createAbortAwareDispatcher(params: {
       recordNonTerminalBuildUpdateEmitted(params.dispatcher, `stop_contract:${detail}`);
       return;
     }
-    if (continuation.stopAllowed === true && isLawfulActiveRunStopReason(continuation.stopReason)) {
+    if (
+      continuation.stopAllowed === true &&
+      (continuation.stopReason === "blocker" ||
+        continuation.stopReason === "restart_or_reload" ||
+        continuation.stopReason === "hard_stop" ||
+        continuation.stopReason === "safety_stop")
+    ) {
       recordLawfulBlocker(params.dispatcher, continuation.stopReason);
     }
   };
