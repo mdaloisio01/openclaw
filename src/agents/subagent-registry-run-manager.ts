@@ -310,6 +310,33 @@ export function createSubagentRunManager(params: {
         waitTerminalOutcome?.reason === "aborted" || waitTerminalOutcome?.reason === "cancelled";
       const waitStatus = waitTerminalOutcome?.status ?? wait.status;
       if (wait.yielded === true && waitStatus !== "timeout" && !waitBlocked) {
+        const terminalCompletion = params.resolveSubagentSessionCompletion({
+          childSessionKey: entry.childSessionKey,
+          fallbackEndedAt:
+            typeof wait.endedAt === "number" && Number.isFinite(wait.endedAt)
+              ? wait.endedAt
+              : Date.now(),
+          notBeforeMs: entry.startedAt ?? entry.createdAt,
+        });
+        if (terminalCompletion) {
+          log.info("subagent yielded wait had terminal session completion; completing run", {
+            runId,
+            childSessionKey: entry.childSessionKey,
+            outcome: terminalCompletion.outcome.status,
+          });
+          completionForRetry = {
+            runId,
+            endedAt: terminalCompletion.endedAt,
+            outcome: terminalCompletion.outcome,
+            reason: terminalCompletion.reason,
+            sendFarewell: true,
+            accountId: entry.requesterOrigin?.accountId,
+            triggerCleanup: true,
+            startedAt: terminalCompletion.startedAt,
+          };
+          await params.completeSubagentRun(completionForRetry);
+          return;
+        }
         if (
           markSubagentRunPausedAfterYield({
             entry,

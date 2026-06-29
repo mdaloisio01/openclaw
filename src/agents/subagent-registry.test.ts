@@ -2165,6 +2165,53 @@ describe("subagent registry seam flow", () => {
     expect(replacement?.endedAt).toBeUndefined();
   });
 
+  it("completes a sessions_yield wait when the child session is already terminal", async () => {
+    const startedAt = Date.now() + 10;
+    const endedAt = startedAt + 100;
+    mocks.loadSessionStore.mockReturnValue({
+      "agent:main:subagent:child": {
+        sessionId: "child-session",
+        status: "done",
+        startedAt,
+        endedAt,
+        updatedAt: endedAt,
+      },
+    });
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return {
+          status: "ok",
+          startedAt,
+          endedAt,
+          stopReason: "end_turn",
+          livenessState: "paused",
+          yielded: true,
+        };
+      }
+      return {};
+    });
+
+    mod.registerSubagentRun({
+      runId: "run-yield-terminal",
+      childSessionKey: "agent:main:subagent:child",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "wait for completed child",
+      cleanup: "keep",
+    });
+
+    await waitForFast(() => {
+      const run = mod
+        .listSubagentRunsForRequester("agent:main:main")
+        .find((entry) => entry.runId === "run-yield-terminal");
+      expect(run?.pauseReason).toBeUndefined();
+      expect(run?.endedAt).toBe(endedAt);
+      expectRecordFields(run?.outcome, { status: "ok" }, "yield terminal outcome");
+    });
+    expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalled();
+    expect(mod.countPendingDescendantRuns("agent:main:main")).toBe(0);
+  });
+
   it("announces blocked agent.wait snapshots as errors instead of success", async () => {
     mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
       if (request.method === "agent.wait") {

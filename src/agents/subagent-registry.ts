@@ -656,6 +656,39 @@ function completeSubagentRunInBackground(params: CompleteSubagentRunParams, sour
   void completeSubagentRunWithRecovery(params, source);
 }
 
+function completePausedYieldRunIfTerminal(runId: string, entry: SubagentRunRecord): boolean {
+  if (entry.pauseReason !== "sessions_yield") {
+    return false;
+  }
+  const completion = resolveSubagentSessionCompletion({
+    childSessionKey: entry.childSessionKey,
+    fallbackEndedAt: entry.endedAt ?? Date.now(),
+    notBeforeMs: entry.startedAt ?? entry.createdAt,
+  });
+  if (!completion) {
+    return false;
+  }
+  log.info("resuming sessions_yield-paused subagent after terminal session completion", {
+    runId,
+    childSessionKey: entry.childSessionKey,
+    outcome: completion.outcome.status,
+  });
+  completeSubagentRunInBackground(
+    {
+      runId,
+      endedAt: completion.endedAt,
+      outcome: completion.outcome,
+      reason: completion.reason,
+      sendFarewell: true,
+      accountId: entry.requesterOrigin?.accountId,
+      triggerCleanup: true,
+      startedAt: completion.startedAt,
+    },
+    "sessions-yield-terminal-resume",
+  );
+  return true;
+}
+
 function schedulePendingLifecycleError(params: {
   runId: string;
   endedAt: number;
@@ -865,6 +898,9 @@ function resumeSubagentRun(runId: string) {
     return;
   }
   if (entry.pauseReason === "sessions_yield") {
+    if (completePausedYieldRunIfTerminal(runId, entry)) {
+      resumedRuns.add(runId);
+    }
     return;
   }
   // Skip entries that have exhausted their retry budget or expired (#18264).
