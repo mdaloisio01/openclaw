@@ -106,6 +106,7 @@ export type HookContext = {
   stopContract?: EmbeddedRunStopContract;
   trace?: DiagnosticTraceContext;
   channelId?: string;
+  memoryFlushWritePath?: string;
   loopDetection?: ToolLoopDetectionConfig;
   onToolOutcome?: ToolOutcomeObserver;
   skillsSnapshot?: SkillSnapshot;
@@ -486,8 +487,12 @@ function formatDirtyTreeHygieneBlockMessage(report: DirtyTreeHygieneReport): str
 async function resolveDirtyTreeHygieneBlock(args: {
   toolName: string;
   params: unknown;
+  ctx?: HookContext;
 }): Promise<HookOutcome | undefined> {
   if (!isSourceModifyingToolCall(args.toolName, args.params)) {
+    return undefined;
+  }
+  if (isAllowedMemoryFlushWrite(args)) {
     return undefined;
   }
   let statusShortOutput: string;
@@ -513,6 +518,36 @@ async function resolveDirtyTreeHygieneBlock(args: {
     reason: formatDirtyTreeHygieneBlockMessage(report),
     params: args.params,
   };
+}
+
+function normalizeMemoryFlushRelativePath(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "");
+  return /^memory\/\d{4}-\d{2}-\d{2}\.md$/.test(normalized) ? normalized : undefined;
+}
+
+function isWriteToolName(toolName: string): boolean {
+  const normalized = normalizeToolName(toolName);
+  return normalized === "write" || normalized === "write_file";
+}
+
+function isAllowedMemoryFlushWrite(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+}): boolean {
+  const allowedPath = normalizeMemoryFlushRelativePath(args.ctx?.memoryFlushWritePath);
+  if (!allowedPath || !isWriteToolName(args.toolName)) {
+    return false;
+  }
+  const record = isPlainObject(args.params) ? args.params : {};
+  const requestedPath = normalizeMemoryFlushRelativePath(record.path);
+  return requestedPath === allowedPath;
 }
 
 export function recordAdjustedParamsForToolCall(
@@ -1208,7 +1243,11 @@ export async function runBeforeToolCallHook(args: {
     params = gatewayRestartCheckpoint.params;
   }
 
-  const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({ toolName, params });
+  const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({
+    toolName,
+    params,
+    ctx: args.ctx,
+  });
   if (dirtyTreeHygieneBlock) {
     return dirtyTreeHygieneBlock;
   }
@@ -1249,6 +1288,9 @@ export async function runBeforeToolCallHook(args: {
       ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
       ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),
       ...(args.ctx?.runId && { runId: args.ctx.runId }),
+      ...(args.ctx?.memoryFlushWritePath && {
+        memoryFlushWritePath: args.ctx.memoryFlushWritePath,
+      }),
       ...(args.ctx?.trace && { trace: freezeDiagnosticTraceContext(args.ctx.trace) }),
       ...(args.toolCallId && { toolCallId: args.toolCallId }),
       ...(args.ctx?.channelId && { channelId: args.ctx.channelId }),

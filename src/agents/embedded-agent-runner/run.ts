@@ -1341,6 +1341,9 @@ export async function runEmbeddedAgent(
         const resolveActiveHookContext = () => ({
           ...hookCtx,
           sessionId: activeSessionId,
+          ...(params.memoryFlushWritePath
+            ? { memoryFlushWritePath: params.memoryFlushWritePath }
+            : {}),
         });
         const adoptCompactionTranscript = (
           compactResult: Awaited<ReturnType<typeof contextEngine.compact>>,
