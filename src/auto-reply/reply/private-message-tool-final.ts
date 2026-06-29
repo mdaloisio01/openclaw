@@ -1,6 +1,8 @@
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { SourceReplyDeliveryMode } from "../get-reply-options.types.js";
+import { markReplyPayloadForSourceSuppressionDelivery } from "../reply-payload.js";
 import { isSilentReplyText } from "../tokens.js";
+import type { ReplyPayload } from "../types.js";
 
 const privateFinalReplyLogger = createSubsystemLogger("source-reply/private-final");
 
@@ -53,13 +55,21 @@ export function warnPrivateMessageToolFinal(params: {
   finalTextLength: number;
 }): void {
   privateFinalReplyLogger.warn(
-    "agent produced a long private final reply without calling the configured delivery tool (message_tool_only); response kept private and not delivered to the source channel",
+    "agent produced a long private final reply without calling the configured delivery tool (message_tool_only); private body withheld and delivery-contract error payload emitted",
     {
       sessionKey: params.sessionKey,
       channel: params.channel,
       chars: params.finalTextLength,
     },
   );
+}
+
+export function buildPrivateMessageToolFinalDeliveryError(): ReplyPayload {
+  return markReplyPayloadForSourceSuppressionDelivery({
+    text: "Internal delivery error: the agent wrote a final reply but did not use the required message delivery tool. The private reply body was withheld.",
+    isError: true,
+    isStatusNotice: true,
+  });
 }
 
 function countSentenceLikeTerminators(text: string): number {

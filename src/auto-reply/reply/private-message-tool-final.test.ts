@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { shouldWarnAboutPrivateMessageToolFinal } from "./private-message-tool-final.js";
+import { getReplyPayloadMetadata } from "../reply-payload.js";
+import {
+  buildPrivateMessageToolFinalDeliveryError,
+  shouldWarnAboutPrivateMessageToolFinal,
+} from "./private-message-tool-final.js";
 
 const base = {
   sourceReplyDeliveryMode: "message_tool_only" as const,
@@ -70,5 +74,13 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
 
   it("does not flag when delivery was intentionally denied by send policy", () => {
     expect(shouldWarnAboutPrivateMessageToolFinal({ ...base, sendPolicyDenied: true })).toBe(false);
+  });
+
+  it("builds a visible delivery error without exposing the private final body", () => {
+    const payload = buildPrivateMessageToolFinalDeliveryError();
+    expect(payload.isError).toBe(true);
+    expect(payload.text).toContain("did not use the required message delivery tool");
+    expect(payload.text).not.toContain(base.finalText);
+    expect(getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression).toBe(true);
   });
 });
