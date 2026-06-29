@@ -505,6 +505,38 @@ describe("subagent registry seam flow", () => {
     expect(run?.outcome).toBeUndefined();
   });
 
+  it("does not mark cross-process live child runs lost when gateway wait still sees them", async () => {
+    const createdAt = Date.parse("2026-03-24T12:00:00Z");
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return {
+          status: "pending",
+        };
+      }
+      return {};
+    });
+
+    vi.setSystemTime(createdAt);
+    mod.registerSubagentRun({
+      runId: "run-cross-process-live",
+      childSessionKey: "agent:main:subagent:child",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "remote child still running",
+      cleanup: "keep",
+    });
+
+    vi.setSystemTime(createdAt + 120_000);
+    await mod.testing.sweepOnceForTests();
+
+    const run = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-cross-process-live");
+    expect(run?.endedAt).toBeUndefined();
+    expect(run?.outcome).toBeUndefined();
+    expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
+  });
+
   it("keeps parent run active when agent.wait times out before child session settles", async () => {
     let waitAttempts = 0;
     let resolveSecondWait: (value: {

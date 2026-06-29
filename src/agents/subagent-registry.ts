@@ -28,6 +28,7 @@ import {
 } from "./agent-steering-queue.js";
 import { removeInternalSessionEffectsTranscript } from "./internal-session-effects.js";
 import { isAbortedAgentStopReason } from "./run-termination.js";
+import { waitForAgentRun, type AgentWaitResult } from "./run-wait.js";
 import type { ensureRuntimePluginsLoaded as ensureRuntimePluginsLoadedFn } from "./runtime-plugins.js";
 import type { SubagentRunOutcome } from "./subagent-announce-output.js";
 import {
@@ -238,6 +239,7 @@ const SUSPENDED_DELIVERY_INTERACTIVE_EXPIRY_MS = 24 * 60 * 60_000;
 const SUSPENDED_DELIVERY_SOFT_CAP = 25;
 const SUSPENDED_DELIVERY_HARD_CAP = 50;
 const SUSPENDED_DELIVERY_PRESSURE_TARGET = 10;
+const REMOTE_AGENT_LIVENESS_PROBE_TIMEOUT_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 25 : 250;
 
 function loadContextEngineInitModule(): Promise<ContextEngineInitModule> {
   return contextEngineInitLoader.load();
@@ -1087,6 +1089,25 @@ function shouldSkipDiscardSuspendedPendingFinalDelivery(entry: SubagentRunRecord
   return { skip: false };
 }
 
+function agentWaitResultStillRepresentsLiveRun(wait: AgentWaitResult): boolean {
+  if (wait.status === "pending") {
+    return true;
+  }
+  if (wait.status !== "timeout") {
+    return false;
+  }
+  return wait.timeoutPhase === "gateway_draining" || wait.providerStarted === true;
+}
+
+async function remoteAgentRunStillAppearsLive(runId: string): Promise<boolean> {
+  const wait = await waitForAgentRun({
+    runId,
+    timeoutMs: REMOTE_AGENT_LIVENESS_PROBE_TIMEOUT_MS,
+    callGateway: subagentRegistryDeps.callGateway,
+  });
+  return agentWaitResultStillRepresentsLiveRun(wait);
+}
+
 async function discardSuspendedPendingFinalDelivery(
   runId: string,
   entry: SubagentRunRecord,
@@ -1233,26 +1254,6 @@ async function sweepSubagentRuns() {
         const hasLiveRunContext = Boolean(getAgentRunContext(runId));
         const activeAgeMs = now - (entry.startedAt ?? entry.createdAt);
         if (!hasLiveRunContext && activeAgeMs >= STALE_ACTIVE_SUBAGENT_GRACE_MS) {
-          const orphanReason = resolveSubagentRunOrphanReason({
-            entry,
-            storeCache,
-          });
-          if (orphanReason) {
-            if (
-              reconcileOrphanedRun({
-                runId,
-                entry,
-                reason: orphanReason,
-                source: "resume",
-                runs: subagentRuns,
-                resumedRuns,
-              })
-            ) {
-              mutated = true;
-            }
-            continue;
-          }
-
           const sessionEntry = loadSubagentSessionEntry({
             childSessionKey: entry.childSessionKey,
             storeCache,
@@ -1279,6 +1280,30 @@ async function sweepSubagentRuns() {
 
           if (sessionEntry?.abortedLastRun === true) {
             scheduleSubagentOrphanRecovery({ delayMs: 1_000 });
+            continue;
+          }
+
+          const orphanReason = resolveSubagentRunOrphanReason({
+            entry,
+            storeCache,
+          });
+          if (orphanReason) {
+            if (
+              reconcileOrphanedRun({
+                runId,
+                entry,
+                reason: orphanReason,
+                source: "resume",
+                runs: subagentRuns,
+                resumedRuns,
+              })
+            ) {
+              mutated = true;
+            }
+            continue;
+          }
+
+          if (await remoteAgentRunStillAppearsLive(runId)) {
             continue;
           }
 
