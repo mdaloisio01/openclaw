@@ -95,6 +95,7 @@ import { sanitizePendingFinalDeliveryText } from "./pending-final-delivery.js";
 import { drainPendingToolTasks } from "./pending-tool-task-drain.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
 import {
+  buildPrivateMessageToolFinalDeliveryError,
   shouldWarnAboutPrivateMessageToolFinal,
   warnPrivateMessageToolFinal,
 } from "./private-message-tool-final.js";
@@ -2322,6 +2323,7 @@ export async function runReplyAgent(params: {
             activeSessionEntry?.channel,
           finalTextLength: assistantFinalText.trim().length,
         });
+        finalPayloads = [buildPrivateMessageToolFinalDeliveryError()];
       }
       const pendingText = sourceReplyPolicy.suppressDelivery ? "" : finalDeliveryText;
       const agentId = followupRun.run.agentId;
