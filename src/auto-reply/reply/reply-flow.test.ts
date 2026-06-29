@@ -271,6 +271,11 @@ describe("createReplyDispatcher", () => {
         text: expect.stringContaining("BLOCKED_CLOSEOUT"),
       }),
     );
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Next action: start the next executable step"),
+      }),
+    );
   });
 
   it("fires onIdle when the queue drains", async () => {

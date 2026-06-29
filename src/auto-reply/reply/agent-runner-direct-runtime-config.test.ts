@@ -25,6 +25,10 @@ const createReplyMediaContextMock = vi.fn();
 const createReplyMediaPathNormalizerMock = vi.fn();
 const runPreflightCompactionIfNeededMock = vi.fn();
 const runMemoryFlushIfNeededMock = vi.fn();
+const runAgentTurnWithFallbackMock = vi.fn();
+const writeActiveWorkCheckpointMock = vi.fn();
+const updateActiveWorkCheckpointProgressMock = vi.fn();
+const updateActiveWorkCheckpointStatusMock = vi.fn();
 const enqueueFollowupRunMock = vi.fn();
 
 vi.mock("./agent-runner-utils.js", async () => {
@@ -63,6 +67,24 @@ vi.mock("./agent-runner-memory.js", () => ({
   runPreflightCompactionIfNeeded: (...args: unknown[]) =>
     runPreflightCompactionIfNeededMock(...args),
   runMemoryFlushIfNeeded: (...args: unknown[]) => runMemoryFlushIfNeededMock(...args),
+}));
+
+vi.mock("./agent-runner-execution.js", async () => {
+  const actual = await vi.importActual<typeof import("./agent-runner-execution.js")>(
+    "./agent-runner-execution.js",
+  );
+  return {
+    ...actual,
+    runAgentTurnWithFallback: (...args: unknown[]) => runAgentTurnWithFallbackMock(...args),
+  };
+});
+
+vi.mock("../../agents/active-work-checkpoint.js", () => ({
+  writeActiveWorkCheckpoint: (...args: unknown[]) => writeActiveWorkCheckpointMock(...args),
+  updateActiveWorkCheckpointProgress: (...args: unknown[]) =>
+    updateActiveWorkCheckpointProgressMock(...args),
+  updateActiveWorkCheckpointStatus: (...args: unknown[]) =>
+    updateActiveWorkCheckpointStatusMock(...args),
 }));
 
 vi.mock("./queue.js", async () => {
@@ -171,6 +193,10 @@ describe("runReplyAgent runtime config", () => {
     createReplyMediaPathNormalizerMock.mockReset();
     runPreflightCompactionIfNeededMock.mockReset();
     runMemoryFlushIfNeededMock.mockReset();
+    runAgentTurnWithFallbackMock.mockReset();
+    writeActiveWorkCheckpointMock.mockReset();
+    updateActiveWorkCheckpointProgressMock.mockReset();
+    updateActiveWorkCheckpointStatusMock.mockReset();
     enqueueFollowupRunMock.mockReset();
 
     resolveQueuedReplyExecutionConfigMock.mockResolvedValue(freshCfg);
@@ -179,6 +205,39 @@ describe("runReplyAgent runtime config", () => {
     createReplyMediaPathNormalizerMock.mockReturnValue((payload: unknown) => payload);
     runPreflightCompactionIfNeededMock.mockRejectedValue(sentinelError);
     runMemoryFlushIfNeededMock.mockResolvedValue(undefined);
+    writeActiveWorkCheckpointMock.mockResolvedValue({
+      checkpointId: "checkpoint-main",
+      status: "pending",
+      maintenanceStatus: "pending",
+      continuationStatus: "pending",
+    });
+    updateActiveWorkCheckpointProgressMock.mockImplementation(async (args) => ({
+      ...args.checkpoint,
+      maintenanceStatus: args.maintenanceStatus ?? args.checkpoint.maintenanceStatus,
+      continuationStatus: args.continuationStatus ?? args.checkpoint.continuationStatus,
+      blockerReason: args.blockerReason,
+    }));
+    updateActiveWorkCheckpointStatusMock.mockImplementation(async (args) => ({
+      ...args.checkpoint,
+      status: args.status,
+      maintenanceStatus: args.maintenanceStatus ?? args.checkpoint.maintenanceStatus,
+      continuationStatus: args.continuationStatus ?? args.checkpoint.continuationStatus,
+      completionReason: args.reason,
+    }));
+    runAgentTurnWithFallbackMock.mockResolvedValue({
+      kind: "result",
+      runId: "run-main",
+      runResult: {
+        payloads: [{ text: "main reply" }],
+        meta: { agentMeta: {} },
+      },
+      fallbackProvider: undefined,
+      fallbackModel: undefined,
+      fallbackAttempts: [],
+      directlySentBlockKeys: new Set<string>(),
+      autoCompactionCount: 0,
+      didLogHeartbeatStrip: false,
+    });
   });
 
   it("resolves direct reply runs before early helpers read config", async () => {
@@ -219,6 +278,24 @@ describe("runReplyAgent runtime config", () => {
     expect(preflightCall.followupRun).toBe(followupRun);
   });
 
+  it("does not admit pre-compaction memory flush prompts as normal reply turns", async () => {
+    const { replyParams } = createDirectRuntimeReplyParams({
+      shouldFollowup: false,
+      isActive: false,
+    });
+    replyParams.commandBody =
+      "Pre-compaction memory flush. Store durable memories only in memory/2026-06-28.md.";
+
+    await expect(runReplyAgent(replyParams)).resolves.toBeUndefined();
+
+    expect(runPreflightCompactionIfNeededMock).not.toHaveBeenCalled();
+    expect(runMemoryFlushIfNeededMock).not.toHaveBeenCalled();
+    expect(runAgentTurnWithFallbackMock).not.toHaveBeenCalled();
+    expect(writeActiveWorkCheckpointMock).not.toHaveBeenCalled();
+    expect(updateActiveWorkCheckpointProgressMock).not.toHaveBeenCalled();
+    expect(updateActiveWorkCheckpointStatusMock).not.toHaveBeenCalled();
+  });
+
   it("passes the derived runtime-policy key to pre-run maintenance", async () => {
     const { followupRun, replyParams } = createDirectRuntimeReplyParams({
       shouldFollowup: false,
@@ -245,11 +322,12 @@ describe("runReplyAgent runtime config", () => {
     expect(memoryCall.runtimePolicySessionKey).toBe(runtimePolicySessionKey);
   });
 
-  it("returns source-suppression-safe memory-flush error payloads before the main reply run", async () => {
-    const { replyParams } = createDirectRuntimeReplyParams({
+  it("records memory-flush error payloads but continues the main reply run", async () => {
+    const { followupRun, replyParams } = createDirectRuntimeReplyParams({
       shouldFollowup: false,
       isActive: false,
     });
+    replyParams.sessionKey = followupRun.run.sessionKey;
     replyParams.opts = { sourceReplyDeliveryMode: "message_tool_only" };
     runPreflightCompactionIfNeededMock.mockResolvedValue(undefined);
     runMemoryFlushIfNeededMock.mockImplementation(
@@ -269,11 +347,11 @@ describe("runReplyAgent runtime config", () => {
     const result = await runReplyAgent(replyParams);
 
     if (!result || Array.isArray(result)) {
-      throw new Error("expected a single memory-flush error reply payload");
+      throw new Error("expected a single main reply payload");
     }
     expect(result).toEqual({
-      text: "⚠️ write failed: Memory flush writes are restricted to memory/2023-11-14.md; use that path only.",
-      isError: true,
+      text: "main reply",
+      isError: undefined,
       replyToId: "msg-1",
       replyToCurrent: undefined,
       replyToTag: false,
@@ -281,9 +359,35 @@ describe("runReplyAgent runtime config", () => {
       mediaUrls: undefined,
       audioAsVoice: false,
     });
-    expect(getReplyPayloadMetadata(result)).toEqual({
-      deliverDespiteSourceReplySuppression: true,
+    expect(getReplyPayloadMetadata(result)).toBeUndefined();
+    expect(runAgentTurnWithFallbackMock).toHaveBeenCalledTimes(1);
+    expect(writeActiveWorkCheckpointMock).toHaveBeenCalledWith({
+      input: expect.objectContaining({
+        source: "runtime_maintenance",
+        sessionKey: followupRun.run.sessionKey,
+        runId: expect.any(String),
+        activeUserPrompt: "hello",
+        normalizedActiveMissionSummary: "hello",
+        maintenanceStatus: "pending",
+        continuationStatus: "pending",
+      }),
     });
+    expect(updateActiveWorkCheckpointProgressMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        checkpoint: expect.objectContaining({ checkpointId: "checkpoint-main" }),
+        maintenanceStatus: "failed",
+        continuationStatus: "pending",
+        blockerReason: expect.stringContaining("continuing original turn"),
+      }),
+    );
+    expect(updateActiveWorkCheckpointStatusMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        checkpoint: expect.objectContaining({ checkpointId: "checkpoint-main" }),
+        status: "continued",
+        continuationStatus: "continued",
+        reason: "original user turn continued after maintenance",
+      }),
+    );
   });
 
   it("surfaces known pre-run Codex usage-limit failures instead of dropping the reply", async () => {

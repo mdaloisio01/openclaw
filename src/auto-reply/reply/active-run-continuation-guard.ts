@@ -174,7 +174,7 @@ export async function flushBlockedCloseoutIfNeeded(dispatcher: ReplyDispatcher):
     return;
   }
   const reason =
-    "active production run tried to close after a non-terminal build update before the next executable step started";
+    "active production run tried to close after a non-terminal build update before the next executable step started or a lawful blocker was recorded. Next action: start the next executable step, or record a lawful blocker such as approval_blocked, approval_unavailable, restart_or_reload, hard_stop, or safety_stop.";
   recordEvent(state, "ACTIVE_RUN_CONTINUITY_VIOLATION", reason);
   emitViolationNotice(dispatcher, state, reason);
   emitBlockedCloseout(state);

@@ -246,6 +246,20 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
       openTruth: "owner execution in progress, build still open.",
     };
   }
+  if (normalized.includes("restart/reload authorization")) {
+    return {
+      stopAllowed: true,
+      stopReason: "restart_or_reload",
+      openTruth: "build still open; waiting on restart/reload authorization.",
+    };
+  }
+  if (normalized.includes("operator approval") || normalized.includes("waiting on approval")) {
+    return {
+      stopAllowed: true,
+      stopReason: "approval_blocked",
+      openTruth: "build still open; waiting on approval.",
+    };
+  }
   if (normalized.includes("paperwork/setup done, build still open")) {
     return {
       stopAllowed: false,
@@ -1050,6 +1064,7 @@ function createAbortAwareDispatcher(params: {
     if (
       continuation.stopAllowed === true &&
       (continuation.stopReason === "blocker" ||
+        continuation.stopReason === "approval_blocked" ||
         continuation.stopReason === "restart_or_reload" ||
         continuation.stopReason === "hard_stop" ||
         continuation.stopReason === "safety_stop")

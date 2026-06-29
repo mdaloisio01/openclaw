@@ -35,4 +35,28 @@ describe("dispatch-from-config active-run continuation inference", () => {
       openTruth: "owner execution in progress, build still open.",
     });
   });
+
+  it("infers approval waiting as a lawful still-open stop", () => {
+    const payload = {
+      text: "paperwork/setup done, build still open. Waiting on operator approval to stage, restart, and live-validate.",
+    } satisfies ReplyPayload;
+
+    expect(dispatchFromConfigTesting.inferActiveRunContinuationFromPayload(payload)).toEqual({
+      stopAllowed: true,
+      stopReason: "approval_blocked",
+      openTruth: "build still open; waiting on approval.",
+    });
+  });
+
+  it("infers restart authorization waiting as a lawful still-open stop", () => {
+    const payload = {
+      text: "What is still not real yet: live activation. Open/closed truth: build still open; waiting on restart/reload authorization.",
+    } satisfies ReplyPayload;
+
+    expect(dispatchFromConfigTesting.inferActiveRunContinuationFromPayload(payload)).toEqual({
+      stopAllowed: true,
+      stopReason: "restart_or_reload",
+      openTruth: "build still open; waiting on restart/reload authorization.",
+    });
+  });
 });

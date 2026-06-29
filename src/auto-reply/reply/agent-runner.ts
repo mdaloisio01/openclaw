@@ -2,6 +2,12 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import {
+  updateActiveWorkCheckpointProgress,
+  updateActiveWorkCheckpointStatus,
+  writeActiveWorkCheckpoint,
+  type ActiveWorkCheckpoint,
+} from "../../agents/active-work-checkpoint.js";
+import {
   hasSessionAutoModelFallbackProvenance,
   hasConfiguredModelFallbacks,
   resolveAgentConfig,
@@ -225,6 +231,32 @@ function hasCommittedMessagingTargetDeliveryEvidence(value: unknown): boolean {
     }
     return true;
   });
+}
+
+function normalizeActiveMissionSummary(prompt: string): string {
+  const compacted = prompt.replace(/\s+/g, " ").trim();
+  if (!compacted) {
+    return "Continue the active direct user turn.";
+  }
+  return compacted.length > 240 ? `${compacted.slice(0, 237)}...` : compacted;
+}
+
+function isPreCompactionMemoryFlushPrompt(commandBody: string): boolean {
+  return commandBody.trim().startsWith("Pre-compaction memory flush.");
+}
+
+function isMaintenanceOnlyReplyTurn(params: {
+  commandBody: string;
+  followupRun: FollowupRun["run"];
+  isHeartbeat: boolean;
+}): boolean {
+  if (params.isHeartbeat || params.followupRun.silentExpected === true) {
+    return true;
+  }
+  const body = params.commandBody.trim();
+  return (
+    isPreCompactionMemoryFlushPrompt(body) || body.includes("\nNO_REPLY") || body === "NO_REPLY"
+  );
 }
 
 function hasSuccessfulSideEffectDelivery(params: {
@@ -1357,6 +1389,13 @@ export async function runReplyAgent(params: {
     ctx: sessionCtx,
     sessionKey: replySessionKey,
   });
+  if (isPreCompactionMemoryFlushPrompt(commandBody)) {
+    typing.cleanup();
+    logVerbose(
+      "blocked misrouted pre-compaction memory flush prompt before normal reply admission",
+    );
+    return undefined;
+  }
   let replyOperation: ReplyOperation;
   if (providedReplyOperation) {
     replyOperation = providedReplyOperation;
@@ -1407,6 +1446,111 @@ export async function runReplyAgent(params: {
   };
   const drainQueuedFollowupsAfterClear = () => {
     scheduleFollowupDrain(queueKey, runFollowupTurn);
+  };
+  const hasOriginalDirectUserTurn = !isMaintenanceOnlyReplyTurn({
+    commandBody,
+    followupRun: followupRun.run,
+    isHeartbeat,
+  });
+  let activeTurnCheckpoint: ActiveWorkCheckpoint | undefined;
+  const writeMaintenanceCheckpoint = async (): Promise<ActiveWorkCheckpoint | undefined> => {
+    if (!hasOriginalDirectUserTurn || !replySessionKey) {
+      return undefined;
+    }
+    const deliveryContext = resolveReplyRunDeliveryContext({
+      cfg,
+      sessionCtx,
+      sessionEntry: activeSessionEntry,
+      sessionKey: replySessionKey,
+      runtimePolicySessionKey,
+      opts,
+    });
+    const checkpointDeliveryContext = deliveryContext
+      ? {
+          channel: deliveryContext.channel,
+          to: deliveryContext.to,
+          accountId: deliveryContext.accountId,
+          ...(deliveryContext.threadId != null
+            ? { threadId: String(deliveryContext.threadId) }
+            : {}),
+        }
+      : undefined;
+    try {
+      activeTurnCheckpoint = await writeActiveWorkCheckpoint({
+        input: {
+          source: "runtime_maintenance",
+          sessionKey: replySessionKey,
+          sessionId: followupRun.run.sessionId,
+          runId: replyOperation.key,
+          deliveryContext: checkpointDeliveryContext,
+          activeUserPrompt: commandBody,
+          normalizedActiveMissionSummary: normalizeActiveMissionSummary(commandBody),
+          maintenanceStatus: "pending",
+          continuationStatus: "pending",
+          activeObjective: normalizeActiveMissionSummary(commandBody),
+          currentPhase: "pre-run maintenance",
+          lastCompletedProof: "Direct user turn admitted before maintenance.",
+          nextValidationStep: "Run maintenance, then continue the original user request.",
+          stopConditions: [
+            "Original user turn cannot be safely continued.",
+            "Continuation would require destructive operations.",
+            "Operator explicitly changes scope.",
+          ],
+          safeToAutoResume: true,
+          requiresOperatorReview: false,
+        },
+      });
+      return activeTurnCheckpoint;
+    } catch (error) {
+      logVerbose(`failed to write active turn maintenance checkpoint: ${String(error)}`);
+      return undefined;
+    }
+  };
+  const updateMaintenanceCheckpoint = async (params: {
+    maintenanceStatus?: "pending" | "completed" | "failed" | "skipped";
+    continuationStatus?: "not_needed" | "pending" | "continued" | "blocked";
+    blockerReason?: string;
+    sessionId?: string;
+    runId?: string;
+  }): Promise<void> => {
+    if (!activeTurnCheckpoint) {
+      return;
+    }
+    try {
+      activeTurnCheckpoint = await updateActiveWorkCheckpointProgress({
+        checkpoint: activeTurnCheckpoint,
+        maintenanceStatus: params.maintenanceStatus,
+        continuationStatus: params.continuationStatus,
+        blockerReason: params.blockerReason,
+        sessionId: params.sessionId,
+        runId: params.runId,
+      });
+    } catch (error) {
+      logVerbose(`failed to update active turn maintenance checkpoint: ${String(error)}`);
+    }
+  };
+  const finishMaintenanceCheckpoint = async (params: {
+    status: "continued" | "blocked";
+    reason: string;
+    maintenanceStatus?: "completed" | "failed" | "skipped";
+    continuationStatus?: "continued" | "blocked";
+    blockerReason?: string;
+  }): Promise<void> => {
+    if (!activeTurnCheckpoint) {
+      return;
+    }
+    try {
+      activeTurnCheckpoint = await updateActiveWorkCheckpointStatus({
+        checkpoint: activeTurnCheckpoint,
+        status: params.status,
+        reason: params.reason,
+        maintenanceStatus: params.maintenanceStatus,
+        continuationStatus: params.continuationStatus,
+        blockerReason: params.blockerReason,
+      });
+    } catch (error) {
+      logVerbose(`failed to finish active turn maintenance checkpoint: ${String(error)}`);
+    }
   };
   const restartRecoveryDeliveryRunId = crypto.randomUUID();
   let trackedRestartRecoveryDeliveryContext = false;
@@ -1481,6 +1625,8 @@ export async function runReplyAgent(params: {
   try {
     await typingSignals.signalRunStart();
 
+    await writeMaintenanceCheckpoint();
+
     activeSessionEntry = await traceAgentPhase("reply.preflight_compaction", () =>
       runPreflightCompactionIfNeeded({
         cfg,
@@ -1499,6 +1645,13 @@ export async function runReplyAgent(params: {
     );
     preflightCompactionApplied =
       (activeSessionEntry?.compactionCount ?? 0) > prePreflightCompactionCount;
+    if (preflightCompactionApplied) {
+      await updateMaintenanceCheckpoint({
+        maintenanceStatus: "completed",
+        continuationStatus: "pending",
+        sessionId: activeSessionEntry?.sessionId,
+      });
+    }
 
     const visibleMemoryFlushErrorPayloads: ReplyPayload[] = [];
     activeSessionEntry = await traceAgentPhase("reply.memory_flush", () =>
@@ -1525,6 +1678,13 @@ export async function runReplyAgent(params: {
     );
 
     if (visibleMemoryFlushErrorPayloads.length > 0) {
+      await updateMaintenanceCheckpoint({
+        maintenanceStatus: "failed",
+        continuationStatus: hasOriginalDirectUserTurn ? "pending" : "blocked",
+        blockerReason: hasOriginalDirectUserTurn
+          ? "memory flush maintenance produced visible error payloads; continuing original turn"
+          : "memory flush maintenance-only turn produced visible error payloads",
+      });
       const currentMessageId = sessionCtx.MessageSidFull ?? sessionCtx.MessageSid;
       const payloadResult = await buildReplyPayloads({
         payloads: visibleMemoryFlushErrorPayloads,
@@ -1549,16 +1709,29 @@ export async function runReplyAgent(params: {
       const replyPayloads = payloadResult.replyPayloads.map((payload) =>
         markReplyPayloadForSourceSuppressionDelivery(payload),
       );
-      if (replyPayloads.length > 0) {
+      if (replyPayloads.length > 0 && !hasOriginalDirectUserTurn) {
         replyOperation.fail(
           "run_failed",
           new Error("memory flush produced visible error payloads"),
         );
+        await finishMaintenanceCheckpoint({
+          status: "blocked",
+          reason: "memory flush maintenance-only turn failed",
+          maintenanceStatus: "failed",
+          continuationStatus: "blocked",
+          blockerReason: "memory flush produced visible error payloads",
+        });
         await signalTypingIfNeeded(replyPayloads, typingSignals);
         return returnWithQueuedFollowupDrain(
           replyPayloads.length === 1 ? replyPayloads[0] : replyPayloads,
         );
       }
+    } else {
+      await updateMaintenanceCheckpoint({
+        maintenanceStatus: "completed",
+        continuationStatus: "pending",
+        sessionId: activeSessionEntry?.sessionId,
+      });
     }
 
     runFollowupTurn = createFollowupRunner({
@@ -2419,6 +2592,29 @@ export async function runReplyAgent(params: {
     returnWithQueuedFollowupDrain(undefined);
     throw error;
   } finally {
+    if (activeTurnCheckpoint?.status === "pending") {
+      const result = replyOperation.result;
+      if (result?.kind === "failed" || result?.kind === "aborted") {
+        await finishMaintenanceCheckpoint({
+          status: "blocked",
+          reason:
+            result.kind === "failed"
+              ? `original turn failed after maintenance: ${result.code}`
+              : `original turn aborted after maintenance: ${result.code}`,
+          continuationStatus: "blocked",
+          blockerReason:
+            result.kind === "failed"
+              ? `reply operation failed: ${result.code}`
+              : `reply operation aborted: ${result.code}`,
+        });
+      } else {
+        await finishMaintenanceCheckpoint({
+          status: "continued",
+          reason: "original user turn continued after maintenance",
+          continuationStatus: "continued",
+        });
+      }
+    }
     try {
       await clearRestartRecoveryDeliveryContext();
     } catch (error) {
