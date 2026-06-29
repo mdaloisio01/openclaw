@@ -1279,6 +1279,51 @@ describe("createCodexDynamicToolBridge", () => {
     });
   });
 
+  it("forwards memory flush metadata into dynamic tool before_tool_call context", async () => {
+    const beforeToolCall = vi.fn(async () => ({ params: { path: "memory/2026-06-28.md" } }));
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
+    );
+
+    const execute = vi.fn(async () => textToolResult("appended", { ok: true }));
+    const bridge = createCodexDynamicToolBridge({
+      tools: [createTool({ name: "write", execute })],
+      signal: new AbortController().signal,
+      hookContext: {
+        agentId: "agent-1",
+        sessionId: "session-1",
+        sessionKey: "agent:agent-1:session-1",
+        runId: "run-memory",
+        trigger: "memory",
+        memoryFlushWritePath: "memory/2026-06-28.md",
+      },
+    });
+
+    const result = await bridge.handleToolCall({
+      threadId: "thread-1",
+      turnId: "turn-1",
+      callId: "call-memory-write",
+      namespace: null,
+      tool: "write",
+      arguments: { path: "memory/2026-06-28.md", content: "durable note" },
+    });
+
+    expect(result).toEqual(expectInputText("appended"));
+    expectContextFields(callArg(beforeToolCall, 0, 1, "before_tool_call context"), {
+      agentId: "agent-1",
+      sessionId: "session-1",
+      sessionKey: "agent:agent-1:session-1",
+      runId: "run-memory",
+      trigger: "memory",
+      memoryFlushWritePath: "memory/2026-06-28.md",
+      toolCallId: "call-memory-write",
+    });
+    expectExecuteCall(execute, {
+      callId: "call-memory-write",
+      args: { path: "memory/2026-06-28.md" },
+    });
+  });
+
   it("does not execute dynamic tools blocked by before_tool_call", async () => {
     const beforeToolCall = vi.fn(async () => ({
       block: true,

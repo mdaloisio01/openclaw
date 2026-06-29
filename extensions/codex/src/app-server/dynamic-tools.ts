@@ -44,6 +44,8 @@ type CodexDynamicToolHookContext = {
   sessionId?: string;
   sessionKey?: string;
   runId?: string;
+  trigger?: EmbeddedRunAttemptParams["trigger"];
+  memoryFlushWritePath?: string;
   channelId?: string;
 };
 

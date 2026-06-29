@@ -642,6 +642,8 @@ export async function runCodexAppServerAttempt(
       sessionId: params.sessionId,
       sessionKey: sandboxSessionKey,
       runId: params.runId,
+      trigger: params.trigger,
+      memoryFlushWritePath: params.memoryFlushWritePath,
       channelId: hookChannelId,
     },
   });

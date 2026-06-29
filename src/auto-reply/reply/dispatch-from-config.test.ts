@@ -1080,6 +1080,76 @@ describe("dispatchReplyFromConfig", () => {
     activeOperation.complete();
   });
 
+  it("rejects pre-compaction memory flush prompts admitted as webchat before model execution", async () => {
+    setNoAbort();
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(async () => ({ text: "should not run" }) satisfies ReplyPayload);
+
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        OriginatingChannel: "webchat",
+        SessionKey: "agent:main",
+        CommandBody:
+          "Pre-compaction memory flush. Store durable memories only in memory/2026-06-29.md.",
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver,
+    });
+
+    expect(result).toMatchObject({
+      queuedFinal: false,
+      counts: { tool: 0, block: 0, final: 0 },
+      beforeAgentRunBlocked: true,
+    });
+    expect(replyResolver).not.toHaveBeenCalled();
+  });
+
+  it("does not reject ordinary webchat messages at admission", async () => {
+    setNoAbort();
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(async () => ({ text: "ok" }) satisfies ReplyPayload);
+
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        OriginatingChannel: "webchat",
+        SessionKey: "agent:main",
+        CommandBody: "please summarize the status",
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver,
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    expect(replyResolver).toHaveBeenCalledTimes(1);
+  });
+
+  it("classifies only webchat pre-compaction memory flush admission for fail-closed handling", () => {
+    expect(
+      dispatchFromConfigTesting.resolvePreCompactionMemoryFlushWebchatAdmissionBlock(
+        buildTestCtx({
+          Provider: "webchat",
+          Surface: "webchat",
+          CommandBody: "Pre-compaction memory flush. Store durable memories only in memory/x.md.",
+        }),
+      ),
+    ).toMatchObject({ reason: "pre_compaction_memory_flush_webchat" });
+    expect(
+      dispatchFromConfigTesting.resolvePreCompactionMemoryFlushWebchatAdmissionBlock(
+        buildTestCtx({
+          Provider: "internal",
+          Surface: "internal",
+          CommandBody: "Pre-compaction memory flush. Store durable memories only in memory/x.md.",
+        }),
+      ),
+    ).toBeNull();
+  });
+
   it("skips a Telegram topic heartbeat turn while a reply operation is active", async () => {
     setNoAbort();
     const sessionKey = "agent:main:telegram:group:-1003774691294:topic:3731";
@@ -2932,6 +3002,72 @@ describe("dispatchReplyFromConfig", () => {
         { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
       ]),
     );
+  });
+
+  it("allows final waiting-on-approval reply after a non-terminal build update", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+      _cfg?: OpenClawConfig,
+    ) => {
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Inspect code"],
+      });
+      return {
+        text: "paperwork/setup done, build still open. Waiting on operator approval to stage, restart, and live-validate.",
+      } satisfies ReplyPayload;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("Waiting on operator approval"),
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        { type: "BLOCKER_STATE", detail: "true:approval_blocked" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
+  it("infers lawful approval and restart waiting stop contracts from final text", () => {
+    expect(
+      dispatchFromConfigTesting.inferActiveRunContinuationFromPayload({
+        text: "paperwork/setup done, build still open. Waiting on operator approval to stage, restart, and live-validate.",
+      } satisfies ReplyPayload),
+    ).toEqual({
+      stopAllowed: true,
+      stopReason: "approval_blocked",
+      openTruth: "build still open; waiting on approval.",
+    });
+
+    expect(
+      dispatchFromConfigTesting.inferActiveRunContinuationFromPayload({
+        text: "Open/closed truth: build still open; waiting on restart/reload authorization.",
+      } satisfies ReplyPayload),
+    ).toEqual({
+      stopAllowed: true,
+      stopReason: "restart_or_reload",
+      openTruth: "build still open; waiting on restart/reload authorization.",
+    });
   });
 
   it("rejects terminal closeout when the final payload says the local slice is complete but the broader mission is still open", async () => {

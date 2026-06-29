@@ -43,6 +43,16 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
     });
   }
 
+  function broadMixedStatus(): string {
+    return [
+      " M src/agents/agent-tools.before-tool-call.ts",
+      " M src/infra/restart.ts",
+      " M src/auto-reply/reply/agent-runner.ts",
+      " M scripts/build-all.mjs",
+      "?? docs/gateway/build-integrity.md",
+    ].join("\n");
+  }
+
   function createWrappedPatchTool(name = "apply_patch") {
     const execute = vi.fn().mockResolvedValue({
       content: [{ type: "text", text: "patched" }],
@@ -132,6 +142,72 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
     expect(text).toContain("staged=1");
     expect(text).toContain("unstaged=1");
     expect(text).toContain("untracked=1");
+  });
+
+  it("allows canonical memory flush writes with matching metadata during broad mixed dirty-tree risk", async () => {
+    const statusCalls: string[] = [];
+    const params = {
+      path: "memory/2026-06-28.md",
+      content: "durable note",
+    };
+    setStatus(broadMixedStatus(), statusCalls);
+
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params,
+      ctx: {
+        agentId: "main",
+        memoryFlushWritePath: "memory/2026-06-28.md",
+      },
+    });
+
+    expect(result).toEqual({ blocked: false, params });
+    expect(statusCalls).toEqual([]);
+  });
+
+  it.each([
+    {
+      name: "normal webchat write to the canonical memory path",
+      params: { path: "memory/2026-06-28.md", content: "durable note" },
+      ctx: { agentId: "main" },
+    },
+    {
+      name: "mismatched memory flush path",
+      params: { path: "memory/2026-06-27.md", content: "durable note" },
+      ctx: { agentId: "main", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "absolute memory path",
+      params: {
+        path: "/home/will/.openclaw/workspace-orchestrator/memory/2026-06-28.md",
+        content: "durable note",
+      },
+      ctx: { agentId: "main", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "bootstrap reference write",
+      params: { path: "AGENTS.md", content: "do not write" },
+      ctx: { agentId: "main", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "normal source write",
+      params: { path: "src/agents/agent-tools.before-tool-call.ts", content: "do not write" },
+      ctx: { agentId: "main" },
+    },
+  ])("blocks $name during broad mixed dirty-tree risk", async ({ params, ctx }) => {
+    setStatus(broadMixedStatus());
+
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params,
+      ctx,
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "dirty-tree-hygiene",
+    });
   });
 
   it("allows read-only diagnostic shell commands during broad mixed dirty-tree risk", async () => {

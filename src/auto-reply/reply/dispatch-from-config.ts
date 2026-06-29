@@ -216,6 +216,18 @@ function formatActiveMissionContextPrefix(params: {
   return `${missionBlock}\n\nCurrent user turn:\n${bodyText}`;
 }
 
+function isLawfulActiveRunStopReason(stopReason?: string): stopReason is string {
+  return (
+    stopReason === "blocker" ||
+    stopReason === "approval_blocked" ||
+    stopReason === "approval_unavailable" ||
+    stopReason === "owner_boundary_stop" ||
+    stopReason === "restart_or_reload" ||
+    stopReason === "hard_stop" ||
+    stopReason === "safety_stop"
+  );
+}
+
 function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
   | {
       stopAllowed?: boolean;
@@ -232,6 +244,36 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
     return undefined;
   }
   const normalized = text.toLowerCase();
+  const hasApprovalWait =
+    normalized.includes("approval required") ||
+    normalized.includes("operator approval required") ||
+    normalized.includes("user approval required") ||
+    normalized.includes("waiting on approval") ||
+    normalized.includes("waiting on operator approval") ||
+    normalized.includes("waiting on user approval") ||
+    normalized.includes("blocked waiting on approval") ||
+    normalized.includes("awaiting approval");
+  const hasRestartWait =
+    normalized.includes("restart/reload authorization") ||
+    normalized.includes("restart or reload authorization") ||
+    normalized.includes("restart authorization") ||
+    normalized.includes("reload authorization") ||
+    normalized.includes("waiting on restart") ||
+    normalized.includes("waiting on reload");
+  if (hasApprovalWait && normalized.includes("build still open")) {
+    return {
+      stopAllowed: true,
+      stopReason: "approval_blocked",
+      openTruth: "build still open; waiting on approval.",
+    };
+  }
+  if (hasRestartWait && normalized.includes("build still open")) {
+    return {
+      stopAllowed: true,
+      stopReason: "restart_or_reload",
+      openTruth: "build still open; waiting on restart/reload authorization.",
+    };
+  }
   if (normalized.includes("routed to lawful owner, build still open")) {
     return {
       stopAllowed: true,
@@ -600,10 +642,35 @@ function createReplyDispatchEvent(
   }) as PluginHookReplyDispatchEvent;
 }
 
+const PRE_COMPACTION_MEMORY_FLUSH_PREFIX = "Pre-compaction memory flush";
+
+function resolvePreCompactionMemoryFlushWebchatAdmissionBlock(
+  ctx: FinalizedMsgContext,
+): { reason: "pre_compaction_memory_flush_webchat"; sourceChannel: string } | null {
+  const sourceChannel = normalizeLowercaseStringOrEmpty(
+    ctx.OriginatingChannel ?? ctx.Provider ?? ctx.Surface,
+  );
+  if (sourceChannel !== "webchat") {
+    return null;
+  }
+  const body =
+    normalizeOptionalString(ctx.BodyForCommands) ??
+    normalizeOptionalString(ctx.CommandBody) ??
+    normalizeOptionalString(ctx.RawBody) ??
+    normalizeOptionalString(ctx.Body) ??
+    normalizeOptionalString(ctx.BodyForAgent) ??
+    "";
+  if (!body.trimStart().startsWith(PRE_COMPACTION_MEMORY_FLUSH_PREFIX)) {
+    return null;
+  }
+  return { reason: "pre_compaction_memory_flush_webchat", sourceChannel };
+}
+
 export const testing = {
   createReplyDispatchEvent,
   activeRunContinuation: activeRunContinuationTesting,
   inferActiveRunContinuationFromPayload,
+  resolvePreCompactionMemoryFlushWebchatAdmissionBlock,
 };
 
 function resolveHarnessDefaultChannel(params: {
@@ -1022,13 +1089,7 @@ function createAbortAwareDispatcher(params: {
       recordNonTerminalBuildUpdateEmitted(params.dispatcher, `stop_contract:${detail}`);
       return;
     }
-    if (
-      continuation.stopAllowed === true &&
-      (continuation.stopReason === "blocker" ||
-        continuation.stopReason === "restart_or_reload" ||
-        continuation.stopReason === "hard_stop" ||
-        continuation.stopReason === "safety_stop")
-    ) {
+    if (continuation.stopAllowed === true && isLawfulActiveRunStopReason(continuation.stopReason)) {
       recordLawfulBlocker(params.dispatcher, continuation.stopReason);
     }
   };
@@ -1077,6 +1138,7 @@ type ReplyHotPathTimingSummary = {
 };
 
 const replyHotPathTimingLog = createSubsystemLogger("auto-reply/reply-timing");
+const memoryFlushAdmissionLog = createSubsystemLogger("auto-reply/memory-flush-admission");
 const REPLY_HOT_PATH_TIMING_WARN_TOTAL_MS = 1_000;
 const REPLY_HOT_PATH_TIMING_WARN_STAGE_MS = 500;
 
@@ -1894,6 +1956,33 @@ export async function dispatchReplyFromConfig(
           ...(sendPolicyDenied ? { sendPolicyDenied: true } : {}),
         }
       : result;
+  const memoryFlushAdmissionBlock = resolvePreCompactionMemoryFlushWebchatAdmissionBlock(ctx);
+  if (memoryFlushAdmissionBlock) {
+    memoryFlushAdmissionLog.warn("blocked pre-compaction memory flush at webchat admission", {
+      action: "rejected",
+      reason: memoryFlushAdmissionBlock.reason,
+      sourceChannel: memoryFlushAdmissionBlock.sourceChannel,
+      trigger: "webchat",
+      memoryFlushWritePath: undefined,
+      sessionId: lifecycleSessionId,
+      sessionKey: acpDispatchSessionKey,
+      runId: params.replyOptions?.runId,
+      messageId,
+      promptPrefix: PRE_COMPACTION_MEMORY_FLUSH_PREFIX,
+    });
+    recordAgentDispatchCompleted("skipped", {
+      reason: memoryFlushAdmissionBlock.reason,
+    });
+    recordProcessed("skipped", {
+      reason: memoryFlushAdmissionBlock.reason,
+    });
+    markIdle(memoryFlushAdmissionBlock.reason);
+    return attachSourceReplyDeliveryMode({
+      queuedFinal: false,
+      counts: dispatcher.getQueuedCounts(),
+      beforeAgentRunBlocked: true,
+    });
+  }
   const explicitCommandTurnCtx = isExplicitSourceReplyCommand(ctx, cfg);
   const unauthorizedTextSlashSourceReplyCtx =
     (chatType === "group" || chatType === "channel") && isUnauthorizedTextSlashCommand(ctx);
