@@ -108,6 +108,22 @@ export type SubagentProductionContinuationState = {
   parentFlowId?: string;
 };
 
+export type SubagentParentYieldWaitState = {
+  waitId: string;
+  parentSessionKey: string;
+  parentRunId?: string;
+  reason?: string;
+  expectedChildRunIds: string[];
+  childSessionKeys: string[];
+  waitStartedAt: number;
+  staleAt: number;
+  requiredCloseout: boolean;
+  status: "waiting" | "ready_to_resume" | "continuation_scheduled";
+  terminalChildRunIds?: string[];
+  continuationScheduledAt?: number;
+  lastUpdatedAt?: number;
+};
+
 export type SubagentRunRecord = {
   runId: string;
   childSessionKey: string;
@@ -147,6 +163,7 @@ export type SubagentRunRecord = {
   /** Durable outbox marker for parent/external completion delivery. */
   delivery?: SubagentCompletionDeliveryState;
   productionContinuation?: SubagentProductionContinuationState;
+  parentYieldWait?: SubagentParentYieldWaitState;
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;

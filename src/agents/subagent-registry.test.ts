@@ -15,6 +15,7 @@ import {
   findTaskByRunId,
   resetTaskRegistryForTests,
 } from "../tasks/task-registry.js";
+import { SUBAGENT_ENDED_REASON_COMPLETE } from "./subagent-lifecycle-events.js";
 
 const noop = () => {};
 const waitForFast = <T>(callback: () => T | Promise<T>) =>
@@ -2242,6 +2243,97 @@ describe("subagent registry seam flow", () => {
     });
     expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalled();
     expect(mod.countPendingDescendantRuns("agent:main:main")).toBe(0);
+  });
+
+  it("marks parent sessions_yield waits and schedules continuation only after all children finish", async () => {
+    mod.addSubagentRunForTests({
+      runId: "run-yield-child-a",
+      childSessionKey: "agent:main:subagent:child-a",
+      requesterSessionKey: "agent:main:main",
+      controllerSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "first child",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt: 1_000,
+      startedAt: 1_000,
+      sessionStartedAt: 1_000,
+    });
+    mod.addSubagentRunForTests({
+      runId: "run-yield-child-b",
+      childSessionKey: "agent:main:subagent:child-b",
+      requesterSessionKey: "agent:main:main",
+      controllerSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "second child",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt: 1_000,
+      startedAt: 1_000,
+      sessionStartedAt: 1_000,
+    });
+
+    const marked = mod.markParentYieldWaitForController({
+      controllerSessionKey: "agent:main:main",
+      parentRunId: "parent-run",
+      reason: "waiting for two children",
+      now: 1_000,
+      staleAfterMs: 60_000,
+    });
+    expect(marked.marked).toBe(2);
+    expect(marked.expectedChildRunIds).toEqual(["run-yield-child-a", "run-yield-child-b"]);
+
+    await mod.testing.completeSubagentRunForTests({
+      runId: "run-yield-child-a",
+      endedAt: 2_000,
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: false,
+    });
+    let childA = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-yield-child-a");
+    let childB = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-yield-child-b");
+    expect(childA?.parentYieldWait?.status).toBe("waiting");
+    expect(childB?.parentYieldWait?.status).toBe("waiting");
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalledWith(
+      expect.stringContaining("Subagent wait ready to resume"),
+      expect.anything(),
+    );
+
+    await mod.testing.completeSubagentRunForTests({
+      runId: "run-yield-child-b",
+      endedAt: 3_000,
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: false,
+    });
+    childA = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-yield-child-a");
+    childB = mod
+      .listSubagentRunsForRequester("agent:main:main")
+      .find((entry) => entry.runId === "run-yield-child-b");
+    expect(childA?.parentYieldWait?.status).toBe("continuation_scheduled");
+    expect(childB?.parentYieldWait?.status).toBe("continuation_scheduled");
+    expect(childA?.parentYieldWait?.terminalChildRunIds).toEqual([
+      "run-yield-child-a",
+      "run-yield-child-b",
+    ]);
+    expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+      expect.stringContaining("Subagent wait ready to resume"),
+      expect.objectContaining({
+        sessionKey: "agent:main:main",
+      }),
+    );
+    expect(mocks.requestHeartbeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "subagent-progress",
+        sessionKey: "agent:main:main",
+      }),
+    );
   });
 
   it("announces blocked agent.wait snapshots as errors instead of success", async () => {

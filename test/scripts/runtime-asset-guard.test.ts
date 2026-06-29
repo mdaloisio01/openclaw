@@ -292,6 +292,35 @@ describe("runtime asset guard", () => {
     }
   });
 
+  it("restores from the newest valid previous backup when last-known-good is invalid", () => {
+    const { rootDir, backupRoot, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+      expect(snapshotRuntimeAssets({ rootDir, backupRoot, requireUi: true }).ok).toBe(true);
+      const latestRoot = path.join(backupRoot, "last-known-good");
+      const previousRoot = path.join(backupRoot, "previous-9999-valid");
+      fs.cpSync(latestRoot, previousRoot, { recursive: true });
+      fs.rmSync(path.join(latestRoot, "dist", "build-info.json"));
+
+      fs.rmSync(path.join(rootDir, "dist"), { recursive: true, force: true });
+      fs.rmSync(path.join(rootDir, "dist-runtime"), { recursive: true, force: true });
+      const restore = restoreRuntimeAssets({ rootDir, backupRoot, requireUi: true });
+
+      expect(restore.ok).toBe(true);
+      expect(restore.sourceBackupLabel).toBe("previous-9999-valid");
+      expect(restore.invalidBackups).toEqual([
+        expect.objectContaining({
+          label: "last-known-good",
+          blocker: "runtime_required_asset_missing",
+          missing: ["dist/build-info.json"],
+        }),
+      ]);
+      expect(validateRuntimeAssets({ rootDir, backupRoot, requireUi: true }).ok).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("ensures assets by restoring from the snapshot", () => {
     const { rootDir, backupRoot, cleanup } = makeTempRoot();
     try {

@@ -34,13 +34,31 @@ const resolveCommit = () => {
   }
 };
 
+const resolveDirtyFiles = () => {
+  try {
+    return execSync("git status --porcelain", {
+      cwd: rootDir,
+      stdio: ["ignore", "pipe", "ignore"],
+    })
+      .toString()
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+};
+
 const version = readPackageVersion();
 const commit = resolveCommit();
+const dirtyFiles = resolveDirtyFiles();
 
 const buildInfo = {
   version,
   commit,
   builtAt: new Date().toISOString(),
+  dirty: dirtyFiles === null ? null : dirtyFiles.length > 0,
+  dirtyFiles: dirtyFiles ?? undefined,
 };
 
 fs.mkdirSync(distDir, { recursive: true });

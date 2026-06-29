@@ -337,6 +337,21 @@ function moveAsideIfPresent(targetPath) {
   return asidePath;
 }
 
+function validationSummary(validation) {
+  return {
+    ok: validation.ok,
+    missing: validation.missing,
+    blocker: validation.blocker,
+    buildInfo: validation.buildInfo,
+    internalImports: {
+      ok: validation.internalImports.ok,
+      checkedFileCount: validation.internalImports.checkedFiles.length,
+      missing: validation.internalImports.missing,
+    },
+    ...(validation.rootMismatch ? { rootMismatch: validation.rootMismatch } : {}),
+  };
+}
+
 export function snapshotRuntimeAssets(params = {}) {
   const rootDir = resolveRootDir(params);
   const backupRoot = resolveBackupRoot(params);
@@ -372,6 +387,27 @@ export function snapshotRuntimeAssets(params = {}) {
         copied.push(name);
       }
     }
+    const backupValidation = validateRuntimeAssets({
+      rootDir: tempRoot,
+      requireUi: params.requireUi ?? false,
+      validateBuildInfo: params.validateBuildInfo,
+      operation: `${operation} backup validation`,
+    });
+    if (!backupValidation.ok) {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+      return {
+        ok: false,
+        action: "snapshot",
+        rootDir,
+        backupRoot,
+        copied,
+        blocker: backupValidation.blocker,
+        missing: backupValidation.missing,
+        rootMismatch: backupValidation.rootMismatch,
+        internalImports: backupValidation.internalImports,
+        backupValidation,
+      };
+    }
     fs.writeFileSync(
       path.join(tempRoot, "runtime-asset-guard.json"),
       `${JSON.stringify(
@@ -380,6 +416,7 @@ export function snapshotRuntimeAssets(params = {}) {
           root_dir: rootDir,
           required_assets: requiredAssets({ requireUi: params.requireUi ?? false }),
           internal_imports_checked: validation.internalImports.checkedFiles.length,
+          backup_validation: validationSummary(backupValidation),
           copied_roots: copied,
         },
         null,
@@ -410,12 +447,31 @@ export function snapshotRuntimeAssets(params = {}) {
   }
 }
 
+function listBackupCandidates(backupRoot) {
+  const candidates = [];
+  const latestRoot = path.join(backupRoot, "last-known-good");
+  if (fs.existsSync(latestRoot)) {
+    candidates.push({ label: "last-known-good", path: latestRoot });
+  }
+  let previous = [];
+  try {
+    previous = fs
+      .readdirSync(backupRoot, { withFileTypes: true })
+      .filter((dirent) => dirent.isDirectory() && dirent.name.startsWith("previous-"))
+      .map((dirent) => ({ label: dirent.name, path: path.join(backupRoot, dirent.name) }))
+      .sort((a, b) => b.label.localeCompare(a.label));
+  } catch {
+    previous = [];
+  }
+  return [...candidates, ...previous];
+}
+
 export function restoreRuntimeAssets(params = {}) {
   const rootDir = resolveRootDir(params);
   const backupRoot = resolveBackupRoot(params);
   const operation = normalizeOperation(params, "restore");
-  const latestRoot = path.join(backupRoot, "last-known-good");
-  if (!fs.existsSync(latestRoot)) {
+  const candidates = listBackupCandidates(backupRoot);
+  if (candidates.length === 0) {
     return {
       ok: false,
       action: "restore",
@@ -425,29 +481,52 @@ export function restoreRuntimeAssets(params = {}) {
     };
   }
 
-  const backupValidation = validateRuntimeAssets({
-    rootDir: latestRoot,
-    requireUi: params.requireUi ?? false,
-    validateBuildInfo: params.validateBuildInfo,
-    operation,
-  });
-  if (!backupValidation.ok) {
+  const invalidBackups = [];
+  let selectedBackup;
+  for (const candidate of candidates) {
+    const backupValidation = validateRuntimeAssets({
+      rootDir: candidate.path,
+      requireUi: params.requireUi ?? false,
+      validateBuildInfo: params.validateBuildInfo,
+      operation,
+    });
+    if (backupValidation.ok) {
+      selectedBackup = { ...candidate, validation: backupValidation };
+      break;
+    }
+    invalidBackups.push({
+      label: candidate.label,
+      path: candidate.path,
+      blocker: backupValidation.blocker,
+      missing: backupValidation.missing,
+      rootMismatch: backupValidation.rootMismatch,
+      internalImports: {
+        ok: backupValidation.internalImports.ok,
+        checkedFileCount: backupValidation.internalImports.checkedFiles.length,
+        missing: backupValidation.internalImports.missing,
+      },
+    });
+  }
+
+  if (!selectedBackup) {
+    const firstInvalid = invalidBackups[0];
     return {
       ok: false,
       action: "restore",
       rootDir,
       backupRoot,
-      blocker: backupValidation.blocker,
-      missing: backupValidation.missing,
-      rootMismatch: backupValidation.rootMismatch,
-      internalImports: backupValidation.internalImports,
+      blocker: firstInvalid?.blocker ?? "runtime_last_known_good_missing",
+      missing: firstInvalid?.missing ?? [],
+      rootMismatch: firstInvalid?.rootMismatch,
+      internalImports: firstInvalid?.internalImports,
+      invalidBackups,
     };
   }
 
   const movedAside = [];
   const restored = [];
   for (const name of BACKUP_ROOT_NAMES) {
-    const source = path.join(latestRoot, name);
+    const source = path.join(selectedBackup.path, name);
     if (!fs.existsSync(source)) {
       continue;
     }
@@ -477,6 +556,9 @@ export function restoreRuntimeAssets(params = {}) {
     action: "restore",
     rootDir,
     backupRoot,
+    sourceBackupRoot: selectedBackup.path,
+    sourceBackupLabel: selectedBackup.label,
+    invalidBackups,
     restored,
     movedAside,
     missing: validation.missing,

@@ -102,6 +102,7 @@ export {
   resolveSubagentSessionStatus,
 } from "./subagent-registry-helpers.js";
 const log = createSubsystemLogger("agents/subagent-registry");
+const PARENT_YIELD_WAIT_STALE_MS = 15 * 60 * 1000;
 
 type SubagentAnnounceModule = Pick<
   typeof import("./subagent-announce.js"),
@@ -452,6 +453,179 @@ function emitSubagentRequesterSystemEvent(
     });
 }
 
+function isRunTerminalForParentYieldWait(entry: SubagentRunRecord): boolean {
+  return (
+    typeof entry.endedAt === "number" &&
+    entry.pauseReason !== "sessions_yield" &&
+    entry.outcome !== undefined
+  );
+}
+
+function collectParentYieldWaitMembers(waitId: string): SubagentRunRecord[] {
+  const trimmed = waitId.trim();
+  if (!trimmed) {
+    return [];
+  }
+  return Array.from(subagentRuns.values()).filter(
+    (entry) => entry.parentYieldWait?.waitId === trimmed,
+  );
+}
+
+function uniqueSorted(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean))).sort();
+}
+
+function updateParentYieldWaitFanIn(
+  waitId: string,
+  sourceEntry: SubagentRunRecord,
+  now = Date.now(),
+): boolean {
+  const members = collectParentYieldWaitMembers(waitId);
+  if (members.length === 0) {
+    return false;
+  }
+  const expected = members[0]?.parentYieldWait?.expectedChildRunIds ?? [];
+  const expectedSet = new Set(expected);
+  const terminalChildRunIds = uniqueSorted(
+    members
+      .filter((entry) => expectedSet.has(entry.runId) && isRunTerminalForParentYieldWait(entry))
+      .map((entry) => entry.runId),
+  );
+  const allTerminal = expected.length > 0 && terminalChildRunIds.length === expectedSet.size;
+  let mutated = false;
+
+  for (const entry of members) {
+    const wait = entry.parentYieldWait;
+    if (!wait) {
+      continue;
+    }
+    const nextStatus = allTerminal && wait.status === "waiting" ? "ready_to_resume" : wait.status;
+    const currentTerminal = JSON.stringify(wait.terminalChildRunIds ?? []);
+    const nextTerminal = JSON.stringify(terminalChildRunIds);
+    if (wait.status !== nextStatus || currentTerminal !== nextTerminal) {
+      entry.parentYieldWait = {
+        ...wait,
+        status: nextStatus,
+        terminalChildRunIds,
+        lastUpdatedAt: now,
+      };
+      mutated = true;
+    }
+  }
+
+  if (!allTerminal) {
+    return mutated;
+  }
+
+  const representative = members.find((entry) => entry.runId === sourceEntry.runId) ?? members[0];
+  const wait = representative?.parentYieldWait;
+  if (!representative || !wait || wait.continuationScheduledAt) {
+    return mutated;
+  }
+
+  emitSubagentRequesterSystemEvent(
+    representative,
+    [
+      "Subagent wait ready to resume:",
+      wait.reason || "parent yielded waiting for child completions.",
+      `All expected child runs are terminal (${wait.expectedChildRunIds.join(", ")}).`,
+      "Resume the parent task now and produce the required user-facing closeout; do not reply NO_REPLY.",
+    ].join(" "),
+    `yield-wait-ready:${wait.waitId}`,
+  );
+
+  for (const entry of members) {
+    const current = entry.parentYieldWait;
+    if (!current) {
+      continue;
+    }
+    entry.parentYieldWait = {
+      ...current,
+      status: "continuation_scheduled",
+      terminalChildRunIds,
+      continuationScheduledAt: now,
+      lastUpdatedAt: now,
+    };
+    mutated = true;
+  }
+
+  return mutated;
+}
+
+export function markParentYieldWaitForController(params: {
+  controllerSessionKey: string;
+  parentRunId?: string;
+  reason?: string;
+  now?: number;
+  staleAfterMs?: number;
+  requiredCloseout?: boolean;
+}): {
+  marked: number;
+  waitId?: string;
+  expectedChildRunIds: string[];
+  terminalChildRunIds: string[];
+} {
+  const controllerSessionKey = normalizeOptionalString(params.controllerSessionKey);
+  if (!controllerSessionKey) {
+    return { marked: 0, expectedChildRunIds: [], terminalChildRunIds: [] };
+  }
+  const now = params.now ?? Date.now();
+  const candidates = listRunsForControllerFromRuns(
+    subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns),
+    controllerSessionKey,
+  ).filter((entry) => {
+    if (entry.expectsCompletionMessage === false) {
+      return false;
+    }
+    if (entry.cleanupCompletedAt !== undefined) {
+      return false;
+    }
+    return !isRunTerminalForParentYieldWait(entry) || entry.delivery?.status !== "delivered";
+  });
+
+  if (candidates.length === 0) {
+    return { marked: 0, expectedChildRunIds: [], terminalChildRunIds: [] };
+  }
+
+  const expectedChildRunIds = uniqueSorted(candidates.map((entry) => entry.runId));
+  const childSessionKeys = uniqueSorted(candidates.map((entry) => entry.childSessionKey));
+  const waitId = `${controllerSessionKey}:${params.parentRunId ?? "run"}:${now}`;
+  const staleAt = now + Math.max(1, params.staleAfterMs ?? PARENT_YIELD_WAIT_STALE_MS);
+  const terminalChildRunIds = uniqueSorted(
+    candidates.filter(isRunTerminalForParentYieldWait).map((entry) => entry.runId),
+  );
+
+  for (const entry of candidates) {
+    entry.parentYieldWait = {
+      waitId,
+      parentSessionKey: controllerSessionKey,
+      ...(params.parentRunId ? { parentRunId: params.parentRunId } : {}),
+      ...(params.reason ? { reason: params.reason } : {}),
+      expectedChildRunIds,
+      childSessionKeys,
+      waitStartedAt: now,
+      staleAt,
+      requiredCloseout: params.requiredCloseout ?? true,
+      status: "waiting",
+      terminalChildRunIds,
+      lastUpdatedAt: now,
+    };
+  }
+
+  updateParentYieldWaitFanIn(waitId, candidates[0]!, now);
+  persistSubagentRuns();
+  return {
+    marked: candidates.length,
+    waitId,
+    expectedChildRunIds,
+    terminalChildRunIds: uniqueSorted(
+      collectParentYieldWaitMembers(waitId).flatMap(
+        (entry) => entry.parentYieldWait?.terminalChildRunIds ?? [],
+      ),
+    ),
+  };
+}
+
 function resolveRoutableDeliveryContext(
   context: DeliveryContext | undefined,
 ): (DeliveryContext & { channel: OriginatingChannelType; to: string }) | undefined {
@@ -599,6 +773,16 @@ async function completeSubagentRunWithRecovery(params: CompleteSubagentRunParams
   const entryBeforeCompletion = subagentRuns.get(params.runId);
   try {
     await completeSubagentRun(params);
+    if (entryBeforeCompletion?.parentYieldWait?.waitId) {
+      if (
+        updateParentYieldWaitFanIn(
+          entryBeforeCompletion.parentYieldWait.waitId,
+          entryBeforeCompletion,
+        )
+      ) {
+        persistSubagentRuns();
+      }
+    }
     if (entryBeforeCompletion) {
       if (params.outcome.status === "ok") {
         clearSubagentFailureStreak(entryBeforeCompletion);
@@ -1653,6 +1837,9 @@ export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
 export const testing = {
   async sweepOnceForTests() {
     await sweepSubagentRuns();
+  },
+  async completeSubagentRunForTests(params: CompleteSubagentRunParams) {
+    await completeSubagentRunWithRecovery(params, "test");
   },
   setDepsForTest(overrides?: Partial<SubagentRegistryDeps>) {
     subagentRegistryDeps = overrides
