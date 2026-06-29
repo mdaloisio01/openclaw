@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createPackageManagerWarningMessage,
   detectLifecyclePackageManager,
+  enforcePnpmLifecycle,
   warnIfNonPnpmLifecycle,
 } from "../../scripts/preinstall-package-manager-warning.mjs";
 
@@ -49,13 +50,16 @@ describe("createPackageManagerWarningMessage", () => {
     expect(createPackageManagerWarningMessage("pnpm")).toBeNull();
   });
 
-  it("warns for npm installs", () => {
-    expect(createPackageManagerWarningMessage("npm")).toContain("prefer: corepack pnpm install");
+  it("returns the fail-closed message for npm installs", () => {
+    const message = createPackageManagerWarningMessage("npm");
+    expect(message).toContain("OpenClaw uses pnpm. Run: corepack pnpm install");
+    expect(message).toContain("Do not generate package-lock.json");
+    expect(message).toContain("tracked release shrinkwrap");
   });
 });
 
 describe("warnIfNonPnpmLifecycle", () => {
-  it("warns once for npm lifecycle runs", () => {
+  it("reports once for npm lifecycle runs", () => {
     const warn = vi.fn();
     expect(
       warnIfNonPnpmLifecycle(
@@ -66,7 +70,7 @@ describe("warnIfNonPnpmLifecycle", () => {
       ),
     ).toBe(true);
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(requireFirstWarning(warn)).toContain("detected npm");
+    expect(requireFirstWarning(warn)).toContain("detectedPackageManager=npm");
   });
 
   it("stays quiet for pnpm", () => {
@@ -80,5 +84,37 @@ describe("warnIfNonPnpmLifecycle", () => {
       ),
     ).toBe(false);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("enforcePnpmLifecycle", () => {
+  it("throws for npm install lifecycles", () => {
+    const error = vi.fn();
+    expect(() =>
+      enforcePnpmLifecycle(
+        {
+          npm_config_user_agent: "npm/11.4.1 node/v22.20.0 darwin arm64",
+        },
+        { cwd: "/repo", error },
+      ),
+    ).toThrow("OpenClaw uses pnpm. Run: corepack pnpm install");
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("detectedPackageManager=npm"));
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("cwd=/repo"));
+  });
+
+  it("allows documented non-pnpm bypass with a visible warning", () => {
+    const warn = vi.fn();
+    expect(
+      enforcePnpmLifecycle(
+        {
+          npm_config_user_agent: "npm/11.4.1 node/v22.20.0 darwin arm64",
+          OPENCLAW_ALLOW_NON_PNPM_INSTALL: "1",
+        },
+        { cwd: "/repo", warn },
+      ),
+    ).toBe(true);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("OPENCLAW_ALLOW_NON_PNPM_INSTALL=1 bypassed"),
+    );
   });
 });

@@ -5,6 +5,8 @@ import { describe, expect, it } from "vitest";
 import {
   parseBundledPluginAssetArgs,
   readBundledPluginAssetHooks,
+  requiredDependencyPreflightsForHook,
+  runBundledPluginDependencyPreflight,
 } from "../../scripts/bundled-plugin-assets.mjs";
 
 async function withPluginAssetFixture(run: (rootDir: string) => Promise<void>) {
@@ -72,5 +74,39 @@ describe("bundled plugin assets", () => {
       phase: "build",
       plugins: ["canvas"],
     });
+  });
+
+  it("declares ESM dependency preflights for the diffs asset build", () => {
+    expect(
+      requiredDependencyPreflightsForHook({
+        packageName: "@openclaw/diffs",
+        phase: "build",
+      }),
+    ).toEqual(["@pierre/diffs", "@pierre/diffs/ssr"]);
+  });
+
+  it("fails bundled dependency preflight with package, dependency, cwd, and repair command", () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-plugin-assets-missing-dep-"));
+    const pluginDir = path.join(rootDir, "extensions", "diffs");
+    try {
+      fs.mkdirSync(pluginDir, { recursive: true });
+
+      const result = runBundledPluginDependencyPreflight(
+        {
+          packageName: "@openclaw/diffs",
+          phase: "build",
+          pluginDir,
+        },
+        { dependencies: ["@pierre/diffs"] },
+      );
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toContain("@openclaw/diffs");
+      expect(result.error).toContain("dependency=@pierre/diffs");
+      expect(result.error).toContain(`cwd=${pluginDir}`);
+      expect(result.error).toContain("corepack pnpm install");
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
   });
 });

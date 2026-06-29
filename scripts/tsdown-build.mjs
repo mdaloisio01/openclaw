@@ -44,6 +44,8 @@ const GENERATED_SOURCE_DECLARATION_PATHSPEC = ":(glob)extensions/**/*.d.ts";
 const DECLARATION_EXTENSIONS = [".d.ts", ".d.mts", ".d.cts"];
 const SOURCE_DECLARATION_SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"];
 const RUN_NODE_SKIP_DTS_BUILD_ENV = "OPENCLAW_RUN_NODE_SKIP_DTS_BUILD";
+const BUILD_MODE_ENV = "OPENCLAW_BUILD_MODE";
+const TSDOWN_CONFIG_PATH = "tsdown.config.ts";
 
 function removeDistPluginNodeModulesSymlinks(rootDir) {
   const extensionsDir = path.join(rootDir, "extensions");
@@ -321,6 +323,62 @@ function parseNonNegativeInteger(value) {
     return null;
   }
   return Math.trunc(parsed);
+}
+
+export function resolveTsdownDtsMode(env = process.env) {
+  const skipDts = env[RUN_NODE_SKIP_DTS_BUILD_ENV] === "1";
+  return {
+    skipDts,
+    expectedDts: !skipDts,
+    dtsStatus: skipDts ? "skipped" : "enabled",
+    buildMode: env[BUILD_MODE_ENV]?.trim() || (skipDts ? "runtime" : "release"),
+  };
+}
+
+export function countTsdownConfigBlocks(params = {}) {
+  const cwd = params.cwd ?? process.cwd();
+  const fsImpl = params.fs ?? fs;
+  const configPath = params.configPath ?? path.join(cwd, TSDOWN_CONFIG_PATH);
+  let source;
+  try {
+    source = fsImpl.readFileSync(configPath, "utf8");
+  } catch {
+    return null;
+  }
+  return source
+    .split(/\r?\n/u)
+    .filter((line) => /^\s{2,}(?:nodeBuildConfig|nodeWorkspacePackageBuildConfig)\s*\(/u.test(line))
+    .length;
+}
+
+function readProcessResidentSetKb(pid, params = {}) {
+  if (!pid || (params.platform ?? process.platform) !== "linux") {
+    return null;
+  }
+  const fsImpl = params.fs ?? fs;
+  try {
+    const status = fsImpl.readFileSync(`/proc/${pid}/status`, "utf8");
+    const match = /^VmRSS:\s+(?<rss>\d+)\s+kB$/imu.exec(status);
+    if (!match?.groups?.rss) {
+      return null;
+    }
+    const rssKb = Number.parseInt(match.groups.rss, 10);
+    return Number.isFinite(rssKb) ? rssKb : null;
+  } catch {
+    return null;
+  }
+}
+
+export function formatTsdownHeartbeat({ pid, elapsedMs, silentForMs, rssKb, dtsStatus } = {}) {
+  const fields = [
+    "still running",
+    pid ? `pid=${pid}` : null,
+    `elapsed=${Math.round(Math.max(0, elapsedMs ?? 0) / 1000)}s`,
+    rssKb === null || rssKb === undefined ? "rss=unknown" : `rss=${rssKb}KB`,
+    `dts=${dtsStatus ?? "unknown"}`,
+    `no output for ${Math.round(Math.max(0, silentForMs ?? 0) / 1000)}s`,
+  ].filter(Boolean);
+  return `[tsdown-build] ${fields.join(" ")}\n`;
 }
 
 function parseCgroupMemoryLimitBytes(value) {
@@ -663,17 +721,26 @@ export async function runTsdownBuildInvocation(invocation, params = {}) {
   const stdout = params.stdout ?? process.stdout;
   const stderr = params.stderr ?? process.stderr;
   const env = params.env ?? process.env;
+  const effectiveEnv = invocation.options?.env ?? env;
   const scanner = params.scanner ?? createTsdownOutputScanner();
   const timeoutMs =
     parsePositiveInteger(env.OPENCLAW_TSDOWN_TIMEOUT_MS) ?? DEFAULT_TSDOWN_TIMEOUT_MS;
   const heartbeatMs =
     parseNonNegativeInteger(env.OPENCLAW_TSDOWN_HEARTBEAT_MS) ?? DEFAULT_HEARTBEAT_MS;
+  const dtsMode = resolveTsdownDtsMode(effectiveEnv);
+  const configCount = countTsdownConfigBlocks({ cwd: params.cwd ?? process.cwd() });
   let timedOut = false;
   let settled = false;
+  const startedAt = Date.now();
   let lastOutputAt = Date.now();
 
   const child = spawn(invocation.command, invocation.args, invocation.options);
   const pidText = child.pid ? ` pid=${child.pid}` : "";
+  stderr.write(
+    `[tsdown-build] mode=${dtsMode.buildMode} dts=${dtsMode.dtsStatus} expectedDts=${
+      dtsMode.expectedDts ? "yes" : "no"
+    } configCount=${configCount ?? "unknown"} heartbeatMs=${heartbeatMs} timeoutMs=${timeoutMs}\n`,
+  );
 
   function markOutput() {
     lastOutputAt = Date.now();
@@ -700,10 +767,16 @@ export async function runTsdownBuildInvocation(invocation, params = {}) {
           if (silentForMs < heartbeatMs) {
             return;
           }
+          const rssKb =
+            params.readProcessResidentSetKb?.(child.pid) ?? readProcessResidentSetKb(child.pid);
           stderr.write(
-            `[tsdown-build] still running${pidText}; no output for ${Math.round(
-              silentForMs / 1000,
-            )}s\n`,
+            formatTsdownHeartbeat({
+              pid: child.pid,
+              elapsedMs: Date.now() - startedAt,
+              silentForMs,
+              rssKb,
+              dtsStatus: dtsMode.dtsStatus,
+            }),
           );
           lastOutputAt = Date.now();
         }, heartbeatMs).unref()
@@ -867,6 +940,7 @@ if (isMainModule()) {
       }
       const postBuildValidation = validateRuntimeAssets({
         requireUi: false,
+        validateBuildInfo: false,
         operation: "build",
       });
       if (!postBuildValidation.ok) {
@@ -878,7 +952,11 @@ if (isMainModule()) {
         );
         process.exit(1);
       }
-      const snapshot = snapshotRuntimeAssets({ requireUi: false, operation: "snapshot" });
+      const snapshot = snapshotRuntimeAssets({
+        requireUi: false,
+        validateBuildInfo: false,
+        operation: "snapshot",
+      });
       if (!snapshot.ok) {
         restoreRuntimeAfterRejectedBuild("broken runtime snapshot");
         console.error(

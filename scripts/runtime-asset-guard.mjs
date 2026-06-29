@@ -13,10 +13,18 @@ const DEFAULT_BACKUP_ROOT = path.join(
   "openclaw-source",
 );
 
-const RUNTIME_ASSETS = ["dist/index.js", "dist/entry.js"];
+const RUNTIME_ASSETS = [
+  "dist/index.js",
+  "dist/entry.js",
+  "dist/build-info.json",
+  "dist/plugin-sdk/state-paths.js",
+  "dist/plugin-sdk/reply-payload.js",
+];
 const UI_ASSETS = ["dist/control-ui/index.html"];
 const BACKUP_ROOT_NAMES = ["dist", "dist-runtime"];
 const INTERNAL_IMPORT_MISSING_BLOCKER = "runtime_internal_import_missing";
+const REQUIRED_ASSET_MISSING_BLOCKER = "runtime_required_asset_missing";
+const BUILD_INFO_BLOCKER = "runtime_build_info_invalid";
 const ROOT_MISMATCH_BLOCKER = "runtime_guard_root_mismatch";
 const VALIDATION_OPERATION_DEFAULT = "production preflight";
 const PLUGIN_SDK_ALIAS_PREFIXES = [
@@ -50,7 +58,11 @@ function resolveRootDir(params = {}) {
 }
 
 function resolveExpectedRootDir(params = {}) {
-  const expectedRoot = params.expectedRoot ?? process.env.OPENCLAW_RUNTIME_GUARD_EXPECTED_ROOT;
+  const expectedRoot =
+    params.expectedRoot ??
+    (Object.prototype.hasOwnProperty.call(params, "rootDir")
+      ? undefined
+      : process.env.OPENCLAW_RUNTIME_GUARD_EXPECTED_ROOT);
   return expectedRoot ? path.resolve(expectedRoot) : undefined;
 }
 
@@ -70,7 +82,51 @@ function isNonEmptyFile(filePath) {
 }
 
 function requiredAssets(params = {}) {
-  return params.requireUi ? [...RUNTIME_ASSETS, ...UI_ASSETS] : [...RUNTIME_ASSETS];
+  const runtimeAssets =
+    params.validateBuildInfo === false
+      ? RUNTIME_ASSETS.filter((asset) => asset !== "dist/build-info.json")
+      : RUNTIME_ASSETS;
+  return params.requireUi ? [...runtimeAssets, ...UI_ASSETS] : [...runtimeAssets];
+}
+
+function validateBuildInfo({ rootDir, operation }) {
+  const buildInfoPath = path.join(rootDir, "dist", "build-info.json");
+  try {
+    const parsed = JSON.parse(fs.readFileSync(buildInfoPath, "utf8"));
+    const commit = typeof parsed.commit === "string" ? parsed.commit.trim() : "";
+    const version = typeof parsed.version === "string" ? parsed.version.trim() : "";
+    const builtAt = typeof parsed.builtAt === "string" ? parsed.builtAt.trim() : "";
+    const missing = [];
+    if (!commit) {
+      missing.push("commit");
+    }
+    if (!version) {
+      missing.push("version");
+    }
+    if (!builtAt) {
+      missing.push("builtAt");
+    }
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        blocker: BUILD_INFO_BLOCKER,
+        operation,
+        rootDir,
+        path: "dist/build-info.json",
+        reason: `missing ${missing.join(", ")}`,
+      };
+    }
+    return { ok: true, commit, version, builtAt };
+  } catch (error) {
+    return {
+      ok: false,
+      blocker: BUILD_INFO_BLOCKER,
+      operation,
+      rootDir,
+      path: "dist/build-info.json",
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 function validateRootMatch({ rootDir, operation, expectedRoot }) {
@@ -235,15 +291,26 @@ export function validateRuntimeAssets(params = {}) {
       missing.push(relativePath);
     }
   }
+  const buildInfo =
+    missing.includes("dist/build-info.json") || params.validateBuildInfo === false
+      ? undefined
+      : validateBuildInfo({ rootDir, operation });
   const internalImports = scanRuntimeInternalImports({ ...params, rootDir, operation });
   return {
-    ok: !rootMismatch && missing.length === 0 && internalImports.ok,
+    ok: !rootMismatch && missing.length === 0 && (buildInfo?.ok ?? true) && internalImports.ok,
     rootDir,
     operation,
     missing,
+    ...(buildInfo ? { buildInfo } : {}),
     internalImports,
     ...(rootMismatch ? { blocker: ROOT_MISMATCH_BLOCKER, rootMismatch } : {}),
-    ...(!rootMismatch && !internalImports.ok ? { blocker: INTERNAL_IMPORT_MISSING_BLOCKER } : {}),
+    ...(!rootMismatch && missing.length > 0 ? { blocker: REQUIRED_ASSET_MISSING_BLOCKER } : {}),
+    ...(!rootMismatch && missing.length === 0 && buildInfo && !buildInfo.ok
+      ? { blocker: BUILD_INFO_BLOCKER }
+      : {}),
+    ...(!rootMismatch && missing.length === 0 && (buildInfo?.ok ?? true) && !internalImports.ok
+      ? { blocker: INTERNAL_IMPORT_MISSING_BLOCKER }
+      : {}),
   };
 }
 
@@ -277,6 +344,7 @@ export function snapshotRuntimeAssets(params = {}) {
   const validation = validateRuntimeAssets({
     rootDir,
     requireUi: params.requireUi ?? false,
+    validateBuildInfo: params.validateBuildInfo,
     operation,
     expectedRoot: params.expectedRoot,
   });
@@ -360,6 +428,7 @@ export function restoreRuntimeAssets(params = {}) {
   const backupValidation = validateRuntimeAssets({
     rootDir: latestRoot,
     requireUi: params.requireUi ?? false,
+    validateBuildInfo: params.validateBuildInfo,
     operation,
   });
   if (!backupValidation.ok) {
@@ -399,6 +468,7 @@ export function restoreRuntimeAssets(params = {}) {
   const validation = validateRuntimeAssets({
     rootDir,
     requireUi: params.requireUi ?? false,
+    validateBuildInfo: params.validateBuildInfo,
     operation,
     expectedRoot: params.expectedRoot,
   });

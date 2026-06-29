@@ -7,6 +7,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VALID_PHASES = new Set(["build", "copy"]);
+const BUNDLED_PLUGIN_DEPENDENCY_PREFLIGHTS = {
+  "@openclaw/diffs": ["@pierre/diffs", "@pierre/diffs/ssr"],
+};
 
 async function readJsonFile(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
@@ -108,6 +111,56 @@ export async function readBundledPluginAssetHooks(options = {}) {
   return hooks.toSorted((left, right) => left.pluginDir.localeCompare(right.pluginDir));
 }
 
+export function requiredDependencyPreflightsForHook(hook) {
+  if (hook.phase !== "build") {
+    return [];
+  }
+  return BUNDLED_PLUGIN_DEPENDENCY_PREFLIGHTS[hook.packageName] ?? [];
+}
+
+export function runBundledPluginDependencyPreflight(hook, options = {}) {
+  const dependencies = options.dependencies ?? requiredDependencyPreflightsForHook(hook);
+  if (dependencies.length === 0) {
+    return { ok: true, checked: [] };
+  }
+
+  const checked = [];
+  for (const dependency of dependencies) {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "-e",
+        `console.log(await import.meta.resolve(${JSON.stringify(dependency)}));`,
+      ],
+      {
+        cwd: hook.pluginDir,
+        encoding: "utf8",
+        env: process.env,
+      },
+    );
+    if (result.status !== 0) {
+      return {
+        ok: false,
+        checked,
+        dependency,
+        error: [
+          `Bundled plugin dependency preflight failed for ${hook.packageName}.`,
+          `dependency=${dependency}`,
+          `cwd=${hook.pluginDir}`,
+          "repair=Run corepack pnpm install from the OpenClaw repo root.",
+          result.stderr.trim() ? `stderr=${result.stderr.trim()}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      };
+    }
+    checked.push({ dependency, resolved: result.stdout.trim() });
+  }
+
+  return { ok: true, checked };
+}
+
 export async function runBundledPluginAssetHooks(options = {}) {
   const phase = options.phase;
   const hooks = await readBundledPluginAssetHooks(options);
@@ -118,6 +171,11 @@ export async function runBundledPluginAssetHooks(options = {}) {
   }
 
   for (const hook of hooks) {
+    const preflight = runBundledPluginDependencyPreflight(hook);
+    if (!preflight.ok) {
+      console.error(preflight.error);
+      process.exit(1);
+    }
     console.log(`[${hook.pluginId}] ${phase}: ${hook.command}`);
     const result = spawnSync(hook.command, {
       cwd: hook.pluginDir,

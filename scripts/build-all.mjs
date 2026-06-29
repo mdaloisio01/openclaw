@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
+import { assertNoNpmInstallArtifacts } from "./install-integrity-guard.mjs";
 import { pluginSdkEntrypoints } from "./lib/plugin-sdk-entries.mjs";
 import { resolvePnpmRunner } from "./pnpm-runner.mjs";
 
@@ -150,6 +151,11 @@ export const BUILD_ALL_STEPS = [
     args: ["--experimental-strip-types", "scripts/write-build-info.ts"],
   },
   {
+    label: "validate-runtime-assets",
+    kind: "node",
+    args: ["scripts/runtime-asset-guard.mjs", "validate", "--no-snapshot", "--operation", "build"],
+  },
+  {
     label: "write-cli-startup-metadata",
     kind: "node",
     args: ["--experimental-strip-types", "scripts/write-cli-startup-metadata.ts"],
@@ -163,6 +169,23 @@ export const BUILD_ALL_STEPS = [
 
 export const BUILD_ALL_PROFILES = {
   full: BUILD_ALL_STEPS.map((step) => step.label),
+  release: BUILD_ALL_STEPS.map((step) => step.label),
+  runtime: [
+    "plugins:assets:build",
+    "tsdown",
+    "check-cli-bootstrap-imports",
+    "runtime-postbuild",
+    "build-stamp",
+    "runtime-postbuild-stamp",
+    "plugins:assets:copy",
+    "copy-hook-metadata",
+    "copy-export-html-templates",
+    "ui:build",
+    "write-build-info",
+    "validate-runtime-assets",
+    "write-cli-startup-metadata",
+    "write-cli-compat",
+  ],
   ciArtifacts: [
     "plugins:assets:build",
     "tsdown",
@@ -178,6 +201,7 @@ export const BUILD_ALL_PROFILES = {
     "copy-export-html-templates",
     "ui:build",
     "write-build-info",
+    "validate-runtime-assets",
     "write-cli-startup-metadata",
     "write-cli-compat",
   ],
@@ -207,21 +231,78 @@ export const BUILD_ALL_PROFILES = {
   ],
 };
 
+export const BUILD_ALL_PROFILE_METADATA = {
+  full: {
+    mode: "release",
+    releaseReady: true,
+    description: "Full release/package build; runs declaration output.",
+  },
+  release: {
+    mode: "release",
+    releaseReady: true,
+    description: "Explicit full release/package build; runs declaration output.",
+  },
+  runtime: {
+    mode: "runtime",
+    releaseReady: false,
+    description:
+      "Gateway runtime activation build; skips declaration output and is not release-ready.",
+  },
+  ciArtifacts: {
+    mode: "ci-artifacts",
+    releaseReady: true,
+    description: "CI artifact build; includes plugin SDK declaration/package checks.",
+  },
+  gatewayWatch: {
+    mode: "runtime-watch",
+    releaseReady: false,
+    description: "Minimal gateway watch runtime rebuild; skips declaration output.",
+  },
+  qaRuntime: {
+    mode: "qa-runtime",
+    releaseReady: false,
+    description: "QA runtime rebuild; skips declaration output.",
+  },
+  cliStartup: {
+    mode: "cli-startup",
+    releaseReady: false,
+    description: "CLI startup metadata runtime rebuild; skips declaration output.",
+  },
+};
+
 export const BUILD_ALL_PROFILE_STEP_ENV = {
   full: {
     tsdown: {
+      OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "0",
+      OPENCLAW_BUILD_MODE: "release",
+      OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1",
+    },
+  },
+  release: {
+    tsdown: {
+      OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "0",
+      OPENCLAW_BUILD_MODE: "release",
+      OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1",
+    },
+  },
+  runtime: {
+    tsdown: {
+      OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1",
+      OPENCLAW_BUILD_MODE: "runtime",
       OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1",
     },
   },
   ciArtifacts: {
     tsdown: {
       OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1",
+      OPENCLAW_BUILD_MODE: "ci-artifacts",
       OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1",
     },
   },
   gatewayWatch: {
     tsdown: {
       OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1",
+      OPENCLAW_BUILD_MODE: "runtime-watch",
     },
     "runtime-postbuild": {
       OPENCLAW_RUNTIME_POSTBUILD_STATIC_ASSETS: "0",
@@ -230,11 +311,13 @@ export const BUILD_ALL_PROFILE_STEP_ENV = {
   qaRuntime: {
     tsdown: {
       OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1",
+      OPENCLAW_BUILD_MODE: "qa-runtime",
     },
   },
   cliStartup: {
     tsdown: {
       OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1",
+      OPENCLAW_BUILD_MODE: "cli-startup",
       OPENCLAW_PRESERVE_CLI_STARTUP_METADATA: "1",
     },
     "runtime-postbuild": {
@@ -250,7 +333,11 @@ export function buildAllUsage() {
     "Builds OpenClaw artifacts for the selected profile.",
     "",
     "Profiles:",
-    ...Object.keys(BUILD_ALL_PROFILES).map((profile) => `  ${profile}`),
+    ...Object.keys(BUILD_ALL_PROFILES).map((profile) => {
+      const metadata = BUILD_ALL_PROFILE_METADATA[profile];
+      const suffix = metadata ? ` - ${metadata.description}` : "";
+      return `  ${profile}${suffix}`;
+    }),
     "",
     "Options:",
     "  -h, --help  Show this help.",
@@ -628,8 +715,21 @@ if (isMainModule()) {
   if (args?.help) {
     console.log(buildAllUsage());
   } else {
+    try {
+      assertNoNpmInstallArtifacts({ operation: `build-all ${args.profile}` });
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
     const timings = [];
     let exitCode = 0;
+    const metadata = BUILD_ALL_PROFILE_METADATA[args.profile];
+    if (metadata) {
+      const releaseReady = metadata.releaseReady ? "yes" : "no";
+      console.error(
+        `[build-all] profile=${args.profile} mode=${metadata.mode} releaseReady=${releaseReady}: ${metadata.description}`,
+      );
+    }
     for (const step of resolveBuildAllSteps(args.profile)) {
       const startedAt = performance.now();
       const cacheState = resolveBuildAllStepCacheState(step);

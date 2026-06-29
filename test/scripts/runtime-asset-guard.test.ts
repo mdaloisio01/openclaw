@@ -24,9 +24,20 @@ function makeTempRoot() {
 
 function writeRuntimeAssets(rootDir: string) {
   fs.mkdirSync(path.join(rootDir, "dist", "control-ui"), { recursive: true });
+  fs.mkdirSync(path.join(rootDir, "dist", "plugin-sdk"), { recursive: true });
   fs.mkdirSync(path.join(rootDir, "dist-runtime"), { recursive: true });
   fs.writeFileSync(path.join(rootDir, "dist", "index.js"), "console.log('index');\n");
   fs.writeFileSync(path.join(rootDir, "dist", "entry.js"), "console.log('entry');\n");
+  fs.writeFileSync(
+    path.join(rootDir, "dist", "build-info.json"),
+    `${JSON.stringify({
+      version: "test",
+      commit: "abc123",
+      builtAt: "2026-06-27T00:00:00.000Z",
+    })}\n`,
+  );
+  fs.writeFileSync(path.join(rootDir, "dist", "plugin-sdk", "state-paths.js"), "export {};\n");
+  fs.writeFileSync(path.join(rootDir, "dist", "plugin-sdk", "reply-payload.js"), "export {};\n");
   fs.writeFileSync(path.join(rootDir, "dist", "control-ui", "index.html"), "<!doctype html>\n");
   fs.writeFileSync(path.join(rootDir, "dist-runtime", "marker.js"), "console.log('runtime');\n");
 }
@@ -80,6 +91,7 @@ describe("runtime asset guard", () => {
       fs.rmSync(path.join(rootDir, "dist", "control-ui"), { recursive: true, force: true });
       expect(validateRuntimeAssets({ rootDir, backupRoot, requireUi: true })).toMatchObject({
         ok: false,
+        blocker: "runtime_required_asset_missing",
         missing: ["dist/control-ui/index.html"],
       });
     } finally {
@@ -220,6 +232,43 @@ describe("runtime asset guard", () => {
         missingTargetFile: "dist/plugin-sdk/state-paths.js",
         importSpecifier: "openclaw/plugin-sdk/state-paths.js",
       });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("requires parseable build-info with runtime identity fields", () => {
+    const { rootDir, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+      fs.writeFileSync(path.join(rootDir, "dist", "build-info.json"), "{ nope\n");
+
+      const validation = validateRuntimeAssets({ rootDir, operation: "restart preflight" });
+
+      expect(validation.ok).toBe(false);
+      expect(validation.blocker).toBe("runtime_build_info_invalid");
+      expect(validation.buildInfo).toMatchObject({
+        ok: false,
+        blocker: "runtime_build_info_invalid",
+        operation: "restart preflight",
+        path: "dist/build-info.json",
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("requires plugin-sdk runtime files used by live extensions", () => {
+    const { rootDir, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+      fs.rmSync(path.join(rootDir, "dist", "plugin-sdk", "reply-payload.js"));
+
+      const validation = validateRuntimeAssets({ rootDir, operation: "restart preflight" });
+
+      expect(validation.ok).toBe(false);
+      expect(validation.blocker).toBe("runtime_required_asset_missing");
+      expect(validation.missing).toEqual(["dist/plugin-sdk/reply-payload.js"]);
     } finally {
       cleanup();
     }

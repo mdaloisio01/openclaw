@@ -5,6 +5,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   BUILD_ALL_PROFILES,
+  BUILD_ALL_PROFILE_METADATA,
   BUILD_ALL_PROFILE_STEP_ENV,
   BUILD_ALL_STEPS,
   buildAllUsage,
@@ -177,7 +178,7 @@ describe("resolveBuildAllStep", () => {
 describe("resolveBuildAllSteps", () => {
   it("parses build-all CLI args before any build work", () => {
     expect(parseBuildAllArgs([])).toEqual({ help: false, profile: "full" });
-    expect(parseBuildAllArgs(["cliStartup"])).toEqual({ help: false, profile: "cliStartup" });
+    expect(parseBuildAllArgs(["runtime"])).toEqual({ help: false, profile: "runtime" });
     expect(parseBuildAllArgs(["cliStartup", "--help"])).toEqual({
       help: true,
       profile: "cliStartup",
@@ -196,6 +197,8 @@ describe("resolveBuildAllSteps", () => {
       expect(result.status).toBe(0);
       expect(result.stderr).toBe("");
       expect(result.stdout).toContain("Usage: node scripts/build-all.mjs [profile]");
+      expect(result.stdout).toContain("runtime");
+      expect(result.stdout).toContain("not release-ready");
       expect(result.stdout).toContain("cliStartup");
       expect(result.stdout).not.toContain("[build-all]");
     }
@@ -222,6 +225,46 @@ describe("resolveBuildAllSteps", () => {
     expect(BUILD_ALL_PROFILES.full).toEqual(BUILD_ALL_STEPS.map((step) => step.label));
   });
 
+  it("keeps the explicit release profile aligned with the declared full release steps", () => {
+    expect(resolveBuildAllSteps("release").map((step) => step.label)).toEqual(
+      BUILD_ALL_STEPS.map((step) => step.label),
+    );
+    expect(BUILD_ALL_PROFILE_METADATA.release).toMatchObject({
+      mode: "release",
+      releaseReady: true,
+    });
+  });
+
+  it("uses a gateway runtime activation profile without release declarations", () => {
+    expect(resolveBuildAllSteps("runtime").map((step) => step.label)).toEqual([
+      "plugins:assets:build",
+      "tsdown",
+      "check-cli-bootstrap-imports",
+      "runtime-postbuild",
+      "build-stamp",
+      "runtime-postbuild-stamp",
+      "plugins:assets:copy",
+      "copy-hook-metadata",
+      "copy-export-html-templates",
+      "ui:build",
+      "write-build-info",
+      "validate-runtime-assets",
+      "write-cli-startup-metadata",
+      "write-cli-compat",
+    ]);
+    expect(resolveBuildAllSteps("runtime").map((step) => step.label)).not.toContain(
+      "build:plugin-sdk:dts",
+    );
+    expect(resolveBuildAllSteps("runtime").map((step) => step.label)).not.toContain(
+      "write-plugin-sdk-entry-dts",
+    );
+    expect(BUILD_ALL_PROFILE_METADATA.runtime).toMatchObject({
+      mode: "runtime",
+      releaseReady: false,
+    });
+    expect(BUILD_ALL_PROFILE_METADATA.runtime.description).toContain("not release-ready");
+  });
+
   it("uses a runtime artifact plus plugin SDK export profile for ci artifacts", () => {
     expect(resolveBuildAllSteps("ciArtifacts").map((step) => step.label)).toEqual([
       "plugins:assets:build",
@@ -238,13 +281,14 @@ describe("resolveBuildAllSteps", () => {
       "copy-export-html-templates",
       "ui:build",
       "write-build-info",
+      "validate-runtime-assets",
       "write-cli-startup-metadata",
       "write-cli-compat",
     ]);
   });
 
   it("skips bundled tsdown declarations for runtime-only profiles", () => {
-    for (const profile of ["ciArtifacts", "gatewayWatch", "qaRuntime", "cliStartup"]) {
+    for (const profile of ["runtime", "ciArtifacts", "gatewayWatch", "qaRuntime", "cliStartup"]) {
       const tsdown = resolveBuildAllSteps(profile).find((step) => step.label === "tsdown");
       if (!tsdown) {
         throw new Error(`Missing ${profile} tsdown step`);
@@ -261,8 +305,27 @@ describe("resolveBuildAllSteps", () => {
     }
   });
 
+  it("forces declaration output on release/full profiles even when the caller env skips DTS", () => {
+    for (const profile of ["full", "release"]) {
+      const tsdown = resolveBuildAllSteps(profile).find((step) => step.label === "tsdown");
+      if (!tsdown) {
+        throw new Error(`Missing ${profile} tsdown step`);
+      }
+
+      expect(BUILD_ALL_PROFILE_STEP_ENV[profile].tsdown).toMatchObject({
+        OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "0",
+        OPENCLAW_BUILD_MODE: "release",
+      });
+      expect(
+        resolveBuildAllStep(tsdown, { env: { OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1" } }).options.env,
+      ).toMatchObject({
+        OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "0",
+      });
+    }
+  });
+
   it("preserves startup metadata only for profiles that regenerate it", () => {
-    for (const profile of ["full", "ciArtifacts", "cliStartup"]) {
+    for (const profile of ["full", "release", "runtime", "ciArtifacts", "cliStartup"]) {
       const tsdown = resolveBuildAllSteps(profile).find((step) => step.label === "tsdown");
       if (!tsdown) {
         throw new Error(`Missing ${profile} tsdown step`);
@@ -368,8 +431,8 @@ describe("resolveBuildAllSteps", () => {
     );
   });
 
-  it("includes ui:build in the full and ciArtifacts profiles after runtime postbuild", () => {
-    for (const profile of ["full", "ciArtifacts"]) {
+  it("includes ui:build in the full, release, runtime, and ciArtifacts profiles after runtime postbuild", () => {
+    for (const profile of ["full", "release", "runtime", "ciArtifacts"]) {
       const labels = resolveBuildAllSteps(profile).map((step) => step.label);
       expect(labels).toContain("ui:build");
       // Control UI bundling must run after tsdown clears dist so that
@@ -379,7 +442,17 @@ describe("resolveBuildAllSteps", () => {
       // ui:build must run before write-build-info so the build manifest can
       // see the final dist/control-ui assets.
       expect(labels.indexOf("ui:build")).toBeLessThan(labels.indexOf("write-build-info"));
+      expect(labels.indexOf("validate-runtime-assets")).toBeGreaterThan(
+        labels.indexOf("write-build-info"),
+      );
     }
+  });
+
+  it("validates runtime assets after writing build-info", () => {
+    const labels = resolveBuildAllSteps("full").map((step) => step.label);
+    expect(labels.indexOf("validate-runtime-assets")).toBeGreaterThan(
+      labels.indexOf("write-build-info"),
+    );
   });
 
   it("keeps ui:build out of minimal backend-only profiles", () => {

@@ -5,13 +5,16 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   cleanTsdownOutputRoots,
+  countTsdownConfigBlocks,
   createTsdownOutputScanner,
+  formatTsdownHeartbeat,
   listTsdownOutputRoots,
   parseTsdownBuildArgs,
   parseTsdownBuildProcessRows,
   pruneSourceCheckoutBundledPluginNodeModules,
   pruneStaleRootChunkFiles,
   pruneUntrackedGeneratedSourceDeclarations,
+  resolveTsdownDtsMode,
   resolveTsdownBuildInvocation,
   runTsdownBuildInvocation,
 } from "../../scripts/tsdown-build.mjs";
@@ -497,6 +500,58 @@ describe("resolveTsdownBuildInvocation", () => {
       fsPromises.readFile(path.join(signalSrcDir, "ambient.d.ts"), "utf8"),
     ).resolves.toBe("declare const x: string;\n");
   });
+
+  it("reports runtime DTS mode from build environment", () => {
+    expect(
+      resolveTsdownDtsMode({
+        OPENCLAW_BUILD_MODE: "runtime",
+        OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "1",
+      }),
+    ).toEqual({
+      buildMode: "runtime",
+      dtsStatus: "skipped",
+      expectedDts: false,
+      skipDts: true,
+    });
+    expect(resolveTsdownDtsMode({ OPENCLAW_RUN_NODE_SKIP_DTS_BUILD: "0" })).toMatchObject({
+      buildMode: "release",
+      dtsStatus: "enabled",
+      expectedDts: true,
+      skipDts: false,
+    });
+  });
+
+  it("counts tsdown config blocks from the local config source", async () => {
+    const rootDir = createTempDir("openclaw-tsdown-config-count-");
+    await fsPromises.writeFile(
+      path.join(rootDir, "tsdown.config.ts"),
+      [
+        "function nodeBuildConfig(config) { return config; }",
+        "function nodeWorkspacePackageBuildConfig(config) { return config; }",
+        "export default [",
+        "  nodeBuildConfig({ entry: 'src/index.ts' });",
+        "  nodeWorkspacePackageBuildConfig({ packagePath: 'packages/plugin-sdk' });",
+        "  nodeBuildConfig({ entry: 'src/cli.ts' });",
+        "];",
+      ].join("\n"),
+    );
+
+    expect(countTsdownConfigBlocks({ cwd: rootDir })).toBe(3);
+  });
+
+  it("formats heartbeats with pid, elapsed time, rss, and DTS state", () => {
+    expect(
+      formatTsdownHeartbeat({
+        pid: 123,
+        elapsedMs: 65_100,
+        silentForMs: 30_200,
+        rssKb: 456_789,
+        dtsStatus: "skipped",
+      }),
+    ).toBe(
+      "[tsdown-build] still running pid=123 elapsed=65s rss=456789KB dts=skipped no output for 30s\n",
+    );
+  });
 });
 
 describe("createTsdownOutputScanner", () => {
@@ -565,6 +620,8 @@ describe("runTsdownBuildInvocation", () => {
 
     expect(result.status).toBe(0);
     expect(result.hasIneffectiveDynamicImport).toBe(true);
+    expect(output.chunks.join("")).toContain("mode=");
+    expect(output.chunks.join("")).toContain("dts=");
     expect(output.chunks.join("")).toContain("stdout-ok");
   });
 
