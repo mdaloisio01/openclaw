@@ -40,12 +40,127 @@ import type { SessionLockInspection } from "./session-write-lock.js";
 
 const log = createSubsystemLogger("main-session-restart-recovery");
 
-const DEFAULT_RECOVERY_DELAY_MS = 5_000;
+const DEFAULT_RECOVERY_DELAY_MS = 30_000;
 const MAX_RECOVERY_RETRIES = 3;
 const RETRY_BACKOFF_MULTIPLIER = 2;
+const RECOVERY_STATUS_FILENAME = "main-session-restart-recovery-status.json";
 const UNRESUMABLE_SESSION_NOTICE =
   "I was interrupted by a gateway restart and couldn't safely resume the previous turn. " +
   "Please send that last request again and I'll pick it up cleanly.";
+
+export type MainSessionRestartRecoveryStatus =
+  | "marked"
+  | "queued"
+  | "continued"
+  | "blocked"
+  | "failed"
+  | "superseded";
+
+export type MainSessionRestartRecoveryStatusRecord = {
+  sessionKey: string;
+  sessionId?: string;
+  markedAt: number;
+  updatedAt: number;
+  status: MainSessionRestartRecoveryStatus;
+  runId?: string;
+  reason?: string;
+  transcriptTailRole?: string;
+  deliveryAttempted: boolean;
+  deliverySucceeded: boolean;
+  artifactPath?: string;
+};
+
+type MainSessionRestartRecoveryStatusStore = {
+  version: 1;
+  records: MainSessionRestartRecoveryStatusRecord[];
+};
+
+function resolveRecoveryStatusPath(stateDir = resolveStateDir()): string {
+  return path.join(stateDir, RECOVERY_STATUS_FILENAME);
+}
+
+async function readRecoveryStatusStore(
+  stateDir?: string,
+): Promise<MainSessionRestartRecoveryStatusStore> {
+  try {
+    const raw = await fs.promises.readFile(resolveRecoveryStatusPath(stateDir), "utf8");
+    const parsed = JSON.parse(raw) as Partial<MainSessionRestartRecoveryStatusStore>;
+    if (parsed.version === 1 && Array.isArray(parsed.records)) {
+      return {
+        version: 1,
+        records: parsed.records.filter(
+          (record): record is MainSessionRestartRecoveryStatusRecord =>
+            Boolean(record) &&
+            typeof record === "object" &&
+            typeof record.sessionKey === "string" &&
+            typeof record.markedAt === "number" &&
+            typeof record.updatedAt === "number" &&
+            typeof record.status === "string",
+        ),
+      };
+    }
+  } catch {
+    // missing or corrupt status files are treated as empty; session stores remain canonical.
+  }
+  return { version: 1, records: [] };
+}
+
+async function writeRecoveryStatusStore(
+  store: MainSessionRestartRecoveryStatusStore,
+  stateDir?: string,
+): Promise<void> {
+  const filePath = resolveRecoveryStatusPath(stateDir);
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.promises.writeFile(tempPath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+  await fs.promises.rename(tempPath, filePath);
+}
+
+async function updateRecoveryStatus(params: {
+  stateDir?: string;
+  sessionKey: string;
+  sessionId?: string;
+  status: MainSessionRestartRecoveryStatus;
+  reason?: string;
+  runId?: string;
+  transcriptTailRole?: string;
+  deliveryAttempted?: boolean;
+  deliverySucceeded?: boolean;
+  artifactPath?: string;
+}): Promise<MainSessionRestartRecoveryStatusRecord> {
+  const now = Date.now();
+  const store = await readRecoveryStatusStore(params.stateDir);
+  const index = store.records.findIndex((record) => record.sessionKey === params.sessionKey);
+  const previous = index >= 0 ? store.records[index] : undefined;
+  const next: MainSessionRestartRecoveryStatusRecord = {
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId ?? previous?.sessionId,
+    markedAt: previous?.markedAt ?? now,
+    updatedAt: now,
+    status: params.status,
+    runId: params.runId ?? previous?.runId,
+    reason: params.reason ?? previous?.reason,
+    transcriptTailRole: params.transcriptTailRole ?? previous?.transcriptTailRole,
+    deliveryAttempted: params.deliveryAttempted ?? previous?.deliveryAttempted ?? false,
+    deliverySucceeded: params.deliverySucceeded ?? previous?.deliverySucceeded ?? false,
+    artifactPath: params.artifactPath ?? previous?.artifactPath,
+  };
+  if (index >= 0) {
+    store.records[index] = next;
+  } else {
+    store.records.push(next);
+  }
+  await writeRecoveryStatusStore(store, params.stateDir);
+  return next;
+}
+
+export async function readMainSessionRestartRecoveryStatus(params: {
+  sessionKey: string;
+  stateDir?: string;
+}): Promise<MainSessionRestartRecoveryStatusRecord | null> {
+  const store = await readRecoveryStatusStore(params.stateDir);
+  return store.records.find((record) => record.sessionKey === params.sessionKey) ?? null;
+}
 
 function shouldSkipMainRecovery(entry: SessionEntry, sessionKey: string): boolean {
   if (typeof entry.spawnDepth === "number" && entry.spawnDepth > 0) {
@@ -164,6 +279,7 @@ export async function markRestartAbortedMainSessions(params: {
   }
 
   for (const storePath of storePaths) {
+    const markedStatuses: Array<{ sessionKey: string; sessionId?: string }> = [];
     await updateSessionStore(
       storePath,
       (store) => {
@@ -186,10 +302,20 @@ export async function markRestartAbortedMainSessions(params: {
           entry.updatedAt = Date.now();
           store[sessionKey] = entry;
           result.marked++;
+          markedStatuses.push({ sessionKey, sessionId: entry.sessionId });
         }
       },
       { skipMaintenance: true },
     );
+    for (const marked of markedStatuses) {
+      await updateRecoveryStatus({
+        stateDir,
+        sessionKey: marked.sessionKey,
+        sessionId: marked.sessionId,
+        status: "marked",
+        reason: params.reason ?? "restart interrupted active main session",
+      });
+    }
   }
 
   if (result.marked > 0) {
@@ -236,7 +362,13 @@ function isApprovalPendingToolResult(message: unknown): boolean {
 
 function resolveMainSessionResumeBlockReason(messages: unknown[]): string | null {
   const lastMeaningful = messages.toReversed().find(isMeaningfulTailMessage);
-  if (!lastMeaningful || !isResumableTailMessage(lastMeaningful)) {
+  if (!lastMeaningful) {
+    return "transcript tail is not resumable";
+  }
+  if (getMessageRole(lastMeaningful) === "assistant") {
+    return "restart interrupted assistant/tool-call turn before a safe checkpoint";
+  }
+  if (!isResumableTailMessage(lastMeaningful)) {
     return "transcript tail is not resumable";
   }
   if (isApprovalPendingToolResult(lastMeaningful)) {
@@ -264,12 +396,14 @@ function buildCheckpointResumeMessage(checkpoint: ActiveWorkCheckpoint): string 
   return [
     "[System] The previous turn was interrupted by a gateway restart.",
     "A structured restart checkpoint is available. Continue only from this safe checkpoint state.",
+    "The restart command may already have performed its side effect. Do not treat aborted, timed-out, or transport-lost tool output as proof that nothing happened.",
     `Checkpoint: ${checkpoint.checkpointId}`,
     `Objective: ${checkpoint.activeObjective}`,
     `Current phase: ${checkpoint.currentPhase}`,
     `Last completed proof: ${checkpoint.lastCompletedProof}`,
     `Next validation step: ${checkpoint.nextValidationStep}`,
     `Stop conditions: ${checkpoint.stopConditions.join("; ")}`,
+    "Before any final report, verify the target live state and write or cite a current-truth closeout/blocker artifact for the interrupted side effect.",
     "Do not run destructive operations after restart. If continuation needs destructive work, report blocked and ask for operator review.",
   ].join("\n");
 }
@@ -413,6 +547,7 @@ function resolveRestartRecoveryDeliveryContext(params: {
 async function resumeMainSession(params: {
   cfg?: OpenClawConfig;
   entry: SessionEntry;
+  stateDir?: string;
   storePath: string;
   sessionKey: string;
   checkpoint?: ActiveWorkCheckpoint;
@@ -449,7 +584,7 @@ async function resumeMainSession(params: {
         agentParams.threadId = String(deliveryContext.threadId);
       }
     }
-    await callGateway<{ runId: string }>({
+    const queued = await callGateway<{ runId: string }>({
       method: "agent",
       params: agentParams,
       timeoutMs: 10_000,
@@ -463,6 +598,7 @@ async function resumeMainSession(params: {
         }
         const now = Date.now();
         entry.abortedLastRun = false;
+        entry.restartRecoveryDeliveryRunId = queued.runId;
         entry.updatedAt = now;
         if (entry.pendingFinalDelivery || entry.pendingFinalDeliveryText) {
           if (sanitizedPendingText) {
@@ -492,8 +628,20 @@ async function resumeMainSession(params: {
           : sanitizedPendingText
             ? " (with pending payload)"
             : ""
-      }`,
+      } runId=${queued.runId} deliver=${Boolean(deliveryContext)}`,
     );
+    await updateRecoveryStatus({
+      stateDir: params.stateDir,
+      sessionKey: params.sessionKey,
+      sessionId: params.entry.sessionId,
+      status: "queued",
+      runId: queued.runId,
+      reason: params.checkpoint
+        ? "restart recovery queued checkpoint continuation"
+        : "restart recovery queued continuation",
+      deliveryAttempted: Boolean(deliveryContext),
+      deliverySucceeded: Boolean(deliveryContext),
+    });
     return true;
   } catch (err) {
     log.warn(`failed to resume interrupted main session ${params.sessionKey}: ${String(err)}`);
@@ -572,6 +720,8 @@ export async function markRestartAbortedMainSessionsFromLocks(params: {
   }
 
   const storePath = path.join(sessionsDir, "sessions.json");
+  const inferredStateDir = path.resolve(sessionsDir, "..", "..", "..");
+  const markedStatuses: Array<{ sessionKey: string; sessionId?: string }> = [];
   await updateSessionStore(
     storePath,
     (store) => {
@@ -590,10 +740,20 @@ export async function markRestartAbortedMainSessionsFromLocks(params: {
         entry.abortedLastRun = true;
         store[sessionKey] = entry;
         result.marked++;
+        markedStatuses.push({ sessionKey, sessionId: entry.sessionId });
       }
     },
     { skipMaintenance: true },
   );
+  for (const marked of markedStatuses) {
+    await updateRecoveryStatus({
+      stateDir: inferredStateDir,
+      sessionKey: marked.sessionKey,
+      sessionId: marked.sessionId,
+      status: "marked",
+      reason: "restart interrupted session transcript lock",
+    });
+  }
 
   if (result.marked > 0) {
     log.warn(`marked ${result.marked} interrupted main session(s) from stale transcript locks`);
@@ -609,6 +769,7 @@ async function recoverStore(params: {
   stateDir?: string;
 }): Promise<{ recovered: number; failed: number; skipped: number }> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
+  log.info(`scanning restart recovery store: ${params.storePath}`);
   let store: Record<string, SessionEntry>;
   try {
     store = loadSessionStore(params.storePath);
@@ -625,13 +786,16 @@ async function recoverStore(params: {
       continue;
     }
     if (shouldSkipMainRecovery(entry, sessionKey)) {
+      log.info(`skipped interrupted main session recovery: ${sessionKey} (non-main session)`);
       result.skipped++;
       continue;
     }
     if (params.resumedSessionKeys.has(sessionKey)) {
+      log.info(`skipped interrupted main session recovery: ${sessionKey} (already resumed)`);
       result.skipped++;
       continue;
     }
+    log.info(`selected interrupted main session for restart recovery: ${sessionKey}`);
 
     const checkpoint = params.checkpoints.find((candidate) =>
       candidate.status === "pending" || candidate.status === "expired"
@@ -641,7 +805,7 @@ async function recoverStore(params: {
     );
     if (checkpoint) {
       if (checkpoint.status === "expired") {
-        await sendCheckpointBlockedNotice({
+        const deliveredNotice = await sendCheckpointBlockedNotice({
           cfg: params.cfg,
           checkpoint,
           entry,
@@ -654,6 +818,16 @@ async function recoverStore(params: {
           reason: "checkpoint expired before restart recovery",
           stateDir: params.stateDir,
         });
+        await updateRecoveryStatus({
+          stateDir: params.stateDir,
+          sessionKey,
+          sessionId: entry.sessionId,
+          status: deliveredNotice ? "blocked" : "failed",
+          reason: "restart checkpoint expired before startup recovery could safely continue",
+          transcriptTailRole: "checkpoint",
+          deliveryAttempted: true,
+          deliverySucceeded: deliveredNotice,
+        });
         result.failed++;
         continue;
       }
@@ -661,7 +835,7 @@ async function recoverStore(params: {
         const reason =
           checkpoint.unsafeAutoResumeReason ??
           "checkpoint requires operator review before continuation";
-        await sendCheckpointBlockedNotice({
+        const deliveredNotice = await sendCheckpointBlockedNotice({
           cfg: params.cfg,
           checkpoint,
           entry,
@@ -674,12 +848,23 @@ async function recoverStore(params: {
           reason,
           stateDir: params.stateDir,
         });
+        await updateRecoveryStatus({
+          stateDir: params.stateDir,
+          sessionKey,
+          sessionId: entry.sessionId,
+          status: deliveredNotice ? "blocked" : "failed",
+          reason,
+          transcriptTailRole: "checkpoint",
+          deliveryAttempted: true,
+          deliverySucceeded: deliveredNotice,
+        });
         result.failed++;
         continue;
       }
       const resumed = await resumeMainSession({
         cfg: params.cfg,
         entry,
+        stateDir: params.stateDir,
         storePath: params.storePath,
         sessionKey,
         checkpoint,
@@ -699,6 +884,16 @@ async function recoverStore(params: {
           status: "blocked",
           reason: "failed to queue restart continuation",
           stateDir: params.stateDir,
+        });
+        await updateRecoveryStatus({
+          stateDir: params.stateDir,
+          sessionKey,
+          sessionId: entry.sessionId,
+          status: "failed",
+          reason: "failed to queue restart continuation",
+          transcriptTailRole: "checkpoint",
+          deliveryAttempted: false,
+          deliverySucceeded: false,
         });
         result.failed++;
       }
@@ -725,11 +920,22 @@ async function recoverStore(params: {
 
     const resumeBlockReason = resolveMainSessionResumeBlockReason(messages);
     if (resumeBlockReason) {
-      await sendUnresumableSessionNotice({
+      const tailRole = getMessageRole(messages.toReversed().find(isMeaningfulTailMessage));
+      const deliveredNotice = await sendUnresumableSessionNotice({
         cfg: params.cfg,
         entry,
         sessionKey,
         reason: resumeBlockReason,
+      });
+      await updateRecoveryStatus({
+        stateDir: params.stateDir,
+        sessionKey,
+        sessionId: entry.sessionId,
+        status: deliveredNotice ? "blocked" : "failed",
+        reason: resumeBlockReason,
+        transcriptTailRole: tailRole,
+        deliveryAttempted: true,
+        deliverySucceeded: deliveredNotice,
       });
       await markSessionFailed({
         storePath: params.storePath,
@@ -743,6 +949,7 @@ async function recoverStore(params: {
     const resumed = await resumeMainSession({
       cfg: params.cfg,
       entry,
+      stateDir: params.stateDir,
       storePath: params.storePath,
       sessionKey,
       pendingFinalDeliveryText: entry.pendingFinalDeliveryText,
@@ -751,6 +958,15 @@ async function recoverStore(params: {
       params.resumedSessionKeys.add(sessionKey);
       result.recovered++;
     } else {
+      await updateRecoveryStatus({
+        stateDir: params.stateDir,
+        sessionKey,
+        sessionId: entry.sessionId,
+        status: "failed",
+        reason: "failed to queue restart continuation",
+        deliveryAttempted: false,
+        deliverySucceeded: false,
+      });
       result.failed++;
     }
   }
@@ -821,9 +1037,13 @@ export function scheduleRestartAbortedMainSessionRecovery(
   const initialDelay = params.delayMs ?? DEFAULT_RECOVERY_DELAY_MS;
   const maxRetries = params.maxRetries ?? MAX_RECOVERY_RETRIES;
   const resumedSessionKeys = new Set<string>();
+  log.info(
+    `scheduled interrupted main session restart recovery delayMs=${initialDelay} maxRetries=${maxRetries}`,
+  );
 
   const attemptRecovery = (attempt: number, delay: number) => {
     setTimeout(() => {
+      log.info(`starting interrupted main session restart recovery attempt=${attempt}`);
       void recoverRestartAbortedMainSessions({
         cfg: params.cfg,
         stateDir: params.stateDir,
@@ -831,12 +1051,22 @@ export function scheduleRestartAbortedMainSessionRecovery(
       })
         .then((result) => {
           if (result.failed > 0 && attempt < maxRetries) {
+            log.info(
+              `main-session restart recovery retry scheduled attempt=${attempt + 1} delayMs=${
+                delay * RETRY_BACKOFF_MULTIPLIER
+              } failed=${result.failed}`,
+            );
             attemptRecovery(attempt + 1, delay * RETRY_BACKOFF_MULTIPLIER);
           }
         })
         .catch((err: unknown) => {
           if (attempt < maxRetries) {
             log.warn(`main-session restart recovery failed: ${String(err)}`);
+            log.info(
+              `main-session restart recovery retry scheduled attempt=${attempt + 1} delayMs=${
+                delay * RETRY_BACKOFF_MULTIPLIER
+              }`,
+            );
             attemptRecovery(attempt + 1, delay * RETRY_BACKOFF_MULTIPLIER);
           } else {
             log.warn(`main-session restart recovery gave up: ${String(err)}`);

@@ -13,6 +13,7 @@ import {
   markRestartAbortedMainSessions,
   markRestartAbortedMainSessionsFromLocks,
   recoverRestartAbortedMainSessions,
+  readMainSessionRestartRecoveryStatus,
 } from "./main-session-restart-recovery.js";
 import type { SessionLockInspection } from "./session-write-lock.js";
 
@@ -707,12 +708,20 @@ describe("main-session-restart-recovery", () => {
 
     expect(result).toEqual({ recovered: 1, failed: 0, skipped: 0 });
     expect(callGateway).toHaveBeenCalledOnce();
-    expect(firstGatewayParams()).toMatchObject({
+    const resumedParams = firstGatewayParams();
+    expect(resumedParams).toMatchObject({
       message: expect.stringContaining(`Checkpoint: ${checkpoint.checkpointId}`),
       sessionKey: "agent:main:main",
       lane: "main",
     });
-    expect(String(firstGatewayParams().message)).toContain("check gateway health");
+    const resumeMessage = String(resumedParams.message);
+    expect(resumeMessage).toContain("check gateway health");
+    expect(resumeMessage).toContain(
+      "Do not treat aborted, timed-out, or transport-lost tool output as proof that nothing happened.",
+    );
+    expect(resumeMessage).toContain(
+      "write or cite a current-truth closeout/blocker artifact for the interrupted side effect",
+    );
     const checkpoints = await listActiveWorkCheckpoints({
       stateDir: tmpDir,
       includeCompleted: true,
@@ -721,6 +730,16 @@ describe("main-session-restart-recovery", () => {
       checkpointId: checkpoint.checkpointId,
       status: "continued",
       completionReason: "restart recovery queued continuation",
+    });
+    await expect(
+      readMainSessionRestartRecoveryStatus({
+        stateDir: tmpDir,
+        sessionKey: "agent:main:main",
+      }),
+    ).resolves.toMatchObject({
+      status: "queued",
+      runId: "run-resumed",
+      reason: "restart recovery queued checkpoint continuation",
     });
   });
 
@@ -854,5 +873,17 @@ describe("main-session-restart-recovery", () => {
     const store = loadSessionStore(path.join(sessionsDir, "sessions.json"));
     expect(store["agent:main:demo-channel:room-1"]?.status).toBe("failed");
     expect(store["agent:main:demo-channel:room-1"]?.abortedLastRun).toBe(true);
+    await expect(
+      readMainSessionRestartRecoveryStatus({
+        stateDir: tmpDir,
+        sessionKey: "agent:main:demo-channel:room-1",
+      }),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      reason: "restart interrupted assistant/tool-call turn before a safe checkpoint",
+      transcriptTailRole: "assistant",
+      deliveryAttempted: true,
+      deliverySucceeded: true,
+    });
   });
 });

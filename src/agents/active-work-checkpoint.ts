@@ -11,6 +11,17 @@ const ACTIVE_WORK_CHECKPOINT_MAX_BYTES = 32 * 1024;
 const ACTIVE_WORK_CHECKPOINT_DIR = "active-work-checkpoints";
 
 export type ActiveWorkCheckpointStatus = "pending" | "continued" | "blocked" | "expired";
+export type ActiveWorkCheckpointSource =
+  | "memory_flush"
+  | "preflight_compaction"
+  | "gateway_restart"
+  | "runtime_maintenance";
+export type ActiveWorkCheckpointMaintenanceStatus = "pending" | "completed" | "failed" | "skipped";
+export type ActiveWorkCheckpointContinuationStatus =
+  | "not_needed"
+  | "pending"
+  | "continued"
+  | "blocked";
 export type ActiveWorkCheckpointDeliveryContext = {
   channel?: string;
   to?: string;
@@ -21,16 +32,25 @@ export type ActiveWorkCheckpointDeliveryContext = {
 export type ActiveWorkCheckpoint = {
   kind: typeof ACTIVE_WORK_CHECKPOINT_KIND;
   schemaVersion: typeof ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION;
+  version: typeof ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION;
   checkpointId: string;
   createdAt: string;
   createdAtMs: number;
+  updatedAt: string;
+  updatedAtMs: number;
   expiresAt: string;
   expiresAtMs: number;
   status: ActiveWorkCheckpointStatus;
+  source: ActiveWorkCheckpointSource;
   sessionKey?: string;
   sessionId?: string;
   runId?: string;
   deliveryContext?: ActiveWorkCheckpointDeliveryContext;
+  activeUserPrompt?: string;
+  normalizedActiveMissionSummary?: string;
+  maintenanceStatus: ActiveWorkCheckpointMaintenanceStatus;
+  continuationStatus: ActiveWorkCheckpointContinuationStatus;
+  blockerReason?: string;
   requestingAgentToolPath?: string;
   restartCommand?: string;
   restartIntent?: string;
@@ -48,17 +68,39 @@ export type ActiveWorkCheckpoint = {
   completionReason?: string;
 };
 
-export type ActiveWorkCheckpointInput = Omit<
+type ActiveWorkCheckpointInputBase = Omit<
   ActiveWorkCheckpoint,
   | "kind"
   | "schemaVersion"
+  | "version"
   | "checkpointId"
   | "createdAt"
   | "createdAtMs"
+  | "updatedAt"
+  | "updatedAtMs"
   | "expiresAt"
   | "expiresAtMs"
   | "status"
+  | "source"
+  | "activeUserPrompt"
+  | "normalizedActiveMissionSummary"
+  | "maintenanceStatus"
+  | "continuationStatus"
+  | "blockerReason"
 >;
+
+export type ActiveWorkCheckpointInput = ActiveWorkCheckpointInputBase &
+  Partial<
+    Pick<
+      ActiveWorkCheckpoint,
+      | "source"
+      | "activeUserPrompt"
+      | "normalizedActiveMissionSummary"
+      | "maintenanceStatus"
+      | "continuationStatus"
+      | "blockerReason"
+    >
+  >;
 
 function checkpointRootDir(stateDir?: string): string {
   return path.join(stateDir ?? resolveStateDir(process.env), ACTIVE_WORK_CHECKPOINT_DIR);
@@ -87,6 +129,30 @@ function normalizeStringArray(values: unknown, fallback: string[]): string[] {
   return normalized.length > 0 ? normalized : fallback;
 }
 
+function normalizeCheckpointSource(value: unknown): ActiveWorkCheckpointSource {
+  return value === "memory_flush" ||
+    value === "preflight_compaction" ||
+    value === "gateway_restart" ||
+    value === "runtime_maintenance"
+    ? value
+    : "runtime_maintenance";
+}
+
+function normalizeMaintenanceStatus(value: unknown): ActiveWorkCheckpointMaintenanceStatus {
+  return value === "pending" || value === "completed" || value === "failed" || value === "skipped"
+    ? value
+    : "pending";
+}
+
+function normalizeContinuationStatus(value: unknown): ActiveWorkCheckpointContinuationStatus {
+  return value === "not_needed" ||
+    value === "pending" ||
+    value === "continued" ||
+    value === "blocked"
+    ? value
+    : "pending";
+}
+
 function normalizeDeliveryContext(
   value: ActiveWorkCheckpointDeliveryContext | undefined,
 ): ActiveWorkCheckpointDeliveryContext | undefined {
@@ -111,12 +177,16 @@ function buildCheckpoint(params: {
   return {
     kind: ACTIVE_WORK_CHECKPOINT_KIND,
     schemaVersion: ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION,
+    version: ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION,
     checkpointId,
     createdAt: new Date(params.nowMs).toISOString(),
     createdAtMs: params.nowMs,
+    updatedAt: new Date(params.nowMs).toISOString(),
+    updatedAtMs: params.nowMs,
     expiresAt: new Date(expiresAtMs).toISOString(),
     expiresAtMs,
     status: "pending",
+    source: normalizeCheckpointSource(params.input.source),
     ...(normalizeOptionalString(params.input.sessionKey, 240)
       ? { sessionKey: normalizeOptionalString(params.input.sessionKey, 240) }
       : {}),
@@ -128,6 +198,22 @@ function buildCheckpoint(params: {
       : {}),
     ...(normalizeDeliveryContext(params.input.deliveryContext)
       ? { deliveryContext: normalizeDeliveryContext(params.input.deliveryContext) }
+      : {}),
+    ...(normalizeOptionalString(params.input.activeUserPrompt, 4000)
+      ? { activeUserPrompt: normalizeOptionalString(params.input.activeUserPrompt, 4000) }
+      : {}),
+    ...(normalizeOptionalString(params.input.normalizedActiveMissionSummary, 1000)
+      ? {
+          normalizedActiveMissionSummary: normalizeOptionalString(
+            params.input.normalizedActiveMissionSummary,
+            1000,
+          ),
+        }
+      : {}),
+    maintenanceStatus: normalizeMaintenanceStatus(params.input.maintenanceStatus),
+    continuationStatus: normalizeContinuationStatus(params.input.continuationStatus),
+    ...(normalizeOptionalString(params.input.blockerReason, 500)
+      ? { blockerReason: normalizeOptionalString(params.input.blockerReason, 500) }
       : {}),
     ...(normalizeOptionalString(params.input.requestingAgentToolPath, 240)
       ? {
@@ -232,7 +318,19 @@ function parseCheckpoint(raw: string): ActiveWorkCheckpoint | undefined {
   ) {
     return undefined;
   }
-  return record as ActiveWorkCheckpoint;
+  return {
+    ...(record as ActiveWorkCheckpoint),
+    version: ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION,
+    updatedAt:
+      typeof record.updatedAt === "string" ? record.updatedAt : String(record.createdAt ?? ""),
+    updatedAtMs:
+      typeof record.updatedAtMs === "number" && Number.isFinite(record.updatedAtMs)
+        ? record.updatedAtMs
+        : record.createdAtMs,
+    source: normalizeCheckpointSource(record.source),
+    maintenanceStatus: normalizeMaintenanceStatus(record.maintenanceStatus),
+    continuationStatus: normalizeContinuationStatus(record.continuationStatus),
+  };
 }
 
 export async function listActiveWorkCheckpoints(
@@ -283,15 +381,56 @@ export async function updateActiveWorkCheckpointStatus(params: {
   reason?: string;
   stateDir?: string;
   nowMs?: number;
+  maintenanceStatus?: ActiveWorkCheckpointMaintenanceStatus;
+  continuationStatus?: ActiveWorkCheckpointContinuationStatus;
+  blockerReason?: string;
 }): Promise<ActiveWorkCheckpoint> {
   const nowMs = params.nowMs ?? Date.now();
   const next: ActiveWorkCheckpoint = {
     ...params.checkpoint,
     status: params.status,
+    updatedAt: new Date(nowMs).toISOString(),
+    updatedAtMs: nowMs,
+    maintenanceStatus: params.maintenanceStatus ?? params.checkpoint.maintenanceStatus,
+    continuationStatus: params.continuationStatus ?? params.checkpoint.continuationStatus,
+    ...(normalizeOptionalString(params.blockerReason, 500)
+      ? { blockerReason: normalizeOptionalString(params.blockerReason, 500) }
+      : {}),
     completedAt: new Date(nowMs).toISOString(),
     completedAtMs: nowMs,
     ...(normalizeOptionalString(params.reason, 500)
       ? { completionReason: normalizeOptionalString(params.reason, 500) }
+      : {}),
+  };
+  await writeCheckpointFile(next, params.stateDir);
+  return next;
+}
+
+export async function updateActiveWorkCheckpointProgress(params: {
+  checkpoint: ActiveWorkCheckpoint;
+  stateDir?: string;
+  nowMs?: number;
+  maintenanceStatus?: ActiveWorkCheckpointMaintenanceStatus;
+  continuationStatus?: ActiveWorkCheckpointContinuationStatus;
+  blockerReason?: string;
+  sessionId?: string;
+  runId?: string;
+}): Promise<ActiveWorkCheckpoint> {
+  const nowMs = params.nowMs ?? Date.now();
+  const next: ActiveWorkCheckpoint = {
+    ...params.checkpoint,
+    updatedAt: new Date(nowMs).toISOString(),
+    updatedAtMs: nowMs,
+    maintenanceStatus: params.maintenanceStatus ?? params.checkpoint.maintenanceStatus,
+    continuationStatus: params.continuationStatus ?? params.checkpoint.continuationStatus,
+    ...(normalizeOptionalString(params.blockerReason, 500)
+      ? { blockerReason: normalizeOptionalString(params.blockerReason, 500) }
+      : {}),
+    ...(normalizeOptionalString(params.sessionId, 240)
+      ? { sessionId: normalizeOptionalString(params.sessionId, 240) }
+      : {}),
+    ...(normalizeOptionalString(params.runId, 240)
+      ? { runId: normalizeOptionalString(params.runId, 240) }
       : {}),
   };
   await writeCheckpointFile(next, params.stateDir);
