@@ -136,12 +136,8 @@ export const healthHandlers: GatewayRequestHandlers = {
         cachedDiffersFromRuntime = false;
       }
     }
-    if (
-      !wantsProbe &&
-      cached &&
-      !cachedDiffersFromRuntime &&
-      now - cached.ts < HEALTH_REFRESH_INTERVAL_MS
-    ) {
+    if (!wantsProbe && cached && !cachedDiffersFromRuntime) {
+      const stale = now - cached.ts >= HEALTH_REFRESH_INTERVAL_MS;
       respond(
         true,
         mergeCachedHealthRuntimeState({
@@ -149,7 +145,7 @@ export const healthHandlers: GatewayRequestHandlers = {
           eventLoop: context.getEventLoopHealth?.(),
         }),
         undefined,
-        { cached: true },
+        stale ? { cached: true, stale: true } : { cached: true },
       );
       // Serve the fresh-enough cache immediately but still refresh in the
       // background so the next caller sees updated expensive probe data.

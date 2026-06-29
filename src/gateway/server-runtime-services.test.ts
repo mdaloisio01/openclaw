@@ -16,6 +16,7 @@ const hoisted = vi.hoisted(() => {
     isVitestRuntimeEnv: vi.fn(() => false),
     recoverPendingDeliveries: vi.fn(async () => undefined),
     recoverPendingRestartContinuationDeliveries: vi.fn(async () => undefined),
+    recoverPendingActivationContinuations: vi.fn(async () => []),
     deliverOutboundPayloads: vi.fn(),
   };
 });
@@ -39,6 +40,10 @@ vi.mock("../infra/outbound/delivery-queue.js", () => ({
 
 vi.mock("./server-restart-sentinel.js", () => ({
   recoverPendingRestartContinuationDeliveries: hoisted.recoverPendingRestartContinuationDeliveries,
+}));
+
+vi.mock("../infra/activation-continuation.js", () => ({
+  recoverPendingActivationContinuations: hoisted.recoverPendingActivationContinuations,
 }));
 
 vi.mock("./channel-health-monitor.js", () => ({
@@ -73,6 +78,7 @@ describe("server-runtime-services", () => {
     hoisted.isVitestRuntimeEnv.mockReset().mockReturnValue(false);
     hoisted.recoverPendingDeliveries.mockClear();
     hoisted.recoverPendingRestartContinuationDeliveries.mockClear();
+    hoisted.recoverPendingActivationContinuations.mockClear();
     hoisted.deliverOutboundPayloads.mockClear();
   });
 
@@ -205,6 +211,39 @@ describe("server-runtime-services", () => {
       maxEnqueuedAt: 123,
       log: sessionDeliveryLog,
     });
+    expect(hoisted.recoverPendingActivationContinuations).not.toHaveBeenCalled();
+  });
+
+  it("starts activation continuation recovery after post-restart startup is ready", async () => {
+    vi.useFakeTimers();
+    hoisted.recoverPendingActivationContinuations.mockResolvedValueOnce([{ id: "activation-1" }]);
+    const cron = { start: vi.fn(async () => undefined) };
+    const log = createLog();
+
+    activateGatewayScheduledServices({
+      minimalTestGateway: false,
+      cfgAtStart: {} as never,
+      deps: {} as never,
+      sessionDeliveryRecoveryMaxEnqueuedAt: 123,
+      cron,
+      logCron: { error: vi.fn() },
+      log,
+    });
+
+    await vi.advanceTimersByTimeAsync(1_750);
+    await vi.dynamicImportSettled();
+
+    expect(log.child).toHaveBeenCalledWith("activation-continuation");
+    const activationLog = log.child.mock.results.find(
+      (_result, index) => log.child.mock.calls[index]?.[0] === "activation-continuation",
+    )?.value;
+    if (!activationLog) {
+      throw new Error("Expected activation continuation log child");
+    }
+    expect(hoisted.recoverPendingActivationContinuations).toHaveBeenCalledWith({
+      log: activationLog,
+    });
+    expect(activationLog.info).toHaveBeenCalledWith("recovered 1 activation continuation(s)");
   });
 
   it("can defer cron startup while activating other scheduled services", async () => {

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { getActiveEmbeddedRunCount } from "../agents/embedded-agent-runner/run-state.js";
 import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
 import { getTotalQueueSize } from "../process/command-queue.js";
@@ -5,7 +6,11 @@ import {
   getInspectableActiveTaskRestartBlockers,
   type ActiveTaskRestartBlocker,
 } from "../tasks/task-registry.maintenance.js";
-import { scheduleGatewaySigusr1Restart, type ScheduledRestart } from "./restart.js";
+import {
+  scheduleGatewaySigusr1Restart,
+  type RestartEmitHooks,
+  type ScheduledRestart,
+} from "./restart.js";
 
 export type SafeGatewayRestartCounts = {
   queueSize: number;
@@ -16,24 +21,32 @@ export type SafeGatewayRestartCounts = {
 };
 
 export type SafeGatewayRestartBlocker = {
-  kind: "queue" | "reply" | "embedded-run" | "task";
+  kind: "queue" | "reply" | "embedded-run" | "task" | "build";
   count: number;
   message: string;
   task?: ActiveTaskRestartBlocker;
+};
+
+export type SafeGatewayRestartBuildCheck = {
+  ok: boolean;
+  reason?: string;
+  detail?: string;
 };
 
 export type SafeGatewayRestartPreflight = {
   safe: boolean;
   counts: SafeGatewayRestartCounts;
   blockers: SafeGatewayRestartBlocker[];
+  build: SafeGatewayRestartBuildCheck;
   summary: string;
 };
 
 export type SafeGatewayRestartRequestResult = {
-  ok: true;
-  status: "scheduled" | "deferred" | "coalesced";
+  ok: boolean;
+  status: "scheduled" | "deferred" | "coalesced" | "blocked";
   preflight: SafeGatewayRestartPreflight;
-  restart: ScheduledRestart;
+  restart?: ScheduledRestart;
+  error?: string;
 };
 
 type SafeRestartInspectors = {
@@ -42,7 +55,50 @@ type SafeRestartInspectors = {
   getEmbeddedRuns: () => number;
   getActiveTasks: () => number;
   getTaskBlockers: () => ActiveTaskRestartBlocker[];
+  validateBuild: () => SafeGatewayRestartBuildCheck;
 };
+
+function resolveSourceRoot(): string {
+  return process.env.OPENCLAW_RUNTIME_GUARD_ROOT ?? process.cwd();
+}
+
+function runNodePreflight(
+  script: string,
+  args: string[],
+  reason: string,
+): SafeGatewayRestartBuildCheck {
+  const sourceRoot = resolveSourceRoot();
+  const result = spawnSync(process.execPath, [script, ...args], {
+    cwd: sourceRoot,
+    encoding: "utf8",
+    env: process.env,
+  });
+  if (result.status === 0) {
+    return { ok: true };
+  }
+  const detail = [result.stdout?.trim(), result.stderr?.trim()].filter(Boolean).join("\n");
+  return {
+    ok: false,
+    reason,
+    detail,
+  };
+}
+
+export function validateGatewayRestartBuildArtifacts(): SafeGatewayRestartBuildCheck {
+  const install = runNodePreflight(
+    "scripts/install-integrity-guard.mjs",
+    ["local-preflight"],
+    "dependency preflight failed",
+  );
+  if (!install.ok) {
+    return install;
+  }
+  return runNodePreflight(
+    "scripts/runtime-asset-guard.mjs",
+    ["validate", "--no-snapshot", "--operation", "gateway restart preflight"],
+    "dist stale/partial or runtime identity unverifiable",
+  );
+}
 
 const defaultInspectors: SafeRestartInspectors = {
   getQueueSize: getTotalQueueSize,
@@ -50,6 +106,7 @@ const defaultInspectors: SafeRestartInspectors = {
   getEmbeddedRuns: getActiveEmbeddedRunCount,
   getActiveTasks: () => getInspectableActiveTaskRestartBlockers().length,
   getTaskBlockers: getInspectableActiveTaskRestartBlockers,
+  validateBuild: validateGatewayRestartBuildArtifacts,
 };
 
 function normalizeCount(value: number): number {
@@ -92,6 +149,14 @@ export function createSafeGatewayRestartPreflight(
     counts.queueSize + counts.pendingReplies + counts.embeddedRuns + counts.activeTasks;
 
   const blockers: SafeGatewayRestartBlocker[] = [];
+  const build = resolved.validateBuild();
+  if (!build.ok) {
+    blockers.push({
+      kind: "build",
+      count: 1,
+      message: build.reason ?? "gateway build/runtime validation failed",
+    });
+  }
   if (counts.queueSize > 0) {
     blockers.push({
       kind: "queue",
@@ -138,9 +203,10 @@ export function createSafeGatewayRestartPreflight(
       ? "safe to restart now"
       : `restart deferred: ${blockers.map((blocker) => blocker.message).join("; ")}`;
   return {
-    safe: counts.totalActive === 0,
+    safe: counts.totalActive === 0 && build.ok,
     counts,
     blockers,
+    build,
     summary,
   };
 }
@@ -150,14 +216,24 @@ export function requestSafeGatewayRestart(
     reason?: string;
     delayMs?: number;
     skipDeferral?: boolean;
+    emitHooks?: RestartEmitHooks;
     inspect?: Partial<SafeRestartInspectors>;
   } = {},
 ): SafeGatewayRestartRequestResult {
   const preflight = createSafeGatewayRestartPreflight(opts.inspect);
+  if (!preflight.build.ok) {
+    return {
+      ok: false,
+      status: "blocked",
+      preflight,
+      error: preflight.build.detail ?? preflight.build.reason ?? "gateway build validation failed",
+    };
+  }
   const skipDeferral = opts.skipDeferral === true;
   const restart = scheduleGatewaySigusr1Restart({
     delayMs: opts.delayMs ?? 0,
     reason: opts.reason ?? "gateway.restart.safe",
+    ...(opts.emitHooks ? { emitHooks: opts.emitHooks } : {}),
     ...(skipDeferral ? { skipDeferral: true } : {}),
   });
   const status = restart.coalesced

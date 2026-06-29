@@ -6,6 +6,7 @@ const EVENT_LOOP_UTILIZATION_WARN = 0.95;
 const CPU_CORE_RATIO_WARN = 0.9;
 // Load counters can spike during frequent short async wakeups; delay is the blocking signal.
 const LOAD_DEGRADATION_DELAY_COEVIDENCE_MS = 25;
+const MAX_DELAY_BLOCKING_P99_COEVIDENCE_MS = 100;
 const SUSTAINED_LOAD_SAMPLE_MIN_INTERVAL_MS = 1_000;
 
 type EventLoopDelayMonitor = ReturnType<typeof monitorEventLoopDelay>;
@@ -57,15 +58,22 @@ function nanosecondsToMilliseconds(value: number): number {
   return roundMetric(value / 1_000_000, 1);
 }
 
+function hasBlockingEventLoopDelayWarning(
+  metrics: Pick<GatewayEventLoopHealthMetrics, "delayP99Ms" | "delayMaxMs">,
+) {
+  return (
+    metrics.delayP99Ms >= EVENT_LOOP_DELAY_WARN_MS ||
+    (metrics.delayMaxMs >= EVENT_LOOP_DELAY_WARN_MS &&
+      metrics.delayP99Ms >= MAX_DELAY_BLOCKING_P99_COEVIDENCE_MS)
+  );
+}
+
 export function classifyGatewayEventLoopHealthReasons(
   metrics: GatewayEventLoopHealthMetrics,
 ): GatewayEventLoopHealthReason[] {
   const reasons: GatewayEventLoopHealthReason[] = [];
 
-  if (
-    metrics.delayP99Ms >= EVENT_LOOP_DELAY_WARN_MS ||
-    metrics.delayMaxMs >= EVENT_LOOP_DELAY_WARN_MS
-  ) {
+  if (hasBlockingEventLoopDelayWarning(metrics)) {
     reasons.push("event_loop_delay");
   }
 
@@ -124,8 +132,7 @@ export function createGatewayEventLoopHealthMonitor(
       const intervalMs = Math.max(1, now - lastWallAt);
       const delayP99Ms = nanosecondsToMilliseconds(monitor.percentile(99));
       const delayMaxMs = nanosecondsToMilliseconds(monitor.max);
-      const hasDelayWarning =
-        delayP99Ms >= EVENT_LOOP_DELAY_WARN_MS || delayMaxMs >= EVENT_LOOP_DELAY_WARN_MS;
+      const hasDelayWarning = hasBlockingEventLoopDelayWarning({ delayP99Ms, delayMaxMs });
 
       if (!hasDelayWarning && intervalMs < SUSTAINED_LOAD_SAMPLE_MIN_INTERVAL_MS) {
         return lastSnapshot;

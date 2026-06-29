@@ -464,12 +464,9 @@ async function emitPreparedGatewayRestart(
       await nextHooks.beforeEmit?.();
       preparedHooks = nextHooks;
     } catch (err) {
-      restartLog.warn(
-        `restart preparation failed; restart will continue without it: ${String(err)}`,
-      );
-    }
-    if (hooks) {
-      break;
+      restartLog.warn(`restart preparation failed; restart will not be emitted: ${String(err)}`);
+      await nextHooks.afterEmitRejected?.().catch(() => undefined);
+      return;
     }
     nextHooks = pendingRestartEmitHooks;
     pendingRestartEmitHooks = undefined;
@@ -827,14 +824,16 @@ export function scheduleGatewaySigusr1Restart(opts?: {
     () => {
       const scheduledReason = pendingRestartReason;
       const scheduledSkipDeferral = pendingRestartSkipDeferral;
+      const scheduledEmitHooks = pendingRestartEmitHooks;
       pendingRestartTimer = null;
       pendingRestartDueAt = 0;
       pendingRestartReason = undefined;
+      pendingRestartEmitHooks = undefined;
       pendingRestartSkipDeferral = false;
       pendingRestartPreparing = true;
       const pendingCheck = preRestartCheck;
       if (scheduledSkipDeferral || !pendingCheck) {
-        void emitPreparedGatewayRestart(undefined, scheduledReason);
+        void emitPreparedGatewayRestart(scheduledEmitHooks, scheduledReason);
         return;
       }
       const cfg = getRuntimeConfig();
@@ -844,6 +843,7 @@ export function scheduleGatewaySigusr1Restart(opts?: {
       deferGatewayRestartUntilIdle({
         getPendingCount: pendingCheck,
         maxWaitMs: deferralTimeoutMs,
+        emitHooks: scheduledEmitHooks,
         reason: scheduledReason,
         timeoutIntent: { force: true, ...(scheduledReason ? { reason: scheduledReason } : {}) },
       });

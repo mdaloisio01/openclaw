@@ -181,6 +181,23 @@ function recoverPendingSessionDeliveries(params: {
   timer.unref?.();
 }
 
+function recoverPendingActivationContinuations(params: { log: GatewayRuntimeServiceLogger }): void {
+  const timer = setTimeout(() => {
+    void (async () => {
+      const { recoverPendingActivationContinuations } =
+        await import("../infra/activation-continuation.js");
+      const logRecovery = params.log.child("activation-continuation");
+      const recovered = await recoverPendingActivationContinuations({ log: logRecovery });
+      if (recovered.length > 0) {
+        logRecovery.info(`recovered ${recovered.length} activation continuation(s)`);
+      }
+    })().catch((err: unknown) =>
+      params.log.error(`Activation continuation recovery failed: ${String(err)}`),
+    );
+  }, 1_750);
+  timer.unref?.();
+}
+
 function startGatewayModelPricingRefreshOnDemand(params: {
   config: OpenClawConfig;
   pluginLookUpTable?: PluginMetadataRegistryView;
@@ -248,6 +265,9 @@ export function activateGatewayScheduledServices(params: {
     deps: params.deps,
     log: params.log,
     maxEnqueuedAt: params.sessionDeliveryRecoveryMaxEnqueuedAt,
+  });
+  recoverPendingActivationContinuations({
+    log: params.log,
   });
   const stopModelPricingRefresh = !isVitestRuntimeEnv()
     ? startGatewayModelPricingRefreshOnDemand({

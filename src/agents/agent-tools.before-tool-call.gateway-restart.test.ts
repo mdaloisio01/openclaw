@@ -88,6 +88,7 @@ describe("before_tool_call gateway restart checkpointing", () => {
     const checkpoints = await listActiveWorkCheckpoints({ stateDir: tmpDir });
     expect(checkpoints).toHaveLength(1);
     expect(checkpoints[0]).toMatchObject({
+      source: "gateway_restart",
       sessionKey: "agent:main:webchat",
       sessionId: "session-webchat",
       runId: "run-webchat",
@@ -96,6 +97,16 @@ describe("before_tool_call gateway restart checkpointing", () => {
       safeToAutoResume: true,
       requiresOperatorReview: false,
     });
+    expect(checkpoints[0]?.currentPhase).toBe("pre-side-effect gateway restart tool call");
+    expect(checkpoints[0]?.nextValidationStep).toContain(
+      "Treat aborted, timed-out, or transport-lost restart output as unknown-not-noop",
+    );
+    expect(checkpoints[0]?.stopConditions).toEqual(
+      expect.arrayContaining([
+        "Gateway live state cannot be verified after the side-effecting restart command.",
+        "A current-truth closeout or blocker artifact cannot be produced before stopping.",
+      ]),
+    );
   });
 
   it("does not treat gateway restart as source dirty-tree modification", async () => {

@@ -3450,6 +3450,90 @@ describe("gateway healthHandlers.health cache freshness", () => {
     });
   });
 
+  it("serves stale cached health immediately when cheap runtime state still matches", async () => {
+    const cached = {
+      ok: true,
+      ts: Date.now() - 60_000,
+      durationMs: 1,
+      channels: {
+        discord: {
+          configured: true,
+          running: true,
+          connected: true,
+          accounts: {
+            default: {
+              accountId: "default",
+              configured: true,
+              running: true,
+              connected: true,
+            },
+          },
+        },
+      },
+      channelOrder: ["discord"],
+      channelLabels: { discord: "Discord" },
+      heartbeatSeconds: 0,
+      defaultAgentId: "main",
+      agents: [],
+      sessions: { path: "/tmp/sessions.json", count: 0, recent: [] },
+    };
+    const fresh = {
+      ...cached,
+      ts: Date.now(),
+      durationMs: 5_000,
+    };
+    const respond = vi.fn();
+    let resolveRefresh: ((value: typeof fresh) => void) | undefined;
+    const refreshHealthSnapshot = vi.fn(
+      () =>
+        new Promise<typeof fresh>((resolve) => {
+          resolveRefresh = resolve;
+        }),
+    );
+
+    await healthHandlers.health({
+      req: {} as never,
+      params: {} as never,
+      respond: respond as never,
+      context: {
+        getHealthCache: () => cached,
+        refreshHealthSnapshot,
+        getRuntimeSnapshot: () => ({
+          channels: {},
+          channelAccounts: {
+            discord: {
+              default: {
+                accountId: "default",
+                running: true,
+                connected: true,
+              },
+            },
+          },
+        }),
+        logHealth: { error: vi.fn() },
+      } as never,
+      client: { connect: { role: "operator", scopes: ["operator.read"] } } as never,
+      isWebchatConnect: () => false,
+    });
+
+    expect(mockCallArg(respond)).toBe(true);
+    expect(mockCallArg(respond, 0, 1)).toMatchObject({
+      channels: {
+        discord: {
+          running: true,
+          connected: true,
+        },
+      },
+    });
+    expect(mockCallArg(respond, 0, 3)).toEqual({ cached: true, stale: true });
+    expect(refreshHealthSnapshot).toHaveBeenCalledWith({
+      probe: false,
+      includeSensitive: false,
+    });
+
+    resolveRefresh?.(fresh);
+  });
+
   it("merges live context-engine quarantine state into cached health responses", async () => {
     const engineId = `health-context-engine-${Date.now()}`;
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});

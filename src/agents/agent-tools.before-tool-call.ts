@@ -102,6 +102,7 @@ export type HookContext = {
   /** Ephemeral session UUID — regenerated on /new and /reset. */
   sessionId?: string;
   runId?: string;
+  trigger?: string;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   stopContract?: EmbeddedRunStopContract;
   trace?: DiagnosticTraceContext;
@@ -396,19 +397,25 @@ function buildGatewayRestartCheckpointInput(params: {
   ctx?: HookContext;
 }): Parameters<typeof writeActiveWorkCheckpoint>[0]["input"] {
   return {
+    source: "gateway_restart",
     sessionKey: params.ctx?.sessionKey,
     sessionId: params.ctx?.sessionId,
     runId: params.ctx?.runId,
     requestingAgentToolPath: params.toolName,
     restartCommand: params.command.command,
     restartIntent: `gateway ${params.command.action}`,
-    activeObjective: "Gateway self-restart requested from an active OpenClaw tool turn.",
-    currentPhase: "pre-restart tool call",
-    lastCompletedProof: "Gateway self-restart command was detected before execution.",
+    activeObjective:
+      "Gateway self-restart requested from an active OpenClaw tool turn; side-effect status must be verified after any interruption.",
+    currentPhase: "pre-side-effect gateway restart tool call",
+    lastCompletedProof:
+      "Gateway self-restart command was detected before execution and routed through the safe restart broker when available.",
     nextValidationStep:
-      "After gateway startup health passes, report restart truth and continue only read-only validation or ask for operator review.",
+      "Treat aborted, timed-out, or transport-lost restart output as unknown-not-noop. Verify gateway PID/start time, health/ready/RPC status, and activation-continuation or recovery status before reporting or stopping.",
     stopConditions: [
-      "Gateway health fails after restart.",
+      "Gateway live state cannot be verified after the side-effecting restart command.",
+      "Gateway health, readiness, or RPC status fails after restart.",
+      "Activation-continuation or restart-recovery proof is missing when the parent turn was interrupted.",
+      "A current-truth closeout or blocker artifact cannot be produced before stopping.",
       "Continuation would require destructive operations.",
       "Continuation would require private context export.",
       "The interrupted transcript cannot be safely resumed.",
@@ -1288,6 +1295,7 @@ export async function runBeforeToolCallHook(args: {
       ...(args.ctx?.sessionKey && { sessionKey: args.ctx.sessionKey }),
       ...(args.ctx?.sessionId && { sessionId: args.ctx.sessionId }),
       ...(args.ctx?.runId && { runId: args.ctx.runId }),
+      ...(args.ctx?.trigger && { trigger: args.ctx.trigger }),
       ...(args.ctx?.memoryFlushWritePath && {
         memoryFlushWritePath: args.ctx.memoryFlushWritePath,
       }),

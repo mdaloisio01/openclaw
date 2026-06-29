@@ -172,11 +172,35 @@ describe("classifyGatewayEventLoopHealthReasons", () => {
     },
   );
 
-  it("still degrades on event-loop delay from a short sample", () => {
+  it("does not degrade on max-only event-loop delay outliers", () => {
     expect(
       classifyGatewayEventLoopHealthReasons({
         intervalMs: 250,
         delayP99Ms: 20,
+        delayMaxMs: 1_500,
+        utilization: 0.1,
+        cpuCoreRatio: 0.1,
+      }),
+    ).toEqual([]);
+  });
+
+  it("still degrades on p99 event-loop delay from a short sample", () => {
+    expect(
+      classifyGatewayEventLoopHealthReasons({
+        intervalMs: 250,
+        delayP99Ms: 1_500,
+        delayMaxMs: 1_500,
+        utilization: 0.1,
+        cpuCoreRatio: 0.1,
+      }),
+    ).toEqual(["event_loop_delay"]);
+  });
+
+  it("still degrades on max event-loop delay with p99 co-evidence", () => {
+    expect(
+      classifyGatewayEventLoopHealthReasons({
+        intervalMs: 250,
+        delayP99Ms: 100,
         delayMaxMs: 1_500,
         utilization: 0.1,
         cpuCoreRatio: 0.1,
@@ -214,17 +238,41 @@ describe("createGatewayEventLoopHealthMonitor", () => {
     expectSaturatedLoadSnapshot(harness.monitor.snapshot());
   });
 
-  it("does not wait for the sustained sample window before reporting event-loop delay", () => {
+  it("does not wait for the sustained sample window before reporting p99 event-loop delay", () => {
     const harness = createMonitorHarness();
-    harness.setDelay({ maxMs: 1_500 });
+    harness.setDelay({ p99Ms: 1_500, maxMs: 1_500 });
     harness.setNow(42);
 
     expectSnapshotFields(harness.monitor.snapshot(), {
       degraded: true,
       reasons: ["event_loop_delay"],
       intervalMs: 42,
-      delayP99Ms: 0,
+      delayP99Ms: 1_500,
       delayMaxMs: 1_500,
+    });
+  });
+
+  it("does not report max-only event-loop delay outliers before the sustained sample window", () => {
+    const harness = createMonitorHarness();
+    harness.setDelay({ maxMs: 1_500 });
+    harness.setNow(42);
+
+    expect(harness.monitor.snapshot()).toBeUndefined();
+  });
+
+  it("does not degrade readiness on a max-only outlier when p99 and load are healthy", () => {
+    const harness = createMonitorHarness({ cpuMsPerWallMs: 0.286, utilization: 0.388 });
+    harness.setDelay({ p99Ms: 36.3, maxMs: 2_428.5 });
+    harness.setNow(23_000);
+
+    expectSnapshotFields(harness.monitor.snapshot(), {
+      degraded: false,
+      reasons: [],
+      intervalMs: 23_000,
+      delayP99Ms: 36.3,
+      delayMaxMs: 2_428.5,
+      utilization: 0.388,
+      cpuCoreRatio: 0.286,
     });
   });
 
