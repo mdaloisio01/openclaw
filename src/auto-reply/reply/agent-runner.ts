@@ -21,6 +21,11 @@ import {
 } from "../../agents/embedded-agent-runner/runs.js";
 import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
+import {
+  buildSourceDeliveryObligationId,
+  recordSourceDeliveryFailure,
+  recordSourceDeliveryObligation,
+} from "../../agents/source-delivery-obligation.js";
 import { deriveContextPromptTokens, hasNonzeroUsage, normalizeUsage } from "../../agents/usage.js";
 import { enqueueCommitmentExtraction } from "../../commitments/runtime.js";
 import type { OpenClawConfig } from "../../config/config.js";
@@ -1452,6 +1457,43 @@ export async function runReplyAgent(params: {
     followupRun: followupRun.run,
     isHeartbeat,
   });
+  const sourceDeliveryObligationId =
+    hasOriginalDirectUserTurn && replySessionKey
+      ? buildSourceDeliveryObligationId({
+          sourceSessionKey: replySessionKey,
+          parentRunId: replyOperation.key,
+          sourceMessageId:
+            normalizeOptionalString(sessionCtx.MessageSidFull) ??
+            normalizeOptionalString(sessionCtx.MessageSid),
+        })
+      : undefined;
+  const recordSourceDeliveryAccepted = (): void => {
+    if (!sourceDeliveryObligationId || !replySessionKey) {
+      return;
+    }
+    const deliveryContext = resolveReplyRunDeliveryContext({
+      cfg,
+      sessionCtx,
+      sessionEntry: activeSessionEntry,
+      sessionKey: replySessionKey,
+      runtimePolicySessionKey,
+      opts,
+    });
+    recordSourceDeliveryObligation({
+      id: sourceDeliveryObligationId,
+      sourceChannel: sessionCtx.OriginatingChannel ?? sessionCtx.Surface ?? sessionCtx.Provider,
+      sourceSessionKey: replySessionKey,
+      sourceMessageId:
+        normalizeOptionalString(sessionCtx.MessageSidFull) ??
+        normalizeOptionalString(sessionCtx.MessageSid),
+      parentRunId: replyOperation.key,
+      missionLabel: normalizeActiveMissionSummary(commandBody),
+      currentStage: "accepted",
+      deliveryContext,
+      internalRunIds: [replyOperation.key],
+      notes: "Accepted direct user turn; source-chat-visible progress/final delivery required.",
+    });
+  };
   let activeTurnCheckpoint: ActiveWorkCheckpoint | undefined;
   const writeMaintenanceCheckpoint = async (): Promise<ActiveWorkCheckpoint | undefined> => {
     if (!hasOriginalDirectUserTurn || !replySessionKey) {
@@ -1625,6 +1667,7 @@ export async function runReplyAgent(params: {
   try {
     await typingSignals.signalRunStart();
 
+    recordSourceDeliveryAccepted();
     await writeMaintenanceCheckpoint();
 
     activeSessionEntry = await traceAgentPhase("reply.preflight_compaction", () =>
@@ -2539,6 +2582,24 @@ export async function runReplyAgent(params: {
           },
         });
       }
+      if (sourceDeliveryObligationId && hasOriginalDirectUserTurn) {
+        recordSourceDeliveryObligation({
+          id: sourceDeliveryObligationId,
+          currentStage: "final payload ready",
+          deliveryStatus: "final_pending",
+          notes:
+            "Final source-chat payload prepared by reply runner; dispatch must prove source-chat delivery.",
+        });
+        finalPayloads = finalPayloads.map((payload) =>
+          setReplyPayloadMetadata(payload, {
+            sourceDeliveryObligation: {
+              id: sourceDeliveryObligationId,
+              final: true,
+              currentStage: "final source dispatch delivered",
+            },
+          }),
+        );
+      }
     }
 
     const result = returnWithQueuedFollowupDrain(
@@ -2558,6 +2619,16 @@ export async function runReplyAgent(params: {
       );
     }
     if (replyOperation.result?.kind === "aborted") {
+      if (sourceDeliveryObligationId && hasOriginalDirectUserTurn) {
+        recordSourceDeliveryFailure({
+          id: sourceDeliveryObligationId,
+          reason: `reply operation aborted before visible source delivery: ${replyOperation.result.code}`,
+          currentStage: "aborted",
+          sourceChannel: sessionCtx.OriginatingChannel ?? sessionCtx.Surface ?? sessionCtx.Provider,
+          sourceSessionKey: replySessionKey,
+          parentRunId: replyOperation.key,
+        });
+      }
       return returnWithQueuedFollowupDrain({ text: SILENT_REPLY_TOKEN });
     }
     if (error instanceof GatewayDrainingError) {
@@ -2584,9 +2655,29 @@ export async function runReplyAgent(params: {
     });
     if (knownFailurePayload) {
       replyOperation.fail("run_failed", error);
+      if (sourceDeliveryObligationId && hasOriginalDirectUserTurn) {
+        recordSourceDeliveryFailure({
+          id: sourceDeliveryObligationId,
+          reason: `reply operation produced failure payload before normal source delivery: ${String(error)}`,
+          currentStage: "failed",
+          sourceChannel: sessionCtx.OriginatingChannel ?? sessionCtx.Surface ?? sessionCtx.Provider,
+          sourceSessionKey: replySessionKey,
+          parentRunId: replyOperation.key,
+        });
+      }
       return returnWithQueuedFollowupDrain(knownFailurePayload);
     }
     replyOperation.fail("run_failed", error);
+    if (sourceDeliveryObligationId && hasOriginalDirectUserTurn) {
+      recordSourceDeliveryFailure({
+        id: sourceDeliveryObligationId,
+        reason: `reply operation failed before visible source delivery: ${String(error)}`,
+        currentStage: "failed",
+        sourceChannel: sessionCtx.OriginatingChannel ?? sessionCtx.Surface ?? sessionCtx.Provider,
+        sourceSessionKey: replySessionKey,
+        parentRunId: replyOperation.key,
+      });
+    }
     // Keep the followup queue moving even when an unexpected exception escapes
     // the run path; the caller still receives the original error.
     returnWithQueuedFollowupDrain(undefined);

@@ -208,6 +208,16 @@ export type ReplyPayloadMetadata = {
     currentStage?: string;
     nextStage?: string;
   };
+  /**
+   * Durable source-channel delivery obligation attached to a payload that must
+   * be proven visible in the original user source chat before it can count as
+   * progress or final closeout delivery.
+   */
+  sourceDeliveryObligation?: {
+    id: string;
+    final?: boolean;
+    currentStage?: string;
+  };
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();

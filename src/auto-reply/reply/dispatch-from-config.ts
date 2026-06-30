@@ -30,6 +30,12 @@ import {
   type ModelAliasIndex,
 } from "../../agents/model-selection.js";
 import {
+  buildSourceDeliveryObligationId,
+  recordSourceDeliveryFailure,
+  recordSourceVisibleDelivery,
+  recordSourceVisibleDeliveryIfPresent,
+} from "../../agents/source-delivery-obligation.js";
+import {
   isSubagentEnvelopeSession,
   resolveSubagentCapabilityStore,
 } from "../../agents/subagent-capabilities.js";
@@ -183,6 +189,13 @@ import { resolveRunTypingPolicy } from "./typing-policy.js";
 type SourceReplyTranscriptMirror = NonNullable<
   NonNullable<ReturnType<typeof getReplyPayloadMetadata>>["sourceReplyTranscriptMirror"]
 >;
+type SourceDeliveryObligationMetadata = NonNullable<
+  NonNullable<ReturnType<typeof getReplyPayloadMetadata>>["sourceDeliveryObligation"]
+>;
+type DeliveredSourceDeliveryObligation = {
+  metadata: SourceDeliveryObligationMetadata;
+  text?: string;
+};
 
 class DispatchReplyOperationAbortedError extends Error {
   constructor() {
@@ -979,6 +992,106 @@ function captureDeliveredSourceReplyTranscriptMirror(params: {
   return () => deliveredMetadata;
 }
 
+function sourceDeliveryTextForDeliveredPayload(payload: ReplyPayload): string | undefined {
+  const sendable = resolveSendableOutboundReplyParts(payload);
+  if (sendable.text?.trim()) {
+    return sendable.text;
+  }
+  if (payload.spokenText?.trim()) {
+    return payload.spokenText;
+  }
+  if (sendable.mediaUrls.length > 0) {
+    return `[source-chat media payload delivered: ${sendable.mediaUrls.length}]`;
+  }
+  return undefined;
+}
+
+function recordDeliveredSourceDeliveryObligation(params: {
+  metadata?: SourceDeliveryObligationMetadata;
+  payload: ReplyPayload;
+  currentStage: string;
+  notes: string;
+}): void {
+  if (!params.metadata?.id) {
+    return;
+  }
+  recordSourceVisibleDelivery({
+    id: params.metadata.id,
+    text: sourceDeliveryTextForDeliveredPayload(params.payload),
+    final: params.metadata.final !== false,
+    currentStage: params.metadata.currentStage ?? params.currentStage,
+    notes: params.notes,
+  });
+}
+
+function recordFailedSourceDeliveryObligation(params: {
+  metadata?: SourceDeliveryObligationMetadata;
+  reason: string;
+  currentStage: string;
+}): void {
+  if (!params.metadata?.id) {
+    return;
+  }
+  recordSourceDeliveryFailure({
+    id: params.metadata.id,
+    reason: params.reason,
+    currentStage: params.metadata.currentStage ?? params.currentStage,
+  });
+}
+
+function captureDeliveredSourceDeliveryObligation(params: {
+  dispatcher: ReplyDispatcher;
+  metadata?: SourceDeliveryObligationMetadata;
+}): () => DeliveredSourceDeliveryObligation | undefined {
+  if (!params.metadata?.id || !params.dispatcher.appendBeforeDeliver) {
+    return () => undefined;
+  }
+  let delivered: DeliveredSourceDeliveryObligation | undefined;
+  const expectedId = params.metadata.id;
+  params.dispatcher.appendBeforeDeliver((payload, info) => {
+    if (info.kind !== "final") {
+      return payload;
+    }
+    const metadata = getReplyPayloadMetadata(payload)?.sourceDeliveryObligation;
+    if (metadata?.id === expectedId) {
+      delivered = {
+        metadata,
+        text: sourceDeliveryTextForDeliveredPayload(payload),
+      };
+    }
+    return payload;
+  });
+  return () => delivered;
+}
+
+async function recordSourceDeliveryAfterDispatcherDelivery(params: {
+  dispatcher: ReplyDispatcher;
+  before: { cancelled: number; failed: number };
+  metadata: () => DeliveredSourceDeliveryObligation | undefined;
+}): Promise<void> {
+  await params.dispatcher.waitForIdle();
+  const delivered = params.metadata();
+  if (!delivered?.metadata.id) {
+    return;
+  }
+  const after = getDispatcherFinalOutcomeCounts(params.dispatcher);
+  if (after.cancelled > params.before.cancelled || after.failed > params.before.failed) {
+    recordSourceDeliveryFailure({
+      id: delivered.metadata.id,
+      reason: "source final payload dispatcher delivery failed or was cancelled",
+      currentStage: delivered.metadata.currentStage ?? "final source dispatch failed",
+    });
+    return;
+  }
+  recordSourceVisibleDelivery({
+    id: delivered.metadata.id,
+    text: delivered.text,
+    final: delivered.metadata.final !== false,
+    currentStage: delivered.metadata.currentStage ?? "final source dispatch delivered",
+    notes: "Final payload delivered through source dispatcher.",
+  });
+}
+
 async function mirrorInternalSourceReplyAfterDispatcherDelivery(params: {
   dispatcher: ReplyDispatcher;
   before: { cancelled: number; failed: number };
@@ -1703,6 +1816,21 @@ export async function dispatchReplyFromConfig(
 
   const isRoutedReplyDelivered = (result: { ok: boolean; suppressed?: boolean }) =>
     result.ok && result.suppressed !== true;
+  const recordSourceProgressIfObligationPresent = (payload: ReplyPayload, currentStage: string) => {
+    if (!sessionKey || !params.replyOptions?.runId) {
+      return;
+    }
+    recordSourceVisibleDeliveryIfPresent({
+      id: buildSourceDeliveryObligationId({
+        sourceSessionKey: sessionKey,
+        parentRunId: params.replyOptions.runId,
+      }),
+      text: sourceDeliveryTextForDeliveredPayload(payload),
+      final: false,
+      currentStage,
+      notes: "Progress payload delivered through source dispatch.",
+    });
+  };
 
   /**
    * Helper to send a payload via route-reply (async).
@@ -1733,6 +1861,9 @@ export async function dispatchReplyFromConfig(
     });
     if (result && !result.ok) {
       logVerbose(`dispatch-from-config: route-reply failed: ${result.error ?? "unknown error"}`);
+    }
+    if (result && isRoutedReplyDelivered(result) && effectiveKind !== "final") {
+      recordSourceProgressIfObligationPresent(payload, `${effectiveKind} source route delivered`);
     }
   };
 
@@ -2297,6 +2428,7 @@ export async function dispatchReplyFromConfig(
       throwIfFinalDeliveryAborted();
       const sourceReplyTranscriptMirror =
         getReplyPayloadMetadata(payload)?.sourceReplyTranscriptMirror;
+      const sourceDeliveryObligation = getReplyPayloadMetadata(payload)?.sourceDeliveryObligation;
       const hasVisibleFinalContent = hasOutboundReplyContent(payload, { trimText: true });
       if (hasVisibleFinalContent) {
         markInboundDedupeReplayUnsafe();
@@ -2330,6 +2462,20 @@ export async function dispatchReplyFromConfig(
             metadata: sourceReplyTranscriptMirror,
             cfg,
           });
+          recordDeliveredSourceDeliveryObligation({
+            metadata: sourceDeliveryObligation,
+            payload: normalizedPayload,
+            currentStage: "final source route delivered",
+            notes: "Final payload delivered through route-reply.",
+          });
+        } else {
+          recordFailedSourceDeliveryObligation({
+            metadata: sourceDeliveryObligation,
+            reason: result.ok
+              ? "source final payload route was suppressed"
+              : `source final payload route failed: ${result.error ?? "unknown error"}`,
+            currentStage: "final source route failed",
+          });
         }
         return {
           queuedFinal: result.ok,
@@ -2343,6 +2489,10 @@ export async function dispatchReplyFromConfig(
         dispatcher,
         metadata: sourceReplyTranscriptMirror,
       });
+      const deliveredSourceDeliveryObligation = captureDeliveredSourceDeliveryObligation({
+        dispatcher,
+        metadata: sourceDeliveryObligation,
+      });
       const queuedFinal = runtimeDispatcher.sendFinalReply(normalizedPayload);
       if (queuedFinal) {
         await mirrorInternalSourceReplyAfterDispatcherDelivery({
@@ -2350,6 +2500,17 @@ export async function dispatchReplyFromConfig(
           before: finalOutcomeBefore,
           metadata: deliveredSourceReplyTranscriptMirror,
           cfg,
+        });
+        await recordSourceDeliveryAfterDispatcherDelivery({
+          dispatcher,
+          before: finalOutcomeBefore,
+          metadata: deliveredSourceDeliveryObligation,
+        });
+      } else {
+        recordFailedSourceDeliveryObligation({
+          metadata: sourceDeliveryObligation,
+          reason: "source final payload was not queued by dispatcher",
+          currentStage: "final source dispatch failed",
         });
       }
       return {
@@ -2544,7 +2705,9 @@ export async function dispatchReplyFromConfig(
         return;
       }
       markInboundDedupeReplayUnsafe();
-      runtimeDispatcher.sendToolResult(payload);
+      if (runtimeDispatcher.sendToolResult(payload)) {
+        recordSourceProgressIfObligationPresent(payload, "working source dispatch delivered");
+      }
     };
     const sendPlanUpdate = async (payload: {
       explanation?: string;
@@ -2570,7 +2733,9 @@ export async function dispatchReplyFromConfig(
         return;
       }
       markInboundDedupeReplayUnsafe();
-      runtimeDispatcher.sendToolResult(replyPayload);
+      if (runtimeDispatcher.sendToolResult(replyPayload)) {
+        recordSourceProgressIfObligationPresent(replyPayload, "plan source dispatch delivered");
+      }
     };
     const summarizeApprovalLabel = (payload: {
       status?: string;
@@ -2910,7 +3075,12 @@ export async function dispatchReplyFromConfig(
                   await sendPayloadAsync(deliveryPayload, undefined, false);
                 } else {
                   markInboundDedupeReplayUnsafe();
-                  runtimeDispatcher.sendToolResult(deliveryPayload);
+                  if (runtimeDispatcher.sendToolResult(deliveryPayload)) {
+                    recordSourceProgressIfObligationPresent(
+                      deliveryPayload,
+                      "tool source dispatch delivered",
+                    );
+                  }
                 }
               };
               return run();
@@ -3101,6 +3271,10 @@ export async function dispatchReplyFromConfig(
                   const delivered = runtimeDispatcher.sendBlockReply(normalizedPayload);
                   if (delivered) {
                     hasPendingDirectBlockReplyDelivery = true;
+                    recordSourceProgressIfObligationPresent(
+                      normalizedPayload,
+                      "block source dispatch delivered",
+                    );
                   }
                 }
               };

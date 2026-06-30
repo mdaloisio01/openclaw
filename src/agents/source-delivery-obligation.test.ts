@@ -1,0 +1,180 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  buildSourceDeliveryObligationId,
+  evaluateSourceDeliveryObligation,
+  listSourceDeliveryObligations,
+  recordSourceDeliveryFailure,
+  recordSourceDeliveryObligation,
+  recordSourceVisibleDelivery,
+  recordSourceVisibleDeliveryIfPresent,
+} from "./source-delivery-obligation.js";
+
+let markerDir: string;
+let originalMarkerDir: string | undefined;
+
+async function readRegistry() {
+  return JSON.parse(
+    await readFile(join(markerDir, "source_delivery_obligations.json"), "utf8"),
+  ) as {
+    rows: Array<Record<string, unknown>>;
+  };
+}
+
+describe("source delivery obligation", () => {
+  beforeEach(async () => {
+    markerDir = await mkdtemp(join(tmpdir(), "openclaw-source-delivery-"));
+    originalMarkerDir = process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
+    process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = markerDir;
+  });
+
+  afterEach(async () => {
+    if (originalMarkerDir === undefined) {
+      delete process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
+    } else {
+      process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = originalMarkerDir;
+    }
+    await rm(markerDir, { recursive: true, force: true });
+  });
+
+  it("creates a durable source delivery obligation for a direct user turn", async () => {
+    const id = buildSourceDeliveryObligationId({
+      sourceSessionKey: "agent:orchestrator:main",
+      parentRunId: "run-1",
+    });
+
+    recordSourceDeliveryObligation({
+      id,
+      sourceChannel: "webchat",
+      sourceSessionKey: "agent:orchestrator:main",
+      sourceMessageId: "msg-1",
+      parentRunId: "run-1",
+      missionLabel: "Fix source delivery.",
+      deliveryContext: { channel: "webchat", to: "session:dashboard" },
+    });
+
+    const registry = await readRegistry();
+    expect(registry.rows).toEqual([
+      expect.objectContaining({
+        id,
+        kind: "openclaw.source-delivery-obligation",
+        sourceChannel: "webchat",
+        sourceSessionKey: "agent:orchestrator:main",
+        sourceMessageId: "msg-1",
+        parentRunId: "run-1",
+        requiredMilestoneDelivery: true,
+        requiredFinalDelivery: true,
+        finalDeliveryDelivered: false,
+        deliveryStatus: "accepted",
+      }),
+    ]);
+  });
+
+  it("marks final source-visible delivery only for real non-NO_REPLY text", () => {
+    const id = "source:agent:orchestrator:main:run-2";
+    recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });
+
+    recordSourceVisibleDelivery({
+      id,
+      text: "STATUS: Success\nFinal body delivered.",
+      final: true,
+    });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      id,
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+    });
+    expect(row?.lastUserVisibleDeliveryAt).toEqual(expect.any(String));
+  });
+
+  it("treats NO_REPLY as a delivery failure when source-visible delivery is required", () => {
+    const id = "source:agent:orchestrator:main:run-3";
+    recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });
+
+    recordSourceVisibleDelivery({ id, text: "NO_REPLY", final: true });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      id,
+      deliveryStatus: "delivery_failed",
+      userFacingDeliveryFailed: true,
+      failureReason: "source-visible delivery was empty or NO_REPLY",
+    });
+  });
+
+  it("updates progress only when the source obligation already exists", () => {
+    recordSourceVisibleDeliveryIfPresent({
+      id: "source:missing:run",
+      text: "hidden progress should not create an obligation",
+      final: false,
+    });
+    expect(listSourceDeliveryObligations({ dir: markerDir })).toEqual([]);
+
+    const id = "source:agent:orchestrator:main:run-progress";
+    recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });
+    recordSourceVisibleDeliveryIfPresent({
+      id,
+      text: "STATUS: In Progress",
+      final: false,
+      currentStage: "plan source dispatch delivered",
+    });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      id,
+      deliveryStatus: "progress_delivered",
+      finalDeliveryDelivered: false,
+      visibleDeliveryCount: 1,
+      currentStage: "plan source dispatch delivered",
+    });
+  });
+
+  it("evaluates stale direct turns with no visible source-chat progress as not clean", () => {
+    const acceptedAt = "2026-06-30T01:02:00.000Z";
+    const row = recordSourceDeliveryObligation({
+      id: "source:agent:orchestrator:main:run-4",
+      sourceChannel: "webchat",
+      acceptedAt,
+    });
+
+    expect(row).toBeTruthy();
+    expect(
+      evaluateSourceDeliveryObligation(row!, {
+        nowMs: Date.parse("2026-06-30T01:20:00.000Z"),
+        staleMs: 10 * 60 * 1000,
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "source_delivery_stale",
+    });
+  });
+
+  it("records suspended or unroutable subagent delivery as a failed source obligation", () => {
+    const id = "source:agent:orchestrator:main:subagent-run";
+    recordSourceDeliveryFailure({
+      id,
+      reason: "announce deferred or direct delivery failed",
+      sourceChannel: "webchat",
+      sourceSessionKey: "agent:orchestrator:main",
+      parentRunId: "subagent-run",
+      deliveryContext: { channel: "webchat" },
+    });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      id,
+      deliveryStatus: "delivery_failed",
+      userFacingDeliveryFailed: true,
+      failureReason: "announce deferred or direct delivery failed",
+      deliveryContext: { channel: "webchat" },
+    });
+    expect(evaluateSourceDeliveryObligation(row!)).toMatchObject({
+      ok: false,
+      reason: "source_delivery_failed",
+    });
+  });
+});
