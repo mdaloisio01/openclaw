@@ -47,11 +47,6 @@ import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/r
 import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
 import type { AgentInternalEvent } from "./internal-events.js";
 import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
-import {
-  buildSourceDeliveryObligationId,
-  recordSourceDeliveryFailure,
-  recordSourceVisibleDelivery,
-} from "./source-delivery-obligation.js";
 import { buildExplicitStopExplanation } from "./stop-contract.js";
 import {
   callGateway,
@@ -1697,7 +1692,7 @@ export async function deliverSubagentAnnouncement(params: {
   directIdempotencyKey: string;
   signal?: AbortSignal;
 }): Promise<SubagentAnnounceDeliveryResult> {
-  const result = await runSubagentAnnounceDispatch({
+  return await runSubagentAnnounceDispatch({
     expectsCompletionMessage: params.expectsCompletionMessage,
     signal: params.signal,
     steer: async () =>
@@ -1728,42 +1723,6 @@ export async function deliverSubagentAnnouncement(params: {
         bestEffortDeliver: params.bestEffortDeliver,
       }),
   });
-  if (params.expectsCompletionMessage) {
-    const obligationId = buildSourceDeliveryObligationId({
-      sourceSessionKey: params.targetRequesterSessionKey,
-      parentRunId: params.directIdempotencyKey,
-    });
-    const sourceChannel =
-      normalizeDeliveryContext(params.requesterOrigin)?.channel ??
-      normalizeDeliveryContext(params.requesterSessionOrigin)?.channel ??
-      params.sourceChannel;
-    if (result.delivered) {
-      recordSourceVisibleDelivery({
-        id: obligationId,
-        text: params.triggerMessage,
-        final: true,
-        currentStage: "subagent completion delivered",
-        notes: `Subagent completion delivered through ${result.path}.`,
-      });
-    } else {
-      recordSourceDeliveryFailure({
-        id: obligationId,
-        reason:
-          result.error ??
-          result.reason ??
-          "subagent completion delivery did not reach a source-chat-visible route",
-        currentStage: "subagent completion delivery failed",
-        sourceChannel,
-        sourceSessionKey: params.targetRequesterSessionKey,
-        parentRunId: params.directIdempotencyKey,
-        deliveryContext:
-          normalizeDeliveryContext(params.requesterOrigin) ??
-          normalizeDeliveryContext(params.requesterSessionOrigin),
-        notes: `Subagent completion delivery path=${result.path}; delivered=false.`,
-      });
-    }
-  }
-  return result;
 }
 
 export const testing = {
