@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
+import { performance } from "node:perf_hooks";
 import { MAX_IMAGE_BYTES } from "@openclaw/media-core/constants";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -762,6 +763,10 @@ function collectAttemptExplicitToolAllowlistSources(params: {
   ]);
 }
 
+function formatEmbeddedRunPerfMs(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(1) : "n/a";
+}
+
 export async function runEmbeddedAttempt(
   params: EmbeddedRunAttemptParams,
 ): Promise<EmbeddedRunAttemptResult> {
@@ -1321,6 +1326,7 @@ export async function runEmbeddedAttempt(
     }
     bootstrapRouting ??= await resolveBootstrapRouting(preloadedBootstrapFiles);
     const bootstrapMode = bootstrapRouting.bootstrapMode;
+    const bootstrapContextStarted = performance.now();
     const {
       bootstrapFiles: hookAdjustedBootstrapFiles,
       contextFiles: resolvedContextFiles,
@@ -1379,6 +1385,29 @@ export async function runEmbeddedAttempt(
       bootstrapMaxChars,
       bootstrapTotalMaxChars,
     });
+    const bootstrapContextDurationMs = performance.now() - bootstrapContextStarted;
+    if (bootstrapContextDurationMs >= 250 || bootstrapAnalysis.hasTruncation) {
+      const fileSummary = bootstrapAnalysis.files
+        .map(
+          (file) =>
+            `${file.name}:raw=${file.rawChars}:injected=${file.injectedChars}:truncated=${file.truncated}`,
+        )
+        .join(",");
+      const message =
+        `[perf:bootstrap-injection] runId=${params.runId} sessionId=${params.sessionId} ` +
+        `agentId=${sessionAgentId ?? "default"} durationMs=${formatEmbeddedRunPerfMs(
+          bootstrapContextDurationMs,
+        )} rawChars=${bootstrapAnalysis.totals.rawChars} ` +
+        `injectedChars=${bootstrapAnalysis.totals.injectedChars} ` +
+        `truncatedFiles=${bootstrapAnalysis.truncatedFiles.length} ` +
+        `bootstrapMaxChars=${bootstrapMaxChars} bootstrapTotalMaxChars=${bootstrapTotalMaxChars} ` +
+        `files="${fileSummary}"`;
+      if (bootstrapContextDurationMs >= 1_000) {
+        log.warn(message);
+      } else {
+        log.info(message);
+      }
+    }
     const bootstrapPromptWarningMode = resolveBootstrapPromptTruncationWarningMode(params.config);
     const bootstrapPromptWarning = buildBootstrapPromptWarning({
       analysis: bootstrapAnalysis,

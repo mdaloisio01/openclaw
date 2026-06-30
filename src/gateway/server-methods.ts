@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { ErrorCodes, errorShape } from "../../packages/gateway-protocol/src/index.js";
 import {
   gatewayStartupUnavailableDetails,
@@ -17,6 +18,13 @@ import {
   type GatewayMethodRegistry,
 } from "./methods/registry.js";
 import { isRoleAuthorizedForMethod, parseGatewayRole } from "./role-policy.js";
+import {
+  formatGatewayPerfCpuUsage,
+  formatGatewayPerfMs,
+  GATEWAY_PERF_INFO_THRESHOLD_MS,
+  GATEWAY_PERF_WARN_THRESHOLD_MS,
+  safeGatewayPerfRequestId,
+} from "./server-methods/perf-logging.js";
 import { restartHandlers } from "./server-methods/restart.js";
 import type {
   GatewayRequestHandler,
@@ -24,6 +32,34 @@ import type {
   GatewayRequestHandlers,
   GatewayRequestOptions,
 } from "./server-methods/types.js";
+
+function logGatewayRequestTiming(params: {
+  context: GatewayRequestOptions["context"];
+  method: string;
+  requestId: string;
+  clientName?: string;
+  durationMs: number;
+  cpuUsage: string;
+  ok?: boolean;
+  responded: boolean;
+  errorCode?: string | number;
+}): void {
+  if (params.durationMs < GATEWAY_PERF_INFO_THRESHOLD_MS) {
+    return;
+  }
+  const threshold =
+    params.durationMs >= GATEWAY_PERF_WARN_THRESHOLD_MS ? "slow_handler_warn" : "slow_handler_info";
+  const message =
+    `[perf:gateway-rpc] method=${params.method} requestId=${params.requestId} ` +
+    `durationMs=${formatGatewayPerfMs(params.durationMs)} threshold=${threshold} responded=${params.responded} ` +
+    `ok=${params.ok ?? "unknown"} errorCode=${params.errorCode ?? "none"} ` +
+    `client=${params.clientName ?? "unknown"} ${params.cpuUsage}`;
+  if (params.durationMs >= GATEWAY_PERF_WARN_THRESHOLD_MS) {
+    params.context.logGateway.warn(message);
+  } else {
+    params.context.logGateway.info(message);
+  }
+}
 
 function lazyHandlerModule<T>(
   loadModule: () => Promise<T>,
@@ -623,17 +659,43 @@ export async function handleGatewayRequest(
   opts: GatewayRequestOptions & { extraHandlers?: GatewayRequestHandlers },
 ): Promise<void> {
   const { req, respond, client, isWebchatConnect, context } = opts;
+  const started = performance.now();
+  const cpuStarted = process.cpuUsage();
+  const requestId = safeGatewayPerfRequestId(req.id);
+  let responded = false;
+  let responseOk: boolean | undefined;
+  let responseErrorCode: string | number | undefined;
+  const timedRespond: typeof respond = (ok, payload, error, meta) => {
+    responded = true;
+    responseOk = ok;
+    responseErrorCode = error?.code;
+    respond(ok, payload, error, meta);
+  };
+  const finishTiming = () => {
+    logGatewayRequestTiming({
+      context,
+      method: req.method,
+      requestId,
+      clientName: client?.connect?.client?.id,
+      durationMs: performance.now() - started,
+      cpuUsage: formatGatewayPerfCpuUsage(cpuStarted),
+      ok: responseOk,
+      responded,
+      errorCode: responseErrorCode,
+    });
+  };
   const methodRegistry =
     opts.methodRegistry ?? createRequestGatewayMethodRegistry(opts.extraHandlers);
   const authError = authorizeGatewayMethod(req.method, client, req.params);
   if (authError) {
-    respond(false, undefined, authError);
+    timedRespond(false, undefined, authError);
+    finishTiming();
     return;
   }
   if (context.unavailableGatewayMethods?.has(req.method)) {
     // During startup, methods can be listed before their runtime is ready. Return the protocol
     // retry shape so clients can back off without treating startup as a permanent unknown method.
-    respond(
+    timedRespond(
       false,
       undefined,
       errorShape(ErrorCodes.UNAVAILABLE, `${req.method} unavailable during gateway startup`, {
@@ -642,6 +704,7 @@ export async function handleGatewayRequest(
         details: { ...gatewayStartupUnavailableDetails(), method: req.method },
       }),
     );
+    finishTiming();
     return;
   }
   if (methodRegistry.isControlPlaneWrite(req.method)) {
@@ -653,7 +716,7 @@ export async function handleGatewayRequest(
       context.logGateway.warn(
         `control-plane write rate-limited method=${req.method} ${formatControlPlaneActor(actor)} retryAfterMs=${budget.retryAfterMs} key=${budget.key}`,
       );
-      respond(
+      timedRespond(
         false,
         undefined,
         errorShape(
@@ -669,16 +732,18 @@ export async function handleGatewayRequest(
           },
         ),
       );
+      finishTiming();
       return;
     }
   }
   const handler = methodRegistry.getHandler(req.method) as GatewayRequestHandler | undefined;
   if (!handler) {
-    respond(
+    timedRespond(
       false,
       undefined,
       errorShape(ErrorCodes.INVALID_REQUEST, `unknown method: ${req.method}`),
     );
+    finishTiming();
     return;
   }
   const invokeHandler = () =>
@@ -687,12 +752,19 @@ export async function handleGatewayRequest(
       params: (req.params ?? {}) as Record<string, unknown>,
       client,
       isWebchatConnect,
-      respond,
+      respond: timedRespond,
       context,
     });
   // All handlers run inside a request scope so that plugin runtime
   // subagent methods (e.g. context engine tools spawning sub-agents
   // during tool execution) can dispatch back into the gateway.
   // The scope also carries caller identity into plugin-owned gateway methods.
-  await withPluginRuntimeGatewayRequestScope({ context, client, isWebchatConnect }, invokeHandler);
+  try {
+    await withPluginRuntimeGatewayRequestScope(
+      { context, client, isWebchatConnect },
+      invokeHandler,
+    );
+  } finally {
+    finishTiming();
+  }
 }

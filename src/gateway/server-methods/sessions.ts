@@ -127,6 +127,11 @@ import { resolveSessionKeyFromResolveParams } from "../sessions-resolve.js";
 import { setGatewayDedupeEntry } from "./agent-wait-dedupe.js";
 import { chatHandlers } from "./chat.js";
 import { loadOptionalServerMethodModelCatalog } from "./optional-model-catalog.js";
+import {
+  createGatewayPerfStageTimer,
+  formatGatewayPerfCpuUsage,
+  logGatewayPerfSummary,
+} from "./perf-logging.js";
 import { hasTrackedActiveSessionRun } from "./session-active-runs.js";
 import type {
   GatewayClient,
@@ -1189,9 +1194,15 @@ export const sessionsHandlers: GatewayRequestHandlers = {
     if (!assertValidParams(params, validateSessionsListParams, "sessions.list", respond)) {
       return;
     }
+    const perf = createGatewayPerfStageTimer();
+    const cpuStarted = process.cpuUsage();
     const p = params;
     const cfg = context.getRuntimeConfig();
     const configuredAgentsOnly = p.configuredAgentsOnly === true;
+    let loadedStorePath = "";
+    let loadedStoreEntries = 0;
+    let listedStoreEntries = 0;
+    let storeBytes: number | undefined;
     const payload = await measureDiagnosticsTimelineSpan(
       "gateway.sessions.list",
       async () => {
@@ -1210,9 +1221,19 @@ export const sessionsHandlers: GatewayRequestHandlers = {
             },
           },
         );
+        perf.mark("store_load");
+        loadedStorePath = storePath;
+        loadedStoreEntries = Object.keys(store).length;
+        try {
+          storeBytes = fs.statSync(storePath).size;
+        } catch {
+          storeBytes = undefined;
+        }
         const listStore = configuredAgentsOnly
           ? filterSessionStoreToConfiguredAgents(cfg, store)
           : store;
+        listedStoreEntries = Object.keys(listStore).length;
+        perf.mark("store_filter");
         const modelCatalog = await measureDiagnosticsTimelineSpan(
           "gateway.sessions.list.model_catalog",
           () => loadOptionalServerMethodModelCatalog(context, "sessions.list"),
@@ -1221,6 +1242,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
             phase: "sessions.list",
           },
         );
+        perf.mark("model_catalog");
         const result = await measureDiagnosticsTimelineSpan(
           "gateway.sessions.list.rows",
           () =>
@@ -1239,6 +1261,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
             },
           },
         );
+        perf.mark("rows");
         const sessions = measureDiagnosticsTimelineSpanSync(
           "gateway.sessions.list.active_run_flags",
           () => {
@@ -1262,6 +1285,7 @@ export const sessionsHandlers: GatewayRequestHandlers = {
             },
           },
         );
+        perf.mark("active_run_flags");
         return {
           ...result,
           sessions,
@@ -1276,6 +1300,18 @@ export const sessionsHandlers: GatewayRequestHandlers = {
         },
       },
     );
+    logGatewayPerfSummary({
+      logger: context.logGateway,
+      surface: "sessions.list",
+      durationMs: perf.totalMs(),
+      message:
+        `agentId=${p.agentId ?? "none"} configuredAgentsOnly=${configuredAgentsOnly} ` +
+        `storePath=${JSON.stringify(loadedStorePath)} storeBytes=${storeBytes ?? "unknown"} ` +
+        `storeEntries=${loadedStoreEntries} listedStoreEntries=${listedStoreEntries} ` +
+        `returnedSessions=${payload.sessions.length} totalCount=${payload.totalCount} ` +
+        `limitApplied=${payload.limitApplied ?? "none"} hasMore=${payload.hasMore} ` +
+        `${formatGatewayPerfCpuUsage(cpuStarted)} stages="${perf.summary()}"`,
+    });
     respond(true, payload, undefined);
   },
   "sessions.cleanup": async ({ params, respond, context }) => {

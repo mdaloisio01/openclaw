@@ -5,6 +5,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { sanitizePendingFinalDeliveryText } from "../auto-reply/reply/pending-final-delivery.js";
 import { resolveStateDir } from "../config/paths.js";
@@ -47,6 +48,10 @@ const RECOVERY_STATUS_FILENAME = "main-session-restart-recovery-status.json";
 const UNRESUMABLE_SESSION_NOTICE =
   "I was interrupted by a gateway restart and couldn't safely resume the previous turn. " +
   "Please send that last request again and I'll pick it up cleanly.";
+
+function formatRestartRecoveryPerfMs(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(1) : "n/a";
+}
 
 export type MainSessionRestartRecoveryStatus =
   | "marked"
@@ -769,9 +774,16 @@ async function recoverStore(params: {
   stateDir?: string;
 }): Promise<{ recovered: number; failed: number; skipped: number }> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
+  const started = performance.now();
   log.info(`scanning restart recovery store: ${params.storePath}`);
   let store: Record<string, SessionEntry>;
+  let storeBytes: number | undefined;
   try {
+    try {
+      storeBytes = fs.statSync(params.storePath).size;
+    } catch {
+      storeBytes = undefined;
+    }
     store = loadSessionStore(params.storePath);
   } catch (err) {
     log.warn(`failed to load session store ${params.storePath}: ${String(err)}`);
@@ -779,12 +791,13 @@ async function recoverStore(params: {
     return result;
   }
 
-  for (const [sessionKey, entry] of Object.entries(store).toSorted(([a], [b]) =>
-    a.localeCompare(b),
-  )) {
+  const entries = Object.entries(store).toSorted(([a], [b]) => a.localeCompare(b));
+  let candidateRows = 0;
+  for (const [sessionKey, entry] of entries) {
     if (!entry || entry.status !== "running" || entry.abortedLastRun !== true) {
       continue;
     }
+    candidateRows++;
     if (shouldSkipMainRecovery(entry, sessionKey)) {
       log.info(`skipped interrupted main session recovery: ${sessionKey} (non-main session)`);
       result.skipped++;
@@ -971,6 +984,19 @@ async function recoverStore(params: {
     }
   }
 
+  const durationMs = performance.now() - started;
+  if (durationMs >= 250 || candidateRows > 0) {
+    const message =
+      `[perf:main-session-restart-recovery] storePath=${JSON.stringify(params.storePath)} ` +
+      `durationMs=${formatRestartRecoveryPerfMs(durationMs)} storeBytes=${storeBytes ?? "unknown"} ` +
+      `storeEntries=${entries.length} candidateRows=${candidateRows} ` +
+      `recovered=${result.recovered} failed=${result.failed} skipped=${result.skipped}`;
+    if (durationMs >= 1_000) {
+      log.warn(message);
+    } else {
+      log.info(message);
+    }
+  }
   return result;
 }
 
@@ -978,6 +1004,7 @@ async function resolveRestartRecoveryStorePaths(params: {
   cfg?: OpenClawConfig;
   stateDir?: string;
 }): Promise<string[]> {
+  const started = performance.now();
   const storePaths = new Set<string>();
   const stateDir = params.stateDir ?? resolveStateDir(process.env);
   for (const sessionsDir of await resolveAgentSessionDirs(stateDir)) {
@@ -989,7 +1016,16 @@ async function resolveRestartRecoveryStorePaths(params: {
       storePaths.add(path.resolve(target.storePath));
     }
   }
-  return [...storePaths].toSorted((a, b) => a.localeCompare(b));
+  const resolved = [...storePaths].toSorted((a, b) => a.localeCompare(b));
+  const durationMs = performance.now() - started;
+  if (durationMs >= 250 || resolved.length > 0) {
+    log.info(
+      `[perf:main-session-restart-recovery] phase=resolve_store_paths durationMs=${formatRestartRecoveryPerfMs(
+        durationMs,
+      )} storePathCount=${resolved.length}`,
+    );
+  }
+  return resolved;
 }
 
 export async function recoverRestartAbortedMainSessions(
@@ -999,6 +1035,7 @@ export async function recoverRestartAbortedMainSessions(
     resumedSessionKeys?: Set<string>;
   } = {},
 ): Promise<{ recovered: number; failed: number; skipped: number }> {
+  const started = performance.now();
   const result = { recovered: 0, failed: 0, skipped: 0 };
   const resumedSessionKeys = params.resumedSessionKeys ?? new Set<string>();
   const checkpoints = await listActiveWorkCheckpoints({
@@ -1022,6 +1059,19 @@ export async function recoverRestartAbortedMainSessions(
     log.info(
       `main-session restart recovery complete: recovered=${result.recovered} failed=${result.failed} skipped=${result.skipped}`,
     );
+  }
+  const durationMs = performance.now() - started;
+  if (durationMs >= 250 || result.recovered > 0 || result.failed > 0 || result.skipped > 0) {
+    const message =
+      `[perf:main-session-restart-recovery] phase=complete durationMs=${formatRestartRecoveryPerfMs(
+        durationMs,
+      )} recovered=${result.recovered} failed=${result.failed} skipped=${result.skipped} ` +
+      `checkpoints=${checkpoints.length}`;
+    if (durationMs >= 1_000) {
+      log.warn(message);
+    } else {
+      log.info(message);
+    }
   }
   return result;
 }

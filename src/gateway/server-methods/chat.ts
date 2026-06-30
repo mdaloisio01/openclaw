@@ -162,6 +162,11 @@ import {
   buildWebchatAudioContentBlocksFromReplyPayloads,
 } from "./chat-webchat-media.js";
 import { loadOptionalServerMethodModelCatalog } from "./optional-model-catalog.js";
+import {
+  createGatewayPerfStageTimer,
+  formatGatewayPerfCpuUsage,
+  logGatewayPerfSummary,
+} from "./perf-logging.js";
 import { hasTrackedActiveSessionRun } from "./session-active-runs.js";
 import type {
   GatewayRequestContext,
@@ -2441,6 +2446,8 @@ async function handleChatHistoryRequest({
     limit?: number;
     maxChars?: number;
   };
+  const perf = createGatewayPerfStageTimer();
+  const cpuStarted = process.cpuUsage();
   const agentIdOverride = normalizeOptionalText((params as { agentId?: string }).agentId);
   const requestedAgentId = resolveRequestedChatAgentId({
     cfg: (context as { getRuntimeConfig?: () => OpenClawConfig }).getRuntimeConfig?.(),
@@ -2452,6 +2459,7 @@ async function handleChatHistoryRequest({
     sessionKey,
     sessionLoadOptions,
   );
+  perf.mark("session_load");
   const selectedAgent = validateChatSelectedAgent({
     cfg,
     requestedSessionKey: sessionKey,
@@ -2485,6 +2493,7 @@ async function handleChatHistoryRequest({
           maxBytes: Math.max(maxHistoryBytes * 2, 1024 * 1024),
         })
       : [];
+  perf.mark("history_read");
   const overreadContextMessage =
     localMessages.length > rawHistoryWindow.maxMessages ? localMessages[0] : undefined;
   const localMessagesWithBoundaryFilter = dropLocalHistoryOverreadContextMessage(
@@ -2514,6 +2523,7 @@ async function handleChatHistoryRequest({
       maxMessages: max,
     }),
   );
+  perf.mark("projection");
   const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);
   const replaced = replaceOversizedChatHistoryMessages({
     messages: normalized,
@@ -2526,6 +2536,7 @@ async function handleChatHistoryRequest({
   });
   const capped = capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
   const bounded = enforceChatHistoryFinalBudget({ messages: capped, maxBytes: maxHistoryBytes });
+  perf.mark("budget");
   const placeholderCount = replaced.replacedCount + bounded.placeholderCount;
   if (placeholderCount > 0) {
     chatHistoryPlaceholderEmitCount += placeholderCount;
@@ -2549,6 +2560,7 @@ async function handleChatHistoryRequest({
       phase: method,
     },
   );
+  perf.mark("model_catalog");
   const sessionInfo = buildGatewaySessionInfo({
     cfg,
     storePath,
@@ -2600,6 +2612,20 @@ async function handleChatHistoryRequest({
     ...(boundedInFlightRun ? { inFlightRun: boundedInFlightRun } : {}),
     ...(includeAgentsList ? { agentsList: listAgentsForGateway(cfg, modelCatalog) } : {}),
   };
+  perf.mark("response_build");
+  logGatewayPerfSummary({
+    logger: context.logGateway,
+    surface: method,
+    durationMs: perf.totalMs(),
+    message:
+      `sessionKey=${JSON.stringify(sessionKey)} canonicalKey=${JSON.stringify(canonicalKey)} ` +
+      `agentId=${selectedAgent.agentId ?? "default"} requestedLimit=${requested} max=${max} ` +
+      `localMessages=${localMessages.length} projectedMessages=${normalized.length} ` +
+      `returnedMessages=${bounded.messages.length} placeholders=${placeholderCount} ` +
+      `storeEntries=${Object.keys(store).length} contextTokens=${sessionInfo.contextTokens ?? "unknown"} ` +
+      `totalTokens=${sessionInfo.totalTokens ?? "unknown"} ${formatGatewayPerfCpuUsage(cpuStarted)} ` +
+      `stages="${perf.summary()}"`,
+  });
   respond(true, payload);
 }
 
