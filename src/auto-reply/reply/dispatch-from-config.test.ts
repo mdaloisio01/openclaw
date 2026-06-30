@@ -9165,11 +9165,8 @@ describe("sendPolicy deny — suppress delivery, not processing (#53328)", () =>
     expect(firstFinalReplyPayload(dispatcher)?.text).toBe("visible direct reply");
   });
 
-  it("emits a delivery-contract failure when Codex message-tool-only final text is private", async () => {
+  it("keeps Codex direct source delivery message-tool-only when config is unset", async () => {
     setNoAbort();
-    const sourceDeliveryDir = mkdtempSync(join(tmpdir(), "openclaw-source-delivery-"));
-    const previousSourceDeliveryDir = process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
-    process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = sourceDeliveryDir;
     registerAgentHarness({
       id: "codex",
       label: "Codex",
@@ -9177,61 +9174,32 @@ describe("sendPolicy deny — suppress delivery, not processing (#53328)", () =>
       supports: () => ({ supported: true, priority: 100 }),
       runAttempt: vi.fn(async () => ({}) as never),
     });
-    try {
-      sessionStoreMocks.currentEntry = {
-        sessionId: "s1",
-        updatedAt: 0,
-        agentHarnessId: "codex",
-        sendPolicy: "allow",
-      };
-      const dispatcher = createDispatcher();
-      const sourceTurnId = "source:agent:main:main:msg-private-final";
-      const replyResolver = vi.fn(async (_ctx: MsgContext, opts?: GetReplyOptions) => {
-        expect(opts?.sourceReplyDeliveryMode).toBe("message_tool_only");
-        return { text: "SECRET_PRIVATE_BODY" } satisfies ReplyPayload;
-      });
+    sessionStoreMocks.currentEntry = {
+      sessionId: "s1",
+      updatedAt: 0,
+      agentHarnessId: "codex",
+      sendPolicy: "allow",
+    };
+    const dispatcher = createDispatcher();
+    const replyResolver = vi.fn(async (_ctx: MsgContext, opts?: GetReplyOptions) => {
+      expect(opts?.sourceReplyDeliveryMode).toBe("message_tool_only");
+      return { text: "private final reply" } satisfies ReplyPayload;
+    });
 
-      const result = await dispatchReplyFromConfig({
-        ctx: buildTestCtx({
-          ChatType: "direct",
-          CommandSource: undefined,
-          SessionKey: "agent:main:main",
-        }),
-        cfg: emptyConfig,
-        dispatcher,
-        replyResolver,
-        replyOptions: {
-          sourceTurnId,
-        },
-      });
+    const result = await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        ChatType: "direct",
+        CommandSource: undefined,
+        SessionKey: "agent:main:main",
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyResolver,
+    });
 
-      expect(replyResolver).toHaveBeenCalledTimes(1);
-      expect(result.queuedFinal).toBe(true);
-      const delivered = firstFinalReplyPayload(dispatcher);
-      expect(delivered?.text).toContain("Delivery failed:");
-      expect(delivered?.text).not.toContain("SECRET_PRIVATE_BODY");
-      const parsed = JSON.parse(
-        readFileSync(join(sourceDeliveryDir, "source_delivery_obligations.json"), "utf8"),
-      ) as { rows?: Array<Record<string, unknown>> };
-      expect(parsed.rows).toEqual([
-        expect.objectContaining({
-          id: sourceTurnId,
-          deliveryStatus: "delivery_failed",
-          sourceTurnState: "delivery_failed",
-          finalDeliveryState: "delivery_failed",
-          recoveryState: "recovery_pending",
-          userFacingDeliveryFailed: true,
-          visibleDeliveryCount: 1,
-        }),
-      ]);
-    } finally {
-      if (previousSourceDeliveryDir === undefined) {
-        delete process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
-      } else {
-        process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = previousSourceDeliveryDir;
-      }
-      rmSync(sourceDeliveryDir, { recursive: true, force: true });
-    }
+    expect(replyResolver).toHaveBeenCalledTimes(1);
+    expect(result.queuedFinal).toBe(false);
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
   });
 
   it("uses Codex direct source delivery defaults before a session entry exists", async () => {
