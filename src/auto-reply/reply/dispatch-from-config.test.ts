@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { clearAgentHarnesses, registerAgentHarness } from "../../agents/harness/registry.js";
 import type { ChannelMessagingAdapter } from "../../channels/plugins/types.core.js";
@@ -8756,6 +8759,60 @@ describe("sendPolicy deny — suppress delivery, not processing (#53328)", () =>
       updateMode: "inline",
       config: emptyConfig,
     });
+  });
+
+  it("records final source delivery from replyOptions sourceTurnId when payload metadata is missing", async () => {
+    setNoAbort();
+    const sourceDeliveryDir = mkdtempSync(join(tmpdir(), "openclaw-source-delivery-"));
+    const previousSourceDeliveryDir = process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
+    process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = sourceDeliveryDir;
+    try {
+      sessionStoreMocks.currentEntry = {
+        sessionId: "s1",
+        updatedAt: 0,
+        sendPolicy: "allow",
+      };
+      const dispatcher = createDispatcher();
+      const sourceTurnId = "source:agent:main:source-convo:msg-fallback";
+      const replyResolver = vi.fn(async () => ({ text: "visible final" }) satisfies ReplyPayload);
+
+      const result = await dispatchReplyFromConfig({
+        ctx: buildTestCtx({
+          Provider: "webchat",
+          Surface: "webchat",
+          SessionKey: "agent:main:source-convo",
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver,
+        replyOptions: {
+          sourceTurnId,
+        },
+      });
+
+      expect(result.queuedFinal).toBe(true);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "visible final" });
+      const parsed = JSON.parse(
+        readFileSync(join(sourceDeliveryDir, "source_delivery_obligations.json"), "utf8"),
+      ) as { rows?: Array<Record<string, unknown>> };
+      expect(parsed.rows).toEqual([
+        expect.objectContaining({
+          id: sourceTurnId,
+          deliveryStatus: "final_delivered",
+          sourceTurnState: "final_delivered",
+          finalDeliveryState: "final_delivered",
+          finalDeliveryDelivered: true,
+          visibleDeliveryCount: 1,
+        }),
+      ]);
+    } finally {
+      if (previousSourceDeliveryDir === undefined) {
+        delete process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
+      } else {
+        process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = previousSourceDeliveryDir;
+      }
+      rmSync(sourceDeliveryDir, { recursive: true, force: true });
+    }
   });
 
   it("mirrors post-hook internal source reply payloads into the active transcript", async () => {

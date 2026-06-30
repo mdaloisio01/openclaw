@@ -1039,6 +1039,23 @@ function recordFailedSourceDeliveryObligation(params: {
   });
 }
 
+function fallbackSourceDeliveryObligationMetadata(params: {
+  sourceTurnId?: string;
+  final?: boolean;
+  currentStage?: string;
+}): SourceDeliveryObligationMetadata | undefined {
+  const id = normalizeOptionalString(params.sourceTurnId);
+  if (!id) {
+    return undefined;
+  }
+  return {
+    id,
+    sourceTurnId: id,
+    final: params.final,
+    currentStage: params.currentStage,
+  };
+}
+
 function captureDeliveredSourceDeliveryObligation(params: {
   dispatcher: ReplyDispatcher;
   metadata?: SourceDeliveryObligationMetadata;
@@ -1053,9 +1070,9 @@ function captureDeliveredSourceDeliveryObligation(params: {
       return payload;
     }
     const metadata = getReplyPayloadMetadata(payload)?.sourceDeliveryObligation;
-    if (metadata?.id === expectedId) {
+    if (metadata?.id === expectedId || metadata === undefined) {
       delivered = {
-        metadata,
+        metadata: metadata ?? params.metadata!,
         text: sourceDeliveryTextForDeliveredPayload(payload),
       };
     }
@@ -2435,7 +2452,13 @@ export async function dispatchReplyFromConfig(
       throwIfFinalDeliveryAborted();
       const sourceReplyTranscriptMirror =
         getReplyPayloadMetadata(payload)?.sourceReplyTranscriptMirror;
-      const sourceDeliveryObligation = getReplyPayloadMetadata(payload)?.sourceDeliveryObligation;
+      const sourceDeliveryObligation =
+        getReplyPayloadMetadata(payload)?.sourceDeliveryObligation ??
+        fallbackSourceDeliveryObligationMetadata({
+          sourceTurnId: params.replyOptions?.sourceTurnId,
+          final: true,
+          currentStage: "final source dispatch delivered",
+        });
       const hasVisibleFinalContent = hasOutboundReplyContent(payload, { trimText: true });
       if (hasVisibleFinalContent) {
         markInboundDedupeReplayUnsafe();
