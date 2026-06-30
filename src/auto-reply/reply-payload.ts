@@ -215,7 +215,6 @@ export type ReplyPayloadMetadata = {
    */
   sourceDeliveryObligation?: {
     id: string;
-    sourceTurnId?: string;
     final?: boolean;
     currentStage?: string;
   };

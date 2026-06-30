@@ -165,7 +165,6 @@ export type RunEmbeddedAgentParams = {
    */
   runTimeoutOverrideMs?: number;
   runId: string;
-  sourceTurnId?: string;
   abortSignal?: AbortSignal;
   onExecutionStarted?: () => void;
   onExecutionPhase?: (info: {

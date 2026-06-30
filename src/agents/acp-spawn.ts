@@ -161,7 +161,6 @@ function toGatewayImageAttachments(
 
 export type SpawnAcpContext = {
   agentSessionKey?: string;
-  sourceTurnId?: string;
   agentChannel?: string;
   agentAccountId?: string;
   agentTo?: string;

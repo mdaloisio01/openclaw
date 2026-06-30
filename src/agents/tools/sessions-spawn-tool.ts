@@ -257,7 +257,6 @@ export function createSessionsSpawnTool(
     config?: OpenClawConfig;
     /** Explicit agent ID override for cron/hook sessions where session key parsing may not work. */
     requesterAgentIdOverride?: string;
-    sourceTurnId?: string;
   } & SpawnedToolContext,
 ): AnyAgentTool {
   const acpAvailable = isAcpRuntimeSpawnAvailable({
@@ -390,7 +389,6 @@ export function createSessionsSpawnTool(
           },
           {
             agentSessionKey: opts?.agentSessionKey,
-            sourceTurnId: opts?.sourceTurnId,
             agentChannel: opts?.agentChannel,
             agentAccountId: opts?.agentAccountId,
             agentTo: opts?.agentTo,
@@ -434,7 +432,6 @@ export function createSessionsSpawnTool(
           try {
             registerSubagentRun({
               runId: childRunId,
-              sourceTurnId: opts?.sourceTurnId,
               childSessionKey,
               controllerSessionKey: ownership.controllerSessionKey,
               requesterSessionKey: ownership.completionRequesterSessionKey,
@@ -490,7 +487,6 @@ export function createSessionsSpawnTool(
         {
           agentSessionKey: opts?.agentSessionKey,
           completionOwnerKey: opts?.completionOwnerKey,
-          sourceTurnId: opts?.sourceTurnId,
           agentChannel: opts?.agentChannel,
           agentAccountId: opts?.agentAccountId,
           agentTo: opts?.agentTo,

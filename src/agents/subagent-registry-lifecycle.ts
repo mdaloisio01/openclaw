@@ -39,10 +39,6 @@ import {
   loadGrantHardeningRulebook,
 } from "./grant-hardening-rulebook.js";
 import { removeInternalSessionEffectsTranscript } from "./internal-session-effects.js";
-import {
-  recordSourceDeliveryFailure,
-  recordSourceTurnReference,
-} from "./source-delivery-obligation.js";
 import type { SubagentAnnounceDeliveryResult } from "./subagent-announce-dispatch.js";
 import { type SubagentRunOutcome, withSubagentOutcomeTiming } from "./subagent-announce-output.js";
 import type { GrantCloseoutGateResult } from "./subagent-announce.js";
@@ -1756,7 +1752,6 @@ export function createSubagentRegistryLifecycleController(params: {
     entry: SubagentRunRecord,
   ): PendingFinalDeliveryPayload => {
     return {
-      sourceTurnId: entry.delivery?.payload?.sourceTurnId ?? entry.sourceTurnId,
       requesterSessionKey:
         entry.delivery?.payload?.requesterSessionKey ?? entry.requesterSessionKey,
       requesterOrigin: entry.delivery?.payload?.requesterOrigin ?? entry.requesterOrigin,
@@ -1791,16 +1786,6 @@ export function createSubagentRegistryLifecycleController(params: {
     delivery.attemptCount = (delivery.attemptCount ?? 0) + 1;
     delivery.lastError = args.error ?? null;
     delivery.payload = payload;
-    if (payload.sourceTurnId) {
-      recordSourceTurnReference({
-        id: payload.sourceTurnId,
-        currentStage: "subagent final delivery pending",
-        childRunIds: [payload.childRunId],
-        subagentTaskIds: [payload.childSessionKey],
-        deliveryStatus: "final_pending",
-        notes: args.error ?? "Subagent final delivery is pending source-chat proof.",
-      });
-    }
   };
 
   const refreshPendingFinalDeliveryPayload = (entry: SubagentRunRecord): boolean => {
@@ -1814,7 +1799,6 @@ export function createSubagentRegistryLifecycleController(params: {
     }
     delivery.payload = {
       ...delivery.payload,
-      sourceTurnId: entry.sourceTurnId ?? delivery.payload.sourceTurnId,
       startedAt: entry.startedAt,
       endedAt: entry.endedAt,
       outcome: entry.outcome,
@@ -1839,21 +1823,6 @@ export function createSubagentRegistryLifecycleController(params: {
     delivery.status = "suspended";
     delivery.suspendedAt ??= now;
     delivery.suspendedReason = args.reason;
-    if (args.entry.sourceTurnId) {
-      recordSourceDeliveryFailure({
-        id: args.entry.sourceTurnId,
-        reason:
-          args.error ??
-          getDeliveryLastError(args.entry) ??
-          `subagent final delivery suspended: ${args.reason}`,
-        currentStage: "subagent final delivery suspended",
-        sourceSessionKey: args.entry.requesterSessionKey,
-        parentRunId: args.entry.runId,
-        deliveryContext: args.entry.requesterOrigin,
-        notes:
-          "Subagent delivery reached suspended state and cannot be treated as user-visible final delivery.",
-      });
-    }
     args.entry.cleanupHandled = false;
     args.entry.wakeOnDescendantSettle = undefined;
     const completion = ensureCompletionState(args.entry);
@@ -2307,7 +2276,6 @@ export function createSubagentRegistryLifecycleController(params: {
       .runSubagentAnnounceFlow({
         childSessionKey: pendingPayload.childSessionKey,
         childRunId: pendingPayload.childRunId,
-        sourceTurnId: pendingPayload.sourceTurnId,
         requesterSessionKey: pendingPayload.requesterSessionKey,
         requesterOrigin,
         requesterDisplayKey: pendingPayload.requesterDisplayKey,

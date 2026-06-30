@@ -90,7 +90,6 @@ export function createOpenClawTools(
     runSessionKey?: string;
     agentChannel?: GatewayMessageChannel;
     runId?: string;
-    sourceTurnId?: string;
     agentAccountId?: string;
     /** Delivery target for topic/thread routing. */
     agentTo?: string;
@@ -514,7 +513,6 @@ export function createOpenClawTools(
             workspaceDir: spawnWorkspaceDir,
             inheritedToolAllowlist: options?.inheritedToolAllowlist,
             inheritedToolDenylist: options?.inheritedToolDenylist,
-            sourceTurnId: options?.sourceTurnId,
           }),
         ]
       : []),
@@ -524,7 +522,6 @@ export function createOpenClawTools(
     }),
     createSubagentsTool({
       agentSessionKey: options?.agentSessionKey,
-      sourceTurnId: options?.sourceTurnId,
     }),
     createSessionStatusTool({
       agentSessionKey: options?.agentSessionKey,

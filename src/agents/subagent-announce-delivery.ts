@@ -1677,7 +1677,6 @@ async function sendSubagentAnnounceDirectly(params: {
 }
 
 export async function deliverSubagentAnnouncement(params: {
-  sourceTurnId?: string;
   requesterSessionKey: string;
   announceId?: string;
   triggerMessage: string;
@@ -1730,12 +1729,10 @@ export async function deliverSubagentAnnouncement(params: {
       }),
   });
   if (params.expectsCompletionMessage) {
-    const obligationId =
-      params.sourceTurnId ??
-      buildSourceDeliveryObligationId({
-        sourceSessionKey: params.targetRequesterSessionKey,
-        parentRunId: params.directIdempotencyKey,
-      });
+    const obligationId = buildSourceDeliveryObligationId({
+      sourceSessionKey: params.targetRequesterSessionKey,
+      parentRunId: params.directIdempotencyKey,
+    });
     const sourceChannel =
       normalizeDeliveryContext(params.requesterOrigin)?.channel ??
       normalizeDeliveryContext(params.requesterSessionOrigin)?.channel ??

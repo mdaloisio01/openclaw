@@ -2934,7 +2934,6 @@ export async function runEmbeddedAgent(
             sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
             agentId: params.agentId,
             runId: params.runId,
-            sourceTurnId: params.sourceTurnId,
             runAborted: aborted,
             didSendDeterministicApprovalPrompt: attempt.didSendDeterministicApprovalPrompt,
             heartbeatToolResponse: attempt.heartbeatToolResponse,

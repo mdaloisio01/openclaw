@@ -297,7 +297,6 @@ export type SpawnSubagentContext = {
   agentGroupSpace?: string | null;
   agentMemberRoleIds?: string[];
   requesterAgentIdOverride?: string;
-  sourceTurnId?: string;
   /** Explicit workspace directory for subagent to inherit (optional). */
   workspaceDir?: string;
   inheritedToolAllowlist?: string[];
@@ -1780,7 +1779,6 @@ export async function spawnSubagentDirect(
   try {
     registerSubagentRun({
       runId: childRunId,
-      sourceTurnId: ctx.sourceTurnId,
       childSessionKey,
       controllerSessionKey: ownership.controllerSessionKey,
       requesterSessionKey: ownership.completionRequesterSessionKey,

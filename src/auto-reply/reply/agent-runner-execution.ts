@@ -2281,7 +2281,6 @@ export async function runAgentTurnWithFallback(params: {
                     groupSpace: normalizeOptionalString(params.sessionCtx.GroupSpace),
                     ...senderContext,
                     ...runBaseParams,
-                    sourceTurnId: params.opts?.sourceTurnId,
                     provider: embeddedRunProvider,
                     agentHarnessId: embeddedRunHarnessOverride,
                     agentHarnessRuntimeOverride: embeddedRunHarnessOverride,

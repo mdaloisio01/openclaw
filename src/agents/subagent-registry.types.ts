@@ -4,7 +4,6 @@ import type { SubagentLifecycleEndedReason } from "./subagent-lifecycle-events.j
 import type { SpawnSubagentMode } from "./subagent-spawn.types.js";
 
 export type PendingFinalDeliveryPayload = {
-  sourceTurnId?: string;
   requesterSessionKey: string;
   requesterOrigin?: DeliveryContext;
   requesterDisplayKey: string;
@@ -111,7 +110,6 @@ export type SubagentProductionContinuationState = {
 
 export type SubagentParentYieldWaitState = {
   waitId: string;
-  sourceTurnId?: string;
   parentSessionKey: string;
   parentRunId?: string;
   reason?: string;
@@ -128,7 +126,6 @@ export type SubagentParentYieldWaitState = {
 
 export type SubagentRunRecord = {
   runId: string;
-  sourceTurnId?: string;
   childSessionKey: string;
   controllerSessionKey?: string;
   requesterSessionKey: string;

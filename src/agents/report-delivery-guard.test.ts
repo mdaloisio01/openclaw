@@ -10,10 +10,6 @@ import {
   validateReportDeliveryText,
   validateReportGovernedStageAdvance,
 } from "./report-delivery-guard.js";
-import {
-  listSourceDeliveryObligations,
-  recordSourceDeliveryObligation,
-} from "./source-delivery-obligation.js";
 
 const artifactPath =
   "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/security_review_report_2026-06-29T2341Z.md";
@@ -117,45 +113,6 @@ describe("report delivery guard", () => {
     }
   });
 
-  it("attaches pending report delivery to the canonical source turn", async () => {
-    const { mkdtemp, rm } = await import("node:fs/promises");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const originalMarker = process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
-    const originalSource = process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
-    const markerDir = await mkdtemp(join(tmpdir(), "openclaw-report-marker-"));
-    const sourceDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-"));
-    process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = markerDir;
-    process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = sourceDir;
-    try {
-      const sourceTurnId = "source:agent:orchestrator:main:msg-report";
-      recordSourceDeliveryObligation({ id: sourceTurnId, sourceChannel: "webchat" });
-
-      enforceReportDeliveryText(`Report saved: ${artifactPath}`, { sourceTurnId });
-
-      const [row] = listSourceDeliveryObligations({ dir: sourceDir });
-      expect(row).toMatchObject({
-        id: sourceTurnId,
-        deliveryStatus: "final_pending",
-        sourceTurnState: "final_pending",
-        reportArtifactPaths: [artifactPath],
-      });
-    } finally {
-      if (originalMarker === undefined) {
-        delete process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
-      } else {
-        process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = originalMarker;
-      }
-      if (originalSource === undefined) {
-        delete process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
-      } else {
-        process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = originalSource;
-      }
-      await rm(markerDir, { recursive: true, force: true });
-      await rm(sourceDir, { recursive: true, force: true });
-    }
-  });
-
   it("applies outside Cleanup Crew reports", () => {
     const result = validateReportDeliveryText(
       "Research pass report saved: file_hub/exports/r_and_d_review_report_2026-06-29T2341Z.md",
@@ -251,54 +208,6 @@ describe("report delivery guard", () => {
         process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = original;
       }
       await rm(markerDir, { recursive: true, force: true });
-    }
-  });
-
-  it("attaches pending milestone delivery to the canonical source turn", async () => {
-    const { mkdtemp, rm } = await import("node:fs/promises");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const originalMarker = process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
-    const originalSource = process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
-    const markerDir = await mkdtemp(join(tmpdir(), "openclaw-milestone-marker-"));
-    const sourceDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-"));
-    process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = markerDir;
-    process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = sourceDir;
-    try {
-      const sourceTurnId = "source:agent:orchestrator:main:msg-milestone";
-      recordSourceDeliveryObligation({ id: sourceTurnId, sourceChannel: "webchat" });
-
-      enforceReportGovernedStageAdvance(
-        {
-          report_governed_mission: true,
-          current_stage: "build",
-          next_stage: "asset guard",
-          stage_complete_pending_report: true,
-          milestone_report_delivered: false,
-        },
-        { sourceTurnId },
-      );
-
-      const [row] = listSourceDeliveryObligations({ dir: sourceDir });
-      expect(row).toMatchObject({
-        id: sourceTurnId,
-        deliveryStatus: "milestone_pending",
-        sourceTurnState: "milestone_pending",
-        currentStage: "build",
-      });
-    } finally {
-      if (originalMarker === undefined) {
-        delete process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
-      } else {
-        process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = originalMarker;
-      }
-      if (originalSource === undefined) {
-        delete process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR;
-      } else {
-        process.env.OPENCLAW_SOURCE_DELIVERY_OBLIGATION_DIR = originalSource;
-      }
-      await rm(markerDir, { recursive: true, force: true });
-      await rm(sourceDir, { recursive: true, force: true });
     }
   });
 

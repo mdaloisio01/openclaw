@@ -1187,7 +1187,6 @@ export async function runEmbeddedAttempt(
                 : undefined,
             sessionId: params.sessionId,
             runId: params.runId,
-            sourceTurnId: params.sourceTurnId,
             toolSearchCatalogRef,
             agentDir,
             cwd: effectiveCwd,
@@ -1245,7 +1244,6 @@ export async function runEmbeddedAttempt(
                 markParentYieldWaitForController({
                   controllerSessionKey,
                   parentRunId: params.runId,
-                  sourceTurnId: params.sourceTurnId,
                   reason: message,
                   requiredCloseout: true,
                 });

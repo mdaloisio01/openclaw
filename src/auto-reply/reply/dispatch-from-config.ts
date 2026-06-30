@@ -1817,19 +1817,14 @@ export async function dispatchReplyFromConfig(
   const isRoutedReplyDelivered = (result: { ok: boolean; suppressed?: boolean }) =>
     result.ok && result.suppressed !== true;
   const recordSourceProgressIfObligationPresent = (payload: ReplyPayload, currentStage: string) => {
-    if (!sessionKey) {
+    if (!sessionKey || !params.replyOptions?.runId) {
       return;
     }
-    const sourceTurnId =
-      params.replyOptions?.sourceTurnId ??
-      buildSourceDeliveryObligationId({
-        sourceSessionKey: sessionKey,
-        parentRunId: params.replyOptions?.runId,
-        sourceMessageId:
-          normalizeOptionalString(ctx.MessageSidFull) ?? normalizeOptionalString(ctx.MessageSid),
-      });
     recordSourceVisibleDeliveryIfPresent({
-      id: sourceTurnId,
+      id: buildSourceDeliveryObligationId({
+        sourceSessionKey: sessionKey,
+        parentRunId: params.replyOptions.runId,
+      }),
       text: sourceDeliveryTextForDeliveredPayload(payload),
       final: false,
       currentStage,
