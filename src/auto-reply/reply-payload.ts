@@ -198,6 +198,16 @@ export type ReplyPayloadMetadata = {
     reason: "missing_chat_report_body";
     artifactPaths?: string[];
   };
+  /**
+   * Marks a payload or state transition synthesized by milestone-reporting
+   * enforcement because a report-governed stage completed without the required
+   * chat milestone report.
+   */
+  pendingMilestoneReport?: {
+    reason: "missing_milestone_report" | "interrupted_stage_not_reported";
+    currentStage?: string;
+    nextStage?: string;
+  };
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();
