@@ -3095,9 +3095,9 @@ describe("runReplyAgent private message_tool_only final warning (#85714)", () =>
     expect(warnPrivateFinalSpy.mock.calls[0]?.[0]).toMatchObject({ sessionKey: "stranded" });
   });
 
-  it("warns for a short private final reply because required source delivery was missed", async () => {
+  it("does not warn for a short private final reply", async () => {
     await runPrivateFinalCase({ finalAssistantText: "Nothing to send here." });
-    expect(warnPrivateFinalSpy).toHaveBeenCalledTimes(1);
+    expect(warnPrivateFinalSpy).not.toHaveBeenCalled();
   });
 
   it("does not warn when the message tool delivered this turn", async () => {

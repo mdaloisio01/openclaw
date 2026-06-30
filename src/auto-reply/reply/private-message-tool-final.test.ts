@@ -18,11 +18,11 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
     expect(shouldWarnAboutPrivateMessageToolFinal(base)).toBe(true);
   });
 
-  it("flags a short private final because required source delivery was missed", () => {
+  it("flags a long private final even without multiple sentence terminators", () => {
     expect(
       shouldWarnAboutPrivateMessageToolFinal({
         ...base,
-        finalText: "private final reply",
+        finalText: "x".repeat(280),
       }),
     ).toBe(true);
   });
@@ -52,6 +52,21 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
     ).toBe(false);
   });
 
+  it("does not flag a short private final", () => {
+    expect(
+      shouldWarnAboutPrivateMessageToolFinal({
+        ...base,
+        finalText: "Nothing to add here.",
+      }),
+    ).toBe(false);
+    expect(
+      shouldWarnAboutPrivateMessageToolFinal({
+        ...base,
+        finalText: "I do not need to send anything. Nothing else to add.",
+      }),
+    ).toBe(false);
+  });
+
   it("does not flag empty or whitespace-only final text", () => {
     expect(shouldWarnAboutPrivateMessageToolFinal({ ...base, finalText: "" })).toBe(false);
     expect(shouldWarnAboutPrivateMessageToolFinal({ ...base, finalText: "   \n " })).toBe(false);
@@ -64,13 +79,8 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
   it("builds a visible delivery error without exposing the private final body", () => {
     const payload = buildPrivateMessageToolFinalDeliveryError();
     expect(payload.isError).toBe(true);
-    expect(payload.text).toContain("did not use the required source delivery tool");
+    expect(payload.text).toContain("did not use the required message delivery tool");
     expect(payload.text).not.toContain(base.finalText);
     expect(getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression).toBe(true);
-    expect(getReplyPayloadMetadata(payload)?.sourceDeliveryContractFailure).toMatchObject({
-      reason: "private_final_without_required_delivery_tool",
-      privateBodyWithheld: true,
-      recoveryNeeded: true,
-    });
   });
 });

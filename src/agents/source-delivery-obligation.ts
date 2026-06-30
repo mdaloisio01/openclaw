@@ -481,16 +481,10 @@ export function recordSourceDeliveryFailure(params: {
   sourceSessionKey?: string;
   parentRunId?: string;
   deliveryContext?: DeliveryContext;
-  visibleFailureText?: string;
   notes?: string;
 }): SourceDeliveryObligation | undefined {
   const failedAt = new Date().toISOString();
   const existing = existingRow(params.id);
-  const visibleFailureText = textPreview(params.visibleFailureText);
-  const visibleFailureDelivered = Boolean(visibleFailureText);
-  const nextVisibleDeliveryCount = visibleFailureDelivered
-    ? (existing?.visibleDeliveryCount ?? 0) + 1
-    : existing?.visibleDeliveryCount;
   return recordSourceDeliveryObligation({
     id: params.id,
     sourceChannel: params.sourceChannel,
@@ -500,25 +494,15 @@ export function recordSourceDeliveryFailure(params: {
     currentStage: params.currentStage,
     deliveryStatus: "delivery_failed",
     sourceTurnState: "delivery_failed",
-    finalDeliveryState: "delivery_failed",
-    finalDeliveryDelivered: false,
     recoveryState: "recovery_pending",
     userFacingDeliveryFailed: true,
     failureReason: params.reason,
-    lastUserVisibleDeliveryAt: visibleFailureDelivered
-      ? failedAt
-      : existing?.lastUserVisibleDeliveryAt,
-    visibleDeliveryCount: nextVisibleDeliveryCount,
     notes: params.notes,
     deliveryEvents: mergeDeliveryEvents(existing, {
       type: "failure",
       at: failedAt,
       stage: params.currentStage,
       reason: params.reason,
-      textPreview: visibleFailureText,
-      proof: visibleFailureDelivered
-        ? "source-chat-visible delivery-contract failure delivered"
-        : undefined,
     }),
   });
 }
