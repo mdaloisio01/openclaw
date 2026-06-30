@@ -219,6 +219,15 @@ export type ReplyPayloadMetadata = {
     final?: boolean;
     currentStage?: string;
   };
+  /**
+   * Marks a safe visible failure synthesized when a required source-delivery
+   * contract was violated. The original private body must not be delivered.
+   */
+  sourceDeliveryContractFailure?: {
+    reason: "private_final_without_required_delivery_tool";
+    privateBodyWithheld?: boolean;
+    recoveryNeeded?: boolean;
+  };
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();
@@ -269,6 +278,16 @@ export function copyReplyPayloadMetadata<T extends object>(source: object, paylo
 export function markReplyPayloadForSourceSuppressionDelivery<T extends object>(payload: T): T {
   return setReplyPayloadMetadata(payload, {
     deliverDespiteSourceReplySuppression: true,
+  });
+}
+
+export function markReplyPayloadAsSourceDeliveryContractFailure<T extends object>(
+  payload: T,
+  params: NonNullable<ReplyPayloadMetadata["sourceDeliveryContractFailure"]>,
+): T {
+  return setReplyPayloadMetadata(payload, {
+    deliverDespiteSourceReplySuppression: true,
+    sourceDeliveryContractFailure: params,
   });
 }
 

@@ -256,6 +256,41 @@ describe("source delivery obligation", () => {
     });
   });
 
+  it("records visible delivery-contract failure proof while keeping recovery debt open", () => {
+    const id = "source:agent:orchestrator:main:private-final";
+    recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });
+
+    recordSourceDeliveryFailure({
+      id,
+      reason: "private final reply withheld because required source delivery tool was not used",
+      currentStage: "final source dispatch delivered",
+      visibleFailureText:
+        "Delivery failed: the agent produced a private final reply but did not use the required source delivery tool. The private reply body was withheld. This turn requires recovery.",
+    });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      id,
+      deliveryStatus: "delivery_failed",
+      sourceTurnState: "delivery_failed",
+      finalDeliveryState: "delivery_failed",
+      finalDeliveryDelivered: false,
+      recoveryState: "recovery_pending",
+      userFacingDeliveryFailed: true,
+      visibleDeliveryCount: 1,
+    });
+    expect(row?.lastUserVisibleDeliveryAt).toEqual(expect.any(String));
+    expect(row?.deliveryEvents?.at(-1)).toMatchObject({
+      type: "failure",
+      proof: "source-chat-visible delivery-contract failure delivered",
+      textPreview: expect.stringContaining("Delivery failed:"),
+    });
+    expect(evaluateSourceDeliveryObligation(row!)).toMatchObject({
+      ok: false,
+      reason: "source_delivery_failed",
+    });
+  });
+
   it("attaches child and report references to the canonical source turn", () => {
     const id = "source:agent:orchestrator:main:run-reference";
     recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });

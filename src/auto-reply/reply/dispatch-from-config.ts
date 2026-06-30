@@ -152,6 +152,11 @@ import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
 import { withFullRuntimeReplyConfig } from "./get-reply-fast-path.js";
 import { claimInboundDedupe, commitInboundDedupe, releaseInboundDedupe } from "./inbound-dedupe.js";
 import { resolveOriginMessageProvider } from "./origin-routing.js";
+import {
+  buildPrivateMessageToolFinalDeliveryError,
+  shouldWarnAboutPrivateMessageToolFinal,
+  warnPrivateMessageToolFinal,
+} from "./private-message-tool-final.js";
 import { waitForReplyDispatcherIdle } from "./reply-dispatcher.js";
 import type {
   DispatcherOutcomeCountsView,
@@ -192,9 +197,13 @@ type SourceReplyTranscriptMirror = NonNullable<
 type SourceDeliveryObligationMetadata = NonNullable<
   NonNullable<ReturnType<typeof getReplyPayloadMetadata>>["sourceDeliveryObligation"]
 >;
+type SourceDeliveryContractFailureMetadata = NonNullable<
+  NonNullable<ReturnType<typeof getReplyPayloadMetadata>>["sourceDeliveryContractFailure"]
+>;
 type DeliveredSourceDeliveryObligation = {
   metadata: SourceDeliveryObligationMetadata;
   text?: string;
+  contractFailure?: SourceDeliveryContractFailureMetadata;
 };
 
 class DispatchReplyOperationAbortedError extends Error {
@@ -1015,6 +1024,22 @@ function recordDeliveredSourceDeliveryObligation(params: {
   if (!params.metadata?.id) {
     return;
   }
+  const contractFailure = getReplyPayloadMetadata(params.payload)?.sourceDeliveryContractFailure;
+  if (contractFailure) {
+    recordSourceDeliveryFailure({
+      id: params.metadata.id,
+      reason:
+        contractFailure.reason === "private_final_without_required_delivery_tool"
+          ? "private final reply withheld because required source delivery tool was not used"
+          : "source delivery contract failure",
+      currentStage: params.metadata.currentStage ?? params.currentStage,
+      visibleFailureText: sourceDeliveryTextForDeliveredPayload(params.payload),
+      notes: contractFailure.recoveryNeeded
+        ? "Visible delivery-contract failure emitted; original private final body withheld; recovery needed."
+        : "Visible delivery-contract failure emitted; original private final body withheld.",
+    });
+    return;
+  }
   recordSourceVisibleDelivery({
     id: params.metadata.id,
     text: sourceDeliveryTextForDeliveredPayload(params.payload),
@@ -1071,9 +1096,11 @@ function captureDeliveredSourceDeliveryObligation(params: {
     }
     const metadata = getReplyPayloadMetadata(payload)?.sourceDeliveryObligation;
     if (metadata?.id === expectedId || metadata === undefined) {
+      const contractFailure = getReplyPayloadMetadata(payload)?.sourceDeliveryContractFailure;
       delivered = {
         metadata: metadata ?? params.metadata!,
         text: sourceDeliveryTextForDeliveredPayload(payload),
+        ...(contractFailure ? { contractFailure } : {}),
       };
     }
     return payload;
@@ -1097,6 +1124,21 @@ async function recordSourceDeliveryAfterDispatcherDelivery(params: {
       id: delivered.metadata.id,
       reason: "source final payload dispatcher delivery failed or was cancelled",
       currentStage: delivered.metadata.currentStage ?? "final source dispatch failed",
+    });
+    return;
+  }
+  if (delivered.contractFailure) {
+    recordSourceDeliveryFailure({
+      id: delivered.metadata.id,
+      reason:
+        delivered.contractFailure.reason === "private_final_without_required_delivery_tool"
+          ? "private final reply withheld because required source delivery tool was not used"
+          : "source delivery contract failure",
+      currentStage: delivered.metadata.currentStage ?? "final source dispatch delivered",
+      visibleFailureText: delivered.text,
+      notes: delivered.contractFailure.recoveryNeeded
+        ? "Visible delivery-contract failure emitted; original private final body withheld; recovery needed."
+        : "Visible delivery-contract failure emitted; original private final body withheld.",
     });
     return;
   }
@@ -2464,18 +2506,24 @@ export async function dispatchReplyFromConfig(
         markInboundDedupeReplayUnsafe();
         finalReplyDeliveryStarted = true;
       }
-      const ttsPayload = await maybeApplyTtsToReplyPayload({
+      const ttsPayload = copyReplyPayloadMetadata(
         payload,
-        cfg,
-        channel: deliveryChannel,
-        kind: "final",
-        inboundAudio,
-        ttsAuto: sessionTtsAuto,
-        agentId: sessionAgentId,
-        accountId: replyRoute.accountId,
-      });
+        await maybeApplyTtsToReplyPayload({
+          payload,
+          cfg,
+          channel: deliveryChannel,
+          kind: "final",
+          inboundAudio,
+          ttsAuto: sessionTtsAuto,
+          agentId: sessionAgentId,
+          accountId: replyRoute.accountId,
+        }),
+      );
       throwIfFinalDeliveryAborted();
-      const normalizedPayload = await normalizeReplyMediaPayload(ttsPayload);
+      const normalizedPayload = copyReplyPayloadMetadata(
+        ttsPayload,
+        await normalizeReplyMediaPayload(ttsPayload),
+      );
       throwIfFinalDeliveryAborted();
       const result = await routeReplyToOriginating(normalizedPayload, {
         abortSignal,
@@ -3397,6 +3445,10 @@ export async function dispatchReplyFromConfig(
         continue;
       }
       if (suppressDelivery && !shouldDeliverDespiteSourceReplySuppression(reply)) {
+        const sourceDeliveryRequired = Boolean(
+          getReplyPayloadMetadata(reply)?.sourceDeliveryObligation?.id ??
+          params.replyOptions?.sourceTurnId,
+        );
         if (hasOutboundReplyContent(reply, { trimText: true })) {
           logVerbose(
             [
@@ -3410,6 +3462,30 @@ export async function dispatchReplyFromConfig(
               `${formatSuppressedReplyPayloadForLog(reply)})`,
             ].join(" "),
           );
+        }
+        if (
+          sourceDeliveryRequired &&
+          sourceReplyDeliveryMode === "message_tool_only" &&
+          !reply.isStatusNotice &&
+          shouldWarnAboutPrivateMessageToolFinal({
+            sourceReplyDeliveryMode,
+            sendPolicyDenied,
+            successfulSourceReplyDelivery: false,
+            finalText: reply.text ?? "",
+          })
+        ) {
+          warnPrivateMessageToolFinal({
+            sessionKey: acpDispatchSessionKey ?? sessionKey,
+            channel: ctx.OriginatingChannel ?? ctx.Surface ?? ctx.Provider,
+            finalTextLength: reply.text?.trim().length ?? 0,
+          });
+          attemptedFinalDelivery = true;
+          const finalReply = await sendFinalPayload(buildPrivateMessageToolFinalDeliveryError());
+          queuedFinal = finalReply.queuedFinal || queuedFinal;
+          routedFinalCount += finalReply.routedFinalCount;
+          if (!finalReply.queuedFinal && finalReply.routedFinalCount === 0) {
+            finalDeliveryFailed = true;
+          }
         }
         continue;
       }
