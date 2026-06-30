@@ -684,6 +684,7 @@ async function wakeSubagentRunAfterDescendants(params: {
 }
 
 export async function runSubagentAnnounceFlow(params: {
+  sourceTurnId?: string;
   childSessionKey: string;
   childRunId: string;
   requesterSessionKey: string;
@@ -1064,6 +1065,7 @@ export async function runSubagentAnnounceFlow(params: {
         : targetRequesterOrigin;
     const directIdempotencyKey = buildAnnounceIdempotencyKey(announceId);
     const delivery = await deliverSubagentAnnouncement({
+      sourceTurnId: params.sourceTurnId,
       requesterSessionKey: targetRequesterSessionKey,
       announceId,
       triggerMessage,

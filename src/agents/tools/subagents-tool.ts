@@ -19,7 +19,10 @@ const SubagentsToolSchema = Type.Object({
   recentMinutes: optionalPositiveIntegerSchema(),
 });
 
-export function createSubagentsTool(opts?: { agentSessionKey?: string }): AnyAgentTool {
+export function createSubagentsTool(opts?: {
+  agentSessionKey?: string;
+  sourceTurnId?: string;
+}): AnyAgentTool {
   return {
     label: "Subagents",
     name: "subagents",

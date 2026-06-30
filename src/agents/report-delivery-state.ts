@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { recordSourceTurnReference } from "./source-delivery-obligation.js";
 
 const MARKER_DIR_ENV = "OPENCLAW_REPORT_DELIVERY_MARKER_DIR";
 
@@ -12,6 +13,7 @@ type MarkerRow = Record<string, unknown> & {
 
 export type PendingReportDeliveryMarker = {
   id: string;
+  sourceTurnId?: string;
   label?: string;
   artifact_path?: string;
   artifact_paths?: string[];
@@ -22,6 +24,7 @@ export type PendingReportDeliveryMarker = {
 
 export type PendingMilestoneReportMarker = {
   id: string;
+  sourceTurnId?: string;
   label?: string;
   current_stage?: string;
   next_stage?: string;
@@ -100,6 +103,18 @@ function upsertMarker(fileName: string, row: MarkerRow): void {
 
 export function recordPendingReportDelivery(marker: PendingReportDeliveryMarker): void {
   try {
+    if (marker.sourceTurnId) {
+      recordSourceTurnReference({
+        id: marker.sourceTurnId,
+        currentStage: "report delivery pending",
+        reportArtifactPaths: [
+          ...(marker.artifact_paths ?? []),
+          ...(marker.artifact_path ? [marker.artifact_path] : []),
+        ],
+        deliveryStatus: "final_pending",
+        notes: marker.notes ?? "Report artifact requires source-chat report body delivery.",
+      });
+    }
     upsertMarker("pending_report_delivery.json", {
       ...marker,
       report_required: marker.report_required ?? true,
@@ -112,6 +127,14 @@ export function recordPendingReportDelivery(marker: PendingReportDeliveryMarker)
 
 export function recordPendingMilestoneReport(marker: PendingMilestoneReportMarker): void {
   try {
+    if (marker.sourceTurnId) {
+      recordSourceTurnReference({
+        id: marker.sourceTurnId,
+        currentStage: marker.current_stage ?? "milestone delivery pending",
+        deliveryStatus: "milestone_pending",
+        notes: marker.notes ?? "Milestone requires source-chat milestone report delivery.",
+      });
+    }
     upsertMarker("pending_milestone_report.json", {
       ...marker,
       report_governed_mission: marker.report_governed_mission ?? true,

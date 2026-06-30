@@ -257,6 +257,7 @@ export function buildEmbeddedRunPayloads(params: {
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   agentId?: string;
   runId?: string;
+  sourceTurnId?: string;
   runAborted?: boolean;
   didSendDeterministicApprovalPrompt?: boolean;
   heartbeatToolResponse?: HeartbeatToolResponse;
@@ -593,6 +594,7 @@ export function buildEmbeddedRunPayloads(params: {
         payload.text && !item.isReasoning
           ? enforceReportDeliveryText(payload.text, {
               explicitArtifactOnlyAllowed: params.reportDeliveryArtifactOnlyAllowed,
+              sourceTurnId: params.sourceTurnId,
             })
           : null;
       if (reportDelivery && !reportDelivery.validation.ok) {

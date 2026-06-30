@@ -166,20 +166,6 @@ function ensureDir(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
 }
 
-function parseJsonObject(raw: string | null): Record<string, unknown> | null {
-  if (!raw?.trim()) {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
 function readCounts(db: DatabaseSync): DeliveryRemediationCounts {
   const blockedDeliveryFlows =
     Number(

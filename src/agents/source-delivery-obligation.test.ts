@@ -8,6 +8,7 @@ import {
   listSourceDeliveryObligations,
   recordSourceDeliveryFailure,
   recordSourceDeliveryObligation,
+  recordSourceTurnReference,
   recordSourceVisibleDelivery,
   recordSourceVisibleDeliveryIfPresent,
 } from "./source-delivery-obligation.js";
@@ -59,6 +60,7 @@ describe("source delivery obligation", () => {
     expect(registry.rows).toEqual([
       expect.objectContaining({
         id,
+        sourceTurnId: id,
         kind: "openclaw.source-delivery-obligation",
         sourceChannel: "webchat",
         sourceSessionKey: "agent:orchestrator:main",
@@ -68,8 +70,19 @@ describe("source delivery obligation", () => {
         requiredFinalDelivery: true,
         finalDeliveryDelivered: false,
         deliveryStatus: "accepted",
+        sourceTurnState: "accepted",
       }),
     ]);
+  });
+
+  it("uses the source message id as the canonical source turn key when available", () => {
+    expect(
+      buildSourceDeliveryObligationId({
+        sourceSessionKey: "agent:orchestrator:main",
+        parentRunId: "run-1",
+        sourceMessageId: "msg-1",
+      }),
+    ).toBe("source:agent:orchestrator:main:msg-1");
   });
 
   it("marks final source-visible delivery only for real non-NO_REPLY text", () => {
@@ -86,9 +99,32 @@ describe("source delivery obligation", () => {
     expect(row).toMatchObject({
       id,
       deliveryStatus: "final_delivered",
+      sourceTurnState: "final_delivered",
+      progressDeliveryState: "progress_delivered",
+      finalDeliveryState: "final_delivered",
       finalDeliveryDelivered: true,
+      visibleDeliveryCount: 1,
     });
     expect(row?.lastUserVisibleDeliveryAt).toEqual(expect.any(String));
+    expect(row?.deliveryEvents?.at(-1)).toMatchObject({
+      type: "final",
+      proof: "source-chat-visible payload delivered",
+    });
+  });
+
+  it("increments source-visible delivery count after each proven chat delivery", () => {
+    const id = "source:agent:orchestrator:main:run-count";
+    recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });
+
+    recordSourceVisibleDelivery({ id, text: "STATUS: In Progress", final: false });
+    recordSourceVisibleDelivery({ id, text: "STATUS: In Progress\nStill working", final: false });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      visibleDeliveryCount: 2,
+      deliveryStatus: "progress_delivered",
+      finalDeliveryDelivered: false,
+    });
   });
 
   it("treats NO_REPLY as a delivery failure when source-visible delivery is required", () => {
@@ -175,6 +211,34 @@ describe("source delivery obligation", () => {
     expect(evaluateSourceDeliveryObligation(row!)).toMatchObject({
       ok: false,
       reason: "source_delivery_failed",
+    });
+  });
+
+  it("attaches child and report references to the canonical source turn", () => {
+    const id = "source:agent:orchestrator:main:run-reference";
+    recordSourceDeliveryObligation({ id, sourceChannel: "webchat" });
+
+    recordSourceTurnReference({
+      id,
+      currentStage: "subagent run registered",
+      childRunIds: ["child-run-1"],
+      subagentTaskIds: ["agent:orchestrator:subagent:child"],
+      reportArtifactPaths: ["/tmp/report.md"],
+      deliveryStatus: "final_pending",
+    });
+
+    const [row] = listSourceDeliveryObligations({ dir: markerDir });
+    expect(row).toMatchObject({
+      id,
+      deliveryStatus: "final_pending",
+      sourceTurnState: "final_pending",
+      childRunIds: ["child-run-1"],
+      subagentTaskIds: ["agent:orchestrator:subagent:child"],
+      reportArtifactPaths: ["/tmp/report.md"],
+    });
+    expect(row?.deliveryEvents?.at(-1)).toMatchObject({
+      type: "reference",
+      stage: "subagent run registered",
     });
   });
 });

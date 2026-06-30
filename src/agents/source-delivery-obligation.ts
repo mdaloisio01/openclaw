@@ -12,13 +12,36 @@ export const SOURCE_DELIVERY_STALE_MS = 10 * 60 * 1000;
 
 export type SourceDeliveryStatus =
   | "accepted"
+  | "progress_required"
   | "progress_delivered"
+  | "milestone_pending"
+  | "milestone_delivered"
   | "final_pending"
   | "final_delivered"
-  | "delivery_failed";
+  | "delivery_failed"
+  | "recovery_pending"
+  | "blocked";
+
+export type SourceTurnDeliveryEvent = {
+  type:
+    | "accepted"
+    | "progress"
+    | "milestone"
+    | "final"
+    | "failure"
+    | "recovery"
+    | "blocked"
+    | "reference";
+  at: string;
+  stage?: string;
+  textPreview?: string;
+  proof?: string;
+  reason?: string;
+};
 
 export type SourceDeliveryObligation = {
   id: string;
+  sourceTurnId?: string;
   kind: typeof SOURCE_DELIVERY_OBLIGATION_KIND;
   sourceChannel?: string;
   sourceSessionKey?: string;
@@ -26,6 +49,10 @@ export type SourceDeliveryObligation = {
   parentRunId?: string;
   missionLabel?: string;
   currentStage?: string;
+  sourceTurnState?: SourceDeliveryStatus;
+  progressDeliveryState?: SourceDeliveryStatus;
+  milestoneDeliveryState?: SourceDeliveryStatus;
+  finalDeliveryState?: SourceDeliveryStatus;
   acceptedAt: string;
   updatedAt: string;
   lastUserVisibleDeliveryAt?: string;
@@ -34,6 +61,14 @@ export type SourceDeliveryObligation = {
   finalDeliveryDelivered?: boolean;
   internalRunIds?: string[];
   internalWorkerIds?: string[];
+  childRunIds?: string[];
+  subagentTaskIds?: string[];
+  codexSessionIds?: string[];
+  guardianApprovalIds?: string[];
+  reportArtifactPaths?: string[];
+  watchdogState?: string;
+  recoveryState?: string;
+  deliveryEvents?: SourceTurnDeliveryEvent[];
   deliveryStatus: SourceDeliveryStatus;
   deliveryContext?: DeliveryContext;
   userFacingDeliveryFailed?: boolean;
@@ -44,12 +79,17 @@ export type SourceDeliveryObligation = {
 
 export type SourceDeliveryObligationInput = {
   id: string;
+  sourceTurnId?: string;
   sourceChannel?: string;
   sourceSessionKey?: string;
   sourceMessageId?: string;
   parentRunId?: string;
   missionLabel?: string;
   currentStage?: string;
+  sourceTurnState?: SourceDeliveryStatus;
+  progressDeliveryState?: SourceDeliveryStatus;
+  milestoneDeliveryState?: SourceDeliveryStatus;
+  finalDeliveryState?: SourceDeliveryStatus;
   acceptedAt?: string;
   lastUserVisibleDeliveryAt?: string;
   requiredMilestoneDelivery?: boolean;
@@ -57,6 +97,14 @@ export type SourceDeliveryObligationInput = {
   finalDeliveryDelivered?: boolean;
   internalRunIds?: string[];
   internalWorkerIds?: string[];
+  childRunIds?: string[];
+  subagentTaskIds?: string[];
+  codexSessionIds?: string[];
+  guardianApprovalIds?: string[];
+  reportArtifactPaths?: string[];
+  watchdogState?: string;
+  recoveryState?: string;
+  deliveryEvents?: SourceTurnDeliveryEvent[];
   deliveryStatus?: SourceDeliveryStatus;
   deliveryContext?: DeliveryContext;
   userFacingDeliveryFailed?: boolean;
@@ -136,6 +184,7 @@ function normalizeInput(input: SourceDeliveryObligationInput): SourceDeliveryObl
   return {
     id: input.id,
     kind: SOURCE_DELIVERY_OBLIGATION_KIND,
+    sourceTurnId: input.sourceTurnId ?? input.id,
     acceptedAt: input.acceptedAt ?? now,
     updatedAt: now,
     deliveryStatus: input.deliveryStatus ?? "accepted",
@@ -157,6 +206,12 @@ function normalizeInput(input: SourceDeliveryObligationInput): SourceDeliveryObl
     ...(normalizeString(input.currentStage)
       ? { currentStage: normalizeString(input.currentStage) }
       : {}),
+    ...(input.sourceTurnState ? { sourceTurnState: input.sourceTurnState } : {}),
+    ...(input.progressDeliveryState ? { progressDeliveryState: input.progressDeliveryState } : {}),
+    ...(input.milestoneDeliveryState
+      ? { milestoneDeliveryState: input.milestoneDeliveryState }
+      : {}),
+    ...(input.finalDeliveryState ? { finalDeliveryState: input.finalDeliveryState } : {}),
     ...(normalizeString(input.lastUserVisibleDeliveryAt)
       ? { lastUserVisibleDeliveryAt: normalizeString(input.lastUserVisibleDeliveryAt) }
       : {}),
@@ -175,6 +230,28 @@ function normalizeInput(input: SourceDeliveryObligationInput): SourceDeliveryObl
     ...(normalizeStringList(input.internalWorkerIds)
       ? { internalWorkerIds: normalizeStringList(input.internalWorkerIds) }
       : {}),
+    ...(normalizeStringList(input.childRunIds)
+      ? { childRunIds: normalizeStringList(input.childRunIds) }
+      : {}),
+    ...(normalizeStringList(input.subagentTaskIds)
+      ? { subagentTaskIds: normalizeStringList(input.subagentTaskIds) }
+      : {}),
+    ...(normalizeStringList(input.codexSessionIds)
+      ? { codexSessionIds: normalizeStringList(input.codexSessionIds) }
+      : {}),
+    ...(normalizeStringList(input.guardianApprovalIds)
+      ? { guardianApprovalIds: normalizeStringList(input.guardianApprovalIds) }
+      : {}),
+    ...(normalizeStringList(input.reportArtifactPaths)
+      ? { reportArtifactPaths: normalizeStringList(input.reportArtifactPaths) }
+      : {}),
+    ...(normalizeString(input.watchdogState)
+      ? { watchdogState: normalizeString(input.watchdogState) }
+      : {}),
+    ...(normalizeString(input.recoveryState)
+      ? { recoveryState: normalizeString(input.recoveryState) }
+      : {}),
+    ...(Array.isArray(input.deliveryEvents) ? { deliveryEvents: input.deliveryEvents } : {}),
     ...(input.deliveryContext ? { deliveryContext: input.deliveryContext } : {}),
     ...(input.userFacingDeliveryFailed !== undefined
       ? { userFacingDeliveryFailed: input.userFacingDeliveryFailed }
@@ -219,21 +296,67 @@ export function buildSourceDeliveryObligationId(params: {
 }): string {
   const session = normalizeString(params.sourceSessionKey) ?? "unknown-session";
   const run =
-    normalizeString(params.parentRunId) ?? normalizeString(params.sourceMessageId) ?? "unknown-run";
+    normalizeString(params.sourceMessageId) ?? normalizeString(params.parentRunId) ?? "unknown-run";
   return `source:${session}:${run}`;
+}
+
+function textPreview(text: string | undefined): string | undefined {
+  const normalized = normalizeString(text);
+  return normalized ? normalized.slice(0, 240) : undefined;
+}
+
+function existingRow(id: string): SourceDeliveryObligation | undefined {
+  const dir = sourceDeliveryDir();
+  if (!dir) {
+    return undefined;
+  }
+  return readRows(path.join(dir, SOURCE_DELIVERY_FILE)).find((row) => row.id === id);
+}
+
+function mergeDeliveryEvents(
+  existing: SourceDeliveryObligation | undefined,
+  next: SourceTurnDeliveryEvent,
+): SourceTurnDeliveryEvent[] {
+  return [...(existing?.deliveryEvents ?? []), next].slice(-200);
 }
 
 export function recordSourceDeliveryObligation(
   input: SourceDeliveryObligationInput,
 ): SourceDeliveryObligation | undefined {
   try {
+    const existing = existingRow(input.id);
     return upsert({
       ...input,
+      sourceTurnId: input.sourceTurnId ?? existing?.sourceTurnId ?? input.id,
       requiredMilestoneDelivery: input.requiredMilestoneDelivery ?? true,
       requiredFinalDelivery: input.requiredFinalDelivery ?? true,
-      finalDeliveryDelivered: input.finalDeliveryDelivered ?? false,
-      visibleDeliveryCount: input.visibleDeliveryCount ?? 0,
-      deliveryStatus: input.deliveryStatus ?? "accepted",
+      finalDeliveryDelivered:
+        input.finalDeliveryDelivered ?? existing?.finalDeliveryDelivered ?? false,
+      visibleDeliveryCount: input.visibleDeliveryCount ?? existing?.visibleDeliveryCount ?? 0,
+      deliveryStatus: input.deliveryStatus ?? existing?.deliveryStatus ?? "accepted",
+      sourceTurnState:
+        input.sourceTurnState ?? input.deliveryStatus ?? existing?.sourceTurnState ?? "accepted",
+      progressDeliveryState: input.progressDeliveryState ?? existing?.progressDeliveryState,
+      milestoneDeliveryState: input.milestoneDeliveryState ?? existing?.milestoneDeliveryState,
+      finalDeliveryState: input.finalDeliveryState ?? existing?.finalDeliveryState,
+      childRunIds: input.childRunIds ?? existing?.childRunIds,
+      subagentTaskIds: input.subagentTaskIds ?? existing?.subagentTaskIds,
+      codexSessionIds: input.codexSessionIds ?? existing?.codexSessionIds,
+      guardianApprovalIds: input.guardianApprovalIds ?? existing?.guardianApprovalIds,
+      reportArtifactPaths: input.reportArtifactPaths ?? existing?.reportArtifactPaths,
+      watchdogState: input.watchdogState ?? existing?.watchdogState,
+      recoveryState: input.recoveryState ?? existing?.recoveryState,
+      deliveryEvents:
+        input.deliveryEvents ??
+        (existing
+          ? existing.deliveryEvents
+          : [
+              {
+                type: "accepted",
+                at: input.acceptedAt ?? new Date().toISOString(),
+                stage: input.currentStage ?? "accepted",
+              },
+            ]),
     });
   } catch {
     return undefined;
@@ -255,14 +378,27 @@ export function recordSourceVisibleDelivery(params: {
     });
   }
   const deliveredAt = new Date().toISOString();
+  const existing = existingRow(params.id);
+  const nextVisibleDeliveryCount = (existing?.visibleDeliveryCount ?? 0) + 1;
+  const final = params.final === true;
   return recordSourceDeliveryObligation({
     id: params.id,
     currentStage: params.currentStage,
     lastUserVisibleDeliveryAt: deliveredAt,
-    deliveryStatus: params.final === true ? "final_delivered" : "progress_delivered",
-    finalDeliveryDelivered: params.final === true ? true : undefined,
-    visibleDeliveryCount: 1,
+    deliveryStatus: final ? "final_delivered" : "progress_delivered",
+    sourceTurnState: final ? "final_delivered" : "progress_delivered",
+    progressDeliveryState: "progress_delivered",
+    finalDeliveryState: final ? "final_delivered" : existing?.finalDeliveryState,
+    finalDeliveryDelivered: final ? true : undefined,
+    visibleDeliveryCount: nextVisibleDeliveryCount,
     notes: params.notes,
+    deliveryEvents: mergeDeliveryEvents(existing, {
+      type: final ? "final" : "progress",
+      at: deliveredAt,
+      stage: params.currentStage,
+      textPreview: textPreview(params.text),
+      proof: "source-chat-visible payload delivered",
+    }),
   });
 }
 
@@ -294,6 +430,8 @@ export function recordSourceDeliveryFailure(params: {
   deliveryContext?: DeliveryContext;
   notes?: string;
 }): SourceDeliveryObligation | undefined {
+  const failedAt = new Date().toISOString();
+  const existing = existingRow(params.id);
   return recordSourceDeliveryObligation({
     id: params.id,
     sourceChannel: params.sourceChannel,
@@ -302,9 +440,62 @@ export function recordSourceDeliveryFailure(params: {
     deliveryContext: params.deliveryContext,
     currentStage: params.currentStage,
     deliveryStatus: "delivery_failed",
+    sourceTurnState: "delivery_failed",
+    recoveryState: "recovery_pending",
     userFacingDeliveryFailed: true,
     failureReason: params.reason,
     notes: params.notes,
+    deliveryEvents: mergeDeliveryEvents(existing, {
+      type: "failure",
+      at: failedAt,
+      stage: params.currentStage,
+      reason: params.reason,
+    }),
+  });
+}
+
+export function recordSourceTurnReference(params: {
+  id: string;
+  currentStage?: string;
+  childRunIds?: string[];
+  subagentTaskIds?: string[];
+  codexSessionIds?: string[];
+  guardianApprovalIds?: string[];
+  reportArtifactPaths?: string[];
+  watchdogState?: string;
+  recoveryState?: string;
+  deliveryStatus?: SourceDeliveryStatus;
+  notes?: string;
+}): SourceDeliveryObligation | undefined {
+  const existing = existingRow(params.id);
+  if (!existing) {
+    return undefined;
+  }
+  return recordSourceDeliveryObligation({
+    id: params.id,
+    currentStage: params.currentStage,
+    childRunIds: [...(existing.childRunIds ?? []), ...(params.childRunIds ?? [])],
+    subagentTaskIds: [...(existing.subagentTaskIds ?? []), ...(params.subagentTaskIds ?? [])],
+    codexSessionIds: [...(existing.codexSessionIds ?? []), ...(params.codexSessionIds ?? [])],
+    guardianApprovalIds: [
+      ...(existing.guardianApprovalIds ?? []),
+      ...(params.guardianApprovalIds ?? []),
+    ],
+    reportArtifactPaths: [
+      ...(existing.reportArtifactPaths ?? []),
+      ...(params.reportArtifactPaths ?? []),
+    ],
+    watchdogState: params.watchdogState,
+    recoveryState: params.recoveryState,
+    deliveryStatus: params.deliveryStatus,
+    sourceTurnState: params.deliveryStatus,
+    notes: params.notes,
+    deliveryEvents: mergeDeliveryEvents(existing, {
+      type: "reference",
+      at: new Date().toISOString(),
+      stage: params.currentStage,
+      reason: params.notes,
+    }),
   });
 }
 

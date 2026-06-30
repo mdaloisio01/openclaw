@@ -1088,7 +1088,6 @@ async function handleSessionSend(params: {
     (await readSessionMessageCountAsync(entry.sessionId, storePath, entry.sessionFile)) + 1;
   let sendAcked = false;
   let sendPayload: unknown;
-  let sendCached = false;
   let startedRunId: string | undefined;
   let sendError: unknown;
   let sendMeta:
@@ -1116,7 +1115,6 @@ async function handleSessionSend(params: {
     respond: (ok, payload, error, meta) => {
       sendAcked = ok;
       sendPayload = payload;
-      sendCached = meta?.cached === true;
       sendError = error;
       sendMeta = meta;
       startedRunId =

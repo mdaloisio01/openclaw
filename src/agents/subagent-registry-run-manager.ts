@@ -15,6 +15,7 @@ import { buildAgentRunTerminalOutcomeFromWaitResult } from "./agent-run-terminal
 import { removeInternalSessionEffectsTranscript } from "./internal-session-effects.js";
 import { isRecoverableAgentWaitError, waitForAgentRun } from "./run-wait.js";
 import type { ensureRuntimePluginsLoaded as ensureRuntimePluginsLoadedFn } from "./runtime-plugins.js";
+import { recordSourceTurnReference } from "./source-delivery-obligation.js";
 import { type SubagentRunOutcome, withSubagentOutcomeTiming } from "./subagent-announce-output.js";
 import {
   clearDeliveryState,
@@ -140,6 +141,7 @@ export function markSubagentRunPausedAfterYield(params: {
 
 export type RegisterSubagentRunParams = {
   runId: string;
+  sourceTurnId?: string;
   childSessionKey: string;
   controllerSessionKey?: string;
   requesterSessionKey: string;
@@ -711,6 +713,7 @@ export function createSubagentRunManager(params: {
     });
     const entry: SubagentRunRecord = normalizeSubagentRunState({
       runId,
+      sourceTurnId: registerParams.sourceTurnId,
       childSessionKey,
       controllerSessionKey,
       requesterSessionKey,
@@ -751,6 +754,15 @@ export function createSubagentRunManager(params: {
       retainAttachmentsOnKeep: registerParams.retainAttachmentsOnKeep,
     });
     params.runs.set(runId, entry);
+    if (entry.sourceTurnId) {
+      recordSourceTurnReference({
+        id: entry.sourceTurnId,
+        currentStage: "subagent run registered",
+        childRunIds: [runId],
+        subagentTaskIds: [childSessionKey],
+        notes: "Subagent child run attached to canonical source turn.",
+      });
+    }
     try {
       params.persistOrThrow();
     } catch (error) {

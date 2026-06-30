@@ -555,6 +555,7 @@ function updateParentYieldWaitFanIn(
 export function markParentYieldWaitForController(params: {
   controllerSessionKey: string;
   parentRunId?: string;
+  sourceTurnId?: string;
   reason?: string;
   now?: number;
   staleAfterMs?: number;
@@ -600,6 +601,7 @@ export function markParentYieldWaitForController(params: {
       waitId,
       parentSessionKey: controllerSessionKey,
       ...(params.parentRunId ? { parentRunId: params.parentRunId } : {}),
+      ...(params.sourceTurnId ? { sourceTurnId: params.sourceTurnId } : {}),
       ...(params.reason ? { reason: params.reason } : {}),
       expectedChildRunIds,
       childSessionKeys,

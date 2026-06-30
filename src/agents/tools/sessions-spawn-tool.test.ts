@@ -1134,6 +1134,18 @@ describe("sessions_spawn tool", () => {
     expect(spawnContext.completionOwnerKey).toBe("agent:main:main");
   });
 
+  it("passes sourceTurnId through to direct subagent spawn context", async () => {
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+      sourceTurnId: "source:agent:main:main:msg-1",
+    });
+
+    await tool.execute("call-source-turn", { task: "background work" });
+
+    const spawnContext = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 1, "spawnSubagentDirect");
+    expect(spawnContext.sourceTurnId).toBe("source:agent:main:main:msg-1");
+  });
+
   it("uses completionOwnerKey for ACP registerSubagentRun requesterSessionKey", async () => {
     registerAcpBackendForTest();
     const tool = createSessionsSpawnTool({
@@ -1154,5 +1166,22 @@ describe("sessions_spawn tool", () => {
     expect(registration.controllerSessionKey).toBe("agent:main:telegram:default:direct:456");
     expect(registration.requesterSessionKey).toBe("agent:main:main");
     expect(registration.requesterDisplayKey).toBe("agent:main:main");
+  });
+
+  it("passes sourceTurnId into ACP-backed subagent registry tracking", async () => {
+    registerAcpBackendForTest();
+    const tool = createSessionsSpawnTool({
+      agentSessionKey: "agent:main:main",
+      sourceTurnId: "source:agent:main:main:msg-acp",
+    });
+
+    await tool.execute("call-acp-source-turn", {
+      runtime: "acp",
+      task: "investigate",
+      agentId: "codex",
+    });
+
+    const registration = mockCallArg(hoisted.registerSubagentRunMock, 0, 0, "registerSubagentRun");
+    expect(registration.sourceTurnId).toBe("source:agent:main:main:msg-acp");
   });
 });

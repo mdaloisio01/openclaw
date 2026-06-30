@@ -297,7 +297,7 @@ export function buildPendingMilestoneReportNotice(validation: MilestoneReportVal
 
 export function enforceReportDeliveryText(
   text: string,
-  options?: { explicitArtifactOnlyAllowed?: boolean },
+  options?: { explicitArtifactOnlyAllowed?: boolean; sourceTurnId?: string },
 ): { text: string; validation: ReportDeliveryValidation } {
   const validation = validateReportDeliveryText(text, options);
   if (validation.ok) {
@@ -307,6 +307,7 @@ export function enforceReportDeliveryText(
     id:
       validation.artifactPaths[0] ??
       `final-response:${Buffer.from(normalizeText(text)).toString("base64url").slice(0, 32)}`,
+    sourceTurnId: options?.sourceTurnId,
     label: "final response report body missing",
     artifact_path: validation.artifactPaths[0],
     artifact_paths: validation.artifactPaths,
@@ -321,12 +322,13 @@ export function enforceReportDeliveryText(
 
 export function enforceReportGovernedStageAdvance(
   state: ReportGovernedMissionState,
-  options?: { explicitNoUpdatesAllowed?: boolean },
+  options?: { explicitNoUpdatesAllowed?: boolean; sourceTurnId?: string },
 ): MilestoneReportValidation {
   const validation = validateReportGovernedStageAdvance(state, options);
   if (!validation.ok) {
     recordPendingMilestoneReport({
       id: `stage:${state.current_stage ?? "unknown"}:${state.next_stage ?? "unknown"}`,
+      sourceTurnId: options?.sourceTurnId,
       label: `pending milestone report: ${state.current_stage ?? "unknown"}`,
       current_stage: state.current_stage,
       next_stage: state.next_stage,

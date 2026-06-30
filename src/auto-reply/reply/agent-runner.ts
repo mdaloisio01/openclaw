@@ -1461,12 +1461,15 @@ export async function runReplyAgent(params: {
     hasOriginalDirectUserTurn && replySessionKey
       ? buildSourceDeliveryObligationId({
           sourceSessionKey: replySessionKey,
-          parentRunId: replyOperation.key,
+          parentRunId: opts?.runId ?? replyOperation.key,
           sourceMessageId:
             normalizeOptionalString(sessionCtx.MessageSidFull) ??
             normalizeOptionalString(sessionCtx.MessageSid),
         })
       : undefined;
+  if (sourceDeliveryObligationId && opts) {
+    opts.sourceTurnId = sourceDeliveryObligationId;
+  }
   const recordSourceDeliveryAccepted = (): void => {
     if (!sourceDeliveryObligationId || !replySessionKey) {
       return;
@@ -1487,6 +1490,7 @@ export async function runReplyAgent(params: {
         normalizeOptionalString(sessionCtx.MessageSidFull) ??
         normalizeOptionalString(sessionCtx.MessageSid),
       parentRunId: replyOperation.key,
+      sourceTurnId: sourceDeliveryObligationId,
       missionLabel: normalizeActiveMissionSummary(commandBody),
       currentStage: "accepted",
       deliveryContext,
@@ -2594,6 +2598,7 @@ export async function runReplyAgent(params: {
           setReplyPayloadMetadata(payload, {
             sourceDeliveryObligation: {
               id: sourceDeliveryObligationId,
+              sourceTurnId: sourceDeliveryObligationId,
               final: true,
               currentStage: "final source dispatch delivered",
             },
