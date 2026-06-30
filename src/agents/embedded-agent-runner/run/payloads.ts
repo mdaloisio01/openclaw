@@ -43,7 +43,6 @@ import {
   applyStopContractToAnswerTexts,
   extractLatestStopContract,
   inferStopContractFromText,
-  type EmbeddedRunStopContract,
 } from "../../stop-contract.js";
 import { isExecLikeToolName, type ToolErrorSummary } from "../../tool-error-summary.js";
 import { isLikelyMutatingToolName } from "../../tool-mutation.js";
