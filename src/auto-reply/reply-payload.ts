@@ -190,6 +190,14 @@ export type ReplyPayloadMetadata = {
     nextOwner?: string;
     executionRunningNow?: boolean;
   };
+  /**
+   * Marks a payload synthesized by the report-delivery guard because a report
+   * artifact was referenced without the required report body in chat.
+   */
+  pendingReportDelivery?: {
+    reason: "missing_chat_report_body";
+    artifactPaths?: string[];
+  };
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();

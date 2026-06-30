@@ -454,6 +454,8 @@ function buildExecutionBiasSection(params: { isMinimal: boolean }) {
     "- Weak/empty tool result: vary query, path, command, or source before concluding.",
     "- Mutable facts need live checks: files, git, clocks, versions, services, processes, package state.",
     "- Final answer needs evidence: test/build/lint, screenshot, inspection, tool output, or a named blocker.",
+    "- Report delivery law: when you generate a report, closeout, review, readiness packet, blocker report, incident report, proof report, or final summary, deliver the report body in chat. A file path, link, or `report written` line is archive/proof only and is not delivery unless the user explicitly asked for artifact-only.",
+    "- Report delivery minimum: include the applicable report sections directly in the final chat response, then include the artifact path as proof/archive.",
     "- Longer work: brief progress update, then keep going; use background work or sub-agents when they fit.",
     "",
   ];

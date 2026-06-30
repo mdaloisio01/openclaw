@@ -39,11 +39,11 @@ import {
   extractAssistantVisibleText,
 } from "../../embedded-agent-utils.js";
 import type { AgentInternalEvent } from "../../internal-events.js";
+import { enforceReportDeliveryText } from "../../report-delivery-guard.js";
 import {
   applyStopContractToAnswerTexts,
   extractLatestStopContract,
   inferStopContractFromText,
-  type EmbeddedRunStopContract,
 } from "../../stop-contract.js";
 import { isExecLikeToolName, type ToolErrorSummary } from "../../tool-error-summary.js";
 import { isLikelyMutatingToolName } from "../../tool-mutation.js";
@@ -260,6 +260,7 @@ export function buildEmbeddedRunPayloads(params: {
   runAborted?: boolean;
   didSendDeterministicApprovalPrompt?: boolean;
   heartbeatToolResponse?: HeartbeatToolResponse;
+  reportDeliveryArtifactOnlyAllowed?: boolean;
 }): ReplyPayload[] {
   if (params.heartbeatToolResponse) {
     return [createHeartbeatToolResponsePayload(params.heartbeatToolResponse)];
@@ -588,6 +589,24 @@ export function buildEmbeddedRunPayloads(params: {
       const payload: ReplyPayload = {
         text: normalizeOptionalString(item.text),
       };
+      const reportDelivery =
+        payload.text && !item.isReasoning
+          ? enforceReportDeliveryText(payload.text, {
+              explicitArtifactOnlyAllowed: params.reportDeliveryArtifactOnlyAllowed,
+            })
+          : null;
+      if (reportDelivery && !reportDelivery.validation.ok) {
+        payload.text = reportDelivery.text;
+        payload.isError = true;
+        setReplyPayloadMetadata(payload, {
+          pendingReportDelivery: {
+            reason: "missing_chat_report_body",
+            ...(reportDelivery.validation.artifactPaths.length
+              ? { artifactPaths: reportDelivery.validation.artifactPaths }
+              : {}),
+          },
+        });
+      }
       const mediaUrl = item.mediaUrl ?? item.media?.[0];
       if (mediaUrl) {
         payload.mediaUrl = mediaUrl;

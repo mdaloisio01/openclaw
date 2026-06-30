@@ -351,6 +351,47 @@ describe("buildEmbeddedRunPayloads tool-error warnings", () => {
     expectSinglePayloadText(payloads, explicitReply);
   });
 
+  it("blocks artifact-only report delivery at the final payload boundary", () => {
+    const artifactPath =
+      "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/gateway_outage_closeout_report_2026-06-29T2341Z.md";
+    const payloads = buildPayloads({
+      assistantTexts: [`Report written here: ${artifactPath}`],
+      lastAssistant: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: `Report written here: ${artifactPath}` }],
+      } as AssistantMessage,
+    });
+
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]?.isError).toBe(true);
+    expect(payloads[0]?.text).toContain("STATUS: Blocked");
+    expect(payloads[0]?.text).toContain("pending_report_delivery");
+    expect(payloads[0]?.text).toContain(artifactPath);
+    expect(getReplyPayloadMetadata(payloads[0] as object)).toMatchObject({
+      pendingReportDelivery: {
+        reason: "missing_chat_report_body",
+        artifactPaths: [artifactPath],
+      },
+    });
+  });
+
+  it("allows explicit artifact-only report delivery when the caller marks it allowed", () => {
+    const artifactPath =
+      "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/artifact_only_report_2026-06-29T2341Z.md";
+    const payloads = buildPayloads({
+      assistantTexts: [`Report written here: ${artifactPath}`],
+      lastAssistant: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: `Report written here: ${artifactPath}` }],
+      } as AssistantMessage,
+      reportDeliveryArtifactOnlyAllowed: true,
+    });
+
+    expectSinglePayloadText(payloads, `Report written here: ${artifactPath}`);
+  });
+
   it("turns internal message-tool source replies into suppression-safe final payloads", () => {
     const payloads = buildPayloads({
       assistantTexts: ["ordinary final should stay private"],
