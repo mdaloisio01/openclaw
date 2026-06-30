@@ -1,7 +1,6 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 
 export const REPORT_DELIVERY_PENDING_MARKER = "pending_report_delivery";
-export const MILESTONE_REPORT_PENDING_MARKER = "pending_milestone_report";
 
 const REPORT_ARTIFACT_PATH_PATTERN =
   /(?:^|[\s(["'`<])(?<path>(?:\/home\/will\/\.openclaw\/workspace-orchestrator\/)?file_hub\/exports\/[^\s)"'`>]*?(?:report|closeout|review|readiness|blocker|incident|proof|summary|delivery|interpretation)[^\s)"'`>]*?\.md)\b/giu;
@@ -35,17 +34,6 @@ const REQUIRED_REPORT_SECTION_LABELS = [
   "ARTIFACT:",
 ] as const;
 
-const REQUIRED_MILESTONE_SECTION_LABELS = [
-  "STATUS:",
-  "MODE:",
-  "STAGE COMPLETE:",
-  "RESULT:",
-  "PROOF:",
-  "NEXT STAGE:",
-  "SAFETY CHECK:",
-  "BLOCKERS:",
-] as const;
-
 export type ReportDeliveryValidation = {
   ok: boolean;
   reason?:
@@ -55,31 +43,6 @@ export type ReportDeliveryValidation = {
     | "missing_chat_report_body";
   pendingReportDelivery?: boolean;
   artifactPaths: string[];
-  sectionCount: number;
-};
-
-export type ReportGovernedMissionState = {
-  report_governed_mission?: boolean;
-  current_stage?: string;
-  next_stage?: string;
-  stage_complete_pending_report?: boolean;
-  milestone_report_delivered?: boolean;
-  final_closeout_required?: boolean;
-  final_closeout_delivered?: boolean;
-  interrupted_stage_pending_report?: boolean;
-};
-
-export type MilestoneReportValidation = {
-  ok: boolean;
-  reason?:
-    | "milestone_body_present"
-    | "milestone_not_required"
-    | "milestone_updates_explicitly_suppressed"
-    | "missing_milestone_report"
-    | "interrupted_stage_not_reported";
-  pendingMilestoneReport?: boolean;
-  currentStage?: string;
-  nextStage?: string;
   sectionCount: number;
 };
 
@@ -117,17 +80,6 @@ export function hasReportDeliveryBody(text: string): boolean {
 export function countReportDeliverySections(text: string): number {
   const upper = normalizeText(text).toUpperCase();
   return REQUIRED_REPORT_SECTION_LABELS.filter((label) => upper.includes(label)).length;
-}
-
-export function countMilestoneReportSections(text: string): number {
-  const upper = normalizeText(text).toUpperCase();
-  return REQUIRED_MILESTONE_SECTION_LABELS.filter((label) => upper.includes(label)).length;
-}
-
-export function hasMilestoneReportBody(text: string): boolean {
-  const upper = normalizeText(text).toUpperCase();
-  const sectionCount = countMilestoneReportSections(upper);
-  return upper.includes("STAGE COMPLETE:") && upper.includes("NEXT STAGE:") && sectionCount >= 6;
 }
 
 export function isReportDeliveryRequiredByText(text: string): boolean {
@@ -180,78 +132,6 @@ export function validateReportDeliveryText(
   };
 }
 
-export function validateMilestoneReportText(text: string): MilestoneReportValidation {
-  const sectionCount = countMilestoneReportSections(text);
-  if (hasMilestoneReportBody(text)) {
-    return {
-      ok: true,
-      reason: "milestone_body_present",
-      sectionCount,
-    };
-  }
-  return {
-    ok: false,
-    reason: "missing_milestone_report",
-    pendingMilestoneReport: true,
-    sectionCount,
-  };
-}
-
-export function validateReportGovernedStageAdvance(
-  state: ReportGovernedMissionState,
-  options?: { explicitNoUpdatesAllowed?: boolean },
-): MilestoneReportValidation {
-  const sectionCount = 0;
-  if (options?.explicitNoUpdatesAllowed === true) {
-    return {
-      ok: true,
-      reason: "milestone_updates_explicitly_suppressed",
-      currentStage: state.current_stage,
-      nextStage: state.next_stage,
-      sectionCount,
-    };
-  }
-  if (state.report_governed_mission !== true) {
-    return {
-      ok: true,
-      reason: "milestone_not_required",
-      currentStage: state.current_stage,
-      nextStage: state.next_stage,
-      sectionCount,
-    };
-  }
-  if (
-    state.interrupted_stage_pending_report === true &&
-    state.milestone_report_delivered !== true
-  ) {
-    return {
-      ok: false,
-      reason: "interrupted_stage_not_reported",
-      pendingMilestoneReport: true,
-      currentStage: state.current_stage,
-      nextStage: state.next_stage,
-      sectionCount,
-    };
-  }
-  if (state.stage_complete_pending_report === true && state.milestone_report_delivered !== true) {
-    return {
-      ok: false,
-      reason: "missing_milestone_report",
-      pendingMilestoneReport: true,
-      currentStage: state.current_stage,
-      nextStage: state.next_stage,
-      sectionCount,
-    };
-  }
-  return {
-    ok: true,
-    reason: "milestone_not_required",
-    currentStage: state.current_stage,
-    nextStage: state.next_stage,
-    sectionCount,
-  };
-}
-
 export function buildPendingReportDeliveryNotice(validation: ReportDeliveryValidation): string {
   const artifactLine =
     validation.artifactPaths.length > 0
@@ -269,25 +149,6 @@ export function buildPendingReportDeliveryNotice(validation: ReportDeliveryValid
     `NEXT ACTION: Deliver the full report body in chat; marker=${REPORT_DELIVERY_PENDING_MARKER}.`,
     "BLOCKERS: pending_report_delivery",
     artifactLine,
-  ].join("\n");
-}
-
-export function buildPendingMilestoneReportNotice(validation: MilestoneReportValidation): string {
-  const currentStage = validation.currentStage ?? "unknown";
-  const nextStage = validation.nextStage ?? "unknown";
-  const result =
-    validation.reason === "interrupted_stage_not_reported"
-      ? "A tool call or runtime phase was interrupted before the stage was proven, and no user-facing not-proven report was delivered."
-      : "A report-governed mission completed a meaningful stage and attempted to advance without delivering the required milestone report in chat.";
-  return [
-    "STATUS: Blocked",
-    "MODE: System-wide milestone report delivery validator",
-    `STAGE COMPLETE: ${currentStage}`,
-    `RESULT: ${result}`,
-    "PROOF: Runtime/report-governed mission state shows stage_complete_pending_report=true or interrupted_stage_pending_report=true while milestone_report_delivered=false.",
-    `NEXT STAGE: Do not advance to ${nextStage} until the milestone report is delivered in chat; marker=${MILESTONE_REPORT_PENDING_MARKER}.`,
-    "SAFETY CHECK: The phase transition was not treated as silently proven. Artifact paths and internal state are not report delivery.",
-    "BLOCKERS: pending_milestone_report",
   ].join("\n");
 }
 

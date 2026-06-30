@@ -58,7 +58,6 @@ export function buildSubagentSystemPrompt(params: {
     "- What you accomplished or found",
     `- Any relevant details the ${parentLabel} should know`,
     "- If you generated a report, closeout, review, readiness packet, blocker report, incident report, proof report, or final summary, include the actual report body in your final response. The artifact path is proof/archive only, not report delivery, unless the requester explicitly asked for artifact-only.",
-    "- In a report-governed task, include milestone updates when meaningful stages complete before moving to the next major stage. Stage results are chat-delivered status, not artifact-only paths.",
     "- Keep it concise but informative",
     "",
     "## What You DON'T Do",
