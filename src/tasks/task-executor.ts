@@ -1,4 +1,3 @@
-import { recordPendingMilestoneReport } from "../agents/report-delivery-state.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import type {
@@ -186,29 +185,7 @@ export function completeTaskRunByRunId(params: {
 }
 
 export function finalizeTaskRunByRunId(params: DetachedTaskFinalizeParams) {
-  const tasks = finalizeTaskRunByRunIdInRegistry(params);
-  for (const task of tasks) {
-    if (
-      task.status !== "running" &&
-      task.notifyPolicy !== "silent" &&
-      task.deliveryStatus !== "delivered" &&
-      task.deliveryStatus !== "not_applicable"
-    ) {
-      recordPendingMilestoneReport({
-        id: `task:${task.runId ?? task.taskId}:${task.status}`,
-        label: task.label ?? task.task,
-        current_stage: `${task.runtime} task ${task.status}`,
-        next_stage: "chat delivery",
-        final_closeout_required: true,
-        final_closeout_delivered: false,
-        notes:
-          task.terminalSummary ??
-          task.error ??
-          "Task reached a terminal state before chat delivery was recorded.",
-      });
-    }
-  }
-  return tasks;
+  return finalizeTaskRunByRunIdInRegistry(params);
 }
 
 export function failTaskRunByRunId(params: {

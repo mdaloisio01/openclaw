@@ -264,56 +264,6 @@ describe("task-executor", () => {
     });
   });
 
-  it("writes a pending milestone marker when a terminal task still needs chat delivery", async () => {
-    const { mkdtemp, readFile, rm } = await import("node:fs/promises");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const original = process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
-    const markerDir = await mkdtemp(join(tmpdir(), "openclaw-task-milestone-"));
-    process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = markerDir;
-    try {
-      await withTaskExecutorStateDir(async () => {
-        createRunningTaskRun({
-          runtime: "subagent",
-          ownerKey: "agent:main:main",
-          scopeKind: "session",
-          childSessionKey: "agent:codex:subagent:child",
-          runId: "run-report-governed-task",
-          task: "Write closeout",
-          startedAt: 10,
-          notifyPolicy: "done_only",
-          deliveryStatus: "pending",
-        });
-
-        completeTaskRunByRunId({
-          runId: "run-report-governed-task",
-          endedAt: 20,
-          terminalSummary: "Closeout complete.",
-        });
-      });
-      const payload = JSON.parse(
-        await readFile(join(markerDir, "pending_milestone_report.json"), "utf8"),
-      ) as { rows: Array<Record<string, unknown>> };
-      expect(payload.rows).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            id: "task:run-report-governed-task:succeeded",
-            current_stage: "subagent task succeeded",
-            next_stage: "chat delivery",
-            milestone_report_delivered: false,
-          }),
-        ]),
-      );
-    } finally {
-      if (original === undefined) {
-        delete process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
-      } else {
-        process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = original;
-      }
-      await rm(markerDir, { recursive: true, force: true });
-    }
-  });
-
   it("records progress, failure, and delivery status through the executor", async () => {
     await withTaskExecutorStateDir(async () => {
       const created = createRunningTaskRun({
