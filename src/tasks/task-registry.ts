@@ -6,7 +6,6 @@ import {
   buildAgentRunTerminalOutcome,
   type AgentRunTerminalOutcome,
 } from "../agents/agent-run-terminal-outcome.js";
-import { recordMilestoneReportDelivered } from "../agents/report-delivery-state.js";
 import { shouldRouteCompletionThroughRequesterSession } from "../auto-reply/reply/completion-delivery-policy.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { onAgentEvent } from "../infra/agent-events.js";
@@ -1311,12 +1310,6 @@ function updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | nu
       taskId,
       flowId: next.parentFlowId,
       error,
-    });
-  }
-  if (patch.deliveryStatus === "delivered" && current.deliveryStatus !== "delivered") {
-    recordMilestoneReportDelivered({
-      id: `task:${next.runId ?? next.taskId}:${next.status}`,
-      notes: "Task delivery status changed to delivered.",
     });
   }
   emitTaskRegistryObserverEvent(() => ({
