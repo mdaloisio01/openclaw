@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { sanitizeGoogleAssistantFirstOrdering } from "../../shared/google-turn-ordering.js";
@@ -101,6 +102,10 @@ const AGENTS_POLICY_DIGEST_RATIO = 0.35;
 const AGENTS_POLICY_HEAD_RATIO = 0.45;
 const AGENTS_POLICY_TAIL_RATIO = 0.15;
 const AGENTS_POLICY_DIGEST_MAX_LINE_CHARS = 240;
+
+function formatBootstrapPerfMs(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(1) : "n/a";
+}
 
 type TrimBootstrapResult = {
   content: string;
@@ -419,6 +424,7 @@ export function buildBootstrapContextFiles(
   let remainingTotalChars = totalMaxChars;
   const result: EmbeddedContextFile[] = [];
   for (const file of files) {
+    const fileStarted = performance.now();
     if (remainingTotalChars <= 0) {
       break;
     }
@@ -456,7 +462,9 @@ export function buildBootstrapContextFiles(
     }
     if (trimmed.truncated || contentWithinBudget.length < trimmed.content.length) {
       opts?.warn?.(
-        `workspace bootstrap file ${file.name} is ${trimmed.originalLength} chars (limit ${trimmed.maxChars}); truncating in injected context`,
+        `workspace bootstrap file ${file.name} is ${trimmed.originalLength} chars (limit ${trimmed.maxChars}); truncating in injected context; [perf:bootstrap-injection] file=${JSON.stringify(file.name)} rawChars=${trimmed.originalLength} injectedChars=${contentWithinBudget.length} truncated=true maxChars=${trimmed.maxChars} remainingTotalBefore=${remainingTotalChars} durationMs=${formatBootstrapPerfMs(
+          performance.now() - fileStarted,
+        )}`,
       );
     }
     remainingTotalChars = Math.max(0, remainingTotalChars - contentWithinBudget.length);

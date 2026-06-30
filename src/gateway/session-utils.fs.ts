@@ -250,7 +250,7 @@ async function readRecentTranscriptTailLinesAsync(
   filePath: string,
   stat: fs.Stats,
   opts: ReadRecentSessionMessagesOptions,
-): Promise<string[]> {
+): Promise<{ lines: string[]; readBytes: number }> {
   const { maxBytes, maxLines } = normalizeRecentSessionReadOptions(opts);
   const readLen = Math.min(stat.size, maxBytes);
   const readStart = Math.max(0, stat.size - readLen);
@@ -259,14 +259,15 @@ async function readRecentTranscriptTailLinesAsync(
     const buffer = Buffer.alloc(readLen);
     const { bytesRead } = await handle.read(buffer, 0, readLen, readStart);
     if (bytesRead <= 0) {
-      return [];
+      return { lines: [], readBytes: 0 };
     }
-    return buffer
+    const lines = buffer
       .toString("utf-8", 0, bytesRead)
       .split(/\r?\n/)
       .slice(readStart > 0 ? 1 : 0)
       .filter((line) => line.trim().length > 0)
       .slice(-maxLines);
+    return { lines, readBytes: bytesRead };
   } finally {
     await handle.close();
   }
@@ -687,30 +688,53 @@ export async function readRecentSessionMessagesAsync(
   sessionFile?: string,
   opts?: ReadRecentSessionMessagesOptions,
 ): Promise<unknown[]> {
+  return (
+    await readRecentSessionMessagesWithTailStatsAsync(sessionId, storePath, sessionFile, opts)
+  ).messages;
+}
+
+export async function readRecentSessionMessagesWithTailStatsAsync(
+  sessionId: string,
+  storePath: string | undefined,
+  sessionFile?: string,
+  opts?: ReadRecentSessionMessagesOptions,
+): Promise<{
+  messages: unknown[];
+  filePath?: string;
+  fileBytes?: number;
+  readBytes: number;
+  tailLines: number;
+}> {
   const normalized = normalizeRecentSessionReadOptions(opts);
   const { maxMessages } = normalized;
   if (maxMessages === 0) {
-    return [];
+    return { messages: [], readBytes: 0, tailLines: 0 };
   }
 
   const filePath = findExistingTranscriptPath(sessionId, storePath, sessionFile);
   if (!filePath) {
-    return [];
+    return { messages: [], readBytes: 0, tailLines: 0 };
   }
 
   let stat: fs.Stats;
   try {
     stat = await fs.promises.stat(filePath);
   } catch {
-    return [];
+    return { messages: [], filePath, readBytes: 0, tailLines: 0 };
   }
   if (stat.size === 0) {
-    return [];
+    return { messages: [], filePath, fileBytes: stat.size, readBytes: 0, tailLines: 0 };
   }
-  const lines = await readRecentTranscriptTailLinesAsync(filePath, stat, {
+  const { lines, readBytes } = await readRecentTranscriptTailLinesAsync(filePath, stat, {
     ...normalized,
   });
-  return parseRecentTranscriptTailMessages(lines, maxMessages);
+  return {
+    messages: parseRecentTranscriptTailMessages(lines, maxMessages),
+    filePath,
+    fileBytes: stat.size,
+    readBytes,
+    tailLines: lines.length,
+  };
 }
 
 export async function readRecentSessionMessagesWithStatsAsync(
@@ -1543,7 +1567,7 @@ export async function readRecentSessionUsageFromTranscriptAsync(
     if (stat.size === 0) {
       return null;
     }
-    const lines = await readRecentTranscriptTailLinesAsync(filePath, stat, {
+    const { lines } = await readRecentTranscriptTailLinesAsync(filePath, stat, {
       maxMessages: 1,
       maxLines: 1000,
       maxBytes,
@@ -1571,7 +1595,7 @@ export async function readLatestRecentSessionUsageFromTranscriptAsync(
     if (stat.size === 0) {
       return null;
     }
-    const lines = await readRecentTranscriptTailLinesAsync(filePath, stat, {
+    const { lines } = await readRecentTranscriptTailLinesAsync(filePath, stat, {
       maxMessages: 1,
       maxLines: 1000,
       maxBytes,

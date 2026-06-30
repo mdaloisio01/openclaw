@@ -85,6 +85,9 @@ describe("buildBootstrapContextFiles", () => {
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("TOOLS.md");
     expect(warnings[0]).toContain("limit 200");
+    expect(warnings[0]).toContain("[perf:bootstrap-injection]");
+    expect(warnings[0]).toContain("rawChars=");
+    expect(warnings[0]).toContain("injectedChars=");
   });
   it("fits the rendered truncation marker inside the per-file budget", () => {
     const maxChars = DEFAULT_BOOTSTRAP_MAX_CHARS;

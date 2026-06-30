@@ -144,7 +144,7 @@ import {
   readSessionMessagesAsync,
   resolveGatewayModelSupportsImages,
   resolveDeletedAgentIdFromSessionKey,
-  readRecentSessionMessagesAsync,
+  readRecentSessionMessagesWithTailStatsAsync,
   resolveSessionModelRef,
   resolveSessionStoreKey,
 } from "../session-utils.js";
@@ -2486,13 +2486,19 @@ async function handleChatHistoryRequest({
     maxMessages: rawHistoryWindow.maxMessages + 1,
     maxLines: rawHistoryWindow.maxLines + 1,
   };
-  const localMessages =
+  const historyRead =
     sessionId && storePath
-      ? await readRecentSessionMessagesAsync(sessionId, storePath, entry?.sessionFile, {
-          ...localHistoryReadOptions,
-          maxBytes: Math.max(maxHistoryBytes * 2, 1024 * 1024),
-        })
-      : [];
+      ? await readRecentSessionMessagesWithTailStatsAsync(
+          sessionId,
+          storePath,
+          entry?.sessionFile,
+          {
+            ...localHistoryReadOptions,
+            maxBytes: Math.max(maxHistoryBytes * 2, 1024 * 1024),
+          },
+        )
+      : { messages: [], readBytes: 0, tailLines: 0 };
+  const localMessages = historyRead.messages;
   perf.mark("history_read");
   const overreadContextMessage =
     localMessages.length > rawHistoryWindow.maxMessages ? localMessages[0] : undefined;
@@ -2570,6 +2576,7 @@ async function handleChatHistoryRequest({
     agentId: selectedAgent.agentId,
     modelCatalog,
   });
+  perf.mark("session_info");
   const defaultAgentId = resolveDefaultAgentId(cfg);
   const activeRunAgentId =
     canonicalKey === "global" ? (selectedAgent.agentId ?? defaultAgentId) : selectedAgent.agentId;
@@ -2580,7 +2587,9 @@ async function handleChatHistoryRequest({
     ...(activeRunAgentId ? { agentId: activeRunAgentId } : {}),
     defaultAgentId,
   });
+  perf.mark("active_run_flag");
   const defaults = getSessionDefaults(cfg, modelCatalog, { allowPluginNormalization: false });
+  perf.mark("defaults");
   const thinkingLevel = sessionInfo.thinkingLevel ?? sessionInfo.thinkingDefault;
   const verboseLevel = entry?.verboseLevel ?? cfg.agents?.defaults?.verboseDefault;
   sessionInfo.verboseLevel = verboseLevel;
@@ -2591,15 +2600,19 @@ async function handleChatHistoryRequest({
     chatAbortControllers: context.chatAbortControllers,
     chatRunBuffers: context.chatRunBuffers,
     requestedSessionKey: sessionKey,
-    canonicalSessionKey: resolveSessionStoreKey({ cfg, sessionKey }),
+    canonicalSessionKey: canonicalKey,
     agentId: activeRunAgentId,
     defaultAgentId,
   });
+  perf.mark("in_flight_snapshot");
   const boundedInFlightRun = boundInFlightRunSnapshotForChatHistory({
     snapshot: inFlightRun,
     messages: bounded.messages,
     maxBytes: maxHistoryBytes,
   });
+  perf.mark("in_flight_bound");
+  const agentsList = includeAgentsList ? listAgentsForGateway(cfg, modelCatalog) : undefined;
+  perf.mark("agents_list");
   const payload = {
     sessionKey,
     sessionId,
@@ -2610,9 +2623,9 @@ async function handleChatHistoryRequest({
     fastMode: entry?.fastMode,
     verboseLevel,
     ...(boundedInFlightRun ? { inFlightRun: boundedInFlightRun } : {}),
-    ...(includeAgentsList ? { agentsList: listAgentsForGateway(cfg, modelCatalog) } : {}),
+    ...(agentsList ? { agentsList } : {}),
   };
-  perf.mark("response_build");
+  perf.mark("payload");
   logGatewayPerfSummary({
     logger: context.logGateway,
     surface: method,
@@ -2622,6 +2635,9 @@ async function handleChatHistoryRequest({
       `agentId=${selectedAgent.agentId ?? "default"} requestedLimit=${requested} max=${max} ` +
       `localMessages=${localMessages.length} projectedMessages=${normalized.length} ` +
       `returnedMessages=${bounded.messages.length} placeholders=${placeholderCount} ` +
+      `historyFile=${historyRead.filePath ? JSON.stringify(historyRead.filePath) : "none"} ` +
+      `historyFileBytes=${historyRead.fileBytes ?? "unknown"} historyReadBytes=${historyRead.readBytes} ` +
+      `historyTailLines=${historyRead.tailLines} ` +
       `storeEntries=${Object.keys(store).length} contextTokens=${sessionInfo.contextTokens ?? "unknown"} ` +
       `totalTokens=${sessionInfo.totalTokens ?? "unknown"} ${formatGatewayPerfCpuUsage(cpuStarted)} ` +
       `stages="${perf.summary()}"`,
