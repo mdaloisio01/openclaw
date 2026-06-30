@@ -2506,13 +2506,11 @@ export async function dispatchReplyFromConfig(
           metadata: deliveredSourceReplyTranscriptMirror,
           cfg,
         });
-        if (sourceDeliveryObligation) {
-          await recordSourceDeliveryAfterDispatcherDelivery({
-            dispatcher,
-            before: finalOutcomeBefore,
-            metadata: deliveredSourceDeliveryObligation,
-          });
-        }
+        await recordSourceDeliveryAfterDispatcherDelivery({
+          dispatcher,
+          before: finalOutcomeBefore,
+          metadata: deliveredSourceDeliveryObligation,
+        });
       } else {
         recordFailedSourceDeliveryObligation({
           metadata: sourceDeliveryObligation,
