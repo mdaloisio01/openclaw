@@ -4,6 +4,7 @@ import type { AssistantMessage } from "../llm/types.js";
 import { buildEmbeddedRunPayloads } from "./embedded-agent-runner/run/payloads.js";
 import {
   buildPendingMilestoneReportNotice,
+  enforceReportGovernedStageAdvance,
   enforceReportDeliveryText,
   validateMilestoneReportText,
   validateReportDeliveryText,
@@ -81,6 +82,37 @@ describe("report delivery guard", () => {
     expect(result.text).toContain(artifactPath);
   });
 
+  it("writes a pending final-report marker when artifact-only delivery is blocked", async () => {
+    const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const original = process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
+    const markerDir = await mkdtemp(join(tmpdir(), "openclaw-report-marker-"));
+    process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = markerDir;
+    try {
+      enforceReportDeliveryText(`Report saved: ${artifactPath}`);
+      const payload = JSON.parse(
+        await readFile(join(markerDir, "pending_report_delivery.json"), "utf8"),
+      ) as { rows: Array<Record<string, unknown>> };
+      expect(payload.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            artifact_path: artifactPath,
+            report_required: true,
+            chat_report_delivered: false,
+          }),
+        ]),
+      );
+    } finally {
+      if (original === undefined) {
+        delete process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
+      } else {
+        process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = original;
+      }
+      await rm(markerDir, { recursive: true, force: true });
+    }
+  });
+
   it("applies outside Cleanup Crew reports", () => {
     const result = validateReportDeliveryText(
       "Research pass report saved: file_hub/exports/r_and_d_review_report_2026-06-29T2341Z.md",
@@ -139,6 +171,44 @@ describe("report delivery guard", () => {
       currentStage: "build",
       nextStage: "asset guard",
     });
+  });
+
+  it("writes a pending milestone marker when a stage advance is blocked", async () => {
+    const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const original = process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
+    const markerDir = await mkdtemp(join(tmpdir(), "openclaw-milestone-marker-"));
+    process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = markerDir;
+    try {
+      enforceReportGovernedStageAdvance({
+        report_governed_mission: true,
+        current_stage: "build",
+        next_stage: "asset guard",
+        stage_complete_pending_report: true,
+        milestone_report_delivered: false,
+      });
+      const payload = JSON.parse(
+        await readFile(join(markerDir, "pending_milestone_report.json"), "utf8"),
+      ) as { rows: Array<Record<string, unknown>> };
+      expect(payload.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            current_stage: "build",
+            next_stage: "asset guard",
+            stage_complete_pending_report: true,
+            milestone_report_delivered: false,
+          }),
+        ]),
+      );
+    } finally {
+      if (original === undefined) {
+        delete process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
+      } else {
+        process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = original;
+      }
+      await rm(markerDir, { recursive: true, force: true });
+    }
   });
 
   it("requires an asset-guard milestone report before restart", () => {

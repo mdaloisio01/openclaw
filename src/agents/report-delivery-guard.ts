@@ -1,4 +1,8 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import {
+  recordPendingMilestoneReport,
+  recordPendingReportDelivery,
+} from "./report-delivery-state.js";
 
 export const REPORT_DELIVERY_PENDING_MARKER = "pending_report_delivery";
 export const MILESTONE_REPORT_PENDING_MARKER = "pending_milestone_report";
@@ -299,8 +303,38 @@ export function enforceReportDeliveryText(
   if (validation.ok) {
     return { text, validation };
   }
+  recordPendingReportDelivery({
+    id:
+      validation.artifactPaths[0] ??
+      `final-response:${Buffer.from(normalizeText(text)).toString("base64url").slice(0, 32)}`,
+    label: "final response report body missing",
+    artifact_path: validation.artifactPaths[0],
+    artifact_paths: validation.artifactPaths,
+    notes:
+      "Final response referenced a report artifact or report-written wording without delivering the report body in chat.",
+  });
   return {
     text: buildPendingReportDeliveryNotice(validation),
     validation,
   };
+}
+
+export function enforceReportGovernedStageAdvance(
+  state: ReportGovernedMissionState,
+  options?: { explicitNoUpdatesAllowed?: boolean },
+): MilestoneReportValidation {
+  const validation = validateReportGovernedStageAdvance(state, options);
+  if (!validation.ok) {
+    recordPendingMilestoneReport({
+      id: `stage:${state.current_stage ?? "unknown"}:${state.next_stage ?? "unknown"}`,
+      label: `pending milestone report: ${state.current_stage ?? "unknown"}`,
+      current_stage: state.current_stage,
+      next_stage: state.next_stage,
+      interrupted_stage_pending_report: state.interrupted_stage_pending_report,
+      final_closeout_required: state.final_closeout_required,
+      final_closeout_delivered: state.final_closeout_delivered,
+      notes: validation.reason,
+    });
+  }
+  return validation;
 }
