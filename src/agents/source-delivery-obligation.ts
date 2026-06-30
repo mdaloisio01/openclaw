@@ -313,42 +313,6 @@ function existingRow(id: string): SourceDeliveryObligation | undefined {
   return readRows(path.join(dir, SOURCE_DELIVERY_FILE)).find((row) => row.id === id);
 }
 
-function isTerminalSourceDelivery(row: SourceDeliveryObligation): boolean {
-  return (
-    row.finalDeliveryDelivered === true ||
-    row.deliveryStatus === "final_delivered" ||
-    row.deliveryStatus === "delivery_failed" ||
-    row.deliveryStatus === "blocked"
-  );
-}
-
-function sourceTurnSortMs(row: SourceDeliveryObligation): number {
-  return timestampMs(row.acceptedAt) ?? timestampMs(row.updatedAt) ?? 0;
-}
-
-function latestOpenSourceTurnForSession(params: {
-  sourceSessionKey?: string;
-  parentRunId?: string;
-}): SourceDeliveryObligation | undefined {
-  const sourceSessionKey = normalizeString(params.sourceSessionKey);
-  if (!sourceSessionKey) {
-    return undefined;
-  }
-  const dir = sourceDeliveryDir();
-  if (!dir) {
-    return undefined;
-  }
-  const rows = readRows(path.join(dir, SOURCE_DELIVERY_FILE));
-  const parentRunId = normalizeString(params.parentRunId);
-  const candidates = rows.filter((row) => {
-    if (row.sourceSessionKey !== sourceSessionKey || isTerminalSourceDelivery(row)) {
-      return false;
-    }
-    return !parentRunId || !row.parentRunId || row.parentRunId === parentRunId;
-  });
-  return candidates.sort((left, right) => sourceTurnSortMs(right) - sourceTurnSortMs(left))[0];
-}
-
 function mergeDeliveryEvents(
   existing: SourceDeliveryObligation | undefined,
   next: SourceTurnDeliveryEvent,
@@ -440,8 +404,6 @@ export function recordSourceVisibleDelivery(params: {
 
 export function recordSourceVisibleDeliveryIfPresent(params: {
   id: string;
-  sourceSessionKey?: string;
-  parentRunId?: string;
   text?: string;
   final?: boolean;
   currentStage?: string;
@@ -453,22 +415,7 @@ export function recordSourceVisibleDeliveryIfPresent(params: {
   }
   const rows = readRows(path.join(dir, SOURCE_DELIVERY_FILE));
   if (!rows.some((row) => row.id === params.id)) {
-    const fallback = latestOpenSourceTurnForSession({
-      sourceSessionKey: params.sourceSessionKey,
-      parentRunId: params.parentRunId,
-    });
-    if (!fallback) {
-      return undefined;
-    }
-    return recordSourceVisibleDelivery({
-      id: fallback.id,
-      text: params.text,
-      final: params.final,
-      currentStage: params.currentStage,
-      notes: params.notes
-        ? `${params.notes}; recovered by latest source-session obligation`
-        : "Recovered by latest source-session obligation.",
-    });
+    return undefined;
   }
   return recordSourceVisibleDelivery(params);
 }

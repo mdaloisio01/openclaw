@@ -1830,8 +1830,6 @@ export async function dispatchReplyFromConfig(
       });
     recordSourceVisibleDeliveryIfPresent({
       id: sourceTurnId,
-      sourceSessionKey: sessionKey,
-      parentRunId: params.replyOptions?.runId,
       text: sourceDeliveryTextForDeliveredPayload(payload),
       final: false,
       currentStage,

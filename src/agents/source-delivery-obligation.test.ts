@@ -169,48 +169,6 @@ describe("source delivery obligation", () => {
     });
   });
 
-  it("records progress on the latest open source turn when progress lacks the source message id", () => {
-    const oldId = "source:agent:orchestrator:main:old-msg";
-    const currentId = "source:agent:orchestrator:main:current-msg";
-    recordSourceDeliveryObligation({
-      id: oldId,
-      sourceChannel: "webchat",
-      sourceSessionKey: "agent:orchestrator:main",
-      sourceMessageId: "old-msg",
-      acceptedAt: "2026-06-30T16:00:00.000Z",
-    });
-    recordSourceDeliveryObligation({
-      id: currentId,
-      sourceChannel: "webchat",
-      sourceSessionKey: "agent:orchestrator:main",
-      sourceMessageId: "current-msg",
-      acceptedAt: "2026-06-30T16:09:00.000Z",
-    });
-
-    recordSourceVisibleDeliveryIfPresent({
-      id: "source:agent:orchestrator:main:agent:orchestrator:main",
-      sourceSessionKey: "agent:orchestrator:main",
-      parentRunId: "agent:orchestrator:main",
-      text: "STATUS: In Progress\nVisible milestone delivered.",
-      final: false,
-      currentStage: "milestone source dispatch delivered",
-    });
-
-    const rows = listSourceDeliveryObligations({ dir: markerDir });
-    expect(rows.find((row) => row.id === oldId)).toMatchObject({
-      deliveryStatus: "accepted",
-      visibleDeliveryCount: 0,
-    });
-    expect(rows.find((row) => row.id === currentId)).toMatchObject({
-      deliveryStatus: "progress_delivered",
-      sourceTurnState: "progress_delivered",
-      progressDeliveryState: "progress_delivered",
-      finalDeliveryDelivered: false,
-      visibleDeliveryCount: 1,
-      currentStage: "milestone source dispatch delivered",
-    });
-  });
-
   it("evaluates stale direct turns with no visible source-chat progress as not clean", () => {
     const acceptedAt = "2026-06-30T01:02:00.000Z";
     const row = recordSourceDeliveryObligation({
