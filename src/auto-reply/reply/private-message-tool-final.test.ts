@@ -14,6 +14,15 @@ const base = {
 };
 
 describe("shouldWarnAboutPrivateMessageToolFinal", () => {
+  it("flags a short substantive private final that was never delivered via the message tool (#85714)", () => {
+    expect(
+      shouldWarnAboutPrivateMessageToolFinal({
+        ...base,
+        finalText: "Yes, I can handle that.",
+      }),
+    ).toBe(true);
+  });
+
   it("flags a multi-sentence private final that was never delivered via the message tool (#85714)", () => {
     expect(shouldWarnAboutPrivateMessageToolFinal(base)).toBe(true);
   });
@@ -52,21 +61,6 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
     ).toBe(false);
   });
 
-  it("does not flag a short private final", () => {
-    expect(
-      shouldWarnAboutPrivateMessageToolFinal({
-        ...base,
-        finalText: "Nothing to add here.",
-      }),
-    ).toBe(false);
-    expect(
-      shouldWarnAboutPrivateMessageToolFinal({
-        ...base,
-        finalText: "I do not need to send anything. Nothing else to add.",
-      }),
-    ).toBe(false);
-  });
-
   it("does not flag empty or whitespace-only final text", () => {
     expect(shouldWarnAboutPrivateMessageToolFinal({ ...base, finalText: "" })).toBe(false);
     expect(shouldWarnAboutPrivateMessageToolFinal({ ...base, finalText: "   \n " })).toBe(false);
@@ -79,7 +73,9 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
   it("builds a visible delivery error without exposing the private final body", () => {
     const payload = buildPrivateMessageToolFinalDeliveryError();
     expect(payload.isError).toBe(true);
-    expect(payload.text).toContain("did not use the required message delivery tool");
+    expect(payload.text).toContain("did not use the required source delivery tool");
+    expect(payload.text).toContain("private reply body was withheld");
+    expect(payload.text).toContain("requires recovery");
     expect(payload.text).not.toContain(base.finalText);
     expect(getReplyPayloadMetadata(payload)?.deliverDespiteSourceReplySuppression).toBe(true);
   });

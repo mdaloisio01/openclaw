@@ -6,16 +6,10 @@ import type { ReplyPayload } from "../types.js";
 
 const privateFinalReplyLogger = createSubsystemLogger("source-reply/private-final");
 
-const LONG_PRIVATE_FINAL_MIN_CHARS = 280;
-const MULTI_SENTENCE_PRIVATE_FINAL_MIN_CHARS = 120;
-const MULTI_SENTENCE_TERMINATOR_MIN_COUNT = 2;
-const SENTENCE_TERMINATOR_REGEX = /[.!?]+(?:\s|$)/g;
-
 /**
- * `message_tool_only` allows the model to stay silent by simply not calling the
- * message tool, so short private final text is not evidence of message loss.
- * Warn only for unusually substantive private finals, which usually means the
- * model wrote a user-facing answer but missed the configured delivery tool.
+ * `message_tool_only` requires visible replies to be sent through the message
+ * tool. Any non-silent private final text means the model attempted a terminal
+ * answer without satisfying that contract, so emit the safe visible fallback.
  */
 export function shouldWarnAboutPrivateMessageToolFinal(params: {
   sourceReplyDeliveryMode: SourceReplyDeliveryMode | undefined;
@@ -35,14 +29,7 @@ export function shouldWarnAboutPrivateMessageToolFinal(params: {
   if (!trimmed || isSilentReplyText(trimmed)) {
     return false;
   }
-  if (trimmed.length >= LONG_PRIVATE_FINAL_MIN_CHARS) {
-    return true;
-  }
-  const sentenceTerminatorCount = countSentenceLikeTerminators(trimmed);
-  return (
-    trimmed.length >= MULTI_SENTENCE_PRIVATE_FINAL_MIN_CHARS &&
-    sentenceTerminatorCount >= MULTI_SENTENCE_TERMINATOR_MIN_COUNT
-  );
+  return true;
 }
 
 /**
@@ -55,7 +42,7 @@ export function warnPrivateMessageToolFinal(params: {
   finalTextLength: number;
 }): void {
   privateFinalReplyLogger.warn(
-    "agent produced a long private final reply without calling the configured delivery tool (message_tool_only); private body withheld and delivery-contract error payload emitted",
+    "agent produced a private final reply without calling the configured delivery tool (message_tool_only); private body withheld and delivery-contract error payload emitted",
     {
       sessionKey: params.sessionKey,
       channel: params.channel,
@@ -66,12 +53,8 @@ export function warnPrivateMessageToolFinal(params: {
 
 export function buildPrivateMessageToolFinalDeliveryError(): ReplyPayload {
   return markReplyPayloadForSourceSuppressionDelivery({
-    text: "Internal delivery error: the agent wrote a final reply but did not use the required message delivery tool. The private reply body was withheld.",
+    text: "Delivery failed: the agent produced a private final reply but did not use the required source delivery tool. The private reply body was withheld. This turn requires recovery.",
     isError: true,
     isStatusNotice: true,
   });
-}
-
-function countSentenceLikeTerminators(text: string): number {
-  return Array.from(text.matchAll(SENTENCE_TERMINATOR_REGEX)).length;
 }
