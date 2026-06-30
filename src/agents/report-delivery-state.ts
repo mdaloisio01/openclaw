@@ -145,3 +145,17 @@ export function recordPendingMilestoneReport(marker: PendingMilestoneReportMarke
     // Reporting-marker writes are watchdog evidence. They must not break task finalization.
   }
 }
+
+export function recordMilestoneReportDelivered(params: { id: string; notes?: string }): void {
+  try {
+    upsertMarker("pending_milestone_report.json", {
+      id: params.id,
+      stage_complete_pending_report: false,
+      milestone_report_delivered: true,
+      final_closeout_delivered: true,
+      notes: params.notes ?? "Milestone delivery was recorded as delivered.",
+    });
+  } catch {
+    // Marker delivery reconciliation must not break the task delivery path.
+  }
+}

@@ -314,6 +314,60 @@ describe("task-executor", () => {
     }
   });
 
+  it("marks the pending milestone delivered when terminal task chat delivery completes", async () => {
+    const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const original = process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
+    const markerDir = await mkdtemp(join(tmpdir(), "openclaw-task-milestone-delivered-"));
+    process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = markerDir;
+    try {
+      await withTaskExecutorStateDir(async () => {
+        createRunningTaskRun({
+          runtime: "subagent",
+          ownerKey: "agent:main:main",
+          scopeKind: "session",
+          childSessionKey: "agent:codex:subagent:child",
+          runId: "run-report-delivered-task",
+          task: "Write closeout",
+          startedAt: 10,
+          notifyPolicy: "done_only",
+          deliveryStatus: "pending",
+        });
+
+        completeTaskRunByRunId({
+          runId: "run-report-delivered-task",
+          endedAt: 20,
+          terminalSummary: "Closeout complete.",
+        });
+        setDetachedTaskDeliveryStatusByRunId({
+          runId: "run-report-delivered-task",
+          deliveryStatus: "delivered",
+        });
+      });
+      const payload = JSON.parse(
+        await readFile(join(markerDir, "pending_milestone_report.json"), "utf8"),
+      ) as { rows: Array<Record<string, unknown>> };
+      expect(payload.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "task:run-report-delivered-task:succeeded",
+            stage_complete_pending_report: false,
+            milestone_report_delivered: true,
+            final_closeout_delivered: true,
+          }),
+        ]),
+      );
+    } finally {
+      if (original === undefined) {
+        delete process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR;
+      } else {
+        process.env.OPENCLAW_REPORT_DELIVERY_MARKER_DIR = original;
+      }
+      await rm(markerDir, { recursive: true, force: true });
+    }
+  });
+
   it("records progress, failure, and delivery status through the executor", async () => {
     await withTaskExecutorStateDir(async () => {
       const created = createRunningTaskRun({
