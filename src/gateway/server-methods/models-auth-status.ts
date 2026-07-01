@@ -36,6 +36,11 @@ import { refreshActiveSecretsRuntimeSnapshot } from "../../secrets/runtime.js";
 import { asDateTimestampMs } from "../../shared/number-coercion.js";
 import { abortChatRunsForProvider, type ChatAbortOps } from "../chat-abort.js";
 import { formatForLog } from "../ws-log.js";
+import {
+  createGatewayPerfStageTimer,
+  formatGatewayPerfCpuUsage,
+  logGatewayPerfSummary,
+} from "./perf-logging.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 
 const log = createSubsystemLogger("models-auth-status");
@@ -432,26 +437,46 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
     }
   },
   "models.authStatus": async ({ params, respond, context }) => {
+    const perf = createGatewayPerfStageTimer();
+    const cpuStarted = process.cpuUsage();
+    const logPerf = (message: string) => {
+      logGatewayPerfSummary({
+        logger: log,
+        surface: "models.authStatus",
+        durationMs: perf.totalMs(),
+        message: `${message} ${formatGatewayPerfCpuUsage(cpuStarted)} stages="${perf.summary()}"`,
+      });
+    };
     const now = Date.now();
     const bypassCache = Boolean((params as { refresh?: boolean } | undefined)?.refresh);
+    perf.mark("cache_check");
     if (!bypassCache && cached && now - cached.ts < CACHE_TTL_MS) {
+      perf.mark("cache_hit_response_build");
+      logPerf("cached=true");
       respond(true, cached.result, undefined, { cached: true });
       return;
     }
     try {
       const cfg = context.getRuntimeConfig();
+      perf.mark("config_read");
       const agentDir = resolveDefaultAgentDir(cfg);
+      perf.mark("agent_dir_resolve");
       // Use the external-profile-aware store for status reads so the dashboard
       // reflects CLI-discovered credentials without persisting them here.
+      const externalCli = externalCliDiscoveryForConfigStatus({ cfg });
+      perf.mark("external_cli_config");
       const store = ensureAuthProfileStore(agentDir, {
-        externalCli: externalCliDiscoveryForConfigStatus({ cfg }),
+        externalCli,
       });
+      perf.mark("auth_store_read");
       const configured = resolveConfiguredProviders(cfg);
+      perf.mark("configured_providers");
       const authHealth: AuthHealthSummary = buildAuthHealthSummary({
         store,
         cfg,
         providers: configured.providers.length > 0 ? configured.providers : undefined,
       });
+      perf.mark("auth_health");
 
       // Usage queries usually need refreshable credentials. Keep API-key status
       // enrichment explicit so static auth providers are not polled by default.
@@ -471,6 +496,7 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
             .filter((id): id is UsageProviderId => Boolean(id)),
         ),
       ];
+      perf.mark("usage_provider_ids");
 
       const usageByProvider = new Map<string, ProviderUsageStatus>();
       if (usageProviderIds.length > 0) {
@@ -496,14 +522,24 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
           );
         }
       }
+      perf.mark("usage_summary");
 
       const providers = authHealth.providers.map((prov) =>
         mapProvider(prov, usageByProvider, configured.expectsOAuth),
       );
+      perf.mark("map_providers");
       const result: ModelAuthStatusResult = { ts: now, providers };
       cached = { ts: now, result };
+      perf.mark("response_build");
+      logPerf(
+        `cached=false refresh=${bypassCache} configuredProviders=${configured.providers.length} ` +
+          `authProviders=${authHealth.providers.length} usageProviders=${usageProviderIds.length} ` +
+          `responseProviders=${providers.length}`,
+      );
       respond(true, result, undefined);
     } catch (err) {
+      perf.mark("error");
+      logPerf("error=true");
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
     }
   },

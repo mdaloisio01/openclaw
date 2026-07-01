@@ -1,8 +1,10 @@
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { hashRuntimeConfigValue } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   listAgentIds,
   resolveAgentDir,
@@ -80,6 +82,54 @@ type ProviderAuthWarmWorkerRunner = (params: {
 
 const PROVIDER_AUTH_WARM_WORKER_TIMEOUT_MS = 120_000;
 const PROVIDER_AUTH_WARM_CANCEL_POLL_MS = 25;
+const PROVIDER_AUTH_WARM_PERF_INFO_THRESHOLD_MS = 250;
+const PROVIDER_AUTH_WARM_PERF_WARN_THRESHOLD_MS = 1_000;
+const log = createSubsystemLogger("model-provider-auth");
+
+function formatProviderAuthWarmPerfMs(value: number): string {
+  return Number.isFinite(value) ? value.toFixed(1) : "n/a";
+}
+
+function createProviderAuthWarmStageTimer(): {
+  mark: (name: string) => void;
+  totalMs: () => number;
+  summary: () => string;
+} {
+  const started = performance.now();
+  let last = started;
+  const stages: string[] = [];
+  return {
+    mark(name: string) {
+      const now = performance.now();
+      stages.push(`${name}=${formatProviderAuthWarmPerfMs(now - last)}ms`);
+      last = now;
+    },
+    totalMs() {
+      return performance.now() - started;
+    },
+    summary() {
+      return stages.join(" ");
+    },
+  };
+}
+
+function logProviderAuthWarmPerf(params: { durationMs: number; message: string }): void {
+  if (params.durationMs < PROVIDER_AUTH_WARM_PERF_INFO_THRESHOLD_MS) {
+    return;
+  }
+  const threshold =
+    params.durationMs >= PROVIDER_AUTH_WARM_PERF_WARN_THRESHOLD_MS
+      ? "slow_handler_warn"
+      : "slow_handler_info";
+  const line =
+    `[perf:provider-auth-warm] durationMs=${formatProviderAuthWarmPerfMs(params.durationMs)} ` +
+    `threshold=${threshold} ${params.message}`;
+  if (params.durationMs >= PROVIDER_AUTH_WARM_PERF_WARN_THRESHOLD_MS) {
+    log.warn(line);
+  } else {
+    log.info(line);
+  }
+}
 
 // One entry per configured agent, keyed by agentId. Populated by the provider
 // auth warm path; consulted by hasAuthForModelProvider on every model-listing call.
@@ -674,16 +724,25 @@ export async function warmCurrentProviderAuthStateOffMainThread(
     runWorker?: ProviderAuthWarmWorkerRunner;
   } = {},
 ): Promise<void> {
+  const perf = createProviderAuthWarmStageTimer();
   currentProviderAuthStateGeneration += 1;
   const ownGeneration = currentProviderAuthStateGeneration;
   cancelCurrentProviderAuthWarmWorker();
+  perf.mark("generation_claim");
   const isWarmStale = () =>
     options.isCancelled?.() === true || ownGeneration !== currentProviderAuthStateGeneration;
   if (isWarmStale()) {
+    perf.mark("cancelled_before_start");
+    logProviderAuthWarmPerf({
+      durationMs: perf.totalMs(),
+      message: `cancelled=true phase=before_start stages="${perf.summary()}"`,
+    });
     return;
   }
   const runtimeAuthStores = collectProviderAuthWarmRuntimeAuthStores(cfg);
+  perf.mark("runtime_auth_state_read");
   const runtimeAuthLookups = collectProviderAuthWarmRuntimeAuthLookups(cfg);
+  perf.mark("runtime_auth_lookup_build");
   const snapshot = await (options.runWorker ?? runProviderAuthWarmWorker)({
     cfg,
     ...(runtimeAuthStores.length ? { runtimeAuthStores } : {}),
@@ -695,10 +754,28 @@ export async function warmCurrentProviderAuthStateOffMainThread(
     isCancelled: isWarmStale,
     workerUrl: options.workerUrl,
   });
+  perf.mark("worker_run");
   if (isWarmStale()) {
+    perf.mark("cancelled_after_worker");
+    logProviderAuthWarmPerf({
+      durationMs: perf.totalMs(),
+      message:
+        `cancelled=true phase=after_worker runtimeStores=${runtimeAuthStores.length} ` +
+        `runtimeLookups=${runtimeAuthLookups.entries.length} agents=${snapshot.agents.length} ` +
+        `stages="${perf.summary()}"`,
+    });
     return;
   }
   publishProviderAuthWarmSnapshot(snapshot);
+  perf.mark("publish_snapshot");
+  logProviderAuthWarmPerf({
+    durationMs: perf.totalMs(),
+    message:
+      `cancelled=false runtimeStores=${runtimeAuthStores.length} ` +
+      `runtimeLookups=${runtimeAuthLookups.entries.length} agents=${snapshot.agents.length} ` +
+      `providerEntries=${snapshot.agents.reduce((sum, agent) => sum + agent.providers.length, 0)} ` +
+      `stages="${perf.summary()}"`,
+  });
 }
 
 function toLintErrorObject(value: unknown, fallbackMessage: string): Error {

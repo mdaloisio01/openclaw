@@ -13,6 +13,11 @@ import {
 import { resolveVisibleModelCatalog } from "../../agents/model-catalog-visibility.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
 import { resolveDefaultAgentWorkspaceDir } from "../../agents/workspace.js";
+import {
+  createGatewayPerfStageTimer,
+  formatGatewayPerfCpuUsage,
+  logGatewayPerfSummary,
+} from "./perf-logging.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
 type ModelsListView = ModelCatalogBrowseView;
@@ -43,7 +48,19 @@ function omitRuntimeModelParamsFromCatalog(catalog: ModelCatalogEntry[]): ModelC
 // extra runtime discovery on each request.
 export const modelsHandlers: GatewayRequestHandlers = {
   "models.list": async ({ params, respond, context }) => {
+    const perf = createGatewayPerfStageTimer();
+    const cpuStarted = process.cpuUsage();
+    const logPerf = (message: string) => {
+      logGatewayPerfSummary({
+        logger: context.logGateway,
+        surface: "models.list",
+        durationMs: perf.totalMs(),
+        message: `${message} ${formatGatewayPerfCpuUsage(cpuStarted)} stages="${perf.summary()}"`,
+      });
+    };
     if (!validateModelsListParams(params)) {
+      perf.mark("validate");
+      logPerf("error=invalid_params");
       respond(
         false,
         undefined,
@@ -56,10 +73,13 @@ export const modelsHandlers: GatewayRequestHandlers = {
     }
     try {
       const cfg = context.getRuntimeConfig();
+      perf.mark("config_read");
       const workspaceDir =
         resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg)) ??
         resolveDefaultAgentWorkspaceDir();
+      perf.mark("workspace_resolve");
       const view = resolveModelsListView(params);
+      perf.mark("view_resolve");
       const catalog = await loadModelCatalogForBrowse({
         cfg,
         view,
@@ -74,8 +94,12 @@ export const modelsHandlers: GatewayRequestHandlers = {
           );
         },
       });
+      perf.mark("catalog_browse");
       if (view === "all") {
-        respond(true, { models: omitRuntimeModelParamsFromCatalog(catalog) }, undefined);
+        const models = omitRuntimeModelParamsFromCatalog(catalog);
+        perf.mark("response_build");
+        logPerf(`view=${view} catalogEntries=${catalog.length} responseEntries=${models.length}`);
+        respond(true, { models }, undefined);
         return;
       }
       const models = await resolveVisibleModelCatalog({
@@ -86,8 +110,17 @@ export const modelsHandlers: GatewayRequestHandlers = {
         view,
         runtimeAuthDiscovery: false,
       });
-      respond(true, { models: omitRuntimeModelParamsFromCatalog(models) }, undefined);
+      perf.mark("visible_catalog");
+      const responseModels = omitRuntimeModelParamsFromCatalog(models);
+      perf.mark("response_build");
+      logPerf(
+        `view=${view} catalogEntries=${catalog.length} visibleEntries=${models.length} ` +
+          `responseEntries=${responseModels.length}`,
+      );
+      respond(true, { models: responseModels }, undefined);
     } catch (err) {
+      perf.mark("error");
+      logPerf("error=true");
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, String(err)));
     }
   },

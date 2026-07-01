@@ -48,6 +48,8 @@ function requestModelsList(params: {
       loadGatewayModelCatalog: params.loadGatewayModelCatalog,
       logGateway: {
         debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
       },
     } as never,
   });
