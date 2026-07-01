@@ -11,6 +11,7 @@ type ProviderAuthWarmRuntimeAuthStore = {
 
 type ProviderAuthWarmWorkerInput = {
   cfg: OpenClawConfig;
+  parentStartedAtEpochMs?: number;
   runtimeAuthStores?: ProviderAuthWarmRuntimeAuthStore[];
   runtimeAuthLookups?: Array<{
     agentId: string;
@@ -36,6 +37,7 @@ function isWorkerInput(value: unknown): value is ProviderAuthWarmWorkerInput {
   const record = value as Record<string, unknown>;
   return (
     "cfg" in record &&
+    (!("parentStartedAtEpochMs" in record) || typeof record.parentStartedAtEpochMs === "number") &&
     (!("runtimeAuthStores" in record) || Array.isArray(record.runtimeAuthStores)) &&
     (!("runtimeAuthLookups" in record) || Array.isArray(record.runtimeAuthLookups)) &&
     (!("omitFalseProviderAuth" in record) || typeof record.omitFalseProviderAuth === "boolean")
@@ -61,6 +63,9 @@ export async function runProviderAuthWarmWorkerInput(
         input.runtimeAuthLookups?.map(({ agentId, lookup }) => [agentId, lookup]),
       ),
       omitFalseProviderAuth: input.omitFalseProviderAuth,
+      ...(typeof input.parentStartedAtEpochMs === "number"
+        ? { workerBootstrapMs: Date.now() - input.parentStartedAtEpochMs }
+        : {}),
     });
     return {
       status: "ok",

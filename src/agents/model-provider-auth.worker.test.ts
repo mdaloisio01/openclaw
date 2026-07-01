@@ -76,6 +76,12 @@ describe("provider auth warm worker", () => {
         return;
       }
       expect(result.snapshot.agents[0]?.providers).toContainEqual(["runtime-only", true]);
+      expect(result.snapshot.timing?.providerCheckCount).toBeGreaterThan(0);
+      expect(result.snapshot.timing?.duplicateProviderCheckCount).toBe(0);
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("catalog_load=");
+      expect(result.snapshot.timing?.providerTimings.join(" ")).toContain(
+        "provider_auth_check_main_runtime-only=",
+      );
     } finally {
       restoreEnv(previousEnv);
     }
