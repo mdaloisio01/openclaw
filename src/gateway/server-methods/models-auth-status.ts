@@ -45,6 +45,7 @@ import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 
 const log = createSubsystemLogger("models-auth-status");
 const apiKeyUsageStatusProviders = new Set<UsageProviderId>(["deepseek"]);
+const USAGE_SUMMARY_CACHE_TTL_MS = 120_000;
 
 type ProviderUsageStatus = Pick<ProviderUsageSnapshot, "windows" | "summary" | "plan">;
 
@@ -98,6 +99,16 @@ export type ModelAuthLogoutResult = {
 
 const CACHE_TTL_MS = 60_000;
 let cached: { ts: number; result: ModelAuthStatusResult } | null = null;
+let usageSummaryCache: {
+  key: string;
+  ts: number;
+  providers: UsageProviderId[];
+  result: Map<string, ProviderUsageStatus>;
+} | null = null;
+let usageSummaryInFlight: {
+  key: string;
+  promise: Promise<Map<string, ProviderUsageStatus>>;
+} | null = null;
 
 /**
  * Invalidate the in-memory cache. Reserved for future gateway-side auth
@@ -107,6 +118,8 @@ let cached: { ts: number; result: ModelAuthStatusResult } | null = null;
  */
 export function invalidateModelAuthStatusCache(): void {
   cached = null;
+  usageSummaryCache = null;
+  usageSummaryInFlight = null;
   // The prepared provider-auth map (model-provider-auth.ts) was built from
   // the pre-mutation auth state, so it must be invalidated alongside this
   // cache whenever an auth-profile mutation lands (logout, login, token
@@ -185,6 +198,95 @@ function providerDisplayName(provider: string): string {
     return PROVIDER_LABELS[usageId];
   }
   return provider;
+}
+
+function usageSummaryCacheKey(params: { agentDir: string; providers: UsageProviderId[] }): string {
+  return JSON.stringify({
+    agentDir: params.agentDir,
+    providers: [...params.providers].sort(),
+  });
+}
+
+function mapUsageSummaryProviders(summary: Awaited<ReturnType<typeof loadProviderUsageSummary>>) {
+  const usageByProvider = new Map<string, ProviderUsageStatus>();
+  for (const snap of summary.providers) {
+    usageByProvider.set(snap.provider, {
+      windows: snap.windows,
+      ...(snap.summary ? { summary: snap.summary } : {}),
+      ...(snap.plan ? { plan: snap.plan } : {}),
+    });
+  }
+  return usageByProvider;
+}
+
+async function loadUsageSummaryForAuthStatus(params: {
+  providers: UsageProviderId[];
+  agentDir: string;
+  bypassCache: boolean;
+  now: number;
+  mark: (name: string) => void;
+}): Promise<{
+  usageByProvider: Map<string, ProviderUsageStatus>;
+  cacheStatus: "skipped" | "hit" | "miss" | "inflight" | "bypass";
+}> {
+  if (params.providers.length === 0) {
+    params.mark("usage_skipped");
+    return { usageByProvider: new Map(), cacheStatus: "skipped" };
+  }
+  const key = usageSummaryCacheKey({
+    agentDir: params.agentDir,
+    providers: params.providers,
+  });
+  params.mark("usage_cache_check");
+  if (!params.bypassCache) {
+    if (
+      usageSummaryCache &&
+      usageSummaryCache.key === key &&
+      params.now - usageSummaryCache.ts < USAGE_SUMMARY_CACHE_TTL_MS
+    ) {
+      params.mark("usage_cache_hit");
+      return { usageByProvider: new Map(usageSummaryCache.result), cacheStatus: "hit" };
+    }
+    if (usageSummaryInFlight?.key === key) {
+      params.mark("usage_cache_inflight");
+      return {
+        usageByProvider: new Map(await usageSummaryInFlight.promise),
+        cacheStatus: "inflight",
+      };
+    }
+  }
+  params.mark(params.bypassCache ? "usage_cache_bypass" : "usage_cache_miss");
+  const load = async () => {
+    const summary = await loadProviderUsageSummary({
+      providers: params.providers,
+      agentDir: params.agentDir,
+      timeoutMs: 3500,
+      onPerfMark: (name) => params.mark(`usage_${name}`),
+    });
+    const usageByProvider = mapUsageSummaryProviders(summary);
+    params.mark("usage_response_merge");
+    if (!params.bypassCache) {
+      usageSummaryCache = {
+        key,
+        ts: params.now,
+        providers: [...params.providers],
+        result: new Map(usageByProvider),
+      };
+    }
+    return usageByProvider;
+  };
+  if (params.bypassCache) {
+    return { usageByProvider: await load(), cacheStatus: "bypass" };
+  }
+  const promise = load();
+  usageSummaryInFlight = { key, promise };
+  try {
+    return { usageByProvider: await promise, cacheStatus: "miss" };
+  } finally {
+    if (usageSummaryInFlight?.promise === promise) {
+      usageSummaryInFlight = null;
+    }
+  }
 }
 
 /**
@@ -444,6 +546,7 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
         logger: log,
         surface: "models.authStatus",
         durationMs: perf.totalMs(),
+        minInfoMs: 0,
         message: `${message} ${formatGatewayPerfCpuUsage(cpuStarted)} stages="${perf.summary()}"`,
       });
     };
@@ -498,29 +601,25 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       ];
       perf.mark("usage_provider_ids");
 
-      const usageByProvider = new Map<string, ProviderUsageStatus>();
-      if (usageProviderIds.length > 0) {
-        try {
-          const usage = await loadProviderUsageSummary({
-            providers: usageProviderIds,
-            agentDir,
-            timeoutMs: 3500,
-          });
-          for (const snap of usage.providers) {
-            usageByProvider.set(snap.provider, {
-              windows: snap.windows,
-              ...(snap.summary ? { summary: snap.summary } : {}),
-              ...(snap.plan ? { plan: snap.plan } : {}),
-            });
-          }
-        } catch (err) {
-          // Usage data is auxiliary — failing here must not block auth status,
-          // but log at debug so a silently-broken usage endpoint is still
-          // diagnosable in gateway logs.
-          log.debug(
-            `usage enrichment failed (auth status still returned): providers=${usageProviderIds.join(",")} error=${formatForLog(err)}`,
-          );
-        }
+      let usageByProvider = new Map<string, ProviderUsageStatus>();
+      let usageCacheStatus: "skipped" | "hit" | "miss" | "inflight" | "bypass" = "skipped";
+      try {
+        const usage = await loadUsageSummaryForAuthStatus({
+          providers: usageProviderIds,
+          agentDir,
+          bypassCache,
+          now,
+          mark: (name) => perf.mark(name),
+        });
+        usageByProvider = usage.usageByProvider;
+        usageCacheStatus = usage.cacheStatus;
+      } catch (err) {
+        // Usage data is auxiliary — failing here must not block auth status,
+        // but log at debug so a silently-broken usage endpoint is still
+        // diagnosable in gateway logs. Failed usage loads are not cached.
+        log.debug(
+          `usage enrichment failed (auth status still returned): providers=${usageProviderIds.join(",")} error=${formatForLog(err)}`,
+        );
       }
       perf.mark("usage_summary");
 
@@ -534,6 +633,7 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       logPerf(
         `cached=false refresh=${bypassCache} configuredProviders=${configured.providers.length} ` +
           `authProviders=${authHealth.providers.length} usageProviders=${usageProviderIds.length} ` +
+          `usageCache=${usageCacheStatus} usageCacheTtlMs=${USAGE_SUMMARY_CACHE_TTL_MS} ` +
           `responseProviders=${providers.length}`,
       );
       respond(true, result, undefined);

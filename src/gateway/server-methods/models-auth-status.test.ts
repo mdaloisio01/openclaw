@@ -7,6 +7,25 @@ import type { GatewayRequestHandlerOptions } from "./types.js";
 
 const emptyUsageSummary = (): UsageSummary => ({ updatedAt: 0, providers: [] });
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+};
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve: ((value: T) => void) | undefined;
+  let reject: ((error: unknown) => void) | undefined;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  if (!resolve || !reject) {
+    throw new Error("Expected deferred callbacks to be initialized");
+  }
+  return { promise, resolve, reject };
+}
+
 const mocks = vi.hoisted(() => ({
   getRuntimeConfig: vi.fn(() => ({})),
   resolveDefaultAgentDir: vi.fn(() => "/tmp/agent"),
@@ -379,6 +398,7 @@ describe("models.authStatus", () => {
       providers: ["deepseek"],
       agentDir: "/tmp/agent",
       timeoutMs: 3500,
+      onPerfMark: expect.any(Function),
     });
     const [, payload] = firstRespondCall(opts) ?? [];
     const result = payload as ModelAuthStatusResult;
@@ -386,6 +406,157 @@ describe("models.authStatus", () => {
       windows: [],
       summary: "Balance ¥42.50",
     });
+  });
+
+  it("reuses short-lived usage summary cache after auth-status cache expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      mocks.buildAuthHealthSummary.mockReturnValue(createOpenAiCodexOauthHealthSummary());
+      mocks.loadProviderUsageSummary.mockResolvedValue({
+        updatedAt: 0,
+        providers: [
+          {
+            provider: "openai",
+            displayName: "OpenAI",
+            windows: [{ label: "5h", usedPercent: 2 }],
+            plan: "pro",
+          },
+        ],
+      });
+
+      const opts1 = createOptions();
+      await handler(opts1);
+      vi.setSystemTime(61_000);
+      const opts2 = createOptions();
+      await handler(opts2);
+
+      expect(mocks.buildAuthHealthSummary).toHaveBeenCalledTimes(2);
+      expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(1);
+      const [, payload] = firstRespondCall(opts2) ?? [];
+      const result = payload as ModelAuthStatusResult;
+      expect(result.providers[0]?.usage).toEqual({
+        windows: [{ label: "5h", usedPercent: 2 }],
+        plan: "pro",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bypasses usage summary cache when refresh is explicit", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      mocks.buildAuthHealthSummary.mockReturnValue(createOpenAiCodexOauthHealthSummary());
+      mocks.loadProviderUsageSummary
+        .mockResolvedValueOnce({
+          updatedAt: 0,
+          providers: [
+            {
+              provider: "openai",
+              displayName: "OpenAI",
+              windows: [{ label: "5h", usedPercent: 2 }],
+            },
+          ],
+        })
+        .mockResolvedValueOnce({
+          updatedAt: 61_000,
+          providers: [
+            {
+              provider: "openai",
+              displayName: "OpenAI",
+              windows: [{ label: "5h", usedPercent: 3 }],
+            },
+          ],
+        });
+
+      await handler(createOptions());
+      vi.setSystemTime(61_000);
+      const refreshed = createOptions({ refresh: true });
+      await handler(refreshed);
+
+      expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(2);
+      const secondCall = mocks.loadProviderUsageSummary.mock.calls[1]?.[0];
+      expect(secondCall).toMatchObject({
+        providers: ["openai"],
+        agentDir: "/tmp/agent",
+        timeoutMs: 3500,
+      });
+      const [, payload] = firstRespondCall(refreshed) ?? [];
+      const result = payload as ModelAuthStatusResult;
+      expect(result.providers[0]?.usage?.windows).toEqual([{ label: "5h", usedPercent: 3 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not cache failed usage summary loads", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(0);
+      mocks.buildAuthHealthSummary.mockReturnValue(createOpenAiCodexOauthHealthSummary());
+      mocks.loadProviderUsageSummary
+        .mockRejectedValueOnce(new Error("timeout"))
+        .mockResolvedValueOnce({
+          updatedAt: 61_000,
+          providers: [
+            {
+              provider: "openai",
+              displayName: "OpenAI",
+              windows: [{ label: "5h", usedPercent: 4 }],
+            },
+          ],
+        });
+
+      const first = createOptions();
+      await handler(first);
+      vi.setSystemTime(61_000);
+      const second = createOptions();
+      await handler(second);
+
+      expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(2);
+      const [, firstPayload] = firstRespondCall(first) ?? [];
+      expect((firstPayload as ModelAuthStatusResult).providers[0]?.usage).toBeUndefined();
+      const [, secondPayload] = firstRespondCall(second) ?? [];
+      expect((secondPayload as ModelAuthStatusResult).providers[0]?.usage?.windows).toEqual([
+        { label: "5h", usedPercent: 4 },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("dedupes concurrent usage summary loads for identical auth-status requests", async () => {
+    mocks.buildAuthHealthSummary.mockReturnValue(createOpenAiCodexOauthHealthSummary());
+    const usage = createDeferred<UsageSummary>();
+    mocks.loadProviderUsageSummary.mockReturnValue(usage.promise);
+
+    const first = createOptions();
+    const second = createOptions();
+    const firstRun = handler(first);
+    const secondRun = handler(second);
+    await vi.waitFor(() => expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(1));
+
+    usage.resolve({
+      updatedAt: 0,
+      providers: [
+        {
+          provider: "openai",
+          displayName: "OpenAI",
+          windows: [{ label: "5h", usedPercent: 5 }],
+        },
+      ],
+    });
+    await Promise.all([firstRun, secondRun]);
+
+    expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(1);
+    for (const opts of [first, second]) {
+      const [, payload] = firstRespondCall(opts) ?? [];
+      expect((payload as ModelAuthStatusResult).providers[0]?.usage?.windows).toEqual([
+        { label: "5h", usedPercent: 5 },
+      ]);
+    }
   });
 
   it("scopes external CLI auth overlays to configured providers", async () => {

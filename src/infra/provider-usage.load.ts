@@ -41,6 +41,7 @@ type UsageSummaryOptions = {
   env?: NodeJS.ProcessEnv;
   fetch?: typeof fetch;
   skipPluginAuthWithoutCredentialSource?: boolean;
+  onPerfMark?: (name: string) => void;
 };
 
 async function fetchProviderUsageSnapshot(params: {
@@ -85,8 +86,10 @@ export async function loadProviderUsageSummary(
   const now = opts.now ?? Date.now();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const config = opts.config ?? getRuntimeConfig();
+  opts.onPerfMark?.("config_resolve");
   const env = opts.env ?? process.env;
   const fetchFn = resolveFetch(opts.fetch);
+  opts.onPerfMark?.("fetch_resolve");
   if (!fetchFn) {
     throw new Error("fetch is not available");
   }
@@ -99,7 +102,9 @@ export async function loadProviderUsageSummary(
     env,
     skipPluginAuthWithoutCredentialSource: opts.skipPluginAuthWithoutCredentialSource,
   });
+  opts.onPerfMark?.("auth_resolve");
   if (auths.length === 0) {
+    opts.onPerfMark?.("no_auth_response");
     return { updatedAt: now, providers: [] };
   }
 
@@ -132,8 +137,10 @@ export async function loadProviderUsageSummary(
       return failureSnapshot(message.trim() || "Fetch failed");
     });
   });
+  opts.onPerfMark?.("provider_tasks_build");
 
   const snapshots = await Promise.all(tasks);
+  opts.onPerfMark?.("provider_fetch_aggregate");
   const providers = snapshots.filter((entry) => {
     if (entry.windows.length > 0) {
       return true;
@@ -146,6 +153,7 @@ export async function loadProviderUsageSummary(
     }
     return !ignoredErrors.has(entry.error);
   });
+  opts.onPerfMark?.("provider_filter");
 
   return { updatedAt: now, providers };
 }

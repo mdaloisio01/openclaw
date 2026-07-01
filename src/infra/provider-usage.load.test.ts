@@ -110,6 +110,34 @@ describe("provider-usage.load", () => {
     expect(summary).toEqual({ updatedAt: usageNow, providers: [] });
   });
 
+  it("marks provider usage load subphases for callers that collect perf attribution", async () => {
+    resolveProviderUsageSnapshotWithPluginMock.mockResolvedValueOnce({
+      provider: "openai",
+      displayName: "Codex",
+      windows: [{ label: "3h", usedPercent: 12 }],
+    });
+    const marks: string[] = [];
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new Error("legacy fetch should not run");
+    });
+
+    await loadProviderUsageSummary({
+      now: usageNow,
+      auth: [{ provider: "openai", token: "codex-token" }],
+      fetch: mockFetch as unknown as typeof fetch,
+      onPerfMark: (name) => marks.push(name),
+    });
+
+    expect(marks).toEqual([
+      "config_resolve",
+      "fetch_resolve",
+      "auth_resolve",
+      "provider_tasks_build",
+      "provider_fetch_aggregate",
+      "provider_filter",
+    ]);
+  });
+
   it("returns unsupported provider snapshots for unknown provider ids", async () => {
     const mockFetch = createProviderUsageFetch(async () => makeResponse(404, "not found"));
     const summary = await loadUsageWithAuth(
