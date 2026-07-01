@@ -736,6 +736,8 @@ function runProviderAuthWarmWorker(params: {
   workerUrl?: URL;
 }): Promise<ProviderAuthWarmSnapshot> {
   const parentStartedAtEpochMs = Date.now();
+  let workerConstructorReturnedAtEpochMs = parentStartedAtEpochMs;
+  let workerOnlineAtEpochMs: number | undefined;
   const worker = new Worker(params.workerUrl ?? resolveProviderAuthWarmWorkerUrl(import.meta.url), {
     workerData: {
       cfg: params.cfg,
@@ -747,10 +749,41 @@ function runProviderAuthWarmWorker(params: {
       ...(params.omitFalseProviderAuth ? { omitFalseProviderAuth: true } : {}),
     },
   });
+  workerConstructorReturnedAtEpochMs = Date.now();
   worker.unref?.();
   const handle = {
     worker,
     cancelled: false,
+  };
+  const appendParentStartupTimings = (snapshot: ProviderAuthWarmSnapshot) => {
+    const messageReceivedAtEpochMs = Date.now();
+    const timing = snapshot.timing;
+    if (!timing) {
+      return;
+    }
+    timing.workerStartupTimings.push(
+      `worker_parent_constructor_return=${Math.max(
+        0,
+        workerConstructorReturnedAtEpochMs - parentStartedAtEpochMs,
+      )}ms`,
+    );
+    if (workerOnlineAtEpochMs !== undefined) {
+      timing.workerStartupTimings.push(
+        `worker_parent_online=${Math.max(0, workerOnlineAtEpochMs - parentStartedAtEpochMs)}ms`,
+      );
+      timing.workerStartupTimings.push(
+        `worker_parent_online_to_message=${Math.max(
+          0,
+          messageReceivedAtEpochMs - workerOnlineAtEpochMs,
+        )}ms`,
+      );
+    }
+    timing.workerStartupTimings.push(
+      `worker_parent_message_received=${Math.max(
+        0,
+        messageReceivedAtEpochMs - parentStartedAtEpochMs,
+      )}ms`,
+    );
   };
   currentProviderAuthWarmWorker = handle;
   return new Promise<ProviderAuthWarmSnapshot>((resolve, reject) => {
@@ -788,6 +821,9 @@ function runProviderAuthWarmWorker(params: {
       }
     }, PROVIDER_AUTH_WARM_CANCEL_POLL_MS);
     cancelTimer.unref?.();
+    worker.once("online", () => {
+      workerOnlineAtEpochMs = Date.now();
+    });
     worker.once("message", (message: unknown) => {
       void worker.terminate();
       finish(() => {
@@ -803,6 +839,7 @@ function runProviderAuthWarmWorker(params: {
           reject(new Error(message.error));
           return;
         }
+        appendParentStartupTimings(message.snapshot);
         resolve(message.snapshot);
       });
     });
