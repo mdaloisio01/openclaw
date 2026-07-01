@@ -84,13 +84,25 @@ describe("provider auth warm worker", () => {
         "worker_startup_process_module_load=",
       );
       expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_auth_snapshot_start=",
+      );
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_auth_snapshot_end=",
+      );
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
         "worker_result_ready=",
       );
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("auth_snapshot_start=");
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("agent_list_build=");
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("result_aggregation=");
       expect(result.snapshot.timing?.catalogTimings.join(" ")).toMatch(
         /catalog_(persisted_models_json_read|static_configured_model_catalog_build)=/,
       );
       expect(result.snapshot.timing?.providerTimings.join(" ")).toContain(
         "provider_auth_check_main_runtime-only=",
+      );
+      expect(result.snapshot.timing?.providerTimings.join(" ")).toContain(
+        "provider_auth_check_phase_main_runtime-only_runtime_auth=",
       );
     } finally {
       restoreEnv(previousEnv);

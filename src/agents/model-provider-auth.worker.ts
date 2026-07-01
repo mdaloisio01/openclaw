@@ -61,6 +61,7 @@ export async function runProviderAuthWarmWorkerInput(
       replaceRuntimeAuthProfileStoreSnapshots(input.runtimeAuthStores);
     }
     const runtimeStoresRestoredAtEpochMs = Date.now();
+    const authSnapshotStartedAtEpochMs = Date.now();
     const workerStartupTimings =
       typeof input.parentStartedAtEpochMs === "number"
         ? [
@@ -80,6 +81,10 @@ export async function runProviderAuthWarmWorkerInput(
               0,
               runtimeStoresRestoredAtEpochMs - input.parentStartedAtEpochMs,
             )}ms`,
+            `worker_auth_snapshot_start=${Math.max(
+              0,
+              authSnapshotStartedAtEpochMs - input.parentStartedAtEpochMs,
+            )}ms`,
           ]
         : undefined;
     const snapshot = await buildCurrentProviderAuthStateSnapshot(input.cfg, {
@@ -93,6 +98,11 @@ export async function runProviderAuthWarmWorkerInput(
         : {}),
       ...(workerStartupTimings ? { workerStartupTimings } : {}),
     });
+    if (typeof input.parentStartedAtEpochMs === "number") {
+      snapshot.timing?.workerStartupTimings.push(
+        `worker_auth_snapshot_end=${Math.max(0, Date.now() - input.parentStartedAtEpochMs)}ms`,
+      );
+    }
     if (typeof input.parentStartedAtEpochMs === "number") {
       snapshot.timing?.workerStartupTimings.push(
         `worker_result_ready=${Math.max(0, Date.now() - input.parentStartedAtEpochMs)}ms`,

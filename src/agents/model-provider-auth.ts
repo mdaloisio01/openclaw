@@ -91,6 +91,8 @@ type ProviderAuthWarmWorkerRunner = (params: {
   workerUrl?: URL;
 }) => Promise<ProviderAuthWarmSnapshot>;
 
+type ProviderAuthCheckTimingRecorder = (stage: string, durationMs: number, extra?: string) => void;
+
 const PROVIDER_AUTH_WARM_WORKER_TIMEOUT_MS = 120_000;
 const PROVIDER_AUTH_WARM_CANCEL_POLL_MS = 25;
 const PROVIDER_AUTH_WARM_PERF_INFO_THRESHOLD_MS = 250;
@@ -237,7 +239,12 @@ export async function hasAuthForModelProvider(params: {
   discoverExternalCliAuth?: boolean;
   runtimeAuthLookup?: RuntimeProviderAuthLookup;
   resolveRuntimeAuthLookup?: () => RuntimeProviderAuthLookup;
+  timingRecorder?: ProviderAuthCheckTimingRecorder;
 }): Promise<boolean> {
+  const checkStarted = performance.now();
+  const recordTiming = (stage: string, started: number, extra?: string) => {
+    params.timingRecorder?.(stage, performance.now() - started, extra);
+  };
   const provider = normalizeProviderId(params.provider);
   // The prepared map is built by the provider auth warm path — one entry per
   // configured agent, keyed by agentId. Only consult it when the caller's
@@ -278,12 +285,21 @@ export async function hasAuthForModelProvider(params: {
   if (matchesWarmedScope) {
     const preparedAnswer = preparedState.providers.get(provider);
     if (preparedAnswer !== undefined) {
+      recordTiming(
+        "prepared_state_hit",
+        checkStarted,
+        preparedAnswer ? "result_true" : "result_false",
+      );
       return preparedAnswer;
     }
   }
+  recordTiming("prepared_state_miss", checkStarted);
+  const yieldStarted = performance.now();
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
   });
+  recordTiming("event_loop_yield", yieldStarted);
+  const runtimeAuthStarted = performance.now();
   if (
     hasRuntimeAvailableProviderAuth({
       provider,
@@ -295,13 +311,22 @@ export async function hasAuthForModelProvider(params: {
       modelApi: params.modelApi,
     })
   ) {
+    recordTiming("runtime_auth", runtimeAuthStarted, "result_true");
     return true;
   }
+  recordTiming("runtime_auth", runtimeAuthStarted, "result_false");
   const slowPathAgentDir =
     params.agentDir ??
     (params.agentId && params.cfg
       ? resolveAgentDir(params.cfg, params.agentId, params.env)
       : undefined);
+  let externalCli: ReturnType<typeof externalCliDiscoveryForProviderAuth> | undefined;
+  if (!params.store && params.discoverExternalCliAuth !== false) {
+    const externalCliStarted = performance.now();
+    externalCli = externalCliDiscoveryForProviderAuth({ cfg: params.cfg, provider });
+    recordTiming("external_cli_config", externalCliStarted);
+  }
+  const authStoreStarted = performance.now();
   const store =
     params.store ??
     (params.discoverExternalCliAuth === false
@@ -309,20 +334,35 @@ export async function hasAuthForModelProvider(params: {
           allowKeychainPrompt: false,
         })
       : ensureAuthProfileStore(slowPathAgentDir, {
-          externalCli: externalCliDiscoveryForProviderAuth({ cfg: params.cfg, provider }),
+          ...(externalCli ? { externalCli } : {}),
         }));
-  if (listProfilesForProvider(store, provider).length > 0) {
-    return params.modelApi === undefined
-      ? true
-      : await hasAvailableAuthForProvider({
-          provider,
-          modelApi: params.modelApi,
-          cfg: params.cfg,
-          workspaceDir: params.workspaceDir,
-          agentDir: slowPathAgentDir,
-          store,
-        });
+  recordTiming("auth_store", authStoreStarted, params.store ? "provided_store" : "loaded_store");
+  const profileListStarted = performance.now();
+  const profiles = listProfilesForProvider(store, provider);
+  recordTiming("profile_list", profileListStarted, `profiles_${profiles.length}`);
+  if (profiles.length > 0) {
+    if (params.modelApi === undefined) {
+      recordTiming("complete", checkStarted, "result_true");
+      return true;
+    }
+    const availableAuthStarted = performance.now();
+    const available = await hasAvailableAuthForProvider({
+      provider,
+      modelApi: params.modelApi,
+      cfg: params.cfg,
+      workspaceDir: params.workspaceDir,
+      agentDir: slowPathAgentDir,
+      store,
+    });
+    recordTiming(
+      "available_auth",
+      availableAuthStarted,
+      available ? "result_true" : "result_false",
+    );
+    recordTiming("complete", checkStarted, available ? "result_true" : "result_false");
+    return available;
   }
+  recordTiming("complete", checkStarted, "result_false");
   return false;
 }
 
@@ -450,6 +490,7 @@ export async function buildCurrentProviderAuthStateSnapshot(
     perf.markValue("worker_startup_bootstrap", options.workerBootstrapMs);
   }
   const isWarmStale = () => options.isCancelled?.() === true;
+  perf.mark("auth_snapshot_start");
   const catalog = await loadModelCatalog({
     config: cfg,
     readOnly: true,
@@ -484,13 +525,15 @@ export async function buildCurrentProviderAuthStateSnapshot(
   }
   const providerList = [...providers];
   perf.mark("provider_enumeration");
+  const agentIds = listAgentIds(cfg);
+  perf.mark("agent_list_build");
   const configFingerprint = resolveProviderAuthConfigFingerprint(cfg) ?? "";
   perf.mark("config_fingerprint");
   const states = new Map<string, PreparedProviderAuthState>();
   // Warm one entry per configured agent so callers hit the prepared map for
   // any agentId. The catalog above is shared across agents; the per-agent
   // work is the auth-discovery sweep against that agent's store.
-  for (const agentId of listAgentIds(cfg)) {
+  for (const agentId of agentIds) {
     if (isWarmStale()) {
       return {
         agents: [],
@@ -537,6 +580,7 @@ export async function buildCurrentProviderAuthStateSnapshot(
         });
     perf.mark(`agent_${sanitizeProviderAuthWarmMetricPart(agentId)}_auth_store_read`);
     const state = new Map<string, boolean>();
+    perf.mark(`agent_${sanitizeProviderAuthWarmMetricPart(agentId)}_provider_task_build`);
     for (const provider of providers) {
       if (isWarmStale()) {
         return {
@@ -569,6 +613,17 @@ export async function buildCurrentProviderAuthStateSnapshot(
         agentId,
         store,
         runtimeAuthLookup,
+        timingRecorder: (stage, durationMs, extra) => {
+          providerTimings.push(
+            `provider_auth_check_phase_${sanitizeProviderAuthWarmMetricPart(
+              agentId,
+            )}_${sanitizeProviderAuthWarmMetricPart(
+              provider,
+            )}_${sanitizeProviderAuthWarmMetricPart(stage)}=${formatProviderAuthWarmPerfMs(
+              durationMs,
+            )}ms${extra ? `(${sanitizeProviderAuthWarmMetricPart(extra)})` : ""}`,
+          );
+        },
       });
       providerTimings.push(
         `provider_auth_check_${sanitizeProviderAuthWarmMetricPart(agentId)}_${sanitizeProviderAuthWarmMetricPart(provider)}=${formatProviderAuthWarmPerfMs(
@@ -595,6 +650,7 @@ export async function buildCurrentProviderAuthStateSnapshot(
     });
     perf.mark(`agent_${sanitizeProviderAuthWarmMetricPart(agentId)}_complete`);
   }
+  perf.mark("result_aggregation");
   perf.mark("serialize_snapshot");
   return serializeProviderAuthStates(states, {
     stages: perf.entries(),
@@ -804,6 +860,7 @@ function runProviderAuthWarmWorker(params: {
         "worker_startup_before_auth_snapshot",
         "worker_parent_online_to_auth_snapshot_start",
       );
+      appendOnlineDelta("worker_auth_snapshot_end", "worker_parent_online_to_auth_snapshot_end");
       appendOnlineDelta("worker_result_ready", "worker_parent_online_to_result_ready");
       appendOnlineDelta(
         "worker_result_message_send",
