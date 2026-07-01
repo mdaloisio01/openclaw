@@ -44,6 +44,8 @@ type PreparedProviderAuthState = {
 
 type ProviderAuthWarmTiming = {
   stages: string[];
+  workerStartupTimings: string[];
+  catalogTimings: string[];
   providerTimings: string[];
   providerCheckCount: number;
   duplicateProviderCheckCount: number;
@@ -419,10 +421,15 @@ export async function buildCurrentProviderAuthStateSnapshot(
     runtimeAuthLookups?: ReadonlyMap<string, RuntimeProviderAuthLookup>;
     omitFalseProviderAuth?: boolean;
     workerBootstrapMs?: number;
+    workerStartupTimings?: string[];
   } = {},
 ): Promise<ProviderAuthWarmSnapshot> {
   const perf = createProviderAuthWarmStageTimer();
+  const catalogTimings: string[] = [];
   const providerTimings: string[] = [];
+  const workerStartupTimings = options.workerStartupTimings
+    ? [...options.workerStartupTimings]
+    : [];
   const seenProviderChecks = new Set<string>();
   let providerCheckCount = 0;
   let duplicateProviderCheckCount = 0;
@@ -430,13 +437,25 @@ export async function buildCurrentProviderAuthStateSnapshot(
     perf.markValue("worker_startup_bootstrap", options.workerBootstrapMs);
   }
   const isWarmStale = () => options.isCancelled?.() === true;
-  const catalog = await loadModelCatalog({ config: cfg, readOnly: true });
+  const catalog = await loadModelCatalog({
+    config: cfg,
+    readOnly: true,
+    timingRecorder: (stage, durationMs, extra) => {
+      catalogTimings.push(
+        `catalog_${sanitizeProviderAuthWarmMetricPart(stage)}=${formatProviderAuthWarmPerfMs(
+          durationMs,
+        )}ms${extra ? `(${sanitizeProviderAuthWarmMetricPart(extra)})` : ""}`,
+      );
+    },
+  });
   perf.mark("catalog_load");
   if (isWarmStale()) {
     return {
       agents: [],
       timing: {
         stages: perf.entries(),
+        workerStartupTimings,
+        catalogTimings,
         providerTimings,
         providerCheckCount,
         duplicateProviderCheckCount,
@@ -464,6 +483,8 @@ export async function buildCurrentProviderAuthStateSnapshot(
         agents: [],
         timing: {
           stages: perf.entries(),
+          workerStartupTimings,
+          catalogTimings,
           providerTimings,
           providerCheckCount,
           duplicateProviderCheckCount,
@@ -509,6 +530,8 @@ export async function buildCurrentProviderAuthStateSnapshot(
           agents: [],
           timing: {
             stages: perf.entries(),
+            workerStartupTimings,
+            catalogTimings,
             providerTimings,
             providerCheckCount,
             duplicateProviderCheckCount,
@@ -562,6 +585,8 @@ export async function buildCurrentProviderAuthStateSnapshot(
   perf.mark("serialize_snapshot");
   return serializeProviderAuthStates(states, {
     stages: perf.entries(),
+    workerStartupTimings,
+    catalogTimings,
     providerTimings,
     providerCheckCount,
     duplicateProviderCheckCount,
@@ -884,6 +909,8 @@ function formatProviderAuthWarmTimingForLog(timing: ProviderAuthWarmTiming | und
   }
   return (
     `workerStages="${timing.stages.join(" ")}" ` +
+    `workerStartupTimings="${timing.workerStartupTimings.join(" ")}" ` +
+    `catalogLoadTimings="${timing.catalogTimings.join(" ")}" ` +
     `providerAuthTimings="${timing.providerTimings.join(" ")}" ` +
     `providerAuthChecks=${timing.providerCheckCount} ` +
     `duplicateProviderAuthChecks=${timing.duplicateProviderCheckCount} `

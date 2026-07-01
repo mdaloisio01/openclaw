@@ -55,6 +55,7 @@ describe("provider auth warm worker", () => {
       } as unknown as OpenClawConfig;
       const result = await runProviderAuthWarmWorkerInput({
         cfg,
+        parentStartedAtEpochMs: Date.now(),
         runtimeAuthStores: [
           {
             agentDir,
@@ -79,6 +80,12 @@ describe("provider auth warm worker", () => {
       expect(result.snapshot.timing?.providerCheckCount).toBeGreaterThan(0);
       expect(result.snapshot.timing?.duplicateProviderCheckCount).toBe(0);
       expect(result.snapshot.timing?.stages.join(" ")).toContain("catalog_load=");
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_startup_process_module_load=",
+      );
+      expect(result.snapshot.timing?.catalogTimings.join(" ")).toMatch(
+        /catalog_(persisted_models_json_read|static_configured_model_catalog_build)=/,
+      );
       expect(result.snapshot.timing?.providerTimings.join(" ")).toContain(
         "provider_auth_check_main_runtime-only=",
       );

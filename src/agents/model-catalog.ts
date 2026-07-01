@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -79,8 +80,40 @@ const providerApiKeyResolverLoader = createLazyImportLoader(
   () => import("./models-config.providers.secrets.js"),
 );
 
+type ModelCatalogTimingRecorder = (stage: string, durationMs: number, extra?: string) => void;
+
 function shouldLogModelCatalogTiming(): boolean {
   return process.env.OPENCLAW_DEBUG_INGRESS_TIMING === "1";
+}
+
+async function measureModelCatalogStage<T>(
+  recorder: ModelCatalogTimingRecorder | undefined,
+  stage: string,
+  run: () => Promise<T>,
+  extra?: (value: T) => string | undefined,
+): Promise<T> {
+  if (!recorder) {
+    return run();
+  }
+  const started = performance.now();
+  const value = await run();
+  recorder(stage, performance.now() - started, extra?.(value));
+  return value;
+}
+
+function measureModelCatalogStageSync<T>(
+  recorder: ModelCatalogTimingRecorder | undefined,
+  stage: string,
+  run: () => T,
+  extra?: (value: T) => string | undefined,
+): T {
+  if (!recorder) {
+    return run();
+  }
+  const started = performance.now();
+  const value = run();
+  recorder(stage, performance.now() - started, extra?.(value));
+  return value;
 }
 
 function loadModelSuppression() {
@@ -308,10 +341,27 @@ function readProviderCatalogRows(parsed: unknown): Record<string, Record<string,
 async function loadReadOnlyPersistedProviderRows(
   agentDir: string,
   getPluginMetadataSnapshot: () => PluginModelCatalogMetadataSnapshot,
+  timingRecorder?: ModelCatalogTimingRecorder,
 ): Promise<Record<string, Record<string, unknown>>> {
-  const raw = await readFile(join(agentDir, "models.json"), "utf8");
-  const providers = { ...readProviderCatalogRows(JSON.parse(raw) as unknown) };
-  for (const catalogFile of listPluginModelCatalogFiles(agentDir)) {
+  const raw = await measureModelCatalogStage(
+    timingRecorder,
+    "persisted_models_json_read",
+    () => readFile(join(agentDir, "models.json"), "utf8"),
+    (value) => `bytes=${value.length}`,
+  );
+  const providers = measureModelCatalogStageSync(
+    timingRecorder,
+    "persisted_models_json_parse",
+    () => ({ ...readProviderCatalogRows(JSON.parse(raw) as unknown) }),
+    (value) => `providers=${Object.keys(value).length}`,
+  );
+  const catalogFiles = measureModelCatalogStageSync(
+    timingRecorder,
+    "plugin_catalog_files_list",
+    () => listPluginModelCatalogFiles(agentDir),
+    (value) => `files=${value.length}`,
+  );
+  for (const catalogFile of catalogFiles) {
     const catalogRaw = await readFile(catalogFile.path, "utf8").catch(() => undefined);
     if (!catalogRaw) {
       continue;
@@ -338,12 +388,17 @@ async function loadReadOnlyPersistedProviderRows(
 async function loadReadOnlyPersistedModelCatalog(params?: {
   config?: OpenClawConfig;
   metadataSnapshot?: PluginMetadataSnapshot;
+  timingRecorder?: ModelCatalogTimingRecorder;
 }): Promise<ModelCatalogEntry[]> {
   const cfg = params?.config ?? getRuntimeConfig();
   const agentDir = resolveDefaultAgentDir(cfg);
   const workspaceDir = resolveModelWorkspaceDir(cfg, undefined);
   const models: ModelCatalogEntry[] = [];
-  const { buildShouldSuppressBuiltInModel } = await loadModelSuppression();
+  const { buildShouldSuppressBuiltInModel } = await measureModelCatalogStage(
+    params?.timingRecorder,
+    "model_suppression_load",
+    () => loadModelSuppression(),
+  );
   const shouldSuppressBuiltInModel = buildShouldSuppressBuiltInModel({ config: cfg });
   let metadataSnapshot: PluginMetadataSnapshot | undefined = params?.metadataSnapshot;
   const getMetadataSnapshot = () => {
@@ -359,58 +414,87 @@ async function loadReadOnlyPersistedModelCatalog(params?: {
     manifestPlugins ??= getMetadataSnapshot().plugins;
     return manifestPlugins;
   };
-  const providers = await loadReadOnlyPersistedProviderRows(agentDir, getMetadataSnapshot);
-  for (const [providerRaw, providerConfig] of Object.entries(providers)) {
-    if (!Array.isArray(providerConfig?.models)) {
-      continue;
-    }
-    const providerContextWindow =
-      typeof providerConfig?.contextWindow === "number" && providerConfig.contextWindow > 0
-        ? providerConfig.contextWindow
-        : undefined;
-    const providerContextTokens =
-      typeof providerConfig?.contextTokens === "number" && providerConfig.contextTokens > 0
-        ? providerConfig.contextTokens
-        : undefined;
-    for (const entry of providerConfig.models as Record<string, unknown>[]) {
-      const normalized = normalizePersistedModelCatalogEntry(
-        providerRaw,
-        entry,
-        {
-          contextWindow: providerContextWindow,
-          contextTokens: providerContextTokens,
-        },
-        { manifestPlugins: getManifestPlugins() },
-      );
-      if (normalized && !shouldSuppressBuiltInModel(normalized)) {
-        models.push(normalized);
+  const providers = await loadReadOnlyPersistedProviderRows(
+    agentDir,
+    getMetadataSnapshot,
+    params?.timingRecorder,
+  );
+  const providerEntries = Object.entries(providers);
+  measureModelCatalogStageSync(
+    params?.timingRecorder,
+    "persisted_provider_rows_normalize",
+    () => {
+      for (const [providerRaw, providerConfig] of providerEntries) {
+        if (!Array.isArray(providerConfig?.models)) {
+          continue;
+        }
+        const providerContextWindow =
+          typeof providerConfig?.contextWindow === "number" && providerConfig.contextWindow > 0
+            ? providerConfig.contextWindow
+            : undefined;
+        const providerContextTokens =
+          typeof providerConfig?.contextTokens === "number" && providerConfig.contextTokens > 0
+            ? providerConfig.contextTokens
+            : undefined;
+        for (const entry of providerConfig.models as Record<string, unknown>[]) {
+          const normalized = normalizePersistedModelCatalogEntry(
+            providerRaw,
+            entry,
+            {
+              contextWindow: providerContextWindow,
+              contextTokens: providerContextTokens,
+            },
+            { manifestPlugins: getManifestPlugins() },
+          );
+          if (normalized && !shouldSuppressBuiltInModel(normalized)) {
+            models.push(normalized);
+          }
+        }
       }
-    }
-  }
+    },
+    () => `entries=${models.length}`,
+  );
   if (models.length === 0) {
     throw new Error("persisted model catalog has no usable model rows");
   }
   try {
-    mergeCatalogEntries(
-      models,
-      loadManifestModelCatalog({
-        config: cfg,
-        env: process.env,
-        fallbackToMetadataScan: false,
-        metadataSnapshot: getMetadataSnapshot(),
-      }),
+    measureModelCatalogStageSync(
+      params?.timingRecorder,
+      "manifest_model_catalog_merge",
+      () =>
+        mergeCatalogEntries(
+          models,
+          loadManifestModelCatalog({
+            config: cfg,
+            env: process.env,
+            fallbackToMetadataScan: false,
+            metadataSnapshot: getMetadataSnapshot(),
+          }),
+        ),
+      () => `entries=${models.length}`,
     );
   } catch {
     // Persisted rows are still valid when manifest metadata is temporarily unavailable.
   }
-  const configuredModels = buildConfiguredModelCatalog({
-    cfg,
-    manifestPlugins: hasConfiguredProviderModelRows(cfg) ? getManifestPlugins() : undefined,
-  });
+  const configuredModels = measureModelCatalogStageSync(
+    params?.timingRecorder,
+    "configured_model_catalog_build",
+    () =>
+      buildConfiguredModelCatalog({
+        cfg,
+        manifestPlugins: hasConfiguredProviderModelRows(cfg) ? getManifestPlugins() : undefined,
+      }),
+    (value) => `entries=${value.length}`,
+  );
   if (configuredModels.length > 0) {
     mergeCatalogEntries(models, configuredModels);
   }
-  return sortModelCatalogEntries(models);
+  return measureModelCatalogStageSync(
+    params?.timingRecorder,
+    "catalog_sort",
+    () => sortModelCatalogEntries(models),
+    (value) => `entries=${value.length}`,
+  );
 }
 
 function hasConfiguredProviderRowsNeedingManifestLookup(cfg: OpenClawConfig): boolean {
@@ -427,18 +511,25 @@ function hasConfiguredProviderRowsNeedingManifestLookup(cfg: OpenClawConfig): bo
 function loadReadOnlyStaticModelCatalog(params?: {
   config?: OpenClawConfig;
   metadataSnapshot?: PluginMetadataSnapshot;
+  timingRecorder?: ModelCatalogTimingRecorder;
 }): ModelCatalogEntry[] {
   const cfg = params?.config ?? getRuntimeConfig();
   const models: ModelCatalogEntry[] = [];
   try {
-    mergeCatalogEntries(
-      models,
-      loadManifestModelCatalog({
-        config: cfg,
-        env: process.env,
-        fallbackToMetadataScan: false,
-        metadataSnapshot: params?.metadataSnapshot,
-      }),
+    measureModelCatalogStageSync(
+      params?.timingRecorder,
+      "static_manifest_model_catalog_merge",
+      () =>
+        mergeCatalogEntries(
+          models,
+          loadManifestModelCatalog({
+            config: cfg,
+            env: process.env,
+            fallbackToMetadataScan: false,
+            metadataSnapshot: params?.metadataSnapshot,
+          }),
+        ),
+      () => `entries=${models.length}`,
     );
   } catch (error) {
     if (!hasLoggedReadOnlyStaticCatalogError) {
@@ -447,22 +538,39 @@ function loadReadOnlyStaticModelCatalog(params?: {
     }
   }
 
-  const configuredManifestPlugins = hasConfiguredProviderRowsNeedingManifestLookup(cfg)
-    ? (params?.metadataSnapshot?.plugins ??
-      resolvePluginMetadataSnapshot({
-        config: cfg,
-        env: process.env,
-        allowWorkspaceScopedCurrent: true,
-      }).plugins)
-    : [];
-  const configuredModels = buildConfiguredModelCatalog({
-    cfg,
-    manifestPlugins: configuredManifestPlugins,
-  });
+  const configuredManifestPlugins = measureModelCatalogStageSync(
+    params?.timingRecorder,
+    "static_configured_manifest_plugins",
+    () =>
+      hasConfiguredProviderRowsNeedingManifestLookup(cfg)
+        ? (params?.metadataSnapshot?.plugins ??
+          resolvePluginMetadataSnapshot({
+            config: cfg,
+            env: process.env,
+            allowWorkspaceScopedCurrent: true,
+          }).plugins)
+        : [],
+    (value) => `plugins=${value.length}`,
+  );
+  const configuredModels = measureModelCatalogStageSync(
+    params?.timingRecorder,
+    "static_configured_model_catalog_build",
+    () =>
+      buildConfiguredModelCatalog({
+        cfg,
+        manifestPlugins: configuredManifestPlugins,
+      }),
+    (value) => `entries=${value.length}`,
+  );
   if (configuredModels.length > 0) {
     mergeCatalogEntries(models, configuredModels);
   }
-  return sortModelCatalogEntries(models);
+  return measureModelCatalogStageSync(
+    params?.timingRecorder,
+    "static_catalog_sort",
+    () => sortModelCatalogEntries(models),
+    (value) => `entries=${value.length}`,
+  );
 }
 
 export async function loadModelCatalog(params?: {
@@ -470,6 +578,7 @@ export async function loadModelCatalog(params?: {
   useCache?: boolean;
   readOnly?: boolean;
   metadataSnapshot?: PluginMetadataSnapshot;
+  timingRecorder?: ModelCatalogTimingRecorder;
 }): Promise<ModelCatalogEntry[]> {
   const readOnly = params?.readOnly === true;
   if (readOnly) {

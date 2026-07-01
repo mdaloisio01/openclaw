@@ -4,6 +4,8 @@ import { replaceRuntimeAuthProfileStoreSnapshots, type AuthProfileStore } from "
 import type { RuntimeProviderAuthLookup } from "./model-auth.js";
 import { buildCurrentProviderAuthStateSnapshot } from "./model-provider-auth.js";
 
+const workerModuleLoadedAtEpochMs = Date.now();
+
 type ProviderAuthWarmRuntimeAuthStore = {
   agentDir?: string;
   store: AuthProfileStore;
@@ -54,9 +56,32 @@ export async function runProviderAuthWarmWorkerInput(
     };
   }
   try {
+    const inputValidatedAtEpochMs = Date.now();
     if (input.runtimeAuthStores?.length) {
       replaceRuntimeAuthProfileStoreSnapshots(input.runtimeAuthStores);
     }
+    const runtimeStoresRestoredAtEpochMs = Date.now();
+    const workerStartupTimings =
+      typeof input.parentStartedAtEpochMs === "number"
+        ? [
+            `worker_startup_process_module_load=${Math.max(
+              0,
+              workerModuleLoadedAtEpochMs - input.parentStartedAtEpochMs,
+            )}ms`,
+            `worker_startup_input_validate=${Math.max(
+              0,
+              inputValidatedAtEpochMs - workerModuleLoadedAtEpochMs,
+            )}ms`,
+            `worker_startup_runtime_store_restore=${Math.max(
+              0,
+              runtimeStoresRestoredAtEpochMs - inputValidatedAtEpochMs,
+            )}ms`,
+            `worker_startup_before_auth_snapshot=${Math.max(
+              0,
+              runtimeStoresRestoredAtEpochMs - input.parentStartedAtEpochMs,
+            )}ms`,
+          ]
+        : undefined;
     const snapshot = await buildCurrentProviderAuthStateSnapshot(input.cfg, {
       readOnlyAuthStore: true,
       runtimeAuthLookups: new Map(
@@ -66,6 +91,7 @@ export async function runProviderAuthWarmWorkerInput(
       ...(typeof input.parentStartedAtEpochMs === "number"
         ? { workerBootstrapMs: Date.now() - input.parentStartedAtEpochMs }
         : {}),
+      ...(workerStartupTimings ? { workerStartupTimings } : {}),
     });
     return {
       status: "ok",

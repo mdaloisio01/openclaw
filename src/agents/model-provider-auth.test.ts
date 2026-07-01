@@ -118,10 +118,12 @@ describe("prepared provider auth state", () => {
 
     await warmCurrentProviderAuthState(cfg);
 
-    expect(modelCatalogMocks.loadModelCatalog).toHaveBeenCalledWith({
-      config: cfg,
-      readOnly: true,
-    });
+    expect(modelCatalogMocks.loadModelCatalog).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: cfg,
+        readOnly: true,
+      }),
+    );
   });
 
   it("disables persisted auth-store sync for read-only warm snapshots", async () => {
