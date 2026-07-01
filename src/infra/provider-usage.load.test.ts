@@ -132,10 +132,105 @@ describe("provider-usage.load", () => {
       "config_resolve",
       "fetch_resolve",
       "auth_resolve",
+      "provider_enumeration",
       "provider_tasks_build",
       "provider_fetch_aggregate",
       "provider_filter",
     ]);
+  });
+
+  it("measures each provider usage fetch inside the aggregate", async () => {
+    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(
+      async ({ provider }): Promise<ProviderUsageSnapshot | null> => ({
+        provider: provider as ProviderUsageSnapshot["provider"],
+        displayName: String(provider),
+        windows: [{ label: "3h", usedPercent: 12 }],
+      }),
+    );
+    const measures: Array<{ name: string; durationMs: number }> = [];
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new Error("legacy fetch should not run");
+    });
+
+    await loadProviderUsageSummary({
+      now: usageNow,
+      auth: [
+        { provider: "anthropic", token: "token-a" },
+        { provider: "openai", token: "token-codex" },
+      ],
+      fetch: mockFetch as unknown as typeof fetch,
+      onPerfMeasure: (name, durationMs) => measures.push({ name, durationMs }),
+    });
+
+    expect(measures.map((measure) => measure.name).sort()).toEqual([
+      "provider_fetch_anthropic",
+      "provider_fetch_openai",
+    ]);
+    expect(measures.every((measure) => Number.isFinite(measure.durationMs))).toBe(true);
+  });
+
+  it("fetches independent provider usage snapshots in parallel", async () => {
+    let active = 0;
+    let peakActive = 0;
+    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(
+      async ({ provider }): Promise<ProviderUsageSnapshot | null> => {
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        await Promise.resolve();
+        active -= 1;
+        return {
+          provider: provider as ProviderUsageSnapshot["provider"],
+          displayName: String(provider),
+          windows: [{ label: "3h", usedPercent: 12 }],
+        };
+      },
+    );
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new Error("legacy fetch should not run");
+    });
+
+    await loadUsageWithAuth(
+      loadProviderUsageSummary,
+      [
+        { provider: "anthropic", token: "token-a" },
+        { provider: "openai", token: "token-codex" },
+      ],
+      mockFetch,
+    );
+
+    expect(peakActive).toBe(2);
+  });
+
+  it("dedupes exact duplicate provider auth entries before fetching usage", async () => {
+    resolveProviderUsageSnapshotWithPluginMock.mockResolvedValue({
+      provider: "openai",
+      displayName: "Codex",
+      windows: [{ label: "3h", usedPercent: 12 }],
+    });
+    const marks: string[] = [];
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new Error("legacy fetch should not run");
+    });
+
+    const summary = await loadProviderUsageSummary({
+      now: usageNow,
+      auth: [
+        { provider: "openai", token: "codex-token", accountId: "acct-1" },
+        { provider: "openai", token: "codex-token", accountId: "acct-1" },
+      ],
+      fetch: mockFetch as unknown as typeof fetch,
+      onPerfMark: (name) => marks.push(name),
+    });
+
+    expect(resolveProviderUsageSnapshotWithPluginMock).toHaveBeenCalledOnce();
+    expect(summary.providers).toEqual([
+      {
+        provider: "openai",
+        displayName: "Codex",
+        windows: [{ label: "3h", usedPercent: 12 }],
+      },
+    ]);
+    expect(marks).toContain("provider_auth_dedupe");
   });
 
   it("returns unsupported provider snapshots for unknown provider ids", async () => {

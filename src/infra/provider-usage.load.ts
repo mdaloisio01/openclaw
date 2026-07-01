@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import { getRuntimeConfig, type OpenClawConfig } from "../config/config.js";
 import { resolveProviderUsageSnapshotWithPlugin } from "../plugins/provider-runtime.js";
 import { resolveFetch } from "./fetch.js";
@@ -42,6 +43,7 @@ type UsageSummaryOptions = {
   fetch?: typeof fetch;
   skipPluginAuthWithoutCredentialSource?: boolean;
   onPerfMark?: (name: string) => void;
+  onPerfMeasure?: (name: string, durationMs: number) => void;
 };
 
 async function fetchProviderUsageSnapshot(params: {
@@ -80,6 +82,24 @@ async function fetchProviderUsageSnapshot(params: {
   });
 }
 
+function usageAuthKey(auth: ProviderAuth): string {
+  return `${auth.provider}\0${auth.accountId ?? ""}\0${auth.token}`;
+}
+
+function dedupeProviderAuths(auths: ProviderAuth[]): ProviderAuth[] {
+  const seen = new Set<string>();
+  const result: ProviderAuth[] = [];
+  for (const auth of auths) {
+    const key = usageAuthKey(auth);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(auth);
+  }
+  return result;
+}
+
 export async function loadProviderUsageSummary(
   opts: UsageSummaryOptions = {},
 ): Promise<UsageSummary> {
@@ -107,14 +127,20 @@ export async function loadProviderUsageSummary(
     opts.onPerfMark?.("no_auth_response");
     return { updatedAt: now, providers: [] };
   }
+  const providerAuths = dedupeProviderAuths(auths);
+  opts.onPerfMark?.("provider_enumeration");
+  if (providerAuths.length !== auths.length) {
+    opts.onPerfMark?.("provider_auth_dedupe");
+  }
 
-  const tasks = auths.map((auth) => {
+  const tasks = providerAuths.map((auth) => {
     const failureSnapshot = (error: string): ProviderUsageSnapshot => ({
       provider: auth.provider,
       displayName: PROVIDER_LABELS[auth.provider] ?? auth.provider,
       windows: [],
       error,
     });
+    const started = performance.now();
     return withTimeout(
       fetchProviderUsageSnapshot({
         auth,
@@ -132,10 +158,14 @@ export async function loadProviderUsageSummary(
         windows: [],
         error: "Timeout",
       },
-    ).catch((error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      return failureSnapshot(message.trim() || "Fetch failed");
-    });
+    )
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return failureSnapshot(message.trim() || "Fetch failed");
+      })
+      .finally(() => {
+        opts.onPerfMeasure?.(`provider_fetch_${auth.provider}`, performance.now() - started);
+      });
   });
   opts.onPerfMark?.("provider_tasks_build");
 

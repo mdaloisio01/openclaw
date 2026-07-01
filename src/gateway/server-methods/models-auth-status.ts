@@ -39,6 +39,7 @@ import { formatForLog } from "../ws-log.js";
 import {
   createGatewayPerfStageTimer,
   formatGatewayPerfCpuUsage,
+  formatGatewayPerfMs,
   logGatewayPerfSummary,
 } from "./perf-logging.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
@@ -225,6 +226,7 @@ async function loadUsageSummaryForAuthStatus(params: {
   bypassCache: boolean;
   now: number;
   mark: (name: string) => void;
+  measure: (name: string, durationMs: number) => void;
 }): Promise<{
   usageByProvider: Map<string, ProviderUsageStatus>;
   cacheStatus: "skipped" | "hit" | "miss" | "inflight" | "bypass";
@@ -262,6 +264,7 @@ async function loadUsageSummaryForAuthStatus(params: {
       agentDir: params.agentDir,
       timeoutMs: 3500,
       onPerfMark: (name) => params.mark(`usage_${name}`),
+      onPerfMeasure: (name, durationMs) => params.measure(`usage_${name}`, durationMs),
     });
     const usageByProvider = mapUsageSummaryProviders(summary);
     params.mark("usage_response_merge");
@@ -541,13 +544,20 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
   "models.authStatus": async ({ params, respond, context }) => {
     const perf = createGatewayPerfStageTimer();
     const cpuStarted = process.cpuUsage();
+    const usageProviderTimings: string[] = [];
     const logPerf = (message: string) => {
+      const providerTimingSummary =
+        usageProviderTimings.length > 0
+          ? ` usageProviderTimings="${usageProviderTimings.join(" ")}"`
+          : "";
       logGatewayPerfSummary({
         logger: log,
         surface: "models.authStatus",
         durationMs: perf.totalMs(),
         minInfoMs: 0,
-        message: `${message} ${formatGatewayPerfCpuUsage(cpuStarted)} stages="${perf.summary()}"`,
+        message:
+          `${message}${providerTimingSummary} ${formatGatewayPerfCpuUsage(cpuStarted)} ` +
+          `stages="${perf.summary()}"`,
       });
     };
     const now = Date.now();
@@ -610,6 +620,8 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
           bypassCache,
           now,
           mark: (name) => perf.mark(name),
+          measure: (name, durationMs) =>
+            usageProviderTimings.push(`${name}=${formatGatewayPerfMs(durationMs)}ms`),
         });
         usageByProvider = usage.usageByProvider;
         usageCacheStatus = usage.cacheStatus;

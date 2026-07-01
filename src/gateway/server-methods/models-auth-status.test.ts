@@ -399,6 +399,7 @@ describe("models.authStatus", () => {
       agentDir: "/tmp/agent",
       timeoutMs: 3500,
       onPerfMark: expect.any(Function),
+      onPerfMeasure: expect.any(Function),
     });
     const [, payload] = firstRespondCall(opts) ?? [];
     const result = payload as ModelAuthStatusResult;
