@@ -93,6 +93,11 @@ export async function runProviderAuthWarmWorkerInput(
         : {}),
       ...(workerStartupTimings ? { workerStartupTimings } : {}),
     });
+    if (typeof input.parentStartedAtEpochMs === "number") {
+      snapshot.timing?.workerStartupTimings.push(
+        `worker_result_ready=${Math.max(0, Date.now() - input.parentStartedAtEpochMs)}ms`,
+      );
+    }
     return {
       status: "ok",
       snapshot,
@@ -108,5 +113,15 @@ export async function runProviderAuthWarmWorkerInput(
 if (parentPort) {
   const sendToParent: (message: ProviderAuthWarmWorkerResult) => void =
     parentPort.postMessage.bind(parentPort);
-  sendToParent(await runProviderAuthWarmWorkerInput(workerData));
+  const result = await runProviderAuthWarmWorkerInput(workerData);
+  if (
+    result.status === "ok" &&
+    isWorkerInput(workerData) &&
+    typeof workerData.parentStartedAtEpochMs === "number"
+  ) {
+    result.snapshot.timing?.workerStartupTimings.push(
+      `worker_result_message_send=${Math.max(0, Date.now() - workerData.parentStartedAtEpochMs)}ms`,
+    );
+  }
+  sendToParent(result);
 }

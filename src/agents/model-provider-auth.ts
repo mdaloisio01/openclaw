@@ -101,6 +101,19 @@ function formatProviderAuthWarmPerfMs(value: number): string {
   return Number.isFinite(value) ? value.toFixed(1) : "n/a";
 }
 
+function readProviderAuthWarmTimingMs(
+  timings: readonly string[] | undefined,
+  name: string,
+): number | undefined {
+  const prefix = `${name}=`;
+  const value = timings?.find((entry) => entry.startsWith(prefix))?.slice(prefix.length);
+  if (!value?.endsWith("ms")) {
+    return undefined;
+  }
+  const parsed = Number(value.slice(0, -"ms".length));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 function createProviderAuthWarmStageTimer(): {
   mark: (name: string) => void;
   markValue: (name: string, durationMs: number) => void;
@@ -757,6 +770,10 @@ function runProviderAuthWarmWorker(params: {
   };
   const appendParentStartupTimings = (snapshot: ProviderAuthWarmSnapshot) => {
     const messageReceivedAtEpochMs = Date.now();
+    const messageReceivedSinceStartMs = Math.max(
+      0,
+      messageReceivedAtEpochMs - parentStartedAtEpochMs,
+    );
     const timing = snapshot.timing;
     if (!timing) {
       return;
@@ -768,8 +785,29 @@ function runProviderAuthWarmWorker(params: {
       )}ms`,
     );
     if (workerOnlineAtEpochMs !== undefined) {
-      timing.workerStartupTimings.push(
-        `worker_parent_online=${Math.max(0, workerOnlineAtEpochMs - parentStartedAtEpochMs)}ms`,
+      const workerOnlineSinceStartMs = Math.max(0, workerOnlineAtEpochMs - parentStartedAtEpochMs);
+      const appendOnlineDelta = (targetName: string, derivedName: string) => {
+        const targetMs = readProviderAuthWarmTimingMs(timing.workerStartupTimings, targetName);
+        if (targetMs === undefined) {
+          return;
+        }
+        timing.workerStartupTimings.push(
+          `${derivedName}=${Math.max(0, targetMs - workerOnlineSinceStartMs)}ms`,
+        );
+      };
+      timing.workerStartupTimings.push(`worker_parent_online=${workerOnlineSinceStartMs}ms`);
+      appendOnlineDelta(
+        "worker_startup_process_module_load",
+        "worker_parent_online_to_module_load",
+      );
+      appendOnlineDelta(
+        "worker_startup_before_auth_snapshot",
+        "worker_parent_online_to_auth_snapshot_start",
+      );
+      appendOnlineDelta("worker_result_ready", "worker_parent_online_to_result_ready");
+      appendOnlineDelta(
+        "worker_result_message_send",
+        "worker_parent_online_to_worker_message_send",
       );
       timing.workerStartupTimings.push(
         `worker_parent_online_to_message=${Math.max(
@@ -777,12 +815,21 @@ function runProviderAuthWarmWorker(params: {
           messageReceivedAtEpochMs - workerOnlineAtEpochMs,
         )}ms`,
       );
+      const workerMessageSendMs = readProviderAuthWarmTimingMs(
+        timing.workerStartupTimings,
+        "worker_result_message_send",
+      );
+      if (workerMessageSendMs !== undefined) {
+        timing.workerStartupTimings.push(
+          `worker_parent_worker_send_to_message=${Math.max(
+            0,
+            messageReceivedSinceStartMs - workerMessageSendMs,
+          )}ms`,
+        );
+      }
     }
     timing.workerStartupTimings.push(
-      `worker_parent_message_received=${Math.max(
-        0,
-        messageReceivedAtEpochMs - parentStartedAtEpochMs,
-      )}ms`,
+      `worker_parent_message_received=${messageReceivedSinceStartMs}ms`,
     );
   };
   currentProviderAuthWarmWorker = handle;

@@ -83,6 +83,9 @@ describe("provider auth warm worker", () => {
       expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
         "worker_startup_process_module_load=",
       );
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_result_ready=",
+      );
       expect(result.snapshot.timing?.catalogTimings.join(" ")).toMatch(
         /catalog_(persisted_models_json_read|static_configured_model_catalog_build)=/,
       );
