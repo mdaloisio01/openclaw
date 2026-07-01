@@ -303,6 +303,7 @@ export {
 } from "../chat-display-projection.js";
 
 export const CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES = 128 * 1024;
+const CHAT_HISTORY_INITIAL_TAIL_READ_BYTES = 1024 * 1024;
 const CHAT_HISTORY_OVERSIZED_PLACEHOLDER = "[chat.history omitted: message too large]";
 const MANAGED_OUTGOING_IMAGE_PATH_PREFIX = "/api/chat/media/outgoing/";
 let chatHistoryPlaceholderEmitCount = 0;
@@ -2486,62 +2487,92 @@ async function handleChatHistoryRequest({
     maxMessages: rawHistoryWindow.maxMessages + 1,
     maxLines: rawHistoryWindow.maxLines + 1,
   };
-  const historyRead =
-    sessionId && storePath
-      ? await readRecentSessionMessagesWithTailStatsAsync(
-          sessionId,
-          storePath,
-          entry?.sessionFile,
-          {
-            ...localHistoryReadOptions,
-            maxBytes: Math.max(maxHistoryBytes * 2, 1024 * 1024),
-          },
-        )
-      : { messages: [], readBytes: 0, tailLines: 0 };
-  const localMessages = historyRead.messages;
-  perf.mark("history_read");
-  const overreadContextMessage =
-    localMessages.length > rawHistoryWindow.maxMessages ? localMessages[0] : undefined;
-  const localMessagesWithBoundaryFilter = dropLocalHistoryOverreadContextMessage(
-    dropPreSessionStartAnnouncePairs(
-      localMessages,
-      typeof entry?.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
-    ),
-    overreadContextMessage,
-  );
-  const rawMessages = augmentChatHistoryWithCliSessionImports({
-    entry,
-    provider: resolvedSessionModel.provider,
-    localMessages: localMessagesWithBoundaryFilter,
-  });
-  // Drop subagent_announce pairs (user inter-session announce + adjacent
-  // assistant) whose record timestamp predates the current session's
-  // sessionStartedAt. Run after CLI history imports too, because those
-  // timestamped messages share the same chat.history response surface.
-  const recencyFilteredMessages = dropPreSessionStartAnnouncePairs(
-    rawMessages,
-    typeof entry?.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
-  );
   const effectiveMaxChars = resolveEffectiveChatHistoryMaxChars(cfg, maxChars);
-  const normalized = augmentChatHistoryWithCanvasBlocks(
-    projectRecentChatDisplayMessages(recencyFilteredMessages, {
-      maxChars: effectiveMaxChars,
-      maxMessages: max,
-    }),
-  );
-  perf.mark("projection");
   const perMessageHardCap = Math.min(CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES, maxHistoryBytes);
-  const replaced = replaceOversizedChatHistoryMessages({
-    messages: normalized,
-    maxSingleMessageBytes: perMessageHardCap,
-  });
+  const fullTailReadMaxBytes = Math.max(maxHistoryBytes * 2, CHAT_HISTORY_INITIAL_TAIL_READ_BYTES);
+  const initialTailReadMaxBytes = Math.min(
+    fullTailReadMaxBytes,
+    CHAT_HISTORY_INITIAL_TAIL_READ_BYTES,
+  );
+  type HistoryTailReadResult = {
+    messages: unknown[];
+    filePath?: string;
+    fileBytes?: number;
+    readBytes: number;
+    tailLines: number;
+  };
+  const readHistoryTail = (readMaxBytes: number): Promise<HistoryTailReadResult> =>
+    sessionId && storePath
+      ? readRecentSessionMessagesWithTailStatsAsync(sessionId, storePath, entry?.sessionFile, {
+          ...localHistoryReadOptions,
+          maxBytes: readMaxBytes,
+        })
+      : Promise.resolve({ messages: [], readBytes: 0, tailLines: 0 });
+  const projectHistoryTail = (historyReadResult: HistoryTailReadResult) => {
+    const localMessages = historyReadResult.messages;
+    const overreadContextMessage =
+      localMessages.length > rawHistoryWindow.maxMessages ? localMessages[0] : undefined;
+    const localMessagesWithBoundaryFilter = dropLocalHistoryOverreadContextMessage(
+      dropPreSessionStartAnnouncePairs(
+        localMessages,
+        typeof entry?.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
+      ),
+      overreadContextMessage,
+    );
+    const rawMessages = augmentChatHistoryWithCliSessionImports({
+      entry,
+      provider: resolvedSessionModel.provider,
+      localMessages: localMessagesWithBoundaryFilter,
+    });
+    // Drop subagent_announce pairs (user inter-session announce + adjacent
+    // assistant) whose record timestamp predates the current session's
+    // sessionStartedAt. Run after CLI history imports too, because those
+    // timestamped messages share the same chat.history response surface.
+    const recencyFilteredMessages = dropPreSessionStartAnnouncePairs(
+      rawMessages,
+      typeof entry?.sessionStartedAt === "number" ? entry.sessionStartedAt : undefined,
+    );
+    const normalized = augmentChatHistoryWithCanvasBlocks(
+      projectRecentChatDisplayMessages(recencyFilteredMessages, {
+        maxChars: effectiveMaxChars,
+        maxMessages: max,
+      }),
+    );
+    const replaced = replaceOversizedChatHistoryMessages({
+      messages: normalized,
+      maxSingleMessageBytes: perMessageHardCap,
+    });
+    const capped = capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
+    const bounded = enforceChatHistoryFinalBudget({ messages: capped, maxBytes: maxHistoryBytes });
+    return {
+      localMessages,
+      normalized,
+      replaced,
+      bounded,
+    };
+  };
+  let historyRead = await readHistoryTail(initialTailReadMaxBytes);
+  perf.mark("history_read");
+  let projectedHistory = projectHistoryTail(historyRead);
+  perf.mark("projection");
+  const canRetryHistoryTail =
+    typeof historyRead.fileBytes === "number" &&
+    historyRead.readBytes < Math.min(historyRead.fileBytes, fullTailReadMaxBytes);
+  if (canRetryHistoryTail && projectedHistory.normalized.length < max) {
+    historyRead = await readHistoryTail(fullTailReadMaxBytes);
+    perf.mark("history_read_retry");
+    projectedHistory = projectHistoryTail(historyRead);
+    perf.mark("projection_retry");
+  }
+  const localMessages = projectedHistory.localMessages;
+  const normalized = projectedHistory.normalized;
   scheduleChatHistoryManagedImageCleanup({
     sessionKey,
     ...(selectedAgent.agentId ? { agentId: selectedAgent.agentId } : {}),
     context,
   });
-  const capped = capArrayByJsonBytes(replaced.messages, maxHistoryBytes).items;
-  const bounded = enforceChatHistoryFinalBudget({ messages: capped, maxBytes: maxHistoryBytes });
+  const replaced = projectedHistory.replaced;
+  const bounded = projectedHistory.bounded;
   perf.mark("budget");
   const placeholderCount = replaced.replacedCount + bounded.placeholderCount;
   if (placeholderCount > 0) {
