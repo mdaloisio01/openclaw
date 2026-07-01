@@ -373,8 +373,10 @@ export async function resolveProviderAuths(params: {
   config?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   skipPluginAuthWithoutCredentialSource?: boolean;
+  onPerfMark?: (name: string) => void;
 }): Promise<ProviderAuth[]> {
   if (params.auth) {
+    params.onPerfMark?.("injected_auth");
     return params.auth;
   }
 
@@ -383,6 +385,7 @@ export async function resolveProviderAuths(params: {
     env: params.env ?? process.env,
     agentDir: params.agentDir,
   };
+  params.onPerfMark?.("state_build");
   const authProfileSourceState: UsageAuthState = {
     ...stateBase,
     allowAuthProfileStore: true,
@@ -390,14 +393,21 @@ export async function resolveProviderAuths(params: {
   const hasAuthProfileStoreSource = params.skipPluginAuthWithoutCredentialSource
     ? hasAnyAuthProfileStoreSource(params.agentDir)
     : false;
+  params.onPerfMark?.("auth_profile_source_check");
   const auths: ProviderAuth[] = [];
+  const providers = [...new Set(params.providers)];
+  if (providers.length !== params.providers.length) {
+    params.onPerfMark?.("provider_dedupe");
+  }
 
-  for (const provider of params.providers) {
+  for (const provider of providers) {
+    params.onPerfMark?.("provider_start");
     if (!params.skipPluginAuthWithoutCredentialSource) {
       const pluginAuth = await resolveProviderUsageAuthViaPlugin({
         state: authProfileSourceState,
         provider,
       });
+      params.onPerfMark?.("plugin_auth");
       if (pluginAuth.auth) {
         auths.push(pluginAuth.auth);
         continue;
@@ -409,6 +419,7 @@ export async function resolveProviderAuths(params: {
         state: authProfileSourceState,
         provider,
       });
+      params.onPerfMark?.("fallback_auth");
       if (fallbackAuth) {
         auths.push(fallbackAuth);
       }
@@ -420,6 +431,7 @@ export async function resolveProviderAuths(params: {
       state: directCredentialState,
       provider,
     });
+    params.onPerfMark?.("credential_provider_ids");
     const hasDirectCredentialSource =
       !isOAuthOnlyUsageProvider(provider) &&
       (Boolean(
@@ -432,6 +444,7 @@ export async function resolveProviderAuths(params: {
           state: directCredentialState,
           providerIds: credentialProviderIds,
         }));
+    params.onPerfMark?.("direct_credential_source");
     const allowAuthProfileStore =
       hasDirectCredentialSource ||
       (hasAuthProfileStoreSource &&
@@ -440,6 +453,7 @@ export async function resolveProviderAuths(params: {
           providerIds: credentialProviderIds,
           usageProvider: provider,
         }));
+    params.onPerfMark?.("auth_profile_credential_source");
     const state: UsageAuthState = {
       ...stateBase,
       allowAuthProfileStore,
@@ -451,6 +465,7 @@ export async function resolveProviderAuths(params: {
         state,
         provider,
       });
+      params.onPerfMark?.("plugin_auth");
       if (pluginAuth.auth) {
         auths.push(pluginAuth.auth);
         continue;
@@ -463,10 +478,12 @@ export async function resolveProviderAuths(params: {
       state,
       provider,
     });
+    params.onPerfMark?.("fallback_auth");
     if (fallbackAuth) {
       auths.push(fallbackAuth);
     }
   }
 
+  params.onPerfMark?.("complete");
   return auths;
 }

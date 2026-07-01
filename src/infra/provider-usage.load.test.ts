@@ -131,6 +131,7 @@ describe("provider-usage.load", () => {
     expect(marks).toEqual([
       "config_resolve",
       "fetch_resolve",
+      "auth_injected_auth",
       "auth_resolve",
       "provider_enumeration",
       "provider_tasks_build",

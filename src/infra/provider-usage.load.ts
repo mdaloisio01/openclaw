@@ -121,6 +121,7 @@ export async function loadProviderUsageSummary(
     config,
     env,
     skipPluginAuthWithoutCredentialSource: opts.skipPluginAuthWithoutCredentialSource,
+    onPerfMark: (name) => opts.onPerfMark?.(`auth_${name}`),
   });
   opts.onPerfMark?.("auth_resolve");
   if (auths.length === 0) {

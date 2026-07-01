@@ -132,6 +132,55 @@ describe("resolveProviderAuths plugin boundary", () => {
     expect(ensureAuthProfileStoreMock).not.toHaveBeenCalled();
   });
 
+  it("marks usage auth resolution subphases", async () => {
+    resolveProviderUsageAuthWithPluginMock.mockResolvedValueOnce({
+      token: "plugin-zai-token",
+    });
+    const marks: string[] = [];
+
+    await expect(
+      resolveProviderAuthsForTest({
+        providers: ["zai"],
+        onPerfMark: (name) => marks.push(name),
+      }),
+    ).resolves.toEqual([
+      {
+        provider: "zai",
+        token: "plugin-zai-token",
+      },
+    ]);
+
+    expect(marks).toEqual([
+      "state_build",
+      "auth_profile_source_check",
+      "provider_start",
+      "plugin_auth",
+      "complete",
+    ]);
+  });
+
+  it("dedupes duplicate provider ids before resolving usage auth", async () => {
+    resolveProviderUsageAuthWithPluginMock.mockResolvedValueOnce({
+      token: "plugin-zai-token",
+    });
+    const marks: string[] = [];
+
+    await expect(
+      resolveProviderAuthsForTest({
+        providers: ["zai", "zai"],
+        onPerfMark: (name) => marks.push(name),
+      }),
+    ).resolves.toEqual([
+      {
+        provider: "zai",
+        token: "plugin-zai-token",
+      },
+    ]);
+
+    expect(resolveProviderUsageAuthWithPluginMock).toHaveBeenCalledOnce();
+    expect(marks).toContain("provider_dedupe");
+  });
+
   it("skips plugin usage auth when requested and no direct credential source exists", async () => {
     await withTempHome(async (homeDir) => {
       await expect(
