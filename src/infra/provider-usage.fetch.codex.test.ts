@@ -66,6 +66,67 @@ describe("fetchCodexUsage", () => {
     ]);
   });
 
+  it("marks local and HTTP subphases without exposing request contents", async () => {
+    const marks: string[] = [];
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(200, {
+        rate_limit: {
+          primary_window: {
+            limit_window_seconds: 10_800,
+            used_percent: 9,
+          },
+        },
+      }),
+    );
+
+    const result = await fetchCodexUsage("secret-token", "acct-1", 5000, mockFetch, {
+      onPerfMark: (name) => marks.push(name),
+    });
+
+    expect(result.windows).toEqual([{ label: "3h", usedPercent: 9, resetAt: undefined }]);
+    expect(marks).toEqual([
+      "setup",
+      "header_prep",
+      "request_construct",
+      "timeout_armed",
+      "http_wait",
+      "response_read",
+      "json_parse",
+      "response_normalize",
+    ]);
+    expect(marks.join(" ")).not.toContain("secret-token");
+    expect(marks.join(" ")).not.toContain("acct-1");
+  });
+
+  it("marks HTTP errors before returning status snapshots", async () => {
+    const marks: string[] = [];
+    const mockFetch = createProviderUsageFetch(async () =>
+      makeResponse(429, { error: "throttled" }),
+    );
+
+    const result = await fetchCodexUsage("token", undefined, 5000, mockFetch, {
+      onPerfMark: (name) => marks.push(name),
+    });
+
+    expect(result.error).toBe("HTTP 429");
+    expect(marks).toContain("http_wait");
+    expect(marks).toContain("http_error_response");
+  });
+
+  it("marks transport errors before preserving the thrown failure", async () => {
+    const marks: string[] = [];
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new Error("network down");
+    });
+
+    await expect(
+      fetchCodexUsage("token", undefined, 5000, mockFetch, {
+        onPerfMark: (name) => marks.push(name),
+      }),
+    ).rejects.toThrow("network down");
+    expect(marks).toContain("http_error");
+  });
+
   it("labels weekly secondary window as Week", async () => {
     const mockFetch = createProviderUsageFetch(async () =>
       makeResponse(200, {

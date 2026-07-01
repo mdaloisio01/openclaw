@@ -54,6 +54,7 @@ async function fetchProviderUsageSnapshot(params: {
   workspaceDir?: string;
   timeoutMs: number;
   fetchFn: typeof fetch;
+  onPerfMark?: (name: string) => void;
 }): Promise<ProviderUsageSnapshot> {
   const pluginSnapshot = await resolveProviderUsageSnapshotWithPlugin({
     provider: params.auth.provider,
@@ -70,6 +71,7 @@ async function fetchProviderUsageSnapshot(params: {
       accountId: params.auth.accountId,
       timeoutMs: params.timeoutMs,
       fetchFn: params.fetchFn,
+      onPerfMark: (name) => params.onPerfMark?.(`${params.auth.provider}_${name}`),
     },
   });
   if (pluginSnapshot) {
@@ -151,6 +153,7 @@ export async function loadProviderUsageSummary(
         workspaceDir: opts.workspaceDir,
         timeoutMs,
         fetchFn,
+        onPerfMark: (name) => opts.onPerfMark?.(`provider_${name}`),
       }),
       timeoutMs + 1000,
       {

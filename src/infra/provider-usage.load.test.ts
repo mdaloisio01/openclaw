@@ -140,6 +140,32 @@ describe("provider-usage.load", () => {
     ]);
   });
 
+  it("prefixes plugin-owned provider fetch subphase marks", async () => {
+    resolveProviderUsageSnapshotWithPluginMock.mockImplementation(async ({ context }) => {
+      context.onPerfMark?.("http_wait");
+      context.onPerfMark?.("response_normalize");
+      return {
+        provider: "openai",
+        displayName: "Codex",
+        windows: [{ label: "3h", usedPercent: 12 }],
+      };
+    });
+    const marks: string[] = [];
+    const mockFetch = createProviderUsageFetch(async () => {
+      throw new Error("legacy fetch should not run");
+    });
+
+    await loadProviderUsageSummary({
+      now: usageNow,
+      auth: [{ provider: "openai", token: "codex-token" }],
+      fetch: mockFetch as unknown as typeof fetch,
+      onPerfMark: (name) => marks.push(name),
+    });
+
+    expect(marks).toContain("provider_openai_http_wait");
+    expect(marks).toContain("provider_openai_response_normalize");
+  });
+
   it("measures each provider usage fetch inside the aggregate", async () => {
     resolveProviderUsageSnapshotWithPluginMock.mockImplementation(
       async ({ provider }): Promise<ProviderUsageSnapshot | null> => ({

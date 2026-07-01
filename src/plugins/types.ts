@@ -677,6 +677,7 @@ export type ProviderFetchUsageSnapshotContext = {
   accountId?: string;
   timeoutMs: number;
   fetchFn: typeof fetch;
+  onPerfMark?: (name: string) => void;
 };
 
 /**

@@ -610,7 +610,9 @@ export function buildOpenAICodexProviderHooks(): Pick<
     },
     resolveUsageAuth: async (ctx) => await ctx.resolveOAuthToken(),
     fetchUsageSnapshot: async (ctx) =>
-      await fetchCodexUsage(ctx.token, ctx.accountId, ctx.timeoutMs, ctx.fetchFn),
+      await fetchCodexUsage(ctx.token, ctx.accountId, ctx.timeoutMs, ctx.fetchFn, {
+        onPerfMark: ctx.onPerfMark,
+      }),
     refreshOAuth: async (cred) => await refreshOpenAICodexOAuthCredential(cred),
     augmentModelCatalog: (ctx) => {
       const gpt54Template = findCatalogTemplate({

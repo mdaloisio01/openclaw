@@ -1,9 +1,9 @@
 import { resolveProviderRequestHeaders } from "../agents/provider-request-config.js";
 import { parseStrictFiniteNumber } from "./parse-finite-number.js";
 import {
+  buildUsageErrorSnapshot,
   buildUsageHttpErrorSnapshot,
   fetchJson,
-  readUsageJson,
 } from "./provider-usage.fetch.shared.js";
 import { clampPercent, PROVIDER_LABELS } from "./provider-usage.shared.js";
 import type { ProviderUsageSnapshot, UsageWindow } from "./provider-usage.types.js";
@@ -29,6 +29,10 @@ type CodexUsageResponse = {
 };
 
 const WEEKLY_RESET_GAP_SECONDS = 3 * 24 * 60 * 60;
+
+type CodexUsageFetchOptions = {
+  onPerfMark?: (name: string) => void;
+};
 
 function resolveSecondaryWindowLabel(params: {
   windowHours: number;
@@ -58,6 +62,7 @@ export async function fetchCodexUsage(
   accountId: string | undefined,
   timeoutMs: number,
   fetchFn: typeof fetch,
+  options: CodexUsageFetchOptions = {},
 ): Promise<ProviderUsageSnapshot> {
   const version = process.env.OPENCLAW_VERSION?.trim();
   const defaultHeaders: Record<string, string> = {
@@ -70,6 +75,7 @@ export async function fetchCodexUsage(
   if (accountId) {
     defaultHeaders["ChatGPT-Account-Id"] = accountId;
   }
+  options.onPerfMark?.("setup");
   const headers =
     resolveProviderRequestHeaders({
       provider: "openai",
@@ -78,15 +84,27 @@ export async function fetchCodexUsage(
       transport: "http",
       defaultHeaders,
     }) ?? defaultHeaders;
+  options.onPerfMark?.("header_prep");
 
-  const res = await fetchJson(
-    "https://chatgpt.com/backend-api/wham/usage",
-    { method: "GET", headers },
-    timeoutMs,
-    fetchFn,
-  );
+  const requestInit = { method: "GET", headers };
+  options.onPerfMark?.("request_construct");
+  options.onPerfMark?.("timeout_armed");
+  let res: Response;
+  try {
+    res = await fetchJson(
+      "https://chatgpt.com/backend-api/wham/usage",
+      requestInit,
+      timeoutMs,
+      fetchFn,
+    );
+    options.onPerfMark?.("http_wait");
+  } catch (error) {
+    options.onPerfMark?.("http_error");
+    throw error;
+  }
 
   if (!res.ok) {
+    options.onPerfMark?.("http_error_response");
     return buildUsageHttpErrorSnapshot({
       provider: "openai",
       status: res.status,
@@ -94,11 +112,16 @@ export async function fetchCodexUsage(
     });
   }
 
-  const parsed = await readUsageJson("openai", res);
-  if (!parsed.ok) {
-    return parsed.snapshot;
+  let data: CodexUsageResponse;
+  try {
+    const responseText = await res.text();
+    options.onPerfMark?.("response_read");
+    data = JSON.parse(responseText) as CodexUsageResponse;
+    options.onPerfMark?.("json_parse");
+  } catch {
+    options.onPerfMark?.("malformed_response");
+    return buildUsageErrorSnapshot("openai", "Malformed usage response");
   }
-  const data = parsed.data as CodexUsageResponse;
   const windows: UsageWindow[] = [];
 
   if (data.rate_limit?.primary_window) {
@@ -135,6 +158,7 @@ export async function fetchCodexUsage(
     plan = plan ? `${plan} ($${balance.toFixed(2)})` : `$${balance.toFixed(2)}`;
   }
 
+  options.onPerfMark?.("response_normalize");
   return {
     provider: "openai",
     displayName: PROVIDER_LABELS.openai,
