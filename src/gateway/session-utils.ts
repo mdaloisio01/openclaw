@@ -7,7 +7,7 @@ import {
 } from "@openclaw/normalization-core/string-coerce";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import type { SessionsListParams } from "../../packages/gateway-protocol/src/index.js";
-import { readAcpSessionMeta } from "../acp/runtime/session-meta.js";
+import { readAcpSessionMetaForEntry } from "../acp/runtime/session-meta.js";
 import { resolveModelAgentRuntimeMetadata } from "../agents/agent-runtime-metadata.js";
 import {
   listAgentIds,
@@ -1866,6 +1866,7 @@ export function buildGatewaySessionRow(params: {
   agentId?: string;
   skipTranscriptUsageFallback?: boolean;
   lightweightListRow?: boolean;
+  perf?: { mark: (name: string) => void };
 }): GatewaySessionRow {
   const { cfg, storePath, store, key, entry } = params;
   const lightweight = params.lightweightListRow === true;
@@ -1952,6 +1953,7 @@ export function buildGatewaySessionRow(params: {
           ? resolveSessionRuntimeMs(subagentRun, now)
           : undefined))
     : undefined;
+  params.perf?.mark("base_metadata");
   const selectedModel = resolveSessionSelectedModelRef({
     cfg,
     entry,
@@ -2019,6 +2021,7 @@ export function buildGatewaySessionRow(params: {
     typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0
       ? true
       : transcriptUsage?.totalTokensFresh === true;
+  params.perf?.mark("model_tokens");
   const goal = entry?.goal
     ? resolveSessionGoalDisplayState(
         {
@@ -2045,6 +2048,7 @@ export function buildGatewaySessionRow(params: {
   const latestCompactionCheckpoint = buildCompactionCheckpointPreview(
     resolveLatestCompactionCheckpoint(compactionCheckpoints),
   );
+  params.perf?.mark("child_compaction");
   const selectedOrRuntimeModelProvider = selectedModel?.provider ?? modelProvider;
   const selectedOrRuntimeModel = selectedModel?.model ?? model;
   const rowModelIdentity = lightweight
@@ -2058,12 +2062,14 @@ export function buildGatewaySessionRow(params: {
       });
   const rowModelProvider = rowModelIdentity.provider;
   const rowModel = rowModelIdentity.model;
+  params.perf?.mark("display_model");
   const acpSessionKey = resolveStoredSessionKeyForAgentStore({
     cfg,
     agentId: sessionAgentId,
     sessionKey: key,
   });
-  const acpMeta = readAcpSessionMeta({ sessionKey: acpSessionKey });
+  const acpMeta = readAcpSessionMetaForEntry({ sessionKey: acpSessionKey, entry });
+  params.perf?.mark("acp_meta");
   const agentRuntime = resolveModelAgentRuntimeMetadata({
     cfg,
     agentId: sessionAgentId,
@@ -2073,6 +2079,7 @@ export function buildGatewaySessionRow(params: {
     acpRuntime: acpMeta != null,
     acpBackend: acpMeta?.backend,
   });
+  params.perf?.mark("agent_runtime");
   const estimatedCostUsd = lightweight
     ? resolveNonNegativeNumber(entry?.estimatedCostUsd)
     : (resolveEstimatedSessionCostUsd({
@@ -2102,6 +2109,7 @@ export function buildGatewaySessionRow(params: {
           allowAsyncLoad: false,
         }),
       ));
+  params.perf?.mark("cost_context");
 
   let derivedTitle: string | undefined;
   let lastMessagePreview: string | undefined;
@@ -2119,6 +2127,7 @@ export function buildGatewaySessionRow(params: {
       lastMessagePreview = fields.lastMessagePreview;
     }
   }
+  params.perf?.mark("title_preview");
 
   const thinkingProvider = rowModelProvider ?? DEFAULT_PROVIDER;
   const thinkingModel = rowModel ?? DEFAULT_MODEL;
@@ -2132,8 +2141,10 @@ export function buildGatewaySessionRow(params: {
   });
   const thinkingLevels = thinkingMetadata.levels;
   const thinkingDefault = thinkingMetadata.defaultLevel;
+  params.perf?.mark("thinking");
   const pluginExtensions =
     !lightweight && entry ? projectPluginSessionExtensionsSync({ sessionKey: key, entry }) : [];
+  params.perf?.mark("plugin_extensions");
 
   return {
     key,
@@ -2364,6 +2375,7 @@ export function buildGatewaySessionInfo(params: {
   agentId?: string;
   now?: number;
   modelCatalog?: ModelCatalogEntry[];
+  perf?: { mark: (name: string) => void };
 }): GatewaySessionRow {
   const now = params.now ?? Date.now();
   const storeChildSessionsByKey = buildSingleRowStoreChildSessionsByKey({
@@ -2384,6 +2396,7 @@ export function buildGatewaySessionInfo(params: {
     storeChildSessionsByKey,
     skipTranscriptUsageFallback: true,
     lightweightListRow: true,
+    perf: params.perf,
   });
 }
 

@@ -2567,6 +2567,7 @@ async function handleChatHistoryRequest({
     },
   );
   perf.mark("model_catalog");
+  const sessionInfoPerf = createGatewayPerfStageTimer();
   const sessionInfo = buildGatewaySessionInfo({
     cfg,
     storePath,
@@ -2575,6 +2576,7 @@ async function handleChatHistoryRequest({
     entry,
     agentId: selectedAgent.agentId,
     modelCatalog,
+    perf: sessionInfoPerf,
   });
   perf.mark("session_info");
   const defaultAgentId = resolveDefaultAgentId(cfg);
@@ -2640,6 +2642,7 @@ async function handleChatHistoryRequest({
       `historyTailLines=${historyRead.tailLines} ` +
       `storeEntries=${Object.keys(store).length} contextTokens=${sessionInfo.contextTokens ?? "unknown"} ` +
       `totalTokens=${sessionInfo.totalTokens ?? "unknown"} ${formatGatewayPerfCpuUsage(cpuStarted)} ` +
+      `sessionInfoStages="${sessionInfoPerf.summary()}" ` +
       `stages="${perf.summary()}"`,
   });
   respond(true, payload);
