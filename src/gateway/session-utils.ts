@@ -641,6 +641,7 @@ function resolveStoreChildSessionKeysFromCandidates(params: {
   store: Record<string, SessionEntry>;
   key: string;
   now: number;
+  subagentRuns?: SessionListRowContext["subagentRuns"];
   candidates: ReadonlyMap<string, readonly string[]>;
 }): string[] | undefined {
   const childSessionKeys: string[] = [];
@@ -649,7 +650,9 @@ function resolveStoreChildSessionKeysFromCandidates(params: {
     if (!entry) {
       continue;
     }
-    const latest = getSessionDisplaySubagentRunByChildSessionKey(childKey);
+    const latest = params.subagentRuns
+      ? params.subagentRuns.getDisplaySubagentRun(childKey)
+      : getSessionDisplaySubagentRunByChildSessionKey(childKey);
     if (latest) {
       const latestControllerSessionKey =
         normalizeOptionalString(latest.controllerSessionKey) ||
@@ -659,7 +662,9 @@ function resolveStoreChildSessionKeysFromCandidates(params: {
       }
       if (
         !shouldKeepSubagentRunChildLink(latest, {
-          activeDescendants: countActiveDescendantRuns(childKey),
+          activeDescendants: params.subagentRuns
+            ? params.subagentRuns.countActiveDescendantRuns(childKey)
+            : countActiveDescendantRuns(childKey),
           now: params.now,
         })
       ) {
@@ -713,11 +718,13 @@ function buildSingleRowStoreChildSessionsByKey(params: {
   storePath: string;
   key: string;
   now: number;
+  subagentRuns?: SessionListRowContext["subagentRuns"];
 }): Map<string, string[]> {
   const storeChildSessions = resolveStoreChildSessionKeysFromCandidates({
     store: params.store,
     key: params.key,
     now: params.now,
+    subagentRuns: params.subagentRuns,
     candidates: getSingleRowChildSessionCandidates({
       storePath: params.storePath,
       store: params.store,
@@ -2378,12 +2385,16 @@ export function buildGatewaySessionInfo(params: {
   perf?: { mark: (name: string) => void };
 }): GatewaySessionRow {
   const now = params.now ?? Date.now();
+  const rowContext = buildSessionListRowMetadataContext({ now });
+  params.perf?.mark("row_context");
   const storeChildSessionsByKey = buildSingleRowStoreChildSessionsByKey({
     storePath: params.storePath,
     store: params.store,
     key: params.key,
     now,
+    subagentRuns: rowContext.subagentRuns,
   });
+  params.perf?.mark("store_child_index");
   return buildGatewaySessionRow({
     cfg: params.cfg,
     storePath: params.storePath,
@@ -2394,6 +2405,7 @@ export function buildGatewaySessionInfo(params: {
     modelCatalog: params.modelCatalog,
     now,
     storeChildSessionsByKey,
+    rowContext,
     skipTranscriptUsageFallback: true,
     lightweightListRow: true,
     perf: params.perf,
