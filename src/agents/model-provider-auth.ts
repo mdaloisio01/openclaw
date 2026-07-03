@@ -466,6 +466,41 @@ function shouldOmitFalsePreparedAuthForProcessSyntheticProvider(params: {
     .some((ref) => eligibleRefs.has(normalizeProviderId(ref)));
 }
 
+async function hasAuthForProviderWarmSnapshot(params: {
+  provider: string;
+  cfg: OpenClawConfig;
+  workspaceDir: string;
+  store: AuthProfileStore;
+  runtimeAuthLookup: RuntimeProviderAuthLookup;
+  timingRecorder: ProviderAuthCheckTimingRecorder;
+}): Promise<boolean> {
+  const checkStarted = performance.now();
+  const provider = normalizeProviderId(params.provider);
+  const recordTiming = (stage: string, started: number, extra?: string) => {
+    params.timingRecorder(stage, performance.now() - started, extra);
+  };
+  const runtimeAuthStarted = performance.now();
+  if (
+    hasRuntimeAvailableProviderAuth({
+      provider,
+      cfg: params.cfg,
+      workspaceDir: params.workspaceDir,
+      runtimeLookup: params.runtimeAuthLookup,
+    })
+  ) {
+    recordTiming("runtime_auth", runtimeAuthStarted, "result_true");
+    recordTiming("complete", checkStarted, "result_true");
+    return true;
+  }
+  recordTiming("runtime_auth", runtimeAuthStarted, "result_false");
+  const profileListStarted = performance.now();
+  const profiles = listProfilesForProvider(params.store, provider);
+  recordTiming("profile_list", profileListStarted, `profiles_${profiles.length}`);
+  const available = profiles.length > 0;
+  recordTiming("complete", checkStarted, available ? "result_true" : "result_false");
+  return available;
+}
+
 export async function buildCurrentProviderAuthStateSnapshot(
   cfg: OpenClawConfig,
   options: {
@@ -606,11 +641,10 @@ export async function buildCurrentProviderAuthStateSnapshot(
         seenProviderChecks.add(providerCheckKey);
       }
       const providerCheckStart = performance.now();
-      const value = await hasAuthForModelProvider({
+      const value = await hasAuthForProviderWarmSnapshot({
         provider,
         cfg,
         workspaceDir,
-        agentId,
         store,
         runtimeAuthLookup,
         timingRecorder: (stage, durationMs, extra) => {

@@ -145,6 +145,29 @@ describe("prepared provider auth state", () => {
     });
   });
 
+  it("uses the warm snapshot fast path instead of the generic per-provider yield path", async () => {
+    const cfg = {} as OpenClawConfig;
+    modelCatalogMocks.loadModelCatalog.mockResolvedValue([
+      { id: "gpt", name: "gpt", provider: "openai" },
+    ]);
+    modelAuthMocks.hasRuntimeAvailableProviderAuth.mockReturnValue(false);
+    authProfilesMocks.listProfilesForProvider.mockReturnValueOnce([{} as never]);
+
+    const snapshot = await buildCurrentProviderAuthStateSnapshot(cfg, { readOnlyAuthStore: true });
+
+    expect(snapshot.agents[0]?.providers).toEqual([["openai", true]]);
+    expect(snapshot.timing?.providerTimings.join(" ")).toContain(
+      "provider_auth_check_phase_default_openai_runtime_auth=",
+    );
+    expect(snapshot.timing?.providerTimings.join(" ")).toContain(
+      "provider_auth_check_phase_default_openai_profile_list=",
+    );
+    expect(snapshot.timing?.providerTimings.join(" ")).not.toContain(
+      "provider_auth_check_phase_default_openai_event_loop_yield=",
+    );
+    expect(authProfilesMocks.ensureAuthProfileStore).toHaveBeenCalledTimes(1);
+  });
+
   it("does not cache false worker answers for process-local plugin synthetic auth", async () => {
     const cfg = {
       models: {
