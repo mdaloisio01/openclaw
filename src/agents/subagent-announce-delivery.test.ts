@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OutboundDeliveryError } from "../infra/outbound/deliver-types.js";
 import {
@@ -24,10 +27,29 @@ import {
 } from "./subagent-announce-delivery.runtime.js";
 import { resolveAnnounceOrigin } from "./subagent-announce-origin.js";
 
-afterEach(() => {
+const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+let sourceTurnDeliveryTempDir: string | undefined;
+
+type SourceTurnDeliveryRegistryForTest = {
+  rows?: Array<{
+    currentStage?: string;
+    deliveryStatus?: string;
+    finalDeliveryDelivered?: boolean;
+    failureReason?: string;
+    sourceTurnState?: string;
+    visibleDeliveryCount?: number;
+  }>;
+};
+
+afterEach(async () => {
   sessionBindingServiceTesting.resetSessionBindingAdaptersForTests();
   setActivePluginRegistry(createTestRegistry());
   testing.setDepsForTest();
+  vi.unstubAllEnvs();
+  if (sourceTurnDeliveryTempDir) {
+    await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
+    sourceTurnDeliveryTempDir = undefined;
+  }
 });
 
 const slackThreadOrigin = {
@@ -126,6 +148,20 @@ function expectRecordFields(record: unknown, expected: Record<string, unknown>) 
 
 function asMock(fn: unknown) {
   return fn as ReturnType<typeof vi.fn>;
+}
+
+async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
+  sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-subagent-source-turn-"));
+  const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
+  vi.stubEnv(SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV, registryPath);
+  return registryPath;
+}
+
+async function readSourceTurnDeliveryRows(registryPath: string) {
+  const registry = JSON.parse(
+    await readFile(registryPath, "utf8"),
+  ) as SourceTurnDeliveryRegistryForTest;
+  return registry.rows ?? [];
 }
 
 function registerDirectTargetTestChannel(channelId: string): void {
@@ -1833,6 +1869,7 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
   });
 
   it("reports requester-agent delivery failure even when output stayed visible", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
     const callGateway = createGatewayMock({
       result: {
         payloads: [{ text: "Tests passed and the PR is ready for review." }],
@@ -1872,6 +1909,62 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
       error: "Slack send failed: channel not found",
     });
     expect(sendMessage).not.toHaveBeenCalled();
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "subagent_completion_final_delivery_failed",
+      deliveryStatus: "delivery_failed",
+      failureReason: "delivery_tool_failed",
+      finalDeliveryDelivered: false,
+      sourceTurnState: "final_delivery_failed",
+      visibleDeliveryCount: 0,
+    });
+  });
+
+  it("records delivered subagent completion source-turn proof", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [{ text: "Tests passed and the PR is ready for review." }],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+    const result = await deliverSlackThreadAnnouncement({
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-4",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-thread-delivered-source-turn",
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "thread completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "subagent_completion_direct_final_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
   });
 
   it("does not raw-send grouped child results when requester-agent output is empty", async () => {

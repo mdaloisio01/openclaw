@@ -1,6 +1,11 @@
 import { isAudioFileName } from "@openclaw/media-core/mime";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { retireSessionMcpRuntime } from "../../agents/agent-bundle-mcp-tools.js";
+import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
+import {
+  persistSourceTurnDeliveryState,
+  type SourceTurnDeliveryRow,
+} from "../../agents/source-turn-delivery-store.js";
 import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
 import {
   isSilentReplyText,
@@ -191,6 +196,44 @@ const subagentFollowupRuntimeLoader = createLazyImportLoader(
 const ttsRuntimeLoader = createLazyImportLoader(() => import("../../tts/tts.runtime.js"));
 
 const COMPLETED_DIRECT_CRON_DELIVERIES = new Map<string, CompletedDirectCronDelivery>();
+const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+
+function resolveSourceTurnDeliveryRegistryPath(): string | undefined {
+  return normalizeOptionalString(process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV]);
+}
+
+function buildCronSourceTurnDeliveryRecordId(params: {
+  job: CronJob;
+  runSessionKey: string;
+  runStartedAt: number;
+}): string {
+  return `source:cron:${params.job.id}:${params.runSessionKey}:${params.runStartedAt}`;
+}
+
+async function persistCronSourceTurnDeliveryState(params: {
+  registryPath?: string;
+  recordId: string;
+  facts: SourceTurnDeliveryFacts;
+  currentStage: string;
+}): Promise<SourceTurnDeliveryRow | undefined> {
+  if (!params.registryPath) {
+    return undefined;
+  }
+  try {
+    return await persistSourceTurnDeliveryState({
+      registryPath: params.registryPath,
+      id: params.recordId,
+      sourceTurnId: params.recordId,
+      facts: params.facts,
+      currentStage: params.currentStage,
+    });
+  } catch (error) {
+    await logCronDeliveryWarn(
+      `cron source-turn delivery state write failed: ${formatErrorMessage(error)}`,
+    );
+    return undefined;
+  }
+}
 
 async function loadGatewayCallRuntime(): Promise<typeof import("../../gateway/call.runtime.js")> {
   return await gatewayCallRuntimeLoader.load();
@@ -759,6 +802,21 @@ async function retryTransientDirectCronDelivery<T>(params: {
 export async function dispatchCronDelivery(
   params: DispatchCronDeliveryParams,
 ): Promise<DispatchCronDeliveryState> {
+  const sourceTurnDeliveryRegistryPath = resolveSourceTurnDeliveryRegistryPath();
+  const sourceTurnDeliveryRecordId = buildCronSourceTurnDeliveryRecordId({
+    job: params.job,
+    runSessionKey: params.runSessionKey,
+    runStartedAt: params.runStartedAt,
+  });
+  const recordSourceTurnDeliveryState = (facts: SourceTurnDeliveryFacts, currentStage: string) =>
+    persistCronSourceTurnDeliveryState({
+      registryPath: sourceTurnDeliveryRegistryPath,
+      recordId: sourceTurnDeliveryRecordId,
+      facts,
+      currentStage,
+    });
+  await recordSourceTurnDeliveryState({}, "accepted");
+
   const sourceDeliverySatisfied = params.sourceDeliveryOutcome.satisfiesSourceDelivery;
   const verifiedMessageToolDelivery = params.sourceDeliveryOutcome.verifiedMessageToolDelivery;
   let summary = params.summary;
@@ -768,6 +826,16 @@ export async function dispatchCronDelivery(
 
   let delivered = verifiedMessageToolDelivery;
   let deliveryAttempted = verifiedMessageToolDelivery;
+  if (verifiedMessageToolDelivery) {
+    await recordSourceTurnDeliveryState(
+      {
+        finalDeliveryRequired: true,
+        finalDeliveryDelivered: true,
+        evidenceKinds: ["verified_message_tool_final"],
+      },
+      "cron_verified_message_tool_final_delivered",
+    );
+  }
   let directCronSessionDeleted = false;
   const formatDeliveryTargetError = (error: string) =>
     params.sourceDeliveryOutcome.unverifiedMessageToolDelivery
@@ -899,6 +967,14 @@ export async function dispatchCronDelivery(
       if (cachedResults) {
         // Cached entries are only recorded after a successful non-empty delivery.
         delivered = true;
+        await recordSourceTurnDeliveryState(
+          {
+            finalDeliveryRequired: true,
+            finalDeliveryDelivered: true,
+            evidenceKinds: ["direct_source_final"],
+          },
+          "cron_direct_final_delivered_cached",
+        );
         return null;
       }
       const deliverySessionKey = await resolveDirectCronDeliverySessionKey({
@@ -983,6 +1059,20 @@ export async function dispatchCronDelivery(
         : await runDelivery();
       // Only mark delivered when ALL payloads succeeded (no partial failure).
       delivered = deliveryResults.length > 0 && !hadPartialFailure;
+      await recordSourceTurnDeliveryState(
+        delivered
+          ? {
+              finalDeliveryRequired: true,
+              finalDeliveryDelivered: true,
+              evidenceKinds: ["direct_source_final"],
+            }
+          : {
+              finalDeliveryRequired: true,
+              deliveryToolFailed: true,
+              evidenceKinds: ["delivery_tool_failure"],
+            },
+        delivered ? "cron_direct_final_delivered" : "cron_direct_final_delivery_failed",
+      );
       // Intentionally leave partial success uncached: replay may duplicate the
       // successful subset, but caching it here would permanently drop the
       // failed payloads by converting the replay into delivered=true.
@@ -1065,6 +1155,14 @@ export async function dispatchCronDelivery(
       }
       return null;
     } catch (err) {
+      await recordSourceTurnDeliveryState(
+        {
+          finalDeliveryRequired: true,
+          deliveryToolFailed: true,
+          evidenceKinds: ["delivery_tool_failure"],
+        },
+        "cron_direct_final_delivery_failed",
+      );
       if (!params.deliveryBestEffort) {
         return params.withRunSession({
           status: "error",
@@ -1209,6 +1307,14 @@ export async function dispatchCronDelivery(
 
   if (params.deliveryRequested && !params.skipHeartbeatDelivery && !sourceDeliverySatisfied) {
     if (!params.resolvedDelivery.ok) {
+      await recordSourceTurnDeliveryState(
+        {
+          finalDeliveryRequired: true,
+          deliveryToolFailed: true,
+          evidenceKinds: ["delivery_tool_failure"],
+        },
+        "cron_delivery_target_failed",
+      );
       if (!params.deliveryBestEffort) {
         return {
           result: failDeliveryTarget(params.resolvedDelivery.error.message),
@@ -1270,6 +1376,16 @@ export async function dispatchCronDelivery(
         };
       }
     }
+  }
+
+  if (!delivered && params.sourceDeliveryOutcome.unverifiedMessageToolDelivery) {
+    await recordSourceTurnDeliveryState(
+      {
+        finalDeliveryRequired: true,
+        evidenceKinds: ["registry_entry"],
+      },
+      "cron_unverified_message_tool_delivery_refused",
+    );
   }
 
   return {

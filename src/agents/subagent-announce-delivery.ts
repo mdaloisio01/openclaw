@@ -13,6 +13,7 @@ import { getLoadedChannelPluginForRead } from "../channels/plugins/registry-load
 import type { ChannelId } from "../channels/plugins/types.public.js";
 import { routeFromConversationRef, routeToDeliveryFields } from "../channels/route-projection.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { isOutboundDeliveryError } from "../infra/outbound/deliver-types.js";
 import type { ConversationRef } from "../infra/outbound/session-binding-service.js";
 import { sourceDeliveryTargetsMatch } from "../infra/outbound/source-delivery-plan.js";
@@ -47,6 +48,11 @@ import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/r
 import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
 import type { AgentInternalEvent } from "./internal-events.js";
 import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
+import type { SourceTurnDeliveryFacts } from "./source-turn-delivery-state.js";
+import {
+  persistSourceTurnDeliveryState,
+  type SourceTurnDeliveryRow,
+} from "./source-turn-delivery-store.js";
 import { buildExplicitStopExplanation } from "./stop-contract.js";
 import {
   callGateway,
@@ -77,6 +83,7 @@ import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
 import type { SpawnSubagentMode } from "./subagent-spawn.types.js";
 
 const DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
+const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
 type SubagentAnnounceDeliveryDeps = {
   dispatchGatewayMethodInProcess: typeof dispatchGatewayMethodInProcess;
   getRuntimeConfig: typeof getRuntimeConfig;
@@ -113,6 +120,47 @@ const defaultSubagentAnnounceDeliveryDeps: SubagentAnnounceDeliveryDeps = {
 
 let subagentAnnounceDeliveryDeps: SubagentAnnounceDeliveryDeps =
   defaultSubagentAnnounceDeliveryDeps;
+
+function resolveSourceTurnDeliveryRegistryPath(): string | undefined {
+  return normalizeOptionalString(process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV]);
+}
+
+function buildSubagentSourceTurnDeliveryRecordId(params: {
+  requesterSessionKey: string;
+  targetRequesterSessionKey: string;
+  announceId?: string;
+  directIdempotencyKey: string;
+}): string {
+  const turnId =
+    normalizeOptionalString(params.announceId) ??
+    normalizeOptionalString(params.directIdempotencyKey);
+  return `source:subagent:${params.targetRequesterSessionKey}:${params.requesterSessionKey}:${turnId}`;
+}
+
+async function persistSubagentSourceTurnDeliveryState(params: {
+  registryPath?: string;
+  recordId: string;
+  facts: SourceTurnDeliveryFacts;
+  currentStage: string;
+}): Promise<SourceTurnDeliveryRow | undefined> {
+  if (!params.registryPath) {
+    return undefined;
+  }
+  try {
+    return await persistSourceTurnDeliveryState({
+      registryPath: params.registryPath,
+      id: params.recordId,
+      sourceTurnId: params.recordId,
+      facts: params.facts,
+      currentStage: params.currentStage,
+    });
+  } catch (error) {
+    defaultRuntime.log(
+      `[warn] subagent source-turn delivery state write failed: ${formatErrorMessage(error)}`,
+    );
+    return undefined;
+  }
+}
 
 async function resolveQueueEmbeddedAgentMessageOutcome(
   sessionId: string,
@@ -1692,7 +1740,23 @@ export async function deliverSubagentAnnouncement(params: {
   directIdempotencyKey: string;
   signal?: AbortSignal;
 }): Promise<SubagentAnnounceDeliveryResult> {
-  return await runSubagentAnnounceDispatch({
+  const sourceTurnDeliveryRegistryPath = resolveSourceTurnDeliveryRegistryPath();
+  const sourceTurnDeliveryRecordId = buildSubagentSourceTurnDeliveryRecordId({
+    requesterSessionKey: params.requesterSessionKey,
+    targetRequesterSessionKey: params.targetRequesterSessionKey,
+    announceId: params.announceId,
+    directIdempotencyKey: params.directIdempotencyKey,
+  });
+  const recordSourceTurnDeliveryState = (facts: SourceTurnDeliveryFacts, currentStage: string) =>
+    persistSubagentSourceTurnDeliveryState({
+      registryPath: sourceTurnDeliveryRegistryPath,
+      recordId: sourceTurnDeliveryRecordId,
+      facts,
+      currentStage,
+    });
+  await recordSourceTurnDeliveryState({}, "accepted");
+
+  const result = await runSubagentAnnounceDispatch({
     expectsCompletionMessage: params.expectsCompletionMessage,
     signal: params.signal,
     steer: async () =>
@@ -1723,6 +1787,30 @@ export async function deliverSubagentAnnouncement(params: {
         bestEffortDeliver: params.bestEffortDeliver,
       }),
   });
+  if (params.expectsCompletionMessage) {
+    if (result.delivered) {
+      await recordSourceTurnDeliveryState(
+        {
+          finalDeliveryRequired: true,
+          finalDeliveryDelivered: true,
+          evidenceKinds: [result.path === "steered" ? "source_chat_final" : "direct_source_final"],
+        },
+        result.path === "steered"
+          ? "subagent_completion_steered_final_delivered"
+          : "subagent_completion_direct_final_delivered",
+      );
+    } else {
+      await recordSourceTurnDeliveryState(
+        {
+          finalDeliveryRequired: true,
+          deliveryToolFailed: true,
+          evidenceKinds: ["delivery_tool_failure"],
+        },
+        "subagent_completion_final_delivery_failed",
+      );
+    }
+  }
+  return result;
 }
 
 export const testing = {

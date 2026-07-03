@@ -1,4 +1,7 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearAgentHarnesses } from "../../agents/harness/registry.js";
 import type { PluginHookReplyDispatchResult } from "../../plugins/hooks.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
@@ -22,6 +25,50 @@ import {
 
 let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatchReplyFromConfig;
 let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
+let sourceTurnDeliveryTempDir: string | undefined;
+let previousSourceTurnDeliveryRegistryPath: string | undefined;
+
+const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+
+type SourceTurnDeliveryRegistryForTest = {
+  rows?: Array<{
+    currentStage?: string;
+    deliveryStatus?: string;
+    finalDeliveryDelivered?: boolean;
+    failureReason?: string;
+    sourceTurnState?: string;
+    visibleDeliveryCount?: number;
+  }>;
+};
+
+async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
+  sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-delivery-"));
+  const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
+  process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV] = registryPath;
+  return registryPath;
+}
+
+async function readSourceTurnDeliveryRows(registryPath: string) {
+  const registry = JSON.parse(
+    await readFile(registryPath, "utf8"),
+  ) as SourceTurnDeliveryRegistryForTest;
+  return registry.rows ?? [];
+}
+
+function createSourceTurnCtx(overrides: Partial<ReturnType<typeof createHookCtx>> = {}) {
+  return {
+    ...createHookCtx(),
+    MessageSid: "source-turn-message-1",
+    ...overrides,
+  };
+}
+
+function createRoutedSourceTurnCtx() {
+  return createSourceTurnCtx({
+    OriginatingChannel: "discord",
+    OriginatingTo: "source-user-1",
+  });
+}
 
 function firstRuntimeLoadCall() {
   return runtimePluginMocks.ensureRuntimePluginsLoaded.mock.calls[0]?.[0] as
@@ -51,6 +98,9 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
   });
 
   beforeEach(() => {
+    previousSourceTurnDeliveryRegistryPath = process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
+    delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
+    sourceTurnDeliveryTempDir = undefined;
     clearAgentHarnesses();
     setDiscordTestRegistry();
     resetInboundDedupe();
@@ -112,6 +162,18 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     diagnosticMocks.markDiagnosticSessionProgress.mockReset();
     runtimePluginMocks.ensureRuntimePluginsLoaded.mockReset();
     resetPluginTtsAndThreadMocks();
+  });
+
+  afterEach(async () => {
+    if (previousSourceTurnDeliveryRegistryPath === undefined) {
+      delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
+    } else {
+      process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV] = previousSourceTurnDeliveryRegistryPath;
+    }
+    if (sourceTurnDeliveryTempDir) {
+      await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
+      sourceTurnDeliveryTempDir = undefined;
+    }
   });
 
   it("returns handled dispatch results from plugins", async () => {
@@ -208,6 +270,103 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     expect(sessionStoreMocks.currentEntry?.pendingFinalDeliveryAttemptCount).toBeUndefined();
     expect(sessionStoreMocks.currentEntry?.pendingFinalDeliveryLastError).toBeUndefined();
     expect(sessionStoreMocks.currentEntry?.pendingFinalDeliveryContext).toBeUndefined();
+  });
+
+  it("records routed final proof as source-turn final delivered", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createRoutedSourceTurnCtx(),
+      cfg: emptyConfig,
+      dispatcher: createDispatcher(),
+      replyResolver: async () => ({ text: "visible final" }),
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
+  });
+
+  it("records direct dispatcher final proof as source-turn final delivered", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx(),
+      cfg: emptyConfig,
+      dispatcher: createDispatcher(),
+      replyResolver: async () => ({ text: "visible final" }),
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
+  });
+
+  it("records final dispatch failure instead of false delivered", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    mocks.routeReply.mockResolvedValue({ ok: false, error: "provider failed" });
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createRoutedSourceTurnCtx(),
+      cfg: emptyConfig,
+      dispatcher: createDispatcher(),
+      replyResolver: async () => ({ text: "visible final" }),
+    });
+
+    expect(result.queuedFinal).toBe(false);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_delivery_failed",
+      deliveryStatus: "delivery_failed",
+      failureReason: "delivery_tool_failed",
+      finalDeliveryDelivered: false,
+      sourceTurnState: "final_delivery_failed",
+      visibleDeliveryCount: 0,
+    });
+  });
+
+  it("records message-tool-only private final as refused, not delivered", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx(),
+      cfg: emptyConfig,
+      dispatcher: createDispatcher(),
+      replyOptions: { sourceReplyDeliveryMode: "message_tool_only" },
+      replyResolver: async () => ({ text: "private-only final" }),
+    });
+
+    expect(result.queuedFinal).toBe(false);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_suppressed_private_only",
+      deliveryStatus: "blocked",
+      failureReason: "private_final_without_visible_delivery",
+      finalDeliveryDelivered: false,
+      sourceTurnState: "blocked_refused",
+      visibleDeliveryCount: 0,
+    });
   });
 
   it("preserves pending final delivery when final dispatch fails", async () => {

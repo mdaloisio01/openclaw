@@ -697,6 +697,7 @@ describe("subagent announce seam flow", () => {
       roundOneReply: [
         "Run label: Grant - hardening slice",
         "Target handled: live Grant announce review path",
+        "Actual execution owner: Grant",
         "Artifact path(s): /tmp/artifact.md",
         `Proof path(s): ${proofPath}`,
         "What is materially real now: announce review now checks Grant closeout truth fields",
@@ -716,6 +717,81 @@ describe("subagent announce seam flow", () => {
       "Apply the Grant closeout gate before treating the original task as done.",
     );
     expect(msg).not.toContain("rejected_closeout_missing_truth");
+  });
+
+  it("keeps Grant closeouts open when actual execution owner is missing", async () => {
+    const proofPath = "/tmp/grant-closeout-owner-proof.txt";
+    await fs.writeFile(proofPath, "proof");
+
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:grant",
+      childRunId: "run-grant-closeout-owner-missing",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Grant - hardening slice",
+      task: "Grant is the sole execution owner for this slice.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: [
+        "Run label: Grant - hardening slice",
+        "Target handled: live Grant announce review path",
+        "Artifact path(s): /tmp/artifact.md",
+        `Proof path(s): ${proofPath}`,
+        "What is materially real now: announce review now checks Grant closeout truth fields",
+        "What is still not real yet: downstream automation remains open",
+        "Who lawfully owns the next step: Will",
+        "Open/closed truth: still open",
+        "Exact next action: wire the next enforcement layer",
+      ].join("\n"),
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("[Grant Closeout Gate Result] rejected_closeout_missing_truth");
+    expect(msg).toContain("actual execution owner");
+    expect(msg).toContain("Grant closeout gate failed: rejected_closeout_missing_truth");
+  });
+
+  it("keeps Grant closeouts open when proof paths are missing", async () => {
+    const didAnnounce = await runSubagentAnnounceFlow({
+      childSessionKey: "agent:main:subagent:grant",
+      childRunId: "run-grant-closeout-proof-missing",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      label: "Grant - hardening slice",
+      task: "Grant is the sole execution owner for this slice.",
+      timeoutMs: 10,
+      cleanup: "keep",
+      waitForCompletion: false,
+      startedAt: 10,
+      endedAt: 20,
+      outcome: { status: "ok" },
+      roundOneReply: [
+        "Run label: Grant - hardening slice",
+        "Target handled: live Grant announce review path",
+        "Actual execution owner: Grant",
+        "Artifact path(s): /tmp/artifact.md",
+        "Proof path(s): /tmp/openclaw-missing-proof-for-grant-closeout.txt",
+        "What is materially real now: announce review now checks Grant closeout truth fields",
+        "What is still not real yet: downstream automation remains open",
+        "Who lawfully owns the next step: Will",
+        "Open/closed truth: still open",
+        "Exact next action: wire the next enforcement layer",
+      ].join("\n"),
+      expectsCompletionMessage: true,
+    });
+
+    expect(didAnnounce).toBe(true);
+    const msg = String(requireAgentCall().params?.message ?? "");
+    expect(msg).toContain("[Grant Closeout Gate Result] rejected_proof_missing");
+    expect(msg).toContain("This run does not count as truthfully complete yet.");
+    expect(msg).toContain("Missing or unreadable proof path(s):");
+    expect(msg).toContain("Grant closeout gate failed: rejected_proof_missing");
   });
 
   it("forces explicit owner-boundary stop truth for routed open completions", async () => {
@@ -791,6 +867,10 @@ describe("subagent announce seam flow", () => {
         "",
         "`live Grant announce review path`",
         "",
+        "Actual execution owner",
+        "",
+        "`Grant`",
+        "",
         "Artifact path(s)",
         "",
         "- `/tmp/artifact.md`",
@@ -851,6 +931,7 @@ describe("subagent announce seam flow", () => {
       roundOneReply: [
         "Run label: Grant - hardening slice",
         "Target handled: live Grant announce review path",
+        "Actual execution owner: Grant",
         "Artifact path(s): /tmp/artifact.md",
         "Proof supporting this claim",
         "",

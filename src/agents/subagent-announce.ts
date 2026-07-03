@@ -105,6 +105,10 @@ const GRANT_CLOSEOUT_REQUIRED_MARKERS: Array<{
 }> = [
   { label: "run label", patterns: ["run label"] },
   { label: "target handled", patterns: ["target handled", "requested target"] },
+  {
+    label: "actual execution owner",
+    patterns: ["actual execution owner"],
+  },
   { label: "artifact path(s)", patterns: ["artifact path", "artifact path(s)"] },
   {
     label: "proof path(s)",

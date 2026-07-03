@@ -29,6 +29,11 @@ import {
   resolveModelRefFromString,
   type ModelAliasIndex,
 } from "../../agents/model-selection.js";
+import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
+import {
+  persistSourceTurnDeliveryState,
+  type SourceTurnDeliveryRow,
+} from "../../agents/source-turn-delivery-store.js";
 import {
   isSubagentEnvelopeSession,
   resolveSubagentCapabilityStore,
@@ -378,6 +383,58 @@ const runtimePluginsLoader = createLazyImportLoader(
 const replyMediaPathsRuntimeLoader = createLazyImportLoader(
   () => import("./reply-media-paths.runtime.js"),
 );
+
+const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+
+function resolveSourceTurnDeliveryRegistryPath(): string | undefined {
+  return normalizeOptionalString(process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV]);
+}
+
+function buildSourceTurnDeliveryRecordId(params: {
+  ctx: FinalizedMsgContext;
+  runId?: string;
+  sessionKey?: string;
+}): string | undefined {
+  const sourceSessionKey =
+    normalizeOptionalString(params.sessionKey) ??
+    normalizeOptionalString(params.ctx.SessionKey) ??
+    normalizeOptionalString(params.ctx.CommandTargetSessionKey);
+  const sourceMessageId =
+    normalizeOptionalString(params.ctx.MessageSidFull) ??
+    normalizeOptionalString(params.ctx.MessageSid) ??
+    normalizeOptionalString(params.ctx.MessageSidFirst) ??
+    normalizeOptionalString(params.ctx.MessageSidLast) ??
+    normalizeOptionalString(params.runId);
+  if (!sourceSessionKey || !sourceMessageId) {
+    return undefined;
+  }
+  return `source:${sourceSessionKey}:${sourceMessageId}`;
+}
+
+async function persistDispatchSourceTurnDeliveryState(params: {
+  registryPath?: string;
+  recordId?: string;
+  facts: SourceTurnDeliveryFacts;
+  currentStage: string;
+}): Promise<SourceTurnDeliveryRow | undefined> {
+  if (!params.registryPath || !params.recordId) {
+    return undefined;
+  }
+  try {
+    return await persistSourceTurnDeliveryState({
+      registryPath: params.registryPath,
+      id: params.recordId,
+      sourceTurnId: params.recordId,
+      facts: params.facts,
+      currentStage: params.currentStage,
+    });
+  } catch (error) {
+    logVerbose(
+      `dispatch-from-config: source-turn delivery state write failed: ${formatErrorMessage(error)}`,
+    );
+    return undefined;
+  }
+}
 
 function loadRouteReplyRuntime() {
   return routeReplyRuntimeLoader.load();
@@ -1935,6 +1992,20 @@ export async function dispatchReplyFromConfig(
           ...(sendPolicyDenied ? { sendPolicyDenied: true } : {}),
         }
       : result;
+  const sourceTurnDeliveryRegistryPath = resolveSourceTurnDeliveryRegistryPath();
+  const sourceTurnDeliveryRecordId = buildSourceTurnDeliveryRecordId({
+    ctx,
+    runId: params.replyOptions?.runId,
+    sessionKey: acpDispatchSessionKey ?? sessionStoreEntry.sessionKey ?? sessionKey,
+  });
+  const recordSourceTurnDeliveryState = (facts: SourceTurnDeliveryFacts, currentStage: string) =>
+    persistDispatchSourceTurnDeliveryState({
+      registryPath: sourceTurnDeliveryRegistryPath,
+      recordId: sourceTurnDeliveryRecordId,
+      facts,
+      currentStage,
+    });
+  await recordSourceTurnDeliveryState({}, "accepted");
   const memoryFlushAdmissionBlock = resolvePreCompactionMemoryFlushWebchatAdmissionBlock(ctx);
   if (memoryFlushAdmissionBlock) {
     memoryFlushAdmissionLog.warn("blocked pre-compaction memory flush at webchat admission", {
@@ -2399,6 +2470,36 @@ export async function dispatchReplyFromConfig(
           );
           queuedFinal = handledReply.queuedFinal;
           routedFinalCount += handledReply.routedFinalCount;
+          const handledFinalDelivered =
+            handledReply.queuedFinal || handledReply.routedFinalCount > 0;
+          await recordSourceTurnDeliveryState(
+            handledFinalDelivered
+              ? {
+                  finalDeliveryRequired: true,
+                  finalDeliveryDelivered: true,
+                  evidenceKinds:
+                    handledReply.routedFinalCount > 0
+                      ? ["direct_source_final"]
+                      : ["source_chat_final"],
+                }
+              : {
+                  finalDeliveryRequired: true,
+                  deliveryToolFailed: true,
+                  evidenceKinds: ["delivery_tool_failure"],
+                },
+            handledFinalDelivered
+              ? "before_dispatch_final_delivered"
+              : "before_dispatch_final_delivery_failed",
+          );
+        } else if (text && suppressDelivery) {
+          await recordSourceTurnDeliveryState(
+            {
+              finalDeliveryRequired: true,
+              privateOnlyFinalResponse: true,
+              evidenceKinds: ["private_final_response"],
+            },
+            "before_dispatch_final_suppressed_private_only",
+          );
         }
         const counts = dispatcher.getQueuedCounts();
         counts.final += routedFinalCount;
@@ -3172,6 +3273,7 @@ export async function dispatchReplyFromConfig(
     let routedFinalCount = 0;
     let attemptedFinalDelivery = false;
     let finalDeliveryFailed = false;
+    let privateOnlyFinalSuppressed = false;
     // Explicit command turns (native or authorized text-slash like /compact) are
     // user-initiated, so a marked terminal reply for the command bypasses
     // room_event suppression. Ambient marked notices (no CommandTurn) stay
@@ -3192,6 +3294,9 @@ export async function dispatchReplyFromConfig(
       }
       if (suppressDelivery && !shouldDeliverDespiteSourceReplySuppression(reply)) {
         if (hasOutboundReplyContent(reply, { trimText: true })) {
+          if (sourceReplyDeliveryMode === "message_tool_only") {
+            privateOnlyFinalSuppressed = true;
+          }
           logVerbose(
             [
               `dispatch-from-config: final reply suppressed by ${deliverySuppressionReason || "source delivery policy"}`,
@@ -3214,6 +3319,33 @@ export async function dispatchReplyFromConfig(
       if (!finalReply.queuedFinal && finalReply.routedFinalCount === 0) {
         finalDeliveryFailed = true;
       }
+    }
+
+    if (attemptedFinalDelivery) {
+      const finalDelivered = !finalDeliveryFailed && (queuedFinal || routedFinalCount > 0);
+      await recordSourceTurnDeliveryState(
+        finalDelivered
+          ? {
+              finalDeliveryRequired: true,
+              finalDeliveryDelivered: true,
+              evidenceKinds: routedFinalCount > 0 ? ["direct_source_final"] : ["source_chat_final"],
+            }
+          : {
+              finalDeliveryRequired: true,
+              deliveryToolFailed: true,
+              evidenceKinds: ["delivery_tool_failure"],
+            },
+        finalDelivered ? "final_dispatch_delivered" : "final_dispatch_delivery_failed",
+      );
+    } else if (privateOnlyFinalSuppressed) {
+      await recordSourceTurnDeliveryState(
+        {
+          finalDeliveryRequired: true,
+          privateOnlyFinalResponse: true,
+          evidenceKinds: ["private_final_response"],
+        },
+        "final_dispatch_suppressed_private_only",
+      );
     }
 
     if (attemptedFinalDelivery && !finalDeliveryFailed) {

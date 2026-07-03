@@ -10,6 +10,9 @@
  * returning so the timer correctly skips the system-event fallback.
  */
 
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
 
@@ -167,6 +170,19 @@ type SuccessfulDeliveryResolution = Extract<DeliveryTargetResolution, { ok: true
 type ResolvedOutboundSessionRoute = NonNullable<
   Awaited<ReturnType<typeof resolveOutboundSessionRoute>>
 >;
+type SourceTurnDeliveryRegistryForTest = {
+  rows?: Array<{
+    currentStage?: string;
+    deliveryStatus?: string;
+    finalDeliveryDelivered?: boolean;
+    failureReason?: string;
+    sourceTurnState?: string;
+    visibleDeliveryCount?: number;
+  }>;
+};
+
+const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+let sourceTurnDeliveryTempDir: string | undefined;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -258,6 +274,20 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
+  sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-cron-source-turn-"));
+  const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
+  vi.stubEnv(SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV, registryPath);
+  return registryPath;
+}
+
+async function readSourceTurnDeliveryRows(registryPath: string) {
+  const registry = JSON.parse(
+    await readFile(registryPath, "utf8"),
+  ) as SourceTurnDeliveryRegistryForTest;
+  return registry.rows ?? [];
+}
+
 function outboundDeliveryCall(callIndex = 0) {
   const call = vi.mocked(deliverOutboundPayloads).mock.calls[callIndex];
   if (!call) {
@@ -303,6 +333,7 @@ function mockResolvedOutboundRoute(
 describe("dispatchCronDelivery — double-announce guard", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sourceTurnDeliveryTempDir = undefined;
     resetCompletedDirectCronDeliveriesForTests();
     vi.mocked(countActiveDescendantRuns).mockReturnValue(0);
     vi.mocked(expectsSubagentFollowup).mockReturnValue(false);
@@ -320,9 +351,13 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     maybeApplyTtsToPayloadMock.mockReset().mockImplementation(async (params) => params.payload);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
+    if (sourceTurnDeliveryTempDir) {
+      await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
+      sourceTurnDeliveryTempDir = undefined;
+    }
   });
 
   it("early return (active subagent) sets deliveryAttempted=true so timer skips enqueueSystemEvent", async () => {
@@ -394,6 +429,7 @@ describe("dispatchCronDelivery — double-announce guard", () => {
   });
 
   it("skips announce fallback after verified message-tool source delivery", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
     const params = makeBaseParams({ synthesizedText: "Fallback cron summary." });
     params.sourceDeliveryOutcome = {
       visibleDeliveries: [
@@ -413,9 +449,19 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     expect(deliverOutboundPayloads).not.toHaveBeenCalled();
     expect(state.deliveryAttempted).toBe(true);
     expect(state.delivered).toBe(true);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "cron_verified_message_tool_final_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
   });
 
   it("keeps announce fallback when message-tool delivery is not verified for the target", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
     const params = makeBaseParams({ synthesizedText: "Fallback cron summary." });
     params.sourceDeliveryOutcome = {
       visibleDeliveries: [
@@ -441,6 +487,15 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     });
     expect(state.deliveryAttempted).toBe(true);
     expect(state.delivered).toBe(true);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "cron_direct_final_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
   });
 
   it("bestEffort delivery skips expected subagent follow-up waits", async () => {
@@ -1442,6 +1497,7 @@ describe("dispatchCronDelivery — double-announce guard", () => {
   });
 
   it("keeps unresolved message-tool delivery out of delivered status", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
     const params = makeBaseParams({ synthesizedText: "hello from cron" });
     params.resolvedDelivery = {
       ok: false,
@@ -1481,6 +1537,16 @@ describe("dispatchCronDelivery — double-announce guard", () => {
     expect(state.result?.error).toContain(
       "the agent used the message tool, but OpenClaw could not verify",
     );
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "cron_delivery_target_failed",
+      deliveryStatus: "delivery_failed",
+      failureReason: "delivery_tool_failed",
+      finalDeliveryDelivered: false,
+      sourceTurnState: "final_delivery_failed",
+      visibleDeliveryCount: 0,
+    });
   });
 
   it("falls back to the current agent session key when route resolution is unavailable", async () => {
