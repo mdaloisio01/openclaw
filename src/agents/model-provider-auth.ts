@@ -28,6 +28,7 @@ import {
 } from "./model-auth.js";
 import { loadModelCatalog } from "./model-catalog.js";
 import { normalizeProviderId } from "./model-selection.js";
+import { resolveProviderIdForAuth } from "./provider-auth-aliases.js";
 import { resolveDefaultAgentWorkspaceDir } from "./workspace.js";
 
 // Prepared runtime fact: which providers have available auth given the
@@ -466,11 +467,19 @@ function shouldOmitFalsePreparedAuthForProcessSyntheticProvider(params: {
     .some((ref) => eligibleRefs.has(normalizeProviderId(ref)));
 }
 
+function createProviderAuthWarmProfileProviderKeySet(store: AuthProfileStore): ReadonlySet<string> {
+  return new Set(
+    Object.values(store.profiles).map((credential) =>
+      resolveProviderIdForAuth(credential.provider),
+    ),
+  );
+}
+
 async function hasAuthForProviderWarmSnapshot(params: {
   provider: string;
   cfg: OpenClawConfig;
   workspaceDir: string;
-  store: AuthProfileStore;
+  profileProviderKeys: ReadonlySet<string>;
   runtimeAuthLookup: RuntimeProviderAuthLookup;
   timingRecorder: ProviderAuthCheckTimingRecorder;
 }): Promise<boolean> {
@@ -494,9 +503,8 @@ async function hasAuthForProviderWarmSnapshot(params: {
   }
   recordTiming("runtime_auth", runtimeAuthStarted, "result_false");
   const profileListStarted = performance.now();
-  const profiles = listProfilesForProvider(params.store, provider);
-  recordTiming("profile_list", profileListStarted, `profiles_${profiles.length}`);
-  const available = profiles.length > 0;
+  const available = params.profileProviderKeys.has(resolveProviderIdForAuth(provider));
+  recordTiming("profile_list", profileListStarted, available ? "profiles_1" : "profiles_0");
   recordTiming("complete", checkStarted, available ? "result_true" : "result_false");
   return available;
 }
@@ -614,6 +622,7 @@ export async function buildCurrentProviderAuthStateSnapshot(
           externalCli,
         });
     perf.mark(`agent_${sanitizeProviderAuthWarmMetricPart(agentId)}_auth_store_read`);
+    const profileProviderKeys = createProviderAuthWarmProfileProviderKeySet(store);
     const state = new Map<string, boolean>();
     perf.mark(`agent_${sanitizeProviderAuthWarmMetricPart(agentId)}_provider_task_build`);
     for (const provider of providers) {
@@ -645,7 +654,7 @@ export async function buildCurrentProviderAuthStateSnapshot(
         provider,
         cfg,
         workspaceDir,
-        store,
+        profileProviderKeys,
         runtimeAuthLookup,
         timingRecorder: (stage, durationMs, extra) => {
           providerTimings.push(

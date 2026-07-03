@@ -151,7 +151,14 @@ describe("prepared provider auth state", () => {
       { id: "gpt", name: "gpt", provider: "openai" },
     ]);
     modelAuthMocks.hasRuntimeAvailableProviderAuth.mockReturnValue(false);
-    authProfilesMocks.listProfilesForProvider.mockReturnValueOnce([{} as never]);
+    authProfilesMocks.ensureAuthProfileStore.mockReturnValueOnce({
+      profiles: {
+        "openai:default": {
+          type: "api_key",
+          provider: "openai",
+        },
+      },
+    });
 
     const snapshot = await buildCurrentProviderAuthStateSnapshot(cfg, { readOnlyAuthStore: true });
 
@@ -166,6 +173,7 @@ describe("prepared provider auth state", () => {
       "provider_auth_check_phase_default_openai_event_loop_yield=",
     );
     expect(authProfilesMocks.ensureAuthProfileStore).toHaveBeenCalledTimes(1);
+    expect(authProfilesMocks.listProfilesForProvider).not.toHaveBeenCalled();
   });
 
   it("does not cache false worker answers for process-local plugin synthetic auth", async () => {
