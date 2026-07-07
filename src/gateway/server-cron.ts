@@ -4,6 +4,7 @@ import { abortAndDrainEmbeddedAgentRun } from "../agents/embedded-agent.js";
 import { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
 import type { CliDeps } from "../cli/deps.types.js";
 import { getRuntimeConfig } from "../config/io.js";
+import { resolveStateDir } from "../config/paths.js";
 import {
   canonicalizeMainSessionAlias,
   resolveAgentIdFromSessionKey,
@@ -39,7 +40,10 @@ import {
 } from "../routing/session-key.js";
 import { defaultRuntime } from "../runtime.js";
 import { parseAgentSessionKey } from "../sessions/session-key-utils.js";
-import { installProductionWatchdogLifecycleGate } from "../tasks/active-production-watchdog-lifecycle.js";
+import {
+  installProductionWatchdogLifecycleGate,
+  resolveProductionWatchdogContinuityGatePersistence,
+} from "../tasks/active-production-watchdog-lifecycle.js";
 import {
   dispatchGatewayCronFinishedNotifications,
   sendGatewayCronFailureAlert,
@@ -512,7 +516,13 @@ export function buildGatewayCronService(params: {
       }
     },
   });
-  installProductionWatchdogLifecycleGate({ cron, log: cronLogger });
+  installProductionWatchdogLifecycleGate({
+    cron,
+    log: cronLogger,
+    continuityGate: resolveProductionWatchdogContinuityGatePersistence({
+      stateDir: resolveStateDir(),
+    }),
+  });
 
   return { cron, storePath, cronEnabled };
 }

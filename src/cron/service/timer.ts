@@ -168,8 +168,23 @@ type WatchdogChatDeliveryRecord = {
 };
 
 type WatchdogReceiptRecord = {
+  watchdog?: string;
   checked_at?: string;
+  reason?: string;
+  summary?: {
+    items_suspicious?: number;
+  };
+  scan_recommended_next_action?: {
+    recommendation_code?: string;
+  };
   chat_delivery?: WatchdogChatDeliveryRecord;
+};
+
+type WatchdogStatusRecord = {
+  status?: string;
+  suspicious_count?: number;
+  recommendation_code?: string;
+  latest_receipt_path?: string;
 };
 
 type WatchdogChatDeliveryStateRecord = {
@@ -415,6 +430,30 @@ async function waitForWatchdogProofSurfaces(params: {
     }
     await params.waitWithAbort(WATCHDOG_PROOF_POLL_MS);
   }
+}
+
+function resolveWatchdogCronProofSummary(receiptPath?: string): string | undefined {
+  if (!receiptPath) {
+    return undefined;
+  }
+  const receipt = loadJsonFile<WatchdogReceiptRecord>(receiptPath);
+  const status = loadJsonFile<WatchdogStatusRecord>(WATCHDOG_STATUS_JSON_PATH);
+  if (receipt?.watchdog !== "system_wide_active_work_watchdog") {
+    return undefined;
+  }
+  const label = status?.status ?? "UNKNOWN";
+  const suspiciousCount =
+    typeof status?.suspicious_count === "number"
+      ? status.suspicious_count
+      : receipt.summary?.items_suspicious;
+  const recommendation =
+    status?.recommendation_code ?? receipt.scan_recommended_next_action?.recommendation_code;
+  return [
+    `WATCHDOG STATUS: ${label}`,
+    `suspicious_count=${typeof suspiciousCount === "number" ? suspiciousCount : "unknown"}`,
+    `recommendation=${recommendation ?? "unknown"}`,
+    `receipt=${receiptPath}`,
+  ].join(" | ");
 }
 
 function loadJsonFile<T>(filePath: string): T | undefined {
@@ -1917,8 +1956,19 @@ async function executeMainSessionCronJob(
         };
       }
       if (requiresWatchdogReceiptProof) {
+        const proofAfter = captureWatchdogProofSurfaceSnapshot();
+        const proofSummary = resolveWatchdogCronProofSummary(proofAfter.receiptPath);
+        if (!proofSummary) {
+          return {
+            status: "error",
+            error:
+              "cron: watchdog command wrote fresh surfaces but no valid WATCHDOG STATUS proof summary could be resolved",
+            summary: text,
+            sessionKey: cronRunSessionKey,
+          };
+        }
         const recovery = await maybeRecoverWatchdogChatDeliveryFromProofSurfaces({
-          receiptPath: captureWatchdogProofSurfaceSnapshot().receiptPath,
+          receiptPath: proofAfter.receiptPath,
         });
         if (!recovery.ok) {
           return {
@@ -1928,6 +1978,7 @@ async function executeMainSessionCronJob(
             sessionKey: cronRunSessionKey,
           };
         }
+        return { status: "ok", summary: proofSummary, sessionKey: cronRunSessionKey };
       }
       return { status: "ok", summary: text, sessionKey: cronRunSessionKey };
     }

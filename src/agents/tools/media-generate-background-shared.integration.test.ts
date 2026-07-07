@@ -43,8 +43,8 @@ describe("media-generate-background-shared integration", () => {
       },
     });
     const blockedClose = finishFlow({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
+      flowId: flow!.flowId,
+      expectedRevision: flow!.revision,
       endedAt: 10,
     });
     if (blockedClose.applied || !blockedClose.current) {
@@ -141,8 +141,8 @@ describe("media-generate-background-shared integration", () => {
       },
     });
     const blockedFlow = recordFlowLawfulStop({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
+      flowId: flow!.flowId,
+      expectedRevision: flow!.revision,
       reason: "blocker",
       detail: "Waiting on media blocker.",
       updatedAt: 20,

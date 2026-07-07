@@ -13,6 +13,7 @@ function confirmationWorkspace(): CodexWorkspaceBootstrapContext {
       {
         name: "USER.md",
         path: "/workspace/USER.md",
+        missing: false,
         content:
           "## Mark Instruction Confirmation Law\n\nBefore doing anything on a new instruction from Mark, first paraphrase back in short plain English and wait for Mark to confirm yes/no.",
       },
@@ -27,6 +28,7 @@ function stalePolicyWorkspace(): CodexWorkspaceBootstrapContext {
       {
         name: "AGENTS.md",
         path: "/workspace/AGENTS.md",
+        missing: false,
         content: [
           "## Mark Instruction Confirmation Law",
           "",

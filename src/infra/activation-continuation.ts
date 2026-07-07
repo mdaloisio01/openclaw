@@ -5,7 +5,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readMainSessionRestartRecoveryStatus } from "../agents/main-session-restart-recovery.js";
+import { persistCleanupCrewContinuityGateDecision } from "../commands/cleanup-plan.js";
 import { resolveGatewayPort, resolveStateDir } from "../config/paths.js";
+import { parseRootOperatorOverride } from "../continuity/continuity-gate-v2.js";
 import { resolveGatewaySystemdServiceName } from "../daemon/constants.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { readJsonIfExists, writeTextAtomic } from "./json-files.js";
@@ -13,6 +15,11 @@ import { enqueueSystemEvent } from "./system-events.js";
 
 const log = createSubsystemLogger("activation-continuation");
 const STORE_FILENAME = "activation-continuations.json";
+const CONTINUITY_GATE_ACTIVATION_OUTPUT_DIR = path.join(
+  "var",
+  "continuity_gate_v2",
+  "activation_continuation",
+);
 const DEFAULT_TTL_MS = 30 * 60 * 1_000;
 const DEFAULT_HARD_STOP_RULES = [
   "do not resume GIE/SADB",
@@ -134,6 +141,7 @@ export type ActivationContinuationRunnerDeps = {
   now?: () => number;
   stateDir?: string;
   exportsDir?: string;
+  continuityGate?: ActivationContinuationContinuityGatePersistenceOptions;
   check?: (
     record: ActivationContinuationRecord,
     check: ActivationContinuationCheckName,
@@ -146,8 +154,64 @@ export type ActivationContinuationRunnerDeps = {
   };
 };
 
+export type ActivationContinuationContinuityGatePersistenceOptions = {
+  outputDir: string;
+  now?: string;
+  userInstruction?: string;
+};
+
+export type ResolveActivationContinuationContinuityGatePersistenceParams = {
+  stateDir?: string | null;
+  now?: string;
+  userInstruction?: string;
+};
+
 function resolveStorePath(stateDir = resolveStateDir()): string {
   return path.join(stateDir, STORE_FILENAME);
+}
+
+function normalizeAbsoluteDir(value: string | undefined | null): string | undefined {
+  const normalized = normalizeString(value, 1_000);
+  if (!normalized || normalized === "undefined" || !path.isAbsolute(normalized)) {
+    return undefined;
+  }
+  return normalized;
+}
+
+export function resolveActivationContinuationContinuityGatePersistence(
+  params: ResolveActivationContinuationContinuityGatePersistenceParams = {},
+): ActivationContinuationContinuityGatePersistenceOptions | undefined {
+  if (params.stateDir === undefined || params.stateDir === null) {
+    return undefined;
+  }
+  const stateDir = normalizeAbsoluteDir(params.stateDir);
+  if (!stateDir) {
+    return undefined;
+  }
+  return {
+    outputDir: path.join(stateDir, CONTINUITY_GATE_ACTIVATION_OUTPUT_DIR),
+    now: params.now,
+    ...(params.userInstruction ? { userInstruction: params.userInstruction } : {}),
+  };
+}
+
+function resolveActivationContinuationContinuityGateOptions(params: {
+  stateDir?: string;
+  continuityGate?: ActivationContinuationContinuityGatePersistenceOptions;
+}): ActivationContinuationContinuityGatePersistenceOptions | undefined {
+  const providedOutputDir = normalizeAbsoluteDir(params.continuityGate?.outputDir);
+  if (providedOutputDir) {
+    return {
+      outputDir: providedOutputDir,
+      ...(params.continuityGate?.now ? { now: params.continuityGate.now } : {}),
+      ...(params.continuityGate?.userInstruction
+        ? { userInstruction: params.continuityGate.userInstruction }
+        : {}),
+    };
+  }
+  return resolveActivationContinuationContinuityGatePersistence({
+    stateDir: params.stateDir ?? resolveStateDir(),
+  });
 }
 
 function resolveDefaultExportsDir(): string {
@@ -357,6 +421,15 @@ export async function persistActivationContinuationBeforeRestart(
     store.records.push(record);
   }
   await writeStore(store, opts.stateDir);
+  await persistActivationContinuationContinuityGateDecision({
+    record,
+    lifecycleStatus: "pending_restart",
+    stateDir: opts.stateDir,
+    continuityGate: resolveActivationContinuationContinuityGateOptions({
+      stateDir: opts.stateDir,
+    }),
+    proofPath: resolveStorePath(opts.stateDir),
+  });
   return record;
 }
 
@@ -664,6 +737,134 @@ async function writeContinuationArtifact(params: {
   return filePath;
 }
 
+async function persistActivationContinuationContinuityGateDecision(params: {
+  record: ActivationContinuationRecord;
+  lifecycleStatus:
+    | "pending_restart"
+    | "continuation_completed"
+    | "continuation_blocked"
+    | "expired_before_recovery"
+    | "answer_only_override";
+  stateDir?: string;
+  continuityGate?: ActivationContinuationContinuityGatePersistenceOptions;
+  checks?: ActivationContinuationCheckResult[];
+  proofPath?: string;
+}): Promise<void> {
+  const continuityGate =
+    params.continuityGate ??
+    resolveActivationContinuationContinuityGateOptions({ stateDir: params.stateDir });
+  const outputDir = normalizeAbsoluteDir(continuityGate?.outputDir);
+  if (!outputDir) {
+    return;
+  }
+  const failedChecks = params.checks?.filter((check) => check.status === "fail") ?? [];
+  const checkRecords =
+    params.checks?.map((check) => `${check.name}:${check.status}:${check.detail}`) ?? [];
+  const isStop = params.lifecycleStatus === "expired_before_recovery";
+  const isRuntimeProofGap =
+    params.lifecycleStatus === "pending_restart" ||
+    params.lifecycleStatus === "continuation_blocked";
+  try {
+    await persistCleanupCrewContinuityGateDecision({
+      outputDir,
+      activeMission: `Gateway restart activation continuation ${params.record.id}`,
+      now: continuityGate?.now,
+      userInstruction: continuityGate?.userInstruction,
+      authoritySources: isStop
+        ? [
+            {
+              kind: "system_authority",
+              id: `activation_continuation:expired:${params.record.id}`,
+              summary:
+                "Activation continuation expired before startup recovery could prove runtime state.",
+              active: true,
+            },
+          ]
+        : [
+            {
+              kind: "active_mission_lock",
+              id: `activation_continuation:${params.record.id}`,
+              summary: `Activation continuation ${params.lifecycleStatus} for ${params.record.objective}`,
+              active: true,
+            },
+          ],
+      issue: isStop
+        ? {
+            summary:
+              "Activation continuation expired before startup recovery could prove runtime state.",
+            blocker: "restart continuation expired",
+            pathRisk: "CRITICAL_CONTROL",
+            diffIntent: "unknown_intent",
+            behaviorImpact: "true_unknown",
+            ownerLevelBlockerAudit: "activation_continuation",
+          }
+        : {
+            summary:
+              params.lifecycleStatus === "pending_restart"
+                ? "Gateway restart was deferred into an activation continuation record before dispatch."
+                : failedChecks.length > 0
+                  ? `Gateway restart activation continuation is blocked on runtime proof: ${failedChecks
+                      .map((check) => check.name)
+                      .join(", ")}.`
+                  : `Gateway restart activation continuation reached ${params.lifecycleStatus}.`,
+            blocker: isRuntimeProofGap ? "restart deferred" : "artifact missing",
+            pathRisk: "MEDIUM_RISK_RUNTIME",
+            diffIntent: "proof_or_receipt_shape",
+            behaviorImpact: "technical",
+            safeTechnicalPathKnown: true,
+            safeTechnicalPathDescription:
+              params.lifecycleStatus === "pending_restart"
+                ? "resume activation continuation after restart and produce runtime proof"
+                : failedChecks.length > 0
+                  ? "repair the failing runtime proof checks and allow activation continuation recovery to retry"
+                  : "record activation continuation runtime proof",
+            scopeWithinMission: true,
+            validationAvailable: true,
+            rollbackOrProofPreserved: true,
+            ownerLevelBlockerAudit: "activation_continuation",
+          },
+      scope: {
+        files: ["src/infra/activation-continuation.ts"],
+        records: [
+          params.record.id,
+          `activation_status:${params.lifecycleStatus}`,
+          ...params.record.requiredChecks,
+          ...checkRecords,
+        ],
+        commands: [],
+      },
+      repairAction: isStop
+        ? "stop restart continuation until expired runtime proof state is diagnosed"
+        : params.lifecycleStatus === "pending_restart"
+          ? "resume activation continuation after restart and produce runtime proof"
+          : failedChecks.length > 0
+            ? "repair the failing runtime proof checks and allow activation continuation recovery to retry"
+            : "record activation continuation runtime proof",
+      proofPath:
+        params.proofPath ??
+        params.record.closeoutPath ??
+        params.record.blockerPath ??
+        params.record.id,
+      diagnostic: {
+        surfaces: ["infra/activation-continuation"],
+        proofRefs: [
+          params.record.id,
+          params.proofPath ?? "",
+          params.record.closeoutPath ?? "",
+          params.record.blockerPath ?? "",
+        ].filter(Boolean),
+        redactionStatus: "no_sensitive_payloads",
+      },
+    });
+  } catch (error) {
+    log.warn(
+      `activation continuation Continuity Gate persistence failed id=${params.record.id}: ${String(
+        error,
+      )}`,
+    );
+  }
+}
+
 async function defaultDeliver(
   record: ActivationContinuationRecord,
   message: string,
@@ -683,8 +884,23 @@ export async function resumeActivationContinuation(
   deps: ActivationContinuationRunnerDeps = {},
 ): Promise<ActivationContinuationRecord> {
   const now = deps.now?.() ?? Date.now();
+  const continuityGate = resolveActivationContinuationContinuityGateOptions({
+    stateDir: deps.stateDir,
+    continuityGate: deps.continuityGate,
+  });
+  if (
+    parseRootOperatorOverride(continuityGate?.userInstruction) === "STOP_USER_ANSWER_ONLY_OVERRIDE"
+  ) {
+    await persistActivationContinuationContinuityGateDecision({
+      record,
+      lifecycleStatus: "answer_only_override",
+      stateDir: deps.stateDir,
+      continuityGate,
+    });
+    return record;
+  }
   if (now > record.expiresAt) {
-    return (
+    const updated =
       (await updateRecord(
         record.id,
         (current) => ({
@@ -697,8 +913,14 @@ export async function resumeActivationContinuation(
           },
         }),
         deps.stateDir,
-      )) ?? record
-    );
+      )) ?? record;
+    await persistActivationContinuationContinuityGateDecision({
+      record: updated,
+      lifecycleStatus: "expired_before_recovery",
+      stateDir: deps.stateDir,
+      continuityGate,
+    });
+    return updated;
   }
   const locked = await updateRecord(
     record.id,
@@ -790,6 +1012,16 @@ export async function resumeActivationContinuation(
       }),
       deps.stateDir,
     )) ?? active;
+  if (status === "continuation_blocked") {
+    await persistActivationContinuationContinuityGateDecision({
+      record: next,
+      lifecycleStatus: status,
+      stateDir: deps.stateDir,
+      continuityGate,
+      checks,
+      proofPath: artifactPath,
+    });
+  }
   deps.log?.info?.("activation continuation resumed", {
     continuationId: next.id,
     status: next.status,

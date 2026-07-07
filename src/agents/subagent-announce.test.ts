@@ -340,7 +340,7 @@ describe("subagent announce seam flow", () => {
   it("ignores stale completion announces after the child session has advanced to a newer run", async () => {
     subagentRegistryRuntimeMock.getLatestSubagentRunByChildSessionKey.mockReturnValue({
       runId: "run-newer",
-    });
+    } as never);
 
     const didAnnounce = await runSubagentAnnounceFlow({
       childSessionKey: "agent:main:subagent:test",

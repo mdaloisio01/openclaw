@@ -254,7 +254,7 @@ describe("FS tools with workspaceOnly=false", () => {
         path: outsideFile,
         content: "should not write here",
       }),
-    ).rejects.toThrow(/Memory flush writes are restricted to memory\/2026-03-07\.md/);
+    ).rejects.toThrow(/restricted to relative path memory\/2026-03-07\.md/);
 
     const result = await writeTool.execute("test-call-memory-append", {
       path: allowedRelativePath,
@@ -264,7 +264,10 @@ describe("FS tools with workspaceOnly=false", () => {
     expect(result).toStrictEqual({
       content: [{ type: "text", text: "Appended content to memory/2026-03-07.md." }],
       details: {
+        schema: "openclaw.memory_append_receipt.v1",
         path: "memory/2026-03-07.md",
+        approvedMemoryRoot: "memory",
+        operation: "operational_memory_append",
         appendOnly: true,
       },
     });
@@ -292,11 +295,84 @@ describe("FS tools with workspaceOnly=false", () => {
     expect(result).toStrictEqual({
       content: [{ type: "text", text: "Appended content to memory/2026-03-08.md." }],
       details: {
+        schema: "openclaw.memory_append_receipt.v1",
         path: "memory/2026-03-08.md",
+        approvedMemoryRoot: "memory",
+        operation: "operational_memory_append",
         appendOnly: true,
       },
     });
     await expect(fs.readFile(allowedAbsolutePath, "utf-8")).resolves.toBe("new note");
+  });
+
+  it("accepts memory-triggered append-only writes with explicit append metadata", async () => {
+    const allowedRelativePath = "memory/2026-03-13.md";
+    const allowedAbsolutePath = path.join(workspaceDir, allowedRelativePath);
+
+    const writeTool = wrapToolMemoryFlushAppendOnlyWrite(
+      createHostWorkspaceWriteTool(workspaceDir),
+      {
+        root: workspaceDir,
+        relativePath: allowedRelativePath,
+      },
+    );
+
+    const result = await writeTool.execute("test-call-memory-append-metadata", {
+      path: allowedRelativePath,
+      content: "new note",
+      mode: "append",
+      appendOnly: true,
+      operation: "operational_memory_append",
+    });
+
+    expect(hasToolError(result)).toBe(false);
+    expect(result).toStrictEqual({
+      content: [{ type: "text", text: "Appended content to memory/2026-03-13.md." }],
+      details: {
+        schema: "openclaw.memory_append_receipt.v1",
+        path: "memory/2026-03-13.md",
+        approvedMemoryRoot: "memory",
+        operation: "operational_memory_append",
+        appendOnly: true,
+      },
+    });
+    await expect(fs.readFile(allowedAbsolutePath, "utf-8")).resolves.toBe("new note");
+  });
+
+  it("rejects memory-triggered append-only writes with overwrite-shaped extra params", async () => {
+    const writeTool = wrapToolMemoryFlushAppendOnlyWrite(
+      createHostWorkspaceWriteTool(workspaceDir),
+      {
+        root: workspaceDir,
+        relativePath: "memory/2026-03-11.md",
+      },
+    );
+
+    await expect(
+      writeTool.execute("test-call-memory-extra-param", {
+        path: "memory/2026-03-11.md",
+        content: "new note",
+        mode: "overwrite",
+      }),
+    ).rejects.toThrow(/only accept path and content/);
+  });
+
+  it("rejects memory-triggered append-only writes using an absolute approved path", async () => {
+    const allowedRelativePath = "memory/2026-03-12.md";
+    const writeTool = wrapToolMemoryFlushAppendOnlyWrite(
+      createHostWorkspaceWriteTool(workspaceDir),
+      {
+        root: workspaceDir,
+        relativePath: allowedRelativePath,
+      },
+    );
+
+    await expect(
+      writeTool.execute("test-call-memory-absolute-path", {
+        path: path.join(workspaceDir, allowedRelativePath),
+        content: "new note",
+      }),
+    ).rejects.toThrow(/restricted to relative path/);
   });
 
   it("rejects memory-triggered append-only paths that become empty after suffix stripping", async () => {
@@ -315,4 +391,39 @@ describe("FS tools with workspaceOnly=false", () => {
       }),
     ).rejects.toThrow(/Missing required parameter: path/);
   });
+
+  it("rejects malformed configured memory append targets", () => {
+    expect(() =>
+      wrapToolMemoryFlushAppendOnlyWrite(createHostWorkspaceWriteTool(workspaceDir), {
+        root: workspaceDir,
+        relativePath: "memory/today.md",
+      }),
+    ).toThrow(/memory\/YYYY-MM-DD\.md/);
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "rejects memory-triggered append-only writes through symlink parents",
+    async () => {
+      const outsideDir = path.join(tmpDir, "outside-memory");
+      const linkDir = path.join(workspaceDir, "memory");
+      await fs.mkdir(outsideDir);
+      await fs.symlink(outsideDir, linkDir, "dir");
+
+      const writeTool = wrapToolMemoryFlushAppendOnlyWrite(
+        createHostWorkspaceWriteTool(workspaceDir),
+        {
+          root: workspaceDir,
+          relativePath: "memory/2026-03-10.md",
+        },
+      );
+
+      await expect(
+        writeTool.execute("test-call-memory-symlink-parent", {
+          path: "memory/2026-03-10.md",
+          content: "new note",
+        }),
+      ).rejects.toThrow(/symlink|outside|workspace|root|alias escape/i);
+      await expect(fs.stat(path.join(outsideDir, "2026-03-10.md"))).rejects.toThrow();
+    },
+  );
 });

@@ -89,6 +89,7 @@ import { isAcpSessionKey } from "../../routing/session-key.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveSilentReplyPolicyFromPolicies } from "../../shared/silent-reply-policy.js";
+import { ensureForegroundCleanupCrewTaskFlow } from "../../tasks/foreground-cleanup-crew-taskflow.js";
 import {
   buildActiveMissionContextBlockForOwnerKey,
   resolveMissionBoundFollowupForOwner,
@@ -132,6 +133,7 @@ import {
   recordNonTerminalBuildUpdateEmitted,
   testing as activeRunContinuationTesting,
 } from "./active-run-continuation-guard.js";
+import { resolveActiveRunContinuityGatePersistence } from "./active-run-continuity-gate-persistence.js";
 import { resolveSessionRuntimeOverrideForProvider } from "./agent-runner-execution.js";
 import { resolveConversationBindingContextFromMessage } from "./conversation-binding-input.js";
 import {
@@ -1139,7 +1141,8 @@ function createAbortAwareDispatcher(params: {
         ? false
         : options?.terminalKind
           ? (primeContinuationGuardFromPayload(payload),
-            allowTerminalCloseout(params.dispatcher, options.terminalKind).allowed && send(payload))
+            allowTerminalCloseout(params.dispatcher, options.terminalKind, payload).allowed &&
+              send(payload))
           : send(payload);
   const dispatcher: ReplyDispatcher = {
     sendToolResult: sendIfActive(params.dispatcher.sendToolResult),
@@ -1457,6 +1460,40 @@ export async function dispatchReplyFromConfig(
   const inboundAudio = isInboundAudioContext(ctx);
   const sessionTtsAuto = normalizeTtsAutoMode(sessionStoreEntry.entry?.ttsAuto);
   const workspaceDir = resolveAgentWorkspaceDir(cfg, sessionAgentId);
+  const currentTurnTextForCleanupCrewGuard = normalizeOptionalString(
+    ctx.BodyForCommands ?? ctx.CommandBody ?? ctx.RawBody ?? ctx.Body,
+  );
+  installActiveRunContinuationGuard(dispatcher, {
+    persistence: resolveActiveRunContinuityGatePersistence({
+      workspaceDir,
+      sessionKey: acpDispatchSessionKey,
+      agentId: sessionAgentId,
+    }),
+    cleanupCrewFinalResponse: {
+      currentTurnText: currentTurnTextForCleanupCrewGuard,
+    },
+  });
+  const cleanupCrewTaskFlowRegistration = ensureForegroundCleanupCrewTaskFlow({
+    sessionKey: acpDispatchSessionKey,
+    currentTurnText: currentTurnTextForCleanupCrewGuard,
+    authorityPath: "foreground_cleanup_crew_user_instruction",
+    authorityBasis: "Foreground Cleanup Crew production mission received through reply dispatch.",
+    ownerLane: "Will",
+  });
+  if (cleanupCrewTaskFlowRegistration.status === "blocked") {
+    recordNonTerminalBuildUpdateEmitted(
+      dispatcher,
+      `cleanup_crew_taskflow_registration_blocked:${cleanupCrewTaskFlowRegistration.reason}`,
+    );
+  } else if (
+    cleanupCrewTaskFlowRegistration.status === "registered" ||
+    cleanupCrewTaskFlowRegistration.status === "attached"
+  ) {
+    recordNonTerminalBuildUpdateEmitted(
+      dispatcher,
+      `cleanup_crew_taskflow_${cleanupCrewTaskFlowRegistration.status}:${cleanupCrewTaskFlowRegistration.flow.flowId}`,
+    );
+  }
   let dispatchReplyOperation: ReplyOperation | undefined;
   let dispatchAbortOperation: ReplyOperation | undefined;
   let preDispatchAbortOperation: ReplyOperation | undefined;

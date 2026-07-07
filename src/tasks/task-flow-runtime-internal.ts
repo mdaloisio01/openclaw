@@ -11,6 +11,7 @@ export {
   finishFlow,
   getTaskFlowById,
   listTaskFlowRecords,
+  listTaskFlowsForOwnerKey,
   recordFlowLawfulStop,
   recordFlowNextExecutableLaunch,
   recordBlindTestCloseoutFailure,

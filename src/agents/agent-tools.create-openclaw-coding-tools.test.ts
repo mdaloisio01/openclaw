@@ -15,6 +15,7 @@ import { createMockPluginRegistry } from "../plugins/hooks.test-helpers.js";
 import "./test-helpers/fast-bash-tools.js";
 import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
+import { setDirtyTreeHygieneStatusReaderForTest } from "./agent-tools.before-tool-call.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
 import * as openClawPluginTools from "./openclaw-plugin-tools.js";
@@ -153,6 +154,7 @@ describe("createOpenClawCodingTools", () => {
 
   afterEach(() => {
     resetGlobalHookRunner();
+    setDirtyTreeHygieneStatusReaderForTest();
   });
 
   it("exposes gateway config and restart actions to owner sessions", () => {
@@ -1370,6 +1372,53 @@ describe("createOpenClawCodingTools", () => {
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
       await fs.rm(taskCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("forwards memory flush metadata into the dirty-tree guard", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-dirty-tree-"));
+    const memoryRelativePath = "memory/2026-03-25.md";
+    const workspaceMemoryFile = path.join(workspaceDir, memoryRelativePath);
+    setDirtyTreeHygieneStatusReaderForTest(async () =>
+      [
+        " M src/agents/agent-tools.before-tool-call.ts",
+        " M src/infra/dirty-tree-hygiene.ts",
+        "?? src/tasks/probe.ts",
+      ].join("\n"),
+    );
+
+    try {
+      await fs.mkdir(path.dirname(workspaceMemoryFile), { recursive: true });
+      await fs.writeFile(workspaceMemoryFile, "seed", "utf8");
+
+      const tools = createOpenClawCodingTools({
+        workspaceDir,
+        trigger: "memory",
+        memoryFlushWritePath: memoryRelativePath,
+      });
+      const writeExecute = requireToolExecute(requireTool(tools, "write"));
+
+      const result = await writeExecute("tool-memory-flush-dirty-tree", {
+        path: memoryRelativePath,
+        content: "dirty tree durable note",
+        mode: "append",
+        appendOnly: true,
+        operation: "operational_memory_append",
+      });
+
+      expect(result).toMatchObject({
+        details: {
+          schema: "openclaw.memory_append_receipt.v1",
+          operation: "operational_memory_append",
+          appendOnly: true,
+          path: memoryRelativePath,
+        },
+      });
+      await expect(fs.readFile(workspaceMemoryFile, "utf8")).resolves.toBe(
+        "seed\ndirty tree durable note",
+      );
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
     }
   });
 

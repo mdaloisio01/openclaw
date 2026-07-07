@@ -163,9 +163,7 @@ Ignore this.
       deliveryStatus: "pending",
     });
 
-    const result = await readDefaultPostCompactionContext({
-      sessionKey: "agent:main:webchat:mission",
-    });
+    const result = await readDefaultPostCompactionContext();
 
     expect(result).toContain("[Active mission refresh]");
     expect(result).toContain("<active_mission>");

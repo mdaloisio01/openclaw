@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createEmptyTaskAuditSummary } from "../tasks/task-registry.audit.shared.js";
 import { redactSensitiveStatusSummary } from "./status.summary.js";
 import type { SessionStatus, StatusSummary } from "./status.types.js";
 
@@ -54,17 +55,10 @@ describe("redactSensitiveStatusSummary", () => {
         },
       },
       taskAudit: {
+        ...createEmptyTaskAuditSummary(),
         total: 1,
         warnings: 1,
-        errors: 0,
-        byCode: {
-          stale_queued: 0,
-          stale_running: 0,
-          lost: 0,
-          delivery_failed: 1,
-          missing_cleanup: 0,
-          inconsistent_timestamps: 0,
-        },
+        byCode: { ...createEmptyTaskAuditSummary().byCode, delivery_failed: 1 },
       },
       sessions: {
         paths: ["/tmp/openclaw/sessions.json"],

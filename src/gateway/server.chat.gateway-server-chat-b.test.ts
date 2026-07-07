@@ -426,6 +426,99 @@ describe("gateway server chat", () => {
     });
   });
 
+  test("chat.startup uses a bounded default history window", async () => {
+    await withGatewayChatHarness(async ({ ws, createSessionDir }) => {
+      await connectOk(ws);
+      const sessionDir = await createSessionDir();
+      const updatedAt = Date.now();
+      await writeSessionStore({
+        entries: {
+          main: {
+            sessionId: "sess-main",
+            updatedAt,
+            modelProvider: "openai",
+            model: "gpt-5",
+          },
+        },
+      });
+      await writeMainSessionTranscript(
+        sessionDir,
+        Array.from({ length: 120 }, (_, index) =>
+          JSON.stringify({
+            message: {
+              role: "user",
+              content: [{ type: "text", text: `startup message ${index}` }],
+              timestamp: updatedAt + index,
+            },
+          }),
+        ),
+      );
+
+      const startup = await rpcReq<{ messages?: unknown[] }>(ws, "chat.startup", {
+        sessionKey: "main",
+      });
+
+      expect(startup.ok).toBe(true);
+      expect(startup.payload?.messages).toHaveLength(80);
+      expect(JSON.stringify(startup.payload?.messages)).toContain("startup message 119");
+    });
+  });
+
+  test("chat.startup does not backfill older visible history when recent tail is silent", async () => {
+    await withGatewayChatHarness(async ({ ws, createSessionDir }) => {
+      await connectOk(ws);
+      const sessionDir = await createSessionDir();
+      const updatedAt = Date.now();
+      await writeSessionStore({
+        entries: {
+          main: {
+            sessionId: "sess-main",
+            updatedAt,
+            modelProvider: "openai",
+            model: "gpt-5",
+          },
+        },
+      });
+      const silentTail = Array.from({ length: 80 }, (_, index) =>
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "NO_REPLY" }],
+            timestamp: updatedAt + index + 2,
+          },
+        }),
+      );
+      await writeMainSessionTranscript(sessionDir, [
+        JSON.stringify({
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "older startup-visible question" }],
+            timestamp: updatedAt,
+          },
+        }),
+        JSON.stringify({
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "older startup-visible answer" }],
+            timestamp: updatedAt + 1,
+          },
+        }),
+        ...silentTail,
+      ]);
+
+      const startup = await rpcReq<{ messages?: unknown[] }>(ws, "chat.startup", {
+        sessionKey: "main",
+        limit: 2,
+      });
+
+      expect(startup.ok).toBe(true);
+      const serialized = JSON.stringify(startup.payload?.messages ?? []);
+      expect(serialized).not.toContain("older startup-visible question");
+      expect(serialized).not.toContain("older startup-visible answer");
+      expect(serialized).not.toContain("NO_REPLY");
+    });
+  });
+
   test("chat.send returns in_flight when duplicate attachment send wins parsing race", async () => {
     const sessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-gw-"));
     const dispatchRelease = createDeferred<void>();

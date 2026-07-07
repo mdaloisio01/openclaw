@@ -2845,8 +2845,8 @@ describe("gateway agent handler", () => {
           },
         });
         const blockedClose = finishFlow({
-          flowId: flow.flowId,
-          expectedRevision: flow.revision,
+          flowId: flow!.flowId,
+          expectedRevision: flow!.revision,
           endedAt: 200,
         });
         if (blockedClose.applied || !blockedClose.current) {
@@ -2974,8 +2974,8 @@ describe("gateway agent handler", () => {
         },
       });
       const blockedFlow = recordFlowLawfulStop({
-        flowId: flow.flowId,
-        expectedRevision: flow.revision,
+        flowId: flow!.flowId,
+        expectedRevision: flow!.revision,
         reason: "blocker",
         detail: "Waiting on external blocker.",
         updatedAt: 300,

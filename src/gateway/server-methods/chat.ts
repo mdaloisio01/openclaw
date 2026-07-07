@@ -216,6 +216,11 @@ type PreRegisteredAgentRun = {
 
 type ChatHistoryMethod = "chat.history" | "chat.startup";
 
+const CHAT_HISTORY_DEFAULT_LIMIT = 200;
+const CHAT_HISTORY_HARD_LIMIT = 1000;
+const CHAT_STARTUP_DEFAULT_LIMIT = 80;
+const CHAT_STARTUP_HARD_LIMIT = 200;
+
 function normalizeUnknownText(value: unknown): string | undefined {
   return typeof value === "string" ? normalizeOptionalText(value) : undefined;
 }
@@ -2477,8 +2482,9 @@ async function handleChatHistoryRequest({
     agentId: selectedAgent.agentId,
   });
   const resolvedSessionModel = resolveSessionModelRef(cfg, entry, sessionAgentId);
-  const hardMax = 1000;
-  const defaultLimit = 200;
+  const hardMax = method === "chat.startup" ? CHAT_STARTUP_HARD_LIMIT : CHAT_HISTORY_HARD_LIMIT;
+  const defaultLimit =
+    method === "chat.startup" ? CHAT_STARTUP_DEFAULT_LIMIT : CHAT_HISTORY_DEFAULT_LIMIT;
   const requested = typeof limit === "number" ? limit : defaultLimit;
   const max = Math.min(hardMax, requested);
   const maxHistoryBytes = getMaxChatHistoryMessagesBytes();
@@ -2556,6 +2562,7 @@ async function handleChatHistoryRequest({
   let projectedHistory = projectHistoryTail(historyRead);
   perf.mark("projection");
   const canRetryHistoryTail =
+    method !== "chat.startup" &&
     typeof historyRead.fileBytes === "number" &&
     historyRead.readBytes < Math.min(historyRead.fileBytes, fullTailReadMaxBytes);
   if (canRetryHistoryTail && projectedHistory.normalized.length < max) {

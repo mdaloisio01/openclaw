@@ -1276,8 +1276,8 @@ describe("spawnAcpDirect", () => {
       });
 
       const blockedClose = finishFlow({
-        flowId: flow.flowId,
-        expectedRevision: flow.revision,
+        flowId: flow!.flowId,
+        expectedRevision: flow!.revision,
         endedAt: 200,
       });
       if (blockedClose.applied || !blockedClose.current) {

@@ -246,7 +246,7 @@ describe("buildEmbeddedRunPayloads tool-error warnings", () => {
         role: "assistant",
         stopReason: "stop",
         content: [],
-      } as AssistantMessage,
+      } as unknown as AssistantMessage,
       internalEvents: [
         makeTaskCompletionEvent({
           stopReason: "owner_boundary_stop",

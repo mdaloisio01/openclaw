@@ -89,7 +89,10 @@ describe("runEmbeddedAttempt memory flush tool forwarding", () => {
         { type: "text", text: `Appended content to ${MEMORY_RELATIVE_PATH}.` },
       ]);
       expect(result.details).toEqual({
+        schema: "openclaw.memory_append_receipt.v1",
         path: MEMORY_RELATIVE_PATH,
+        approvedMemoryRoot: "memory",
+        operation: "operational_memory_append",
         appendOnly: true,
       });
       await expect(fs.readFile(memoryFile, "utf-8")).resolves.toBe("seed\nnew durable note");

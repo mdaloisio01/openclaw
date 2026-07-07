@@ -192,7 +192,7 @@ function seedCandidateState(
   closeOpenClawStateDatabaseForTest();
 }
 
-function readRow<T>(dbPath: string, sql: string, ...args: unknown[]): T {
+function readRow<T>(dbPath: string, sql: string, ...args: (string | number | bigint | null)[]): T {
   const database = openOpenClawStateDatabase({ path: dbPath });
   const row = database.db.prepare(sql).get(...args) as T;
   closeOpenClawStateDatabaseForTest();

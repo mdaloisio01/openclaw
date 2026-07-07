@@ -13,6 +13,7 @@ import { readShortTermRecallEntries, recordShortTermRecalls } from "./short-term
 
 const getMemorySearchManager = vi.hoisted(() => vi.fn());
 const getRuntimeConfig = vi.hoisted(() => vi.fn(() => ({})));
+const runMemoryFlushProof = vi.hoisted(() => vi.fn());
 const resolveDefaultAgentId = vi.hoisted(() => vi.fn(() => "main"));
 const resolveCommandSecretRefsViaGateway = vi.hoisted(() =>
   vi.fn(async ({ config }: { config: unknown }) => ({
@@ -31,6 +32,15 @@ async function expectPathMissing(targetPath: string): Promise<void> {
   expect(error).toBeInstanceOf(Error);
   expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
 }
+
+vi.mock("openclaw/plugin-sdk/memory-core-host-runtime-core", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("openclaw/plugin-sdk/memory-core-host-runtime-core")>();
+  return {
+    ...actual,
+    runMemoryFlushProof,
+  };
+});
 
 vi.mock("./cli.host.runtime.js", async () => {
   const [runtimeCli, runtimeCore, runtimeFiles] = await Promise.all([
@@ -85,6 +95,7 @@ beforeAll(async () => {
 beforeEach(() => {
   getMemorySearchManager.mockReset();
   getRuntimeConfig.mockReset().mockReturnValue({});
+  runMemoryFlushProof.mockReset();
   resolveDefaultAgentId.mockReset().mockReturnValue("main");
   resolveCommandSecretRefsViaGateway.mockReset().mockImplementation(async ({ config }) => ({
     resolvedConfig: config,
@@ -211,6 +222,54 @@ describe("memory cli", () => {
     registerMemoryCli(program);
     await program.parseAsync(["memory", ...args], { from: "user" });
   }
+
+  it("runs the hidden memory flush proof command and prints the receipt as JSON", async () => {
+    runMemoryFlushProof.mockResolvedValueOnce({
+      schema: "openclaw.memory_flush_proof.v1",
+      ok: true,
+      agentId: "main",
+      workspaceDir: "/tmp/workspace",
+      target: {
+        path: "memory/2026-07-07.md",
+        absolutePath: "/tmp/workspace/memory/2026-07-07.md",
+        before: { exists: true, size: 4, mtimeMs: 1, sha256: "before" },
+        after: { exists: true, size: 15, mtimeMs: 2, sha256: "after" },
+        tailDelta: "\nproof note",
+        appendOnly: true,
+      },
+      dirtyTree: {
+        sourceRepo: "/home/will/openclaw-source",
+        status: " M src/agents/agent-tools.ts\n",
+      },
+      receipt: {
+        schema: "openclaw.memory_append_receipt.v1",
+        path: "memory/2026-07-07.md",
+        approvedMemoryRoot: "memory",
+        operation: "operational_memory_append",
+        appendOnly: true,
+      },
+      protectedFiles: [],
+    });
+    const jsonSpy = spyRuntimeJson(defaultRuntime);
+
+    await runMemoryCli(["flush-proof", "--content", "proof note", "--json"]);
+
+    expect(runMemoryFlushProof).toHaveBeenCalledWith({
+      agentId: "main",
+      cfg: {},
+      workspaceDir: process.cwd(),
+      content: "proof note",
+    });
+    expect(firstWrittenJsonArg(jsonSpy)).toMatchObject({
+      schema: "openclaw.memory_flush_proof.v1",
+      receipt: {
+        schema: "openclaw.memory_append_receipt.v1",
+        operation: "operational_memory_append",
+        appendOnly: true,
+        path: "memory/2026-07-07.md",
+      },
+    });
+  });
 
   it("rejects invalid memory search numeric options before running the command", async () => {
     const program = new Command();

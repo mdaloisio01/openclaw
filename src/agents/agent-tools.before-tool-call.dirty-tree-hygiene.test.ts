@@ -102,12 +102,99 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
     expect(result).toMatchObject({ details: { ok: true } });
   });
 
+  it("blocks source mutation during Cleanup Crew read-only analysis mode", async () => {
+    setStatus("");
+    const result = await runBeforeToolCallHook({
+      toolName: "apply_patch",
+      params: { patch: "*** Begin Patch\n*** End Patch" },
+      ctx: {
+        agentId: "main",
+        cleanupCrewRecovery: {
+          analysisMode: true,
+          missionId: "cleanup-crew-pause-analyze-plan-resume",
+          stoppageId: "stoppage_receipt_123",
+          nextAnalysisOwner: "cleanup_crew_planning_dev_sop",
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "cleanup-crew-analysis-mode",
+    });
+    expect(result.blocked ? result.reason : "").toContain("read-only inspection only");
+  });
+
+  it("allows read-only diagnostics during Cleanup Crew analysis mode", async () => {
+    const params = { cmd: "git status --short" };
+    const result = await runBeforeToolCallHook({
+      toolName: "bash",
+      params,
+      ctx: {
+        agentId: "main",
+        cleanupCrewRecovery: {
+          analysisMode: true,
+          missionId: "cleanup-crew-pause-analyze-plan-resume",
+          stoppageId: "stoppage_receipt_123",
+        },
+      },
+    });
+
+    expect(result).toEqual({ blocked: false, params });
+  });
+
+  it("blocks shell mutation during Cleanup Crew analysis mode before dirty-tree evaluation", async () => {
+    const statusCalls: string[] = [];
+    setStatus("", statusCalls);
+
+    const result = await runBeforeToolCallHook({
+      toolName: "bash",
+      params: { cmd: "touch src/continuity/tmp.txt" },
+      ctx: {
+        agentId: "main",
+        cleanupCrewRecovery: {
+          analysisMode: true,
+          missionId: "cleanup-crew-pause-analyze-plan-resume",
+          stoppageId: "stoppage_receipt_123",
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      deniedReason: "cleanup-crew-analysis-mode",
+    });
+    expect(statusCalls).toEqual([]);
+  });
+
   it("does not hard-block a narrow coherent dirty package", async () => {
     setStatus(" M src/infra/dirty-tree-hygiene.ts\n?? src/infra/new-helper.ts\n");
     const { execute, tool } = createWrappedPatchTool();
 
     const result = await tool.execute(
       "patch-narrow",
+      { patch: "*** Begin Patch\n*** End Patch" },
+      undefined,
+      undefined,
+    );
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ details: { ok: true } });
+  });
+
+  it("does not let generated output clutter turn narrow source work into broad mixed risk", async () => {
+    setStatus(
+      [
+        " M src/infra/dirty-tree-hygiene.ts",
+        "?? dist.broken-2026-07-07T055954357Z/",
+        "?? file_hub/exports/cleanup-proof.md",
+      ].join("\n"),
+    );
+    const { execute, tool } = createWrappedPatchTool();
+
+    const result = await tool.execute(
+      "patch-generated-clutter",
       { patch: "*** Begin Patch\n*** End Patch" },
       undefined,
       undefined,
@@ -157,12 +244,58 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
       params,
       ctx: {
         agentId: "main",
+        trigger: "memory",
         memoryFlushWritePath: "memory/2026-06-28.md",
       },
     });
 
     expect(result).toEqual({ blocked: false, params });
     expect(statusCalls).toEqual([]);
+  });
+
+  it("allows namespaced memory flush write tools with append-only metadata", async () => {
+    const statusCalls: string[] = [];
+    const params = {
+      path: "memory/2026-06-28.md",
+      content: "durable note",
+      mode: "append",
+      appendOnly: true,
+      operation: "operational_memory_append",
+    };
+    setStatus(broadMixedStatus(), statusCalls);
+
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.write",
+      params,
+      ctx: {
+        agentId: "main",
+        trigger: "memory",
+        memoryFlushWritePath: "memory/2026-06-28.md",
+      },
+    });
+
+    expect(result).toEqual({ blocked: false, params });
+    expect(statusCalls).toEqual([]);
+  });
+
+  it("allows canonical memory flush writes when the tree is clean", async () => {
+    const params = {
+      path: "memory/2026-06-28.md",
+      content: "durable note",
+    };
+    setStatus("");
+
+    const result = await runBeforeToolCallHook({
+      toolName: "write",
+      params,
+      ctx: {
+        agentId: "main",
+        trigger: "memory",
+        memoryFlushWritePath: "memory/2026-06-28.md",
+      },
+    });
+
+    expect(result).toEqual({ blocked: false, params });
   });
 
   it.each([
@@ -174,7 +307,7 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
     {
       name: "mismatched memory flush path",
       params: { path: "memory/2026-06-27.md", content: "durable note" },
-      ctx: { agentId: "main", memoryFlushWritePath: "memory/2026-06-28.md" },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
     },
     {
       name: "absolute memory path",
@@ -182,12 +315,40 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
         path: "/home/will/.openclaw/workspace-orchestrator/memory/2026-06-28.md",
         content: "durable note",
       },
-      ctx: { agentId: "main", memoryFlushWritePath: "memory/2026-06-28.md" },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
     },
     {
       name: "bootstrap reference write",
       params: { path: "AGENTS.md", content: "do not write" },
-      ctx: { agentId: "main", memoryFlushWritePath: "memory/2026-06-28.md" },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "memory overwrite-shaped write",
+      params: {
+        path: "memory/2026-06-28.md",
+        content: "durable note",
+        mode: "overwrite",
+      },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "false append-only metadata",
+      params: {
+        path: "memory/2026-06-28.md",
+        content: "durable note",
+        appendOnly: false,
+      },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "malformed memory target",
+      params: { path: "memory/today.md", content: "durable note" },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
+    },
+    {
+      name: "path escape from memory root",
+      params: { path: "memory/../src/agents/agent-tools.before-tool-call.ts", content: "nope" },
+      ctx: { agentId: "main", trigger: "memory", memoryFlushWritePath: "memory/2026-06-28.md" },
     },
     {
       name: "normal source write",

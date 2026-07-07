@@ -40,6 +40,7 @@ type TaskResponsePayload = {
   afterCloseEnabled?: boolean;
   flowStatus?: string;
   flow?: Record<string, unknown>;
+  diagnostic?: Record<string, unknown>;
 };
 
 let stateDir: string;
@@ -347,6 +348,53 @@ describe("tasks gateway handlers", () => {
     expect(flow?.status).toBe("succeeded");
   });
 
+  it("returns structured diagnostics when watchdog probe cron.readJob stalls", async () => {
+    const cron = createCronHarness(false);
+    cron.readJob = vi.fn(async () => await new Promise<never>(() => {}));
+
+    const { calls, payload } = await runTaskHandler(
+      "tasks.probeProductionWatchdogLifecycle",
+      {},
+      { cron },
+    );
+
+    expect(calls[0]?.[0]).toBe(false);
+    expect(payload?.diagnostic).toMatchObject({
+      kind: "watchdog_lifecycle_probe_timeout",
+      operation: "cron.readJob",
+      stage: "initial-read",
+      timeoutMs: 2000,
+    });
+    expect(calls[0]?.[2]).toMatchObject({
+      code: "UNAVAILABLE",
+      message: expect.stringContaining("cron.readJob timed out"),
+    });
+  });
+
+  it("returns structured diagnostics when watchdog probe cron.list stalls", async () => {
+    const cron = createCronHarness(false);
+    cron.readJob = vi.fn(async () => undefined);
+    cron.list = vi.fn(async () => await new Promise<never>(() => {}));
+
+    const { calls, payload } = await runTaskHandler(
+      "tasks.probeProductionWatchdogLifecycle",
+      {},
+      { cron },
+    );
+
+    expect(calls[0]?.[0]).toBe(false);
+    expect(payload?.diagnostic).toMatchObject({
+      kind: "watchdog_lifecycle_probe_timeout",
+      operation: "cron.list",
+      stage: "initial-read",
+      timeoutMs: 2000,
+    });
+    expect(calls[0]?.[2]).toMatchObject({
+      code: "UNAVAILABLE",
+      message: expect.stringContaining("cron.list timed out"),
+    });
+  });
+
   it("starts and lawfully blocks a production flow through gateway observer state", async () => {
     const cron = createCronHarness(false);
     installProductionWatchdogLifecycleGate({ cron });
@@ -641,7 +689,6 @@ describe("tasks gateway handlers", () => {
       status: "running",
       deliveryStatus: "session_queued",
       notifyPolicy: "done_only",
-      createdAt: Date.now(),
       startedAt: Date.now(),
       lastEventAt: Date.now(),
     });
@@ -689,7 +736,6 @@ describe("tasks gateway handlers", () => {
       status: "running",
       deliveryStatus: "session_queued",
       notifyPolicy: "done_only",
-      createdAt: Date.now(),
       startedAt: Date.now(),
       lastEventAt: Date.now(),
     });
@@ -741,7 +787,6 @@ describe("tasks gateway handlers", () => {
       status: "running",
       deliveryStatus: "session_queued",
       notifyPolicy: "done_only",
-      createdAt: Date.now(),
       startedAt: Date.now(),
       lastEventAt: Date.now(),
     });

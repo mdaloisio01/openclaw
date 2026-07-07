@@ -341,7 +341,8 @@ describe("probeGateway", () => {
 
     expectProbeResultFields(result, {
       ok: false,
-      error: "timeout",
+      error:
+        "gateway event loop not ready before probe timeout (250ms): elapsed=250ms maxDrift=500ms checks=1",
       close: null,
     });
     expectProbeAuthFields(result, {
@@ -503,6 +504,28 @@ describe("probeGateway", () => {
       close: { code: 1008, reason: "pairing required" },
     });
     expectProbeAuthFields(result, { capability: "pairing_pending" });
+    expect(gatewayClientState.requests).toStrictEqual([]);
+  });
+
+  it("reports normal pre-handshake closes as degraded handshake failures", async () => {
+    gatewayClientState.startMode = "close";
+    gatewayClientState.close = { code: 1000, reason: "" };
+
+    const result = await runTokenLightweightProbe({
+      timeoutMs: 5_000,
+    });
+
+    expectProbeResultFields(result, {
+      ok: false,
+      error:
+        "gateway closed (1000 normal closure before gateway probe handshake completed): no close reason",
+      close: {
+        code: 1000,
+        reason: "",
+        hint: "normal closure before gateway probe handshake completed",
+      },
+    });
+    expectProbeAuthFields(result, { capability: "unknown" });
     expect(gatewayClientState.requests).toStrictEqual([]);
   });
 

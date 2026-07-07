@@ -117,6 +117,12 @@ export type HookContext = {
     skillSource?: SkillTelemetrySource;
     toolName?: string;
   };
+  cleanupCrewRecovery?: {
+    analysisMode?: boolean;
+    stoppageId?: string;
+    missionId?: string;
+    nextAnalysisOwner?: string;
+  };
   sandbox?: {
     root: string;
     bridge: SandboxFsBridge;
@@ -128,7 +134,8 @@ type HookBlockedReason =
   | "plugin-before-tool-call"
   | "plugin-approval"
   | "tool-loop"
-  | "dirty-tree-hygiene";
+  | "dirty-tree-hygiene"
+  | "cleanup-crew-analysis-mode";
 type HookOutcome =
   | {
       blocked: true;
@@ -491,6 +498,36 @@ function formatDirtyTreeHygieneBlockMessage(report: DirtyTreeHygieneReport): str
   ].join(" ");
 }
 
+function resolveCleanupCrewAnalysisModeBlock(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+}): HookOutcome | undefined {
+  if (args.ctx?.cleanupCrewRecovery?.analysisMode !== true) {
+    return undefined;
+  }
+  if (!isSourceModifyingToolCall(args.toolName, args.params)) {
+    return undefined;
+  }
+  if (isAllowedMemoryFlushWrite(args)) {
+    return undefined;
+  }
+  const mission = args.ctx.cleanupCrewRecovery.missionId ?? "active Cleanup Crew mission";
+  const stoppage = args.ctx.cleanupCrewRecovery.stoppageId ?? "unrecorded stoppage";
+  return {
+    blocked: true,
+    kind: "veto",
+    deniedReason: "cleanup-crew-analysis-mode",
+    reason: [
+      "Cleanup Crew analysis mode blocked this source-modifying tool call.",
+      `Mission: ${mission}.`,
+      `Stoppage: ${stoppage}.`,
+      "Pause/analyze mode permits read-only inspection only; write the active build plan amendment before repair execution resumes.",
+    ].join(" "),
+    params: args.params,
+  };
+}
+
 async function resolveDirtyTreeHygieneBlock(args: {
   toolName: string;
   params: unknown;
@@ -540,7 +577,25 @@ function normalizeMemoryFlushRelativePath(value: unknown): string | undefined {
 
 function isWriteToolName(toolName: string): boolean {
   const normalized = normalizeToolName(toolName);
-  return normalized === "write" || normalized === "write_file";
+  return (
+    normalized === "write" ||
+    normalized === "write_file" ||
+    normalized.endsWith(".write") ||
+    normalized.endsWith(".write_file") ||
+    normalized.endsWith("__write") ||
+    normalized.endsWith("__write_file")
+  );
+}
+
+function isAllowedMemoryFlushWriteMetadata(key: string, value: unknown): boolean {
+  if (key === "mode" || key === "operation") {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return normalized === "append" || normalized === "operational_memory_append";
+  }
+  if (key === "append" || key === "appendOnly") {
+    return value === true;
+  }
+  return false;
 }
 
 function isAllowedMemoryFlushWrite(args: {
@@ -548,13 +603,25 @@ function isAllowedMemoryFlushWrite(args: {
   params: unknown;
   ctx?: HookContext;
 }): boolean {
+  if (args.ctx?.trigger !== "memory") {
+    return false;
+  }
   const allowedPath = normalizeMemoryFlushRelativePath(args.ctx?.memoryFlushWritePath);
   if (!allowedPath || !isWriteToolName(args.toolName)) {
     return false;
   }
   const record = isPlainObject(args.params) ? args.params : {};
+  const keys = Object.keys(record);
+  if (
+    keys.some(
+      (key) =>
+        key !== "path" && key !== "content" && !isAllowedMemoryFlushWriteMetadata(key, record[key]),
+    )
+  ) {
+    return false;
+  }
   const requestedPath = normalizeMemoryFlushRelativePath(record.path);
-  return requestedPath === allowedPath;
+  return requestedPath === allowedPath && typeof record.content === "string";
 }
 
 export function recordAdjustedParamsForToolCall(
@@ -1239,6 +1306,15 @@ export async function runBeforeToolCallHook(args: {
         loopScope,
       );
     }
+  }
+
+  const cleanupCrewAnalysisBlock = resolveCleanupCrewAnalysisModeBlock({
+    toolName,
+    params,
+    ctx: args.ctx,
+  });
+  if (cleanupCrewAnalysisBlock) {
+    return cleanupCrewAnalysisBlock;
   }
 
   const gatewayRestartCheckpoint = await resolveGatewaySelfRestartCheckpoint({

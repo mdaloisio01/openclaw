@@ -48,7 +48,8 @@ async function withProofHarnessState<T>(run: (root: string) => Promise<T>): Prom
 async function loadFollowupProofTools(params: { callGatewayMock: ReturnType<typeof vi.fn> }) {
   vi.resetModules();
   vi.doMock("../gateway/call.js", () => ({
-    callGateway: (opts: unknown) => params.callGatewayMock(opts),
+    callGateway: (opts: unknown) =>
+      (params.callGatewayMock as unknown as (opts: unknown) => unknown)(opts),
   }));
   vi.doMock("../config/config.js", async () => {
     const actual =

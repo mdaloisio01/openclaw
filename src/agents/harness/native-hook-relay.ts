@@ -1408,7 +1408,7 @@ async function runNativeHookRelayPreToolUse(params: {
   return params.adapter.renderNoopResponse(params.invocation.event);
 }
 
-async function runNativeHookRelayPostToolUse(params: {
+function runNativeHookRelayPostToolUse(params: {
   registration: NativeHookRelayRegistration;
   invocation: NativeHookRelayInvocation;
   adapter: NativeHookRelayProviderAdapter;
@@ -1416,18 +1416,28 @@ async function runNativeHookRelayPostToolUse(params: {
   const toolName = normalizeNativeHookToolName(params.invocation.toolName);
   const toolCallId =
     params.invocation.toolUseId ?? `${params.invocation.event}:${params.invocation.receivedAt}`;
-  await runAgentHarnessAfterToolCallHook({
-    toolName,
-    toolCallId,
-    runId: params.registration.runId,
-    ...(params.registration.agentId ? { agentId: params.registration.agentId } : {}),
-    sessionId: params.registration.sessionId,
-    ...(params.registration.sessionKey ? { sessionKey: params.registration.sessionKey } : {}),
-    ...(params.registration.channelId ? { channelId: params.registration.channelId } : {}),
-    startArgs: params.adapter.readToolInput(params.invocation.rawPayload),
-    result: params.adapter.readToolResponse(params.invocation.rawPayload),
+  const startArgs = params.adapter.readToolInput(params.invocation.rawPayload);
+  const result = params.adapter.readToolResponse(params.invocation.rawPayload);
+  setImmediate(() => {
+    void runAgentHarnessAfterToolCallHook({
+      toolName,
+      toolCallId,
+      runId: params.registration.runId,
+      ...(params.registration.agentId ? { agentId: params.registration.agentId } : {}),
+      sessionId: params.registration.sessionId,
+      ...(params.registration.sessionKey ? { sessionKey: params.registration.sessionKey } : {}),
+      ...(params.registration.channelId ? { channelId: params.registration.channelId } : {}),
+      startArgs,
+      result,
+    }).catch((error) => {
+      log.warn(
+        `native hook relay PostToolUse observer failed runId=${JSON.stringify(params.registration.runId)} ` +
+          `toolName=${JSON.stringify(toolName)} toolCallId=${JSON.stringify(toolCallId)} ` +
+          `error=${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
   });
-  return params.adapter.renderNoopResponse(params.invocation.event);
+  return Promise.resolve(params.adapter.renderNoopResponse(params.invocation.event));
 }
 
 async function runNativeHookRelayPermissionRequest(params: {

@@ -56,6 +56,7 @@ const DEFAULT_TASKS_LIST_LIMIT = 100;
 const MAX_TASKS_LIST_LIMIT = 500;
 const WATCHDOG_PROBE_POLL_TIMEOUT_MS = 5_000;
 const WATCHDOG_PROBE_POLL_INTERVAL_MS = 50;
+const WATCHDOG_PROBE_CRON_OPERATION_TIMEOUT_MS = 2_000;
 const WATCHDOG_LIFECYCLE_PROBE_CONTROLLER_ID = "gateway/tasks/watchdog-lifecycle-live-probe";
 const PRODUCTION_FLOW_KIND = "production_taskflow_slice";
 const CHILD_EXECUTION_PROOF_KIND = "production_taskflow_child_execution_proof";
@@ -150,6 +151,48 @@ function normalizeTaskStatusFilter(status: TasksListParams["status"]): Set<TaskS
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class WatchdogProbeDiagnosticError extends Error {
+  constructor(
+    public readonly diagnostic: {
+      operation: "cron.readJob" | "cron.list";
+      timeoutMs: number;
+      stage: "initial-read" | "poll-read";
+    },
+  ) {
+    super(
+      `${diagnostic.operation} timed out after ${diagnostic.timeoutMs}ms during ${diagnostic.stage}`,
+    );
+    this.name = "WatchdogProbeDiagnosticError";
+  }
+}
+
+function isWatchdogProbeDiagnosticError(error: unknown): error is WatchdogProbeDiagnosticError {
+  return error instanceof WatchdogProbeDiagnosticError;
+}
+
+async function withWatchdogProbeCronTimeout<T>(
+  operation: WatchdogProbeDiagnosticError["diagnostic"]["operation"],
+  stage: WatchdogProbeDiagnosticError["diagnostic"]["stage"],
+  run: Promise<T>,
+  timeoutMs = WATCHDOG_PROBE_CRON_OPERATION_TIMEOUT_MS,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new WatchdogProbeDiagnosticError({ operation, stage, timeoutMs }));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function optionalStringField(value: unknown): string | undefined {
@@ -345,12 +388,23 @@ function resolveProductionChildTaskForMutation(input: Record<string, unknown>):
   return { ok: true, flow, runId: runId.value, task };
 }
 
-async function readActiveWorkWatchdogJob(context: GatewayRequestContext) {
-  const byId = await context.cron.readJob(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID);
+async function readActiveWorkWatchdogJob(
+  context: GatewayRequestContext,
+  stage: WatchdogProbeDiagnosticError["diagnostic"]["stage"] = "poll-read",
+) {
+  const byId = await withWatchdogProbeCronTimeout(
+    "cron.readJob",
+    stage,
+    context.cron.readJob(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID),
+  );
   if (byId) {
     return byId;
   }
-  const jobs = await context.cron.list({ includeDisabled: true });
+  const jobs = await withWatchdogProbeCronTimeout(
+    "cron.list",
+    stage,
+    context.cron.list({ includeDisabled: true }),
+  );
   return jobs.find((job) => job.name === ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME);
 }
 
@@ -360,13 +414,13 @@ async function waitForActiveWorkWatchdogEnabledState(params: {
   timeoutMs?: number;
 }) {
   const startedAt = Date.now();
-  let lastJob = await readActiveWorkWatchdogJob(params.context);
+  let lastJob = await readActiveWorkWatchdogJob(params.context, "poll-read");
   while (Date.now() - startedAt <= (params.timeoutMs ?? WATCHDOG_PROBE_POLL_TIMEOUT_MS)) {
     if (lastJob?.enabled === params.expected) {
       return { matched: true, job: lastJob, elapsedMs: Date.now() - startedAt };
     }
     await delay(WATCHDOG_PROBE_POLL_INTERVAL_MS);
-    lastJob = await readActiveWorkWatchdogJob(params.context);
+    lastJob = await readActiveWorkWatchdogJob(params.context, "poll-read");
   }
   return { matched: false, job: lastJob, elapsedMs: Date.now() - startedAt };
 }
@@ -1069,157 +1123,175 @@ export const tasksHandlers: GatewayRequestHandlers = {
     respond(true, { flow: result });
   },
   "tasks.probeProductionWatchdogLifecycle": async ({ respond, context }) => {
-    const initial = await readActiveWorkWatchdogJob(context);
-    if (!initial) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          `managed watchdog cron not found: ${ACTIVE_WORK_WATCHDOG_CRON_JOB_ID}`,
-        ),
-      );
-      return;
-    }
+    try {
+      const initial = await readActiveWorkWatchdogJob(context, "initial-read");
+      if (!initial) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            `managed watchdog cron not found: ${ACTIVE_WORK_WATCHDOG_CRON_JOB_ID}`,
+          ),
+        );
+        return;
+      }
 
-    const startedAt = Date.now();
-    const flow = createManagedTaskFlow({
-      ownerKey: "agent:orchestrator:main",
-      controllerId: WATCHDOG_LIFECYCLE_PROBE_CONTROLLER_ID,
-      goal: "Disposable active production watchdog lifecycle live probe",
-      status: "running",
-      currentStep: "probe_open",
-      notifyPolicy: "done_only",
-      continuation: {
-        activeProductionRun: true,
-        parentRunOpen: true,
-      },
-      stateJson: {
-        probe: "active-production-watchdog-lifecycle",
+      const startedAt = Date.now();
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: WATCHDOG_LIFECYCLE_PROBE_CONTROLLER_ID,
+        goal: "Disposable active production watchdog lifecycle live probe",
+        status: "running",
+        currentStep: "probe_open",
+        notifyPolicy: "done_only",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+        },
+        stateJson: {
+          probe: "active-production-watchdog-lifecycle",
+          startedAt,
+        },
+        createdAt: startedAt,
+        updatedAt: startedAt,
+      });
+      if (!flow) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "failed to create disposable watchdog lifecycle probe flow",
+          ),
+        );
+        return;
+      }
+
+      const enabled = await waitForActiveWorkWatchdogEnabledState({
+        context,
+        expected: true,
+      });
+      if (!enabled.matched) {
+        respond(
+          false,
+          {
+            flowId: flow.flowId,
+            initialEnabled: initial.enabled,
+            afterOpenEnabled: enabled.job?.enabled,
+            enabledPollElapsedMs: enabled.elapsedMs,
+          },
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "watchdog cron did not enable after disposable active production flow opened",
+          ),
+        );
+        return;
+      }
+      const afterOpenEnabled = enabled.job?.enabled;
+
+      const stoppedAt = Date.now();
+      const lawfulStop = recordFlowLawfulStop({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        reason: "whole_run_complete",
+        detail: "Disposable watchdog lifecycle live probe closed truthfully.",
+        currentStep: "probe_closed",
+        updatedAt: stoppedAt,
+      });
+      if (!lawfulStop.applied) {
+        respond(
+          false,
+          {
+            flowId: flow.flowId,
+            initialEnabled: initial.enabled,
+            afterOpenEnabled,
+            stopReason: lawfulStop.reason,
+          },
+          errorShape(ErrorCodes.UNAVAILABLE, "failed to record lawful stop for probe flow"),
+        );
+        return;
+      }
+
+      const finishedAt = Date.now();
+      const finished = finishFlow({
+        flowId: lawfulStop.flow.flowId,
+        expectedRevision: lawfulStop.flow.revision,
+        currentStep: "probe_finished",
+        endedAt: finishedAt,
+        updatedAt: finishedAt,
+      });
+      if (!finished.applied) {
+        respond(
+          false,
+          {
+            flowId: lawfulStop.flow.flowId,
+            initialEnabled: initial.enabled,
+            afterOpenEnabled,
+            finishReason: finished.reason,
+          },
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "failed to finish disposable probe flow after lawful stop",
+          ),
+        );
+        return;
+      }
+
+      const disabled = await waitForActiveWorkWatchdogEnabledState({
+        context,
+        expected: false,
+      });
+      if (!disabled.matched) {
+        respond(
+          false,
+          {
+            flowId: finished.flow.flowId,
+            initialEnabled: initial.enabled,
+            afterOpenEnabled,
+            afterCloseEnabled: disabled.job?.enabled,
+            disabledPollElapsedMs: disabled.elapsedMs,
+          },
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            "watchdog cron did not disable after disposable active production flow closed",
+          ),
+        );
+        return;
+      }
+
+      respond(true, {
+        ok: true,
+        flowId: finished.flow.flowId,
+        cronJobId: disabled.job?.id ?? enabled.job?.id ?? initial.id,
+        initialEnabled: initial.enabled,
+        afterOpenEnabled,
+        afterCloseEnabled: disabled.job?.enabled,
+        enabledPollElapsedMs: enabled.elapsedMs,
+        disabledPollElapsedMs: disabled.elapsedMs,
+        flowStatus: finished.flow.status,
+        controllerId: WATCHDOG_LIFECYCLE_PROBE_CONTROLLER_ID,
         startedAt,
-      },
-      createdAt: startedAt,
-      updatedAt: startedAt,
-    });
-    if (!flow) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          "failed to create disposable watchdog lifecycle probe flow",
-        ),
-      );
-      return;
+        stoppedAt,
+        finishedAt,
+      });
+    } catch (error) {
+      if (isWatchdogProbeDiagnosticError(error)) {
+        respond(
+          false,
+          {
+            ok: false,
+            diagnostic: {
+              kind: "watchdog_lifecycle_probe_timeout",
+              ...error.diagnostic,
+            },
+          },
+          errorShape(ErrorCodes.UNAVAILABLE, error.message),
+        );
+        return;
+      }
+      throw error;
     }
-
-    const enabled = await waitForActiveWorkWatchdogEnabledState({
-      context,
-      expected: true,
-    });
-    if (!enabled.matched) {
-      respond(
-        false,
-        {
-          flowId: flow.flowId,
-          initialEnabled: initial.enabled,
-          afterOpenEnabled: enabled.job?.enabled,
-          enabledPollElapsedMs: enabled.elapsedMs,
-        },
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          "watchdog cron did not enable after disposable active production flow opened",
-        ),
-      );
-      return;
-    }
-    const afterOpenEnabled = enabled.job?.enabled;
-
-    const stoppedAt = Date.now();
-    const lawfulStop = recordFlowLawfulStop({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
-      reason: "whole_run_complete",
-      detail: "Disposable watchdog lifecycle live probe closed truthfully.",
-      currentStep: "probe_closed",
-      updatedAt: stoppedAt,
-    });
-    if (!lawfulStop.applied) {
-      respond(
-        false,
-        {
-          flowId: flow.flowId,
-          initialEnabled: initial.enabled,
-          afterOpenEnabled,
-          stopReason: lawfulStop.reason,
-        },
-        errorShape(ErrorCodes.UNAVAILABLE, "failed to record lawful stop for probe flow"),
-      );
-      return;
-    }
-
-    const finishedAt = Date.now();
-    const finished = finishFlow({
-      flowId: lawfulStop.flow.flowId,
-      expectedRevision: lawfulStop.flow.revision,
-      currentStep: "probe_finished",
-      endedAt: finishedAt,
-      updatedAt: finishedAt,
-    });
-    if (!finished.applied) {
-      respond(
-        false,
-        {
-          flowId: lawfulStop.flow.flowId,
-          initialEnabled: initial.enabled,
-          afterOpenEnabled,
-          finishReason: finished.reason,
-        },
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          "failed to finish disposable probe flow after lawful stop",
-        ),
-      );
-      return;
-    }
-
-    const disabled = await waitForActiveWorkWatchdogEnabledState({
-      context,
-      expected: false,
-    });
-    if (!disabled.matched) {
-      respond(
-        false,
-        {
-          flowId: finished.flow.flowId,
-          initialEnabled: initial.enabled,
-          afterOpenEnabled,
-          afterCloseEnabled: disabled.job?.enabled,
-          disabledPollElapsedMs: disabled.elapsedMs,
-        },
-        errorShape(
-          ErrorCodes.UNAVAILABLE,
-          "watchdog cron did not disable after disposable active production flow closed",
-        ),
-      );
-      return;
-    }
-
-    respond(true, {
-      ok: true,
-      flowId: finished.flow.flowId,
-      cronJobId: disabled.job?.id ?? enabled.job?.id ?? initial.id,
-      initialEnabled: initial.enabled,
-      afterOpenEnabled,
-      afterCloseEnabled: disabled.job?.enabled,
-      enabledPollElapsedMs: enabled.elapsedMs,
-      disabledPollElapsedMs: disabled.elapsedMs,
-      flowStatus: finished.flow.status,
-      controllerId: WATCHDOG_LIFECYCLE_PROBE_CONTROLLER_ID,
-      startedAt,
-      stoppedAt,
-      finishedAt,
-    });
   },
 };
 

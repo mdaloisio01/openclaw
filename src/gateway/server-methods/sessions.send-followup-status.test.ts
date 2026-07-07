@@ -111,7 +111,19 @@ describe("sessions.send completed subagent follow-up status", () => {
     });
 
     const call = respondMock.mock.calls.at(0) as
-      | [boolean, { runId?: string; status?: string; messageSeq?: number }, unknown?, unknown?]
+      | [
+          boolean,
+          {
+            runId?: string;
+            status?: string;
+            messageSeq?: number;
+            runningNow?: boolean;
+            runningNowAnswer?: "yes" | "no";
+            followupExecutionTruth?: Record<string, unknown>;
+          },
+          unknown?,
+          unknown?,
+        ]
       | undefined;
     expect(call?.[0]).toBe(true);
     expect(call?.[1]?.runId).toBe("run-new");

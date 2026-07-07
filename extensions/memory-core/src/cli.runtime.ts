@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import type { MemoryEmbeddingProbeResult } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import {
+  registerMemoryCapability,
+  runMemoryFlushProof,
+} from "openclaw/plugin-sdk/memory-core-host-runtime-core";
+import {
   resolveMemoryDreamingConfig,
   resolveMemoryRemDreamingConfig,
 } from "openclaw/plugin-sdk/memory-core-host-status";
@@ -33,6 +37,7 @@ import {
 } from "./cli.host.runtime.js";
 import type {
   MemoryCommandOptions,
+  MemoryFlushProofCommandOptions,
   MemoryPromoteCommandOptions,
   MemoryPromoteExplainOptions,
   MemoryRemBackfillOptions,
@@ -49,6 +54,7 @@ import {
 } from "./dreaming-repair.js";
 import { asRecord } from "./dreaming-shared.js";
 import { resolveShortTermPromotionDreamingConfig } from "./dreaming.js";
+import { buildMemoryFlushPlan } from "./flush-plan.js";
 import { formatMemoryVectorDegradedWriteReason } from "./memory/manager-vector-warning.js";
 import { previewGroundedRemMarkdown } from "./rem-evidence.js";
 import { previewRemHarness } from "./rem-harness.js";
@@ -320,6 +326,33 @@ function resolveAgentIds(cfg: OpenClawConfig, agent?: string): string[] {
     return list.map((entry) => entry.id).filter(Boolean);
   }
   return [resolveDefaultAgentId(cfg)];
+}
+
+export async function runMemoryFlushProofCommand(
+  opts: MemoryFlushProofCommandOptions,
+): Promise<void> {
+  const { config, diagnostics } = await loadMemoryCommandConfig("memory flush-proof");
+  emitMemorySecretResolveDiagnostics(diagnostics, { json: Boolean(opts.json) });
+  registerMemoryCapability("memory-core", { flushPlanResolver: buildMemoryFlushPlan });
+  const agentId = resolveAgent(config, opts.agent);
+  const result = await runMemoryFlushProof({
+    agentId,
+    cfg: config,
+    workspaceDir: process.cwd(),
+    content: opts.content,
+  });
+  if (opts.json) {
+    defaultRuntime.writeJson(result);
+    return;
+  }
+  const receipt = result.receipt as { schema?: unknown; path?: unknown; operation?: unknown };
+  defaultRuntime.log("Memory flush proof: PASS");
+  defaultRuntime.log(`Target: ${result.target.path}`);
+  defaultRuntime.log(`Before size: ${result.target.before.size}`);
+  defaultRuntime.log(`After size: ${result.target.after.size}`);
+  defaultRuntime.log(`Receipt schema: ${String(receipt?.schema ?? "missing")}`);
+  defaultRuntime.log(`Receipt operation: ${String(receipt?.operation ?? "missing")}`);
+  defaultRuntime.log(`Receipt path: ${String(receipt?.path ?? "missing")}`);
 }
 
 function formatExtraPaths(workspaceDir: string, extraPaths: string[]): string[] {

@@ -216,7 +216,9 @@ describe("server-runtime-services", () => {
 
   it("starts activation continuation recovery after post-restart startup is ready", async () => {
     vi.useFakeTimers();
-    hoisted.recoverPendingActivationContinuations.mockResolvedValueOnce([{ id: "activation-1" }]);
+    hoisted.recoverPendingActivationContinuations.mockResolvedValueOnce([
+      { id: "activation-1" },
+    ] as never);
     const cron = { start: vi.fn(async () => undefined) };
     const log = createLog();
 
@@ -235,7 +237,9 @@ describe("server-runtime-services", () => {
 
     expect(log.child).toHaveBeenCalledWith("activation-continuation");
     const activationLog = log.child.mock.results.find(
-      (_result, index) => log.child.mock.calls[index]?.[0] === "activation-continuation",
+      (_result, index) =>
+        (log.child.mock.calls[index] as unknown as [string] | undefined)?.[0] ===
+        "activation-continuation",
     )?.value;
     if (!activationLog) {
       throw new Error("Expected activation continuation log child");

@@ -12,6 +12,7 @@ export type DirtyTreePackageGroup =
   | "gateway-auto-reply-routing"
   | "state-schema-storage"
   | "cli-config-cron-infra"
+  | "generated-output"
   | "unknown";
 
 export type DirtyTreeStatusEntry = {
@@ -23,6 +24,7 @@ export type DirtyTreeStatusEntry = {
   unstaged: boolean;
   untracked: boolean;
   group: DirtyTreePackageGroup;
+  generatedOutput: boolean;
 };
 
 export type DirtyTreeGroupReport = {
@@ -38,9 +40,11 @@ export type DirtyTreeHygieneReport = {
   risk: DirtyTreeRisk;
   entries: DirtyTreeStatusEntry[];
   groups: DirtyTreeGroupReport[];
+  sourceGroups: DirtyTreeGroupReport[];
   stagedCount: number;
   unstagedCount: number;
   untrackedCount: number;
+  generatedOutputCount: number;
   packageBoundaryCount: number;
   broadMixed: boolean;
   summary: string;
@@ -63,10 +67,12 @@ export function buildDirtyTreeHygieneReport(statusShortOutput: string): DirtyTre
       untrackedCount: groupEntries.filter((entry) => entry.untracked).length,
     }))
     .toSorted((left, right) => left.group.localeCompare(right.group));
+  const sourceGroups = groups.filter((group) => group.group !== "generated-output");
   const stagedCount = entries.filter((entry) => entry.staged).length;
   const unstagedCount = entries.filter((entry) => entry.unstaged).length;
   const untrackedCount = entries.filter((entry) => entry.untracked).length;
-  const packageBoundaryCount = groups.length;
+  const generatedOutputCount = entries.filter((entry) => entry.generatedOutput).length;
+  const packageBoundaryCount = sourceGroups.length;
   const broadMixed = packageBoundaryCount > 1;
   const risk: DirtyTreeRisk =
     entries.length === 0 ? "clean" : broadMixed ? "broad-mixed" : "single-package";
@@ -75,12 +81,21 @@ export function buildDirtyTreeHygieneReport(statusShortOutput: string): DirtyTre
     risk,
     entries,
     groups,
+    sourceGroups,
     stagedCount,
     unstagedCount,
     untrackedCount,
+    generatedOutputCount,
     packageBoundaryCount,
     broadMixed,
-    summary: buildDirtyTreeSummary({ entries, groups, stagedCount, unstagedCount, untrackedCount }),
+    summary: buildDirtyTreeSummary({
+      entries,
+      groups: sourceGroups,
+      stagedCount,
+      unstagedCount,
+      untrackedCount,
+      generatedOutputCount,
+    }),
   };
 }
 
@@ -109,10 +124,28 @@ function parseGitStatusShortLine(line: string): DirtyTreeStatusEntry {
     unstaged: !untracked && worktreeStatus !== " " && worktreeStatus !== "?",
     untracked,
     group: classifyDirtyTreePackageGroup(path),
+    generatedOutput: isGeneratedOutputPath(path),
   };
 }
 
+export function isGeneratedOutputPath(path: string): boolean {
+  return (
+    path.startsWith("dist/") ||
+    path.startsWith("dist-runtime/") ||
+    path.startsWith("coverage/") ||
+    /^dist(?:-runtime)?\.broken-/u.test(path) ||
+    path.includes("/dist/") ||
+    path.endsWith(".tsbuildinfo") ||
+    path.endsWith(".log") ||
+    path.startsWith("var/") ||
+    path.startsWith("file_hub/exports/")
+  );
+}
+
 export function classifyDirtyTreePackageGroup(path: string): DirtyTreePackageGroup {
+  if (isGeneratedOutputPath(path)) {
+    return "generated-output";
+  }
   if (path.startsWith("extensions/codex/src/app-server/")) {
     return "codex-app-server";
   }
@@ -196,6 +229,7 @@ function buildDirtyTreeSummary(params: {
   stagedCount: number;
   unstagedCount: number;
   untrackedCount: number;
+  generatedOutputCount: number;
 }): string {
   if (params.entries.length === 0) {
     return "clean";
@@ -207,6 +241,7 @@ function buildDirtyTreeSummary(params: {
     `staged=${params.stagedCount}`,
     `unstaged=${params.unstagedCount}`,
     `untracked=${params.untrackedCount}`,
+    `generated_output=${params.generatedOutputCount}`,
     `groups=${groupList}`,
   ].join("; ");
 }

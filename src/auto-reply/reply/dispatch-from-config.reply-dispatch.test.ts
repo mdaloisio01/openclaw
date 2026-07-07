@@ -322,7 +322,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
   it("records final dispatch failure instead of false delivered", async () => {
     const registryPath = await useTempSourceTurnDeliveryRegistry();
     hookMocks.runner.hasHooks.mockReturnValue(false);
-    mocks.routeReply.mockResolvedValue({ ok: false, error: "provider failed" });
+    mocks.routeReply.mockResolvedValue({ ok: false, error: "provider failed" } as never);
 
     const result = await dispatchReplyFromConfig({
       ctx: createRoutedSourceTurnCtx(),

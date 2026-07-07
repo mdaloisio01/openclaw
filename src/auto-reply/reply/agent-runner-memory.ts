@@ -35,6 +35,7 @@ import { readSessionMessagesAsync } from "../../gateway/session-utils.fs.js";
 import { logVerbose } from "../../globals.js";
 import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-events.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { root as fsSafeRoot } from "../../infra/fs-safe.js";
 import { isAbortError } from "../../infra/unhandled-rejections.js";
 import { resolveMemoryFlushPlan } from "../../plugins/memory-state.js";
 import { CommandLane } from "../../process/lanes.js";
@@ -65,6 +66,7 @@ type EmbeddedAgentRuntime = typeof import("../../agents/embedded-agent.js");
 const MAX_VISIBLE_MEMORY_FLUSH_ERROR_CHARS = 600;
 const MAX_FLUSH_FAILURES = 3;
 const MAX_FLUSH_ERROR_LENGTH = 200;
+const MEMORY_FLUSH_TARGET_RE = /^memory\/\d{4}-\d{2}-\d{2}\.md$/;
 
 const embeddedAgentRuntimeLoader = createLazyImportLoader<EmbeddedAgentRuntime>(
   () => import("../../agents/embedded-agent.js"),
@@ -95,9 +97,12 @@ async function ensureMemoryFlushTargetFile(params: {
   relativePath: string;
 }): Promise<void> {
   const workspaceDir = normalizeOptionalString(params.workspaceDir);
-  const relativePath = normalizeOptionalString(params.relativePath);
+  const relativePath = normalizeOptionalString(params.relativePath)?.replace(/\\/g, "/");
   if (!workspaceDir || !relativePath || path.isAbsolute(relativePath)) {
     throw new Error("Invalid memory flush target path");
+  }
+  if (!MEMORY_FLUSH_TARGET_RE.test(relativePath)) {
+    throw new Error("Memory flush target must be memory/YYYY-MM-DD.md");
   }
   const workspaceRoot = path.resolve(workspaceDir);
   const targetPath = path.resolve(workspaceRoot, relativePath);
@@ -109,9 +114,11 @@ async function ensureMemoryFlushTargetFile(params: {
   ) {
     throw new Error("Memory flush target path must stay inside the workspace");
   }
-  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
-  const handle = await fs.promises.open(targetPath, "a");
-  await handle.close();
+  const safeRoot = await fsSafeRoot(workspaceRoot);
+  await safeRoot.append(relativePath, "", {
+    mkdir: true,
+    prependNewlineIfNeeded: false,
+  });
 }
 
 const memoryDeps = {

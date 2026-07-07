@@ -627,20 +627,48 @@ async function appendMemoryFlushContent(params: {
   await fs.writeFile(params.absolutePath, next, "utf-8");
 }
 
+function isAllowedMemoryFlushAppendMetadata(key: string, value: unknown): boolean {
+  if (key === "mode" || key === "operation") {
+    const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+    return normalized === "append" || normalized === "operational_memory_append";
+  }
+  if (key === "append" || key === "appendOnly") {
+    return value === true;
+  }
+  return false;
+}
+
 export function wrapToolMemoryFlushAppendOnlyWrite(
   tool: AnyAgentTool,
   options: MemoryFlushAppendOnlyWriteOptions,
 ): AnyAgentTool {
-  const allowedAbsolutePath = path.resolve(options.root, options.relativePath);
+  const allowedRelativePath = normalizeDailyMemoryReadPath(options.relativePath);
+  if (!allowedRelativePath) {
+    throw new Error("Memory flush append target must be memory/YYYY-MM-DD.md.");
+  }
+  const allowedAbsolutePath = path.resolve(options.root, allowedRelativePath);
   return {
     ...tool,
-    description: `${tool.description} During memory flush, this tool may only append to ${options.relativePath}.`,
+    description: `${tool.description} During memory flush, this tool may only append to ${allowedRelativePath}.`,
     execute: async (toolCallId, args, signal, onUpdate) => {
       const record = getToolParamsRecord(args);
       const normalizedRecord = record
         ? stripMalformedXmlArgValueSuffixFromKeys(record, ["path"])
         : undefined;
       assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.write, tool.name);
+      const keys = Object.keys(normalizedRecord ?? {});
+      if (
+        keys.some(
+          (key) =>
+            key !== "path" &&
+            key !== "content" &&
+            !isAllowedMemoryFlushAppendMetadata(key, normalizedRecord?.[key]),
+        )
+      ) {
+        throw new Error(
+          `Memory flush writes only accept path and content for ${allowedRelativePath}.`,
+        );
+      }
       const filePath =
         typeof normalizedRecord?.path === "string" && normalizedRecord.path.trim()
           ? normalizedRecord.path
@@ -648,6 +676,11 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
       const content = typeof record?.content === "string" ? record.content : undefined;
       if (!filePath || content === undefined) {
         return tool.execute(toolCallId, args, signal, onUpdate);
+      }
+      if (path.isAbsolute(filePath)) {
+        throw new Error(
+          `Memory flush writes are restricted to relative path ${allowedRelativePath}.`,
+        );
       }
 
       const resolvedPath = resolveToolPathAgainstWorkspaceRoot({
@@ -657,22 +690,25 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
       });
       if (resolvedPath !== allowedAbsolutePath) {
         throw new Error(
-          `Memory flush writes are restricted to ${options.relativePath}; use that path only.`,
+          `Memory flush writes are restricted to ${allowedRelativePath}; use that path only.`,
         );
       }
 
       await appendMemoryFlushContent({
         absolutePath: allowedAbsolutePath,
         root: options.root,
-        relativePath: options.relativePath,
+        relativePath: allowedRelativePath,
         content,
         sandbox: options.sandbox,
         signal,
       });
       return {
-        content: [{ type: "text", text: `Appended content to ${options.relativePath}.` }],
+        content: [{ type: "text", text: `Appended content to ${allowedRelativePath}.` }],
         details: {
-          path: options.relativePath,
+          schema: "openclaw.memory_append_receipt.v1",
+          path: allowedRelativePath,
+          approvedMemoryRoot: "memory",
+          operation: "operational_memory_append",
           appendOnly: true,
         },
       };

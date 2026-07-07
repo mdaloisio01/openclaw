@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { clearAgentHarnesses, registerAgentHarness } from "../../agents/harness/registry.js";
 import type { ChannelMessagingAdapter } from "../../channels/plugins/types.core.js";
@@ -632,6 +635,13 @@ function createDispatcher(): ReplyDispatcher {
     getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
     markComplete: vi.fn(),
   };
+}
+
+async function readOnlyJsonArtifact<T>(dir: string, subdir: string): Promise<T> {
+  const artifactDir = path.join(dir, subdir);
+  const files = await readdir(artifactDir);
+  expect(files).toHaveLength(1);
+  return JSON.parse(await readFile(path.join(artifactDir, files[0]!), "utf8")) as T;
 }
 
 function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
@@ -2869,6 +2879,88 @@ describe("dispatchReplyFromConfig", () => {
         text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
       }),
     );
+  });
+
+  it("injects Continuity Gate persistence into active-run guard when workspace and session context are present", async () => {
+    setNoAbort();
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-dispatch-gate-"));
+    try {
+      const cfg = {
+        agents: {
+          defaults: {
+            verboseDefault: "on",
+            workspace: workspaceDir,
+          },
+        },
+      } satisfies OpenClawConfig;
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "telegram",
+        ChatType: "direct",
+        SessionKey: "agent:main:telegram:direct:continuity-gate",
+      });
+
+      const replyResolver = async (
+        _ctx: MsgContext,
+        opts?: GetReplyOptions,
+        _cfg?: OpenClawConfig,
+      ) => {
+        await opts?.onPlanUpdate?.({
+          phase: "update",
+          steps: ["Inspect code"],
+        });
+        return { text: "done" } satisfies ReplyPayload;
+      };
+
+      await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+      await dispatchFromConfigTesting.activeRunContinuation.flushPersistence(dispatcher);
+
+      const outputDir = path.join(workspaceDir, "var", "continuity_gate_v2", "active_run_guard");
+      const decisionRecord = await readOnlyJsonArtifact<{
+        selected_state: string;
+        active_mission: string;
+        authority_resolution: { winner: string; winnerId: string };
+      }>(outputDir, "cleanup_crew_decision_records");
+      const continueReceipt = await readOnlyJsonArtifact<{
+        selected_state: string;
+        proof_path: string;
+      }>(outputDir, "cleanup_crew_continue_receipts");
+      const trace = await readOnlyJsonArtifact<{
+        selected_state: string;
+        scope: { surfaces: string[]; records: string[] };
+        proof_refs: string[];
+      }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+      expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+      expect(decisionRecord).toMatchObject({
+        selected_state: "CONTINUE_PLAN_NEXT_STEP",
+        active_mission:
+          "Active reply run continuation for agent:main:telegram:direct:continuity-gate",
+        authority_resolution: {
+          winner: "active_mission_lock",
+          winnerId: "active_reply_run:agent:main:telegram:direct:continuity-gate",
+        },
+      });
+      expect(continueReceipt).toMatchObject({
+        selected_state: "CONTINUE_PLAN_NEXT_STEP",
+        proof_path: "agent:main:telegram:direct:continuity-gate",
+      });
+      expect(trace).toMatchObject({
+        selected_state: "CONTINUE_PLAN_NEXT_STEP",
+        scope: {
+          surfaces: ["dispatch-from-config:active-run-continuation-guard"],
+          records: ["plan:Inspect code"],
+        },
+        proof_refs: ["agent:main:telegram:direct:continuity-gate"],
+      });
+      await expect(
+        readdir(path.join(outputDir, "cleanup_crew_stop_reports")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
   });
 
   it("allows terminal closeout after a next executable step starts", async () => {

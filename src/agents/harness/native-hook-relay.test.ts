@@ -74,6 +74,12 @@ function getOnlyNativeHookRelayInvocation() {
   return requireRecord(invocations[0], "native hook relay invocation");
 }
 
+function waitForNativeHookRelayBackgroundWork(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 async function waitForNativeHookRelayBridgeRecord(
   relayId: string,
 ): Promise<Record<string, unknown>> {
@@ -2255,6 +2261,7 @@ describe("native hook relay registry", () => {
     });
 
     expect(response).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+    await waitForNativeHookRelayBackgroundWork();
     const event = getMockCallArg(afterToolCall, 0, 0, "after tool call event");
     expectRecordFields(event, {
       toolName: "exec",
@@ -2273,6 +2280,44 @@ describe("native hook relay registry", () => {
       toolName: "exec",
       toolCallId: "native-call-1",
     });
+  });
+
+  it("does not make Codex PostToolUse wait for after_tool_call observers", async () => {
+    let resolveAfterToolCall: (() => void) | undefined;
+    const afterToolCall = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveAfterToolCall = resolve;
+        }),
+    );
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
+    );
+    const relay = registerNativeHookRelay({
+      provider: "codex",
+      agentId: "agent-1",
+      sessionId: "session-1",
+      sessionKey: "agent:main:session-1",
+      runId: "run-1",
+    });
+
+    const response = await invokeNativeHookRelay({
+      provider: "codex",
+      relayId: relay.relayId,
+      event: "post_tool_use",
+      rawPayload: {
+        hook_event_name: "PostToolUse",
+        tool_name: "Bash",
+        tool_use_id: "native-call-slow",
+        tool_input: { command: "pnpm test" },
+        tool_response: { output: "ok", exit_code: 0 },
+      },
+    });
+
+    expect(response).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+    await waitForNativeHookRelayBackgroundWork();
+    expect(afterToolCall).toHaveBeenCalledTimes(1);
+    resolveAfterToolCall?.();
   });
 
   it("maps Codex MCP PreToolUse to OpenClaw before_tool_call and can block", async () => {
@@ -2419,6 +2464,7 @@ describe("native hook relay registry", () => {
     });
 
     expect(response).toEqual({ stdout: "", stderr: "", exitCode: 0 });
+    await waitForNativeHookRelayBackgroundWork();
     const event = getMockCallArg(afterToolCall, 0, 0, "after tool call event");
     expectRecordFields(event, {
       toolName: "mcp__filesystem__read_file",

@@ -26,6 +26,12 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
+function flushBackgroundWork(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 const mocks = vi.hoisted(() => ({
   getRuntimeConfig: vi.fn(() => ({})),
   resolveDefaultAgentDir: vi.fn(() => "/tmp/agent"),
@@ -315,7 +321,7 @@ describe("models.authStatus", () => {
   it("returns a serialisable snapshot on first call", async () => {
     mocks.buildAuthHealthSummary.mockReturnValue(createOpenAiCodexOauthHealthSummary());
 
-    const opts = createOptions();
+    const opts = createOptions({ refresh: true });
     await handler(opts);
 
     expect(opts.respond).toHaveBeenCalledTimes(1);
@@ -391,7 +397,7 @@ describe("models.authStatus", () => {
       ],
     });
 
-    const opts = createOptions();
+    const opts = createOptions({ refresh: true });
     await handler(opts);
 
     expect(mocks.loadProviderUsageSummary).toHaveBeenCalledWith({
@@ -428,6 +434,7 @@ describe("models.authStatus", () => {
 
       const opts1 = createOptions();
       await handler(opts1);
+      await vi.waitFor(() => expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(1));
       vi.setSystemTime(61_000);
       const opts2 = createOptions();
       await handler(opts2);
@@ -478,12 +485,14 @@ describe("models.authStatus", () => {
       await handler(refreshed);
 
       expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(2);
-      const secondCall = mocks.loadProviderUsageSummary.mock.calls[1]?.[0];
-      expect(secondCall).toMatchObject({
-        providers: ["openai"],
-        agentDir: "/tmp/agent",
-        timeoutMs: 3500,
-      });
+      expect(mocks.loadProviderUsageSummary).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          providers: ["openai"],
+          agentDir: "/tmp/agent",
+          timeoutMs: 3500,
+        }),
+      );
       const [, payload] = firstRespondCall(refreshed) ?? [];
       const result = payload as ModelAuthStatusResult;
       expect(result.providers[0]?.usage?.windows).toEqual([{ label: "5h", usedPercent: 3 }]);
@@ -512,8 +521,9 @@ describe("models.authStatus", () => {
 
       const first = createOptions();
       await handler(first);
+      await vi.waitFor(() => expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(1));
       vi.setSystemTime(61_000);
-      const second = createOptions();
+      const second = createOptions({ refresh: true });
       await handler(second);
 
       expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(2);
@@ -550,14 +560,19 @@ describe("models.authStatus", () => {
       ],
     });
     await Promise.all([firstRun, secondRun]);
+    await flushBackgroundWork();
 
     expect(mocks.loadProviderUsageSummary).toHaveBeenCalledTimes(1);
     for (const opts of [first, second]) {
       const [, payload] = firstRespondCall(opts) ?? [];
-      expect((payload as ModelAuthStatusResult).providers[0]?.usage?.windows).toEqual([
-        { label: "5h", usedPercent: 5 },
-      ]);
+      expect((payload as ModelAuthStatusResult).providers[0]?.usage).toBeUndefined();
     }
+    const third = createOptions();
+    await handler(third);
+    const [, thirdPayload] = firstRespondCall(third) ?? [];
+    expect((thirdPayload as ModelAuthStatusResult).providers[0]?.usage?.windows).toEqual([
+      { label: "5h", usedPercent: 5 },
+    ]);
   });
 
   it("scopes external CLI auth overlays to configured providers", async () => {

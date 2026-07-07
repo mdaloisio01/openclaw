@@ -3,6 +3,8 @@ export const AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION = "task_completion" as co
 export const AGENT_INTERNAL_EVENT_SOURCES = [
   "subagent",
   "cron",
+  "runtime",
+  "tool",
   "image_generation",
   "video_generation",
   "music_generation",

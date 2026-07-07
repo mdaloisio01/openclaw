@@ -1,3 +1,5 @@
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CronServiceContract } from "../cron/service-contract.js";
 import type { CronJob } from "../cron/types.js";
@@ -9,6 +11,7 @@ import {
   installProductionWatchdogLifecycleGate,
   reconcileProductionWatchdogCron,
   resetProductionWatchdogLifecycleGateForTests,
+  resolveProductionWatchdogContinuityGatePersistence,
   resolveProductionWatchdogLifecycleDecision,
 } from "./active-production-watchdog-lifecycle.js";
 import {
@@ -72,7 +75,7 @@ function createCronHarness(enabled: boolean): CronServiceContract & {
   } as unknown as CronServiceContract & { job: CronJob; update: ReturnType<typeof vi.fn> };
 }
 
-async function withTaskState<T>(run: () => Promise<T>): Promise<T> {
+async function withTaskState<T>(run: (stateDir: string) => Promise<T>): Promise<T> {
   return await withOpenClawTestState(
     { layout: "state-only", prefix: "openclaw-production-watchdog-lifecycle-" },
     async (state) => {
@@ -81,7 +84,7 @@ async function withTaskState<T>(run: () => Promise<T>): Promise<T> {
       resetTaskFlowRegistryForTests({ persist: false });
       resetProductionWatchdogLifecycleGateForTests();
       try {
-        return await run();
+        return await run(state.stateDir);
       } finally {
         resetProductionWatchdogLifecycleGateForTests();
         resetTaskRegistryForTests({ persist: false });
@@ -89,6 +92,13 @@ async function withTaskState<T>(run: () => Promise<T>): Promise<T> {
       }
     },
   );
+}
+
+async function readOnlyJsonArtifact<T>(dir: string, subdir: string): Promise<T> {
+  const artifactDir = path.join(dir, subdir);
+  const files = await fs.readdir(artifactDir);
+  expect(files).toHaveLength(1);
+  return JSON.parse(await fs.readFile(path.join(artifactDir, files[0]!), "utf8")) as T;
 }
 
 describe("active production watchdog lifecycle", () => {
@@ -127,6 +137,32 @@ describe("active production watchdog lifecycle", () => {
       });
       expect(cron.job.enabled).toBe(true);
       expect(resolveProductionWatchdogLifecycleDecision().shouldRun).toBe(true);
+    });
+  });
+
+  it("classifies cron update stalls as structured lifecycle update failures", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(false);
+      cron.update = vi.fn(async () => await new Promise<never>(() => {}));
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+      expect(flow).not.toBeNull();
+
+      const result = await reconcileProductionWatchdogCron({ cron });
+
+      expect(result).toMatchObject({
+        ok: false,
+        action: "update-failed",
+        jobId: ACTIVE_WORK_WATCHDOG_CRON_JOB_ID,
+        error: expect.stringContaining(
+          "cron.update active production watchdog lifecycle timed out",
+        ),
+      });
     });
   });
 
@@ -189,6 +225,159 @@ describe("active production watchdog lifecycle", () => {
         }),
       );
       expect(cron.job.enabled).toBe(true);
+    });
+  });
+
+  it("resolves Continuity Gate persistence only for absolute state directories", () => {
+    expect(
+      resolveProductionWatchdogContinuityGatePersistence({ stateDir: undefined }),
+    ).toBeUndefined();
+    expect(
+      resolveProductionWatchdogContinuityGatePersistence({ stateDir: "undefined" }),
+    ).toBeUndefined();
+    expect(
+      resolveProductionWatchdogContinuityGatePersistence({ stateDir: "relative/openclaw-state" }),
+    ).toBeUndefined();
+    expect(
+      resolveProductionWatchdogContinuityGatePersistence({ stateDir: "/tmp/openclaw-state" }),
+    ).toMatchObject({
+      outputDir: path.join(
+        "/tmp/openclaw-state",
+        "var",
+        "continuity_gate_v2",
+        "active_production_watchdog",
+      ),
+    });
+  });
+
+  it("persists Continuity Gate technical continuation evidence when active work keeps the watchdog enabled", async () => {
+    await withTaskState(async (stateDir) => {
+      const cron = createCronHarness(false);
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+      expect(flow).not.toBeNull();
+      const continuityGate = resolveProductionWatchdogContinuityGatePersistence({
+        stateDir,
+        now: "2026-07-04T22:45:00.000Z",
+      });
+
+      const result = await reconcileProductionWatchdogCron({ cron, continuityGate });
+
+      expect(result).toMatchObject({ ok: true, action: "enabled" });
+      const outputDir = path.join(
+        stateDir,
+        "var",
+        "continuity_gate_v2",
+        "active_production_watchdog",
+      );
+      const decisionRecord = await readOnlyJsonArtifact<{
+        selected_state: string;
+        authority_resolution: { winner: string; winnerId: string };
+        technical_vs_product: { lane: string };
+      }>(outputDir, "cleanup_crew_decision_records");
+      const continueReceipt = await readOnlyJsonArtifact<{
+        selected_state: string;
+        repair_action: string;
+      }>(outputDir, "cleanup_crew_continue_receipts");
+      const trace = await readOnlyJsonArtifact<{
+        selected_state: string;
+        technical_vs_product: { lane: string };
+        scope: { surfaces: string[]; records: string[] };
+      }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+      expect(decisionRecord).toMatchObject({
+        selected_state: "CONTINUE_TECHNICAL_REPAIR",
+        authority_resolution: {
+          winner: "active_mission_lock",
+          winnerId: `active_production_watchdog:${flow!.flowId}`,
+        },
+        technical_vs_product: {
+          lane: "technical",
+        },
+      });
+      expect(continueReceipt).toMatchObject({
+        selected_state: "CONTINUE_TECHNICAL_REPAIR",
+      });
+      expect(continueReceipt.repair_action).toContain(
+        "record active production watchdog lifecycle action enabled",
+      );
+      expect(trace).toMatchObject({
+        selected_state: "CONTINUE_TECHNICAL_REPAIR",
+        technical_vs_product: {
+          lane: "technical",
+        },
+        scope: {
+          surfaces: ["active-production-watchdog-lifecycle"],
+          records: expect.arrayContaining([flow!.flowId, "watchdog_action:enabled"]),
+        },
+      });
+      await expect(
+        fs.readdir(path.join(outputDir, "cleanup_crew_stop_reports")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    });
+  });
+
+  it("persists Continuity Gate stop evidence for unresolved unsafe active-work states", async () => {
+    await withTaskState(async (stateDir) => {
+      const cron = createCronHarness(false);
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true, safetyStopPresent: true },
+      });
+      expect(flow).not.toBeNull();
+      const continuityGate = resolveProductionWatchdogContinuityGatePersistence({
+        stateDir,
+        now: "2026-07-04T22:46:00.000Z",
+      });
+
+      const result = await reconcileProductionWatchdogCron({ cron, continuityGate });
+
+      expect(result).toMatchObject({ ok: true, action: "enabled" });
+      const outputDir = path.join(
+        stateDir,
+        "var",
+        "continuity_gate_v2",
+        "active_production_watchdog",
+      );
+      const stopReport = await readOnlyJsonArtifact<{
+        stop_state: string;
+        plain_text_question: string;
+      }>(outputDir, "cleanup_crew_stop_reports");
+      const trace = await readOnlyJsonArtifact<{
+        selected_state: string;
+        authority_resolution: { winner: string; winnerId: string };
+        technical_vs_product: { lane: string };
+      }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+      expect(stopReport).toMatchObject({
+        stop_state: "STOP_UNSAFE_BEHAVIOR_CHANGE",
+        plain_text_question: "No operator action requested unless a human decision is required.",
+      });
+      expect(trace).toMatchObject({
+        selected_state: "STOP_UNSAFE_BEHAVIOR_CHANGE",
+        authority_resolution: {
+          winner: "global_sop",
+          winnerId: `active_production_watchdog:unsafe:${flow!.flowId}`,
+        },
+        technical_vs_product: {
+          lane: "true_unknown",
+        },
+      });
+      await expect(
+        fs.readdir(path.join(outputDir, "cleanup_crew_continue_receipts")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
     });
   });
 });

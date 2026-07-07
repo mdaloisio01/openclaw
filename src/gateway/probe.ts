@@ -82,7 +82,45 @@ export function clampProbeTimeoutMs(timeoutMs: number): number {
 }
 
 function formatProbeCloseError(close: GatewayProbeClose): string {
-  return `gateway closed (${close.code}): ${close.reason}`;
+  const reason = close.reason.trim() || "no close reason";
+  const hint =
+    close.code === 1006
+      ? "abnormal closure (no close frame)"
+      : close.code === 1000
+        ? "normal closure before gateway probe handshake completed"
+        : "";
+  const suffix = hint ? ` ${hint}` : "";
+  return `gateway closed (${close.code}${suffix}): ${reason}`;
+}
+
+function createProbeClose(code: number, reason: string): GatewayProbeClose {
+  if (code === 1000) {
+    return {
+      code,
+      reason,
+      hint: "normal closure before gateway probe handshake completed",
+    };
+  }
+  if (code === 1006) {
+    return {
+      code,
+      reason,
+      hint: "abnormal closure (no close frame)",
+    };
+  }
+  return { code, reason };
+}
+
+function formatProbeEventLoopReadinessTimeout(params: {
+  timeoutMs: number;
+  elapsedMs: number;
+  maxDriftMs: number;
+  checks: number;
+}): string {
+  return (
+    `gateway event loop not ready before probe timeout (${params.timeoutMs}ms)` +
+    `: elapsed=${params.elapsedMs}ms maxDrift=${params.maxDriftMs}ms checks=${params.checks}`
+  );
 }
 
 function resolveDeviceRequiredProbeCacheKey(url: string): string {
@@ -374,7 +412,7 @@ export async function probeGateway(opts: {
         connectErrorDetails = err instanceof GatewayClientRequestError ? err.details : null;
       },
       onClose: (code, reason) => {
-        close = { code, reason };
+        close = createProbeClose(code, reason);
         if (connectLatencyMs == null) {
           settleProbe({
             ok: false,
@@ -491,7 +529,12 @@ export async function probeGateway(opts: {
         }
         settleProbe({
           ok: false,
-          error: "timeout",
+          error: formatProbeEventLoopReadinessTimeout({
+            timeoutMs: initialProbeTimeoutMs,
+            elapsedMs: readiness.elapsedMs,
+            maxDriftMs: readiness.maxDriftMs,
+            checks: readiness.checks,
+          }),
           health: null,
           status: null,
           presence: null,

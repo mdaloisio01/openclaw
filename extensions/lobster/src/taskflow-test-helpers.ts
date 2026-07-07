@@ -34,6 +34,14 @@ export function createFakeTaskFlow(overrides?: Partial<BoundTaskFlow>): BoundTas
       applied: true,
       flow: { ...baseFlow, revision: input.expectedRevision + 1, status: "running" as const },
     })),
+    recordNextExecutableLaunch: vi.fn().mockImplementation((input) => ({
+      applied: true,
+      flow: { ...baseFlow, revision: input.expectedRevision + 1 },
+    })),
+    recordLawfulStop: vi.fn().mockImplementation((input) => ({
+      applied: true,
+      flow: { ...baseFlow, revision: input.expectedRevision + 1, status: "blocked" as const },
+    })),
     finish: vi.fn().mockImplementation((input) => ({
       applied: true,
       flow: { ...baseFlow, revision: input.expectedRevision + 1, status: "completed" as const },

@@ -39,3 +39,7 @@ export type MemoryRemBackfillOptions = MemoryCommandOptions & {
   stageShortTerm?: boolean;
   rollbackShortTerm?: boolean;
 };
+
+export type MemoryFlushProofCommandOptions = MemoryCommandOptions & {
+  content?: string;
+};

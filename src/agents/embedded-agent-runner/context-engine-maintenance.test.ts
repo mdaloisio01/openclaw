@@ -702,8 +702,8 @@ describe("runContextEngineMaintenance", () => {
           },
         });
         const blockedClose = finishFlow({
-          flowId: flow.flowId,
-          expectedRevision: flow.revision,
+          flowId: flow!.flowId,
+          expectedRevision: flow!.revision,
           endedAt: 10,
         });
         if (blockedClose.applied || !blockedClose.current) {

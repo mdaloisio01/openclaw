@@ -35,6 +35,13 @@ const grantRetirementRequestScriptPath = path.join(
   "grant-retirement-request.mjs",
 );
 
+function requireCreatedFlow<T>(flow: T | null): T {
+  if (!flow) {
+    throw new Error("Expected test task flow to be created");
+  }
+  return flow;
+}
+
 const taskExecutorMocks = vi.hoisted(() => ({
   completeTaskRunByRunId: vi.fn(),
   failTaskRunByRunId: vi.fn(),
@@ -141,6 +148,13 @@ function expectFields(value: unknown, expected: Record<string, unknown>): void {
   for (const [key, expectedValue] of Object.entries(expected)) {
     expect(record[key], key).toEqual(expectedValue);
   }
+}
+
+async function readOnlyJsonArtifact<T>(dir: string, subdir: string): Promise<T> {
+  const artifactDir = path.join(dir, subdir);
+  const files = await fs.readdir(artifactDir);
+  expect(files).toHaveLength(1);
+  return JSON.parse(await fs.readFile(path.join(artifactDir, files[0]!), "utf8")) as T;
 }
 
 function firstCall(mock: ReturnType<typeof vi.fn>): ReadonlyArray<unknown> {
@@ -2099,16 +2113,18 @@ describe("subagent registry lifecycle hardening", () => {
         task: "Grant blind-test slice continuity",
         workspaceDir,
       });
-      const flow = createBlindTestSliceFlow({
-        ownerKey: entry.requesterSessionKey,
-        goal: "Grant blind-test slice continuity",
-        sliceKey: "grant-slice-9",
-        subjectAgent: "Grant",
-        continuation: {
-          activeProductionRun: true,
-          parentRunOpen: true,
-        },
-      });
+      const flow = requireCreatedFlow(
+        createBlindTestSliceFlow({
+          ownerKey: entry.requesterSessionKey,
+          goal: "Grant blind-test slice continuity",
+          sliceKey: "grant-slice-9",
+          subjectAgent: "Grant",
+          continuation: {
+            activeProductionRun: true,
+            parentRunOpen: true,
+          },
+        }),
+      );
       createTaskRecord({
         runtime: "subagent",
         ownerKey: entry.requesterSessionKey,
@@ -2150,7 +2166,7 @@ describe("subagent registry lifecycle hardening", () => {
           },
           findings: completionText,
           rawFindings: completionText,
-          taskLabel: entry.label,
+          taskLabel: entry.label ?? entry.runId,
           statusLabel: "completed",
         },
       });
@@ -2199,7 +2215,284 @@ describe("subagent registry lifecycle hardening", () => {
     } finally {
       resetTaskRegistryForTests({ persist: false });
       resetTaskFlowRegistryForTests({ persist: false });
-      process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists Continuity Gate continuation artifacts for mechanical Grant proof failures", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-continuity-mechanical-"));
+    try {
+      const entry = createRunEntry({
+        label: "Grant closeout continuity mechanical",
+        task: "Grant closeout proof repair",
+        workspaceDir,
+      });
+      const controller = createLifecycleController({ entry });
+      const findings =
+        "Run label: Grant closeout continuity mechanical\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof";
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: false,
+            outcomeCode: "rejected_proof_missing",
+            missingFields: [],
+            missingProofPaths: ["no readable proof path found"],
+          },
+          findings,
+          rawFindings: findings,
+          taskLabel: entry.label ?? entry.runId,
+          statusLabel: "completed",
+        },
+      });
+
+      const outputDir = path.join(workspaceDir, "var", "continuity_gate_v2", "grant_closeout_gate");
+      const decisionRecord = await readOnlyJsonArtifact<{
+        selected_state: string;
+        authority_resolution: { winner: string; winnerId: string };
+        technical_vs_product: { lane: string };
+      }>(outputDir, "cleanup_crew_decision_records");
+      const continueReceipt = await readOnlyJsonArtifact<{
+        selected_state: string;
+        repair_action: string;
+      }>(outputDir, "cleanup_crew_continue_receipts");
+      const trace = await readOnlyJsonArtifact<{
+        selected_state: string;
+        owner_level_blocker_audit: string;
+        grant_result: string;
+        scope: { surfaces: string[]; records: string[] };
+        proof_refs: string[];
+      }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+      expect(decisionRecord).toMatchObject({
+        selected_state: "CONTINUE_AFTER_REPAIRABLE_GRANT_REJECTION",
+        authority_resolution: {
+          winner: "active_mission_lock",
+          winnerId: expect.stringMatching(/^grant_retry_/),
+        },
+        technical_vs_product: {
+          lane: "technical",
+        },
+      });
+      expect(continueReceipt).toMatchObject({
+        selected_state: "CONTINUE_AFTER_REPAIRABLE_GRANT_REJECTION",
+      });
+      expect(continueReceipt.repair_action).toContain(
+        "Grant closeout failed (rejected_proof_missing)",
+      );
+      expect(trace).toMatchObject({
+        selected_state: "CONTINUE_AFTER_REPAIRABLE_GRANT_REJECTION",
+        owner_level_blocker_audit: "grant_closeout_gate",
+        grant_result: "continue_repair:MECHANICAL_PROOF_LINK:attempt_1_of_3",
+        scope: {
+          surfaces: ["subagent-registry-lifecycle:grant-closeout-gate"],
+          records: expect.arrayContaining(["rejected_proof_missing"]),
+        },
+      });
+      expect(trace.proof_refs).toContain("no readable proof path found");
+      await expect(
+        fs.readdir(path.join(outputDir, "cleanup_crew_stop_reports")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not persist Continuity Gate Grant artifacts for missing or unsafe workspace values", async () => {
+    const relativeWorkspace = `relative-grant-continuity-${Date.now()}`;
+    const unsafeCases: Array<{
+      label: string;
+      workspaceDir?: string;
+      forbiddenArtifactDir: string;
+    }> = [
+      {
+        label: "missing workspace",
+        workspaceDir: undefined,
+        forbiddenArtifactDir: path.join(
+          process.cwd(),
+          "var",
+          "continuity_gate_v2",
+          "grant_closeout_gate",
+        ),
+      },
+      {
+        label: "undefined workspace",
+        workspaceDir: "undefined",
+        forbiddenArtifactDir: path.join(
+          process.cwd(),
+          "undefined",
+          "var",
+          "continuity_gate_v2",
+          "grant_closeout_gate",
+        ),
+      },
+      {
+        label: "relative workspace",
+        workspaceDir: relativeWorkspace,
+        forbiddenArtifactDir: path.join(
+          process.cwd(),
+          relativeWorkspace,
+          "var",
+          "continuity_gate_v2",
+          "grant_closeout_gate",
+        ),
+      },
+    ];
+
+    for (const unsafeCase of unsafeCases) {
+      const entry = createRunEntry({
+        runId: `run-${unsafeCase.label.replace(/[^a-z]+/g, "-")}`,
+        label: `Grant closeout ${unsafeCase.label}`,
+        task: "Grant closeout unsafe workspace regression",
+        workspaceDir: unsafeCase.workspaceDir,
+      });
+      const controller = createLifecycleController({ entry });
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: false,
+            outcomeCode: "rejected_proof_missing",
+            missingFields: [],
+            missingProofPaths: ["no readable proof path found"],
+          },
+          findings:
+            "Run label: Grant closeout unsafe workspace\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof",
+          rawFindings:
+            "Run label: Grant closeout unsafe workspace\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof",
+          taskLabel: entry.label ?? entry.runId,
+          statusLabel: "completed",
+        },
+      });
+
+      await expect(fs.stat(unsafeCase.forbiddenArtifactDir)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    }
+  });
+
+  it("does not advance Grant Continuity Gate retry attempts from unrelated same-outcome audits", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-continuity-retry-scope-"));
+    try {
+      const auditDir = path.join(workspaceDir, "var", "grant", "after_action_audits");
+      await fs.mkdir(auditDir, { recursive: true });
+      await fs.writeFile(
+        path.join(auditDir, "unrelated_same_outcome.md"),
+        [
+          "# Grant After-Action Audit",
+          "",
+          "[Grant Closeout Gate Result] rejected_proof_missing",
+          "",
+          "This receipt belongs to an unrelated run and must not count against this retry surface.",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const entry = createRunEntry({
+        label: "Grant closeout retry scope",
+        task: "Grant closeout retry surface scoping",
+        workspaceDir,
+      });
+      const controller = createLifecycleController({ entry });
+      const findings =
+        "Run label: Grant closeout retry scope\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof";
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: false,
+            outcomeCode: "rejected_proof_missing",
+            missingFields: [],
+            missingProofPaths: ["no readable proof path found"],
+          },
+          findings,
+          rawFindings: findings,
+          taskLabel: entry.label ?? entry.runId,
+          statusLabel: "completed",
+        },
+      });
+
+      const outputDir = path.join(workspaceDir, "var", "continuity_gate_v2", "grant_closeout_gate");
+      const trace = await readOnlyJsonArtifact<{
+        grant_result: string;
+      }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+      expect(trace.grant_result).toBe("continue_repair:MECHANICAL_PROOF_LINK:attempt_1_of_3");
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists Continuity Gate stop artifacts for semantic Grant safety failures", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "grant-continuity-semantic-"));
+    try {
+      const entry = createRunEntry({
+        label: "Grant closeout continuity semantic",
+        task: "Grant semantic safety closeout",
+        workspaceDir,
+      });
+      const controller = createLifecycleController({ entry });
+      const findings =
+        "Run label: Grant closeout continuity semantic\nWhat is materially real now: slice output is disputed\nWhat is still not real yet: safety truth is unresolved\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: stop and diagnose the semantic safety issue";
+
+      await controller.testing.persistGrantCloseoutGateAudit({
+        entry,
+        result: {
+          assessment: {
+            applies: true,
+            passed: false,
+            outcomeCode: "rejected_semantic_safety",
+            missingFields: [],
+            missingProofPaths: [],
+          },
+          findings,
+          rawFindings: findings,
+          taskLabel: entry.label ?? entry.runId,
+          statusLabel: "completed",
+        },
+      });
+
+      const outputDir = path.join(workspaceDir, "var", "continuity_gate_v2", "grant_closeout_gate");
+      const stopReport = await readOnlyJsonArtifact<{
+        stop_state: string;
+        plain_text_question: string;
+      }>(outputDir, "cleanup_crew_stop_reports");
+      const trace = await readOnlyJsonArtifact<{
+        selected_state: string;
+        grant_result: string;
+        technical_vs_product: { lane: string };
+      }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+      expect(stopReport).toMatchObject({
+        stop_state: "STOP_TRUE_UNKNOWN_BLOCKER",
+        plain_text_question: "No operator action requested unless a human decision is required.",
+      });
+      expect(trace).toMatchObject({
+        selected_state: "STOP_TRUE_UNKNOWN_BLOCKER",
+        grant_result: "stop_or_true_blocker:SEMANTIC_SAFETY:attempt_1_of_1",
+        technical_vs_product: {
+          lane: "true_unknown",
+        },
+      });
+      await expect(
+        fs.readdir(path.join(outputDir, "cleanup_crew_continue_receipts")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+    } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     }
   });
@@ -2216,16 +2509,18 @@ describe("subagent registry lifecycle hardening", () => {
         task: "Grant blind-test slice blocked",
         workspaceDir,
       });
-      const flow = createBlindTestSliceFlow({
-        ownerKey: entry.requesterSessionKey,
-        goal: "Grant blind-test slice blocked",
-        sliceKey: "grant-slice-blocked",
-        subjectAgent: "Grant",
-        continuation: {
-          activeProductionRun: true,
-          parentRunOpen: true,
-        },
-      });
+      const flow = requireCreatedFlow(
+        createBlindTestSliceFlow({
+          ownerKey: entry.requesterSessionKey,
+          goal: "Grant blind-test slice blocked",
+          sliceKey: "grant-slice-blocked",
+          subjectAgent: "Grant",
+          continuation: {
+            activeProductionRun: true,
+            parentRunOpen: true,
+          },
+        }),
+      );
       createTaskRecord({
         runtime: "subagent",
         ownerKey: entry.requesterSessionKey,
@@ -2260,7 +2555,7 @@ describe("subagent registry lifecycle hardening", () => {
             "Run label: Grant closeout blocked\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof",
           rawFindings:
             "Run label: Grant closeout blocked\nWhat is materially real now: slice output exists\nWhat is still not real yet: proof packet is not readable\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: retry the same slice with readable proof",
-          taskLabel: entry.label,
+          taskLabel: entry.label ?? entry.runId,
           statusLabel: "completed",
         },
       });
@@ -2297,16 +2592,18 @@ describe("subagent registry lifecycle hardening", () => {
         task: "Grant blind-test slice passed",
         workspaceDir,
       });
-      const flow = createBlindTestSliceFlow({
-        ownerKey: entry.requesterSessionKey,
-        goal: "Grant blind-test slice passed",
-        sliceKey: "grant-slice-passed",
-        subjectAgent: "Grant",
-        continuation: {
-          activeProductionRun: true,
-          parentRunOpen: true,
-        },
-      });
+      const flow = requireCreatedFlow(
+        createBlindTestSliceFlow({
+          ownerKey: entry.requesterSessionKey,
+          goal: "Grant blind-test slice passed",
+          sliceKey: "grant-slice-passed",
+          subjectAgent: "Grant",
+          continuation: {
+            activeProductionRun: true,
+            parentRunOpen: true,
+          },
+        }),
+      );
       createTaskRecord({
         runtime: "subagent",
         ownerKey: entry.requesterSessionKey,
@@ -2338,7 +2635,7 @@ describe("subagent registry lifecycle hardening", () => {
             "Run label: Grant closeout passed\nWhat is materially real now: proof packet is readable\nWhat is still not real yet: broader build remains open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: continue to the next lawful step",
           rawFindings:
             "Run label: Grant closeout passed\nWhat is materially real now: proof packet is readable\nWhat is still not real yet: broader build remains open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: continue to the next lawful step",
-          taskLabel: entry.label,
+          taskLabel: entry.label ?? entry.runId,
           statusLabel: "passed",
         },
       });
@@ -2369,18 +2666,20 @@ describe("subagent registry lifecycle hardening", () => {
         task: "Grant bounded managed controller",
         workspaceDir,
       });
-      const flow = createManagedTaskFlow({
-        ownerKey: entry.requesterSessionKey,
-        controllerId: "tests/managed-flow",
-        goal: "Mirror generic continuation proof",
-        status: "running",
-        continuation: {
-          activeProductionRun: true,
-          parentRunOpen: true,
-          continuationRequiredAfterLocalSuccess: true,
-          currentUnitStatus: "passed",
-        },
-      });
+      const flow = requireCreatedFlow(
+        createManagedTaskFlow({
+          ownerKey: entry.requesterSessionKey,
+          controllerId: "tests/managed-flow",
+          goal: "Mirror generic continuation proof",
+          status: "running",
+          continuation: {
+            activeProductionRun: true,
+            parentRunOpen: true,
+            continuationRequiredAfterLocalSuccess: true,
+            currentUnitStatus: "passed",
+          },
+        }),
+      );
       createTaskRecord({
         runtime: "subagent",
         ownerKey: entry.requesterSessionKey,
@@ -2411,7 +2710,7 @@ describe("subagent registry lifecycle hardening", () => {
             "Run label: Grant managed continuation mirror\nWhat is materially real now: proof mirrored\nWhat is still not real yet: broader build open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: launch the next bounded unit.",
           rawFindings:
             "Run label: Grant managed continuation mirror\nWhat is materially real now: proof mirrored\nWhat is still not real yet: broader build open\nWho lawfully owns the next step: Will\nOpen/closed truth: owner execution in progress, build still open.\nExact next action: launch the next bounded unit.",
-          taskLabel: entry.label,
+          taskLabel: entry.label ?? entry.runId,
           statusLabel: "passed",
         },
       });

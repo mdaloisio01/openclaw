@@ -1,8 +1,15 @@
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
+import { persistCleanupCrewContinuityGateDecision } from "../commands/cleanup-plan.js";
+import {
+  createGrantRetryKey,
+  resolveGrantRetry,
+  type GrantRejectionType,
+} from "../continuity/continuity-gate-v2.js";
 import type { callGateway as defaultCallGateway } from "../gateway/call.js";
 import { formatErrorMessage, readErrorName } from "../infra/errors.js";
 import { defaultRuntime } from "../runtime.js";
@@ -84,6 +91,11 @@ type BrowserCleanupModule = Pick<
 
 const DELIVERY_MIRROR_HISTORY_MAX_CHARS = 128 * 1024;
 const GRANT_AUDIT_RELATIVE_DIR = path.join("var", "grant", "after_action_audits");
+const CONTINUITY_GATE_GRANT_CLOSEOUT_RELATIVE_DIR = path.join(
+  "var",
+  "continuity_gate_v2",
+  "grant_closeout_gate",
+);
 const GRANT_CORRECTION_QUEUE_RELATIVE_PATH = path.join(
   "var",
   "grant",
@@ -118,6 +130,160 @@ function buildGrantCorrectionSummary(result: GrantCloseoutGateResult): string {
   return `Grant closeout failed (${outcome}). What was wrong: ${fixes.join(
     "; ",
   )}. Fix it and retry the same slice now. Do not advance to adjacent work.`;
+}
+
+function classifyGrantCloseoutGateRejection(outcomeCode: string | undefined): GrantRejectionType {
+  switch (outcomeCode) {
+    case "rejected_closeout_missing_truth":
+      return "MECHANICAL_CLOSEOUT_FORMAT";
+    case "rejected_proof_missing":
+      return "MECHANICAL_PROOF_LINK";
+    case "rejected_scope_expansion":
+      return "SCOPE_EXPANSION";
+    case "rejected_semantic_safety":
+    case "rejected_false_success_state":
+      return "SEMANTIC_SAFETY";
+    default:
+      return "UNKNOWN_REVIEW_BLOCKER";
+  }
+}
+
+function resolveSafeGrantWorkspaceDir(workspaceDir: string | undefined): string | undefined {
+  const trimmed = workspaceDir?.trim();
+  if (!trimmed || trimmed === "undefined" || !path.isAbsolute(trimmed)) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function buildGrantCloseoutRetrySurfaceId(params: {
+  entry: SubagentRunRecord;
+  result: GrantCloseoutGateResult;
+  rejectionType: GrantRejectionType;
+}): string {
+  const fileSurfaceHash = createHash("sha256")
+    .update(
+      JSON.stringify({
+        task: params.entry.task ?? params.result.taskLabel ?? "",
+        missingFields: params.result.assessment.missingFields ?? [],
+        missingProofPaths: params.result.assessment.missingProofPaths ?? [],
+        outcomeCode: params.result.assessment.outcomeCode ?? "unknown",
+      }),
+    )
+    .digest("hex");
+  return createGrantRetryKey({
+    rejectionType: params.rejectionType,
+    fileSurfaceHash,
+    artifactId: `grant_closeout_gate:${params.entry.runId}:${
+      params.result.assessment.outcomeCode ?? "unknown"
+    }`,
+  });
+}
+
+async function countGrantContinuityDecisionsForRetrySurface(params: {
+  outputDir: string;
+  retrySurfaceId: string;
+}): Promise<number> {
+  const decisionDir = path.join(params.outputDir, "cleanup_crew_decision_records");
+  try {
+    const entries = await fs.readdir(decisionDir);
+    let count = 0;
+    for (const name of entries) {
+      if (!name.endsWith(".json")) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(await fs.readFile(path.join(decisionDir, name), "utf8")) as {
+          authority_resolution?: { winnerId?: unknown };
+        };
+        if (parsed.authority_resolution?.winnerId === params.retrySurfaceId) {
+          count += 1;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+async function persistGrantCloseoutContinuityGateDecision(params: {
+  workspaceDir: string;
+  entry: SubagentRunRecord;
+  result: GrantCloseoutGateResult;
+  correctionSummary: string;
+  auditPath?: string;
+}): Promise<void> {
+  const workspaceDir = resolveSafeGrantWorkspaceDir(params.workspaceDir);
+  if (!workspaceDir) {
+    return;
+  }
+  const rejectionType = classifyGrantCloseoutGateRejection(params.result.assessment.outcomeCode);
+  const retrySurfaceId = buildGrantCloseoutRetrySurfaceId({
+    entry: params.entry,
+    result: params.result,
+    rejectionType,
+  });
+  const outputDir = path.join(workspaceDir, CONTINUITY_GATE_GRANT_CLOSEOUT_RELATIVE_DIR);
+  const priorAttempts = await countGrantContinuityDecisionsForRetrySurface({
+    outputDir,
+    retrySurfaceId,
+  });
+  const retry = resolveGrantRetry({
+    retrySurfaceId,
+    rejectionType,
+    priorAttempts,
+  });
+  const canContinue = retry.result === "continue_repair";
+  await persistCleanupCrewContinuityGateDecision({
+    outputDir,
+    activeMission:
+      params.entry.task ??
+      params.result.taskLabel ??
+      `Grant closeout gate repair for ${params.entry.runId}`,
+    now: new Date().toISOString(),
+    authoritySources: [
+      {
+        kind: "active_mission_lock",
+        id: retrySurfaceId,
+        summary: `Grant closeout gate result ${params.result.assessment.outcomeCode ?? "unknown"} for ${params.entry.label ?? params.result.taskLabel ?? params.entry.runId}`,
+        active: true,
+      },
+    ],
+    issue: {
+      summary: params.correctionSummary,
+      blocker: canContinue ? "grant rejected" : "Grant semantic/safety closeout issue",
+      pathRisk: canContinue ? "MEDIUM_RISK_RUNTIME" : "CRITICAL_CONTROL",
+      diffIntent: canContinue ? "mechanical_format" : "unknown_intent",
+      behaviorImpact: canContinue ? "technical" : "true_unknown",
+      safeTechnicalPathDescription: canContinue ? params.correctionSummary : undefined,
+      ownerLevelBlockerAudit: "grant_closeout_gate",
+    },
+    scope: {
+      files: ["src/agents/subagent-registry-lifecycle.ts"],
+      records: [
+        params.result.assessment.outcomeCode ?? "unknown_grant_closeout_outcome",
+        ...(params.auditPath ? [params.auditPath] : []),
+      ],
+      commands: [],
+    },
+    repairAction: canContinue
+      ? params.correctionSummary
+      : "stop Grant closeout continuation until semantic/safety issue is diagnosed",
+    proofPath: params.auditPath ?? params.entry.runId,
+    diagnostic: {
+      surfaces: ["subagent-registry-lifecycle:grant-closeout-gate"],
+      grantResult: `${retry.result}:${rejectionType}:attempt_${retry.attempt}_of_${retry.maxAttempts}`,
+      proofRefs: [
+        params.entry.runId,
+        ...(params.result.assessment.missingProofPaths ?? []),
+        ...(params.auditPath ? [params.auditPath] : []),
+      ],
+      redactionStatus: "no_sensitive_payloads",
+    },
+  });
 }
 
 function buildRel002QueueSummary(correctionSummary: string): string {
@@ -1338,7 +1504,7 @@ export function createSubagentRegistryLifecycleController(params: {
       correctionCandidateQueuedAt: previousGate?.correctionCandidateQueuedAt,
     };
 
-    const workspaceDir = args.entry.workspaceDir?.trim();
+    const workspaceDir = resolveSafeGrantWorkspaceDir(args.entry.workspaceDir);
     if (workspaceDir) {
       await processGrantCorrectionRetirementsIfReady(workspaceDir);
     }
@@ -1531,6 +1697,13 @@ export function createSubagentRegistryLifecycleController(params: {
     const candidateLabel = args.result.assessment.outcomeCode
       ? `grant-${args.result.assessment.outcomeCode}`
       : "grant-closeout-gate";
+    await persistGrantCloseoutContinuityGateDecision({
+      workspaceDir,
+      entry: args.entry,
+      result: args.result,
+      correctionSummary,
+      auditPath,
+    });
 
     const auditLines = [
       "# Grant After-Action Audit",

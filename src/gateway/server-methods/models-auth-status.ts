@@ -229,7 +229,7 @@ async function loadUsageSummaryForAuthStatus(params: {
   measure: (name: string, durationMs: number) => void;
 }): Promise<{
   usageByProvider: Map<string, ProviderUsageStatus>;
-  cacheStatus: "skipped" | "hit" | "miss" | "inflight" | "bypass";
+  cacheStatus: "skipped" | "hit" | "stale" | "warming" | "inflight" | "miss" | "bypass";
 }> {
   if (params.providers.length === 0) {
     params.mark("usage_skipped");
@@ -251,10 +251,7 @@ async function loadUsageSummaryForAuthStatus(params: {
     }
     if (usageSummaryInFlight?.key === key) {
       params.mark("usage_cache_inflight");
-      return {
-        usageByProvider: new Map(await usageSummaryInFlight.promise),
-        cacheStatus: "inflight",
-      };
+      return { usageByProvider: new Map(), cacheStatus: "inflight" };
     }
   }
   params.mark(params.bypassCache ? "usage_cache_bypass" : "usage_cache_miss");
@@ -283,13 +280,23 @@ async function loadUsageSummaryForAuthStatus(params: {
   }
   const promise = load();
   usageSummaryInFlight = { key, promise };
-  try {
-    return { usageByProvider: await promise, cacheStatus: "miss" };
-  } finally {
-    if (usageSummaryInFlight?.promise === promise) {
-      usageSummaryInFlight = null;
-    }
+  void promise
+    .catch((err) => {
+      log.debug(
+        `usage enrichment warm failed (auth status still returned): providers=${params.providers.join(",")} error=${formatForLog(err)}`,
+      );
+    })
+    .finally(() => {
+      if (usageSummaryInFlight?.promise === promise) {
+        usageSummaryInFlight = null;
+      }
+    });
+  if (usageSummaryCache?.key === key) {
+    params.mark("usage_cache_stale");
+    return { usageByProvider: new Map(usageSummaryCache.result), cacheStatus: "stale" };
   }
+  params.mark("usage_cache_warming");
+  return { usageByProvider: new Map(), cacheStatus: "warming" };
 }
 
 /**
@@ -612,7 +619,14 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       perf.mark("usage_provider_ids");
 
       let usageByProvider = new Map<string, ProviderUsageStatus>();
-      let usageCacheStatus: "skipped" | "hit" | "miss" | "inflight" | "bypass" = "skipped";
+      let usageCacheStatus:
+        | "skipped"
+        | "hit"
+        | "stale"
+        | "warming"
+        | "inflight"
+        | "miss"
+        | "bypass" = "skipped";
       try {
         const usage = await loadUsageSummaryForAuthStatus({
           providers: usageProviderIds,
@@ -640,7 +654,9 @@ export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
       );
       perf.mark("map_providers");
       const result: ModelAuthStatusResult = { ts: now, providers };
-      cached = { ts: now, result };
+      if (usageCacheStatus !== "warming" && usageCacheStatus !== "inflight") {
+        cached = { ts: now, result };
+      }
       perf.mark("response_build");
       logPerf(
         `cached=false refresh=${bypassCache} configuredProviders=${configured.providers.length} ` +

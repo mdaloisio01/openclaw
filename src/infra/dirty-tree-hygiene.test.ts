@@ -17,6 +17,7 @@ describe("dirty-tree hygiene report", () => {
       stagedCount: 0,
       unstagedCount: 0,
       untrackedCount: 0,
+      generatedOutputCount: 0,
       summary: "clean",
     });
     expect(report.entries).toEqual([]);
@@ -41,6 +42,7 @@ describe("dirty-tree hygiene report", () => {
     expect(report.stagedCount).toBe(3);
     expect(report.unstagedCount).toBe(2);
     expect(report.untrackedCount).toBe(1);
+    expect(report.generatedOutputCount).toBe(0);
     expect(report.groups.map((group) => group.group).toSorted()).toEqual([
       "codex-app-server",
       "gateway-auto-reply-routing",
@@ -53,6 +55,28 @@ describe("dirty-tree hygiene report", () => {
     expect(report.summary).toContain("staged=3");
     expect(report.summary).toContain("unstaged=2");
     expect(report.summary).toContain("untracked=1");
+    expect(report.summary).toContain("generated_output=0");
+  });
+
+  it("reports generated output without treating it as source package-boundary poison", () => {
+    const report = buildDirtyTreeHygieneReport(
+      [
+        "?? dist.broken-2026-07-07T055954357Z/",
+        "?? dist-runtime.broken-2026-07-07T055957333Z/",
+        "?? file_hub/exports/cleanup-proof.md",
+      ].join("\n"),
+    );
+
+    expect(report.clean).toBe(false);
+    expect(report.risk).toBe("single-package");
+    expect(report.packageBoundaryCount).toBe(0);
+    expect(report.broadMixed).toBe(false);
+    expect(report.generatedOutputCount).toBe(3);
+    expect(report.groups).toHaveLength(1);
+    expect(report.groups[0]?.group).toBe("generated-output");
+    expect(report.sourceGroups).toEqual([]);
+    expect(report.summary).toContain("0 package boundaries");
+    expect(report.summary).toContain("generated_output=3");
   });
 
   it("keeps single-package dirt separate from broad mixed tree risk", () => {
@@ -88,6 +112,7 @@ describe("dirty-tree hygiene report", () => {
         unstaged: false,
         untracked: false,
         group: "taskflow-state",
+        generatedOutput: false,
       },
     ]);
   });
@@ -99,6 +124,7 @@ describe("dirty-tree hygiene report", () => {
     ["src/gateway/server-methods/tasks.ts", "gateway-auto-reply-routing"],
     ["src/state/openclaw-state-schema.sql", "state-schema-storage"],
     ["src/cli/system-cli.ts", "cli-config-cron-infra"],
+    ["dist.broken-2026-07-07T055954357Z/index.js", "generated-output"],
     ["unknown/file.txt", "unknown"],
   ] as const)("classifies %s as %s", (path, group) => {
     expect(classifyDirtyTreePackageGroup(path)).toBe(group);

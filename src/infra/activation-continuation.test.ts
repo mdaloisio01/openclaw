@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   persistActivationContinuationBeforeRestart,
   recoverPendingActivationContinuations,
+  resolveActivationContinuationContinuityGatePersistence,
   resumeActivationContinuation,
   testing,
   type ActivationContinuationCheckName,
@@ -30,7 +31,34 @@ function passCheck(name: ActivationContinuationCheckName): ActivationContinuatio
   return { name, status: "pass", detail: "ok" };
 }
 
+function continuityGateOutputDir(root = stateDir): string {
+  return path.join(root, "var", "continuity_gate_v2", "activation_continuation");
+}
+
+async function readJsonArtifacts<T>(dir: string, subdir: string): Promise<T[]> {
+  const artifactDir = path.join(dir, subdir);
+  const files = await fs.readdir(artifactDir);
+  return await Promise.all(
+    files.map(
+      async (file) => JSON.parse(await fs.readFile(path.join(artifactDir, file), "utf8")) as T,
+    ),
+  );
+}
+
 describe("activation restart continuations", () => {
+  it("resolves Continuity Gate persistence only for absolute activation state directories", () => {
+    expect(resolveActivationContinuationContinuityGatePersistence()).toBeUndefined();
+    expect(
+      resolveActivationContinuationContinuityGatePersistence({ stateDir: "undefined" }),
+    ).toBeUndefined();
+    expect(
+      resolveActivationContinuationContinuityGatePersistence({ stateDir: "relative-state" }),
+    ).toBeUndefined();
+    expect(resolveActivationContinuationContinuityGatePersistence({ stateDir })).toMatchObject({
+      outputDir: continuityGateOutputDir(),
+    });
+  });
+
   it("persists a pending continuation before restart dispatch", async () => {
     const record = await persistActivationContinuationBeforeRestart(
       {
@@ -61,6 +89,121 @@ describe("activation restart continuations", () => {
         skipDeferral: true,
       },
     });
+  });
+
+  it("defaults restart continuations to the required runtime proof bundle", async () => {
+    const record = await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-default-proof-bundle",
+        now: 10,
+        route: { sessionKey: "main" },
+        objective: "activate patched gateway",
+        expectedRuntime: { commit: "abc" },
+      },
+      { stateDir },
+    );
+
+    expect(record.requiredChecks).toEqual([
+      "systemd",
+      "gateway_status_rpc",
+      "http_health",
+      "runtime_identity",
+      "log_scan",
+    ]);
+
+    await recoverPendingActivationContinuations({
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      check: async (_record, check) =>
+        check === "runtime_identity"
+          ? { name: check, status: "fail", detail: "build-info missing from runtime" }
+          : passCheck(check),
+      deliver: () => {},
+    });
+
+    const store = await testing.readStore(stateDir);
+    expect(store.records[0]).toMatchObject({
+      id: "activation-default-proof-bundle",
+      status: "continuation_blocked",
+    });
+    expect(store.records[0]?.result?.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: "systemd", status: "pass" }),
+        expect.objectContaining({ name: "gateway_status_rpc", status: "pass" }),
+        expect.objectContaining({ name: "http_health", status: "pass" }),
+        expect.objectContaining({
+          name: "runtime_identity",
+          status: "fail",
+          detail: "build-info missing from runtime",
+        }),
+        expect.objectContaining({ name: "log_scan", status: "pass" }),
+      ]),
+    );
+    expect(store.records[0]?.result?.message).toContain("runtime_identity=fail");
+    expect(store.records[0]?.blockerPath).toBeTruthy();
+  });
+
+  it("persists Continuity Gate continuation evidence for restart deferral before dispatch", async () => {
+    await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-deferral-continuity",
+        now: 10,
+        route: { sessionKey: "main" },
+        objective: "activate patched gateway",
+        requiredChecks: ["http_health"],
+        requestedRestartAction: { reason: "activation", skipDeferral: true },
+      },
+      { stateDir },
+    );
+
+    const outputDir = continuityGateOutputDir();
+    const decisionRecords = await readJsonArtifacts<{
+      selected_state: string;
+      authority_resolution: { winner: string; winnerId: string };
+      technical_vs_product: { lane: string };
+    }>(outputDir, "cleanup_crew_decision_records");
+    const continueReceipts = await readJsonArtifacts<{
+      selected_state: string;
+      repair_action: string;
+    }>(outputDir, "cleanup_crew_continue_receipts");
+    const traces = await readJsonArtifacts<{
+      selected_state: string;
+      scope: { records: string[] };
+      technical_vs_product: { lane: string };
+    }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+    expect(decisionRecords).toContainEqual(
+      expect.objectContaining({
+        selected_state: "CONTINUE_AFTER_RUNTIME_PROOF_REPAIR",
+        authority_resolution: expect.objectContaining({
+          winner: "active_mission_lock",
+          winnerId: "activation_continuation:activation-deferral-continuity",
+        }),
+        technical_vs_product: expect.objectContaining({ lane: "technical" }),
+      }),
+    );
+    expect(continueReceipts).toContainEqual(
+      expect.objectContaining({
+        selected_state: "CONTINUE_AFTER_RUNTIME_PROOF_REPAIR",
+        repair_action: "resume activation continuation after restart and produce runtime proof",
+      }),
+    );
+    expect(traces).toContainEqual(
+      expect.objectContaining({
+        selected_state: "CONTINUE_AFTER_RUNTIME_PROOF_REPAIR",
+        technical_vs_product: expect.objectContaining({ lane: "technical" }),
+        scope: expect.objectContaining({
+          records: expect.arrayContaining([
+            "activation-deferral-continuity",
+            "activation_status:pending_restart",
+          ]),
+        }),
+      }),
+    );
+    await expect(
+      fs.readdir(path.join(outputDir, "cleanup_crew_stop_reports")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("loads pending continuations on startup and reports completion after checks pass", async () => {
@@ -188,6 +331,203 @@ describe("activation restart continuations", () => {
     const blocker = await fs.readFile(blockerPath ?? "", "utf8");
     expect(blocker).toContain("Missing proof/check: manual:yield-resume");
     expect(blocker).toContain("Exact next repair step:");
+  });
+
+  it("persists Continuity Gate continuation evidence for runtime proof gaps", async () => {
+    await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-proof-gap-continuity",
+        now: 100,
+        route: { sessionKey: "main" },
+        requiredChecks: ["http_health", "manual:yield-resume"],
+      },
+      { stateDir },
+    );
+
+    await recoverPendingActivationContinuations({
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      check: async (_record, check) =>
+        check === "http_health"
+          ? passCheck(check)
+          : { name: check, status: "fail", detail: "missing smoke proof" },
+      deliver: () => {},
+    });
+
+    const outputDir = continuityGateOutputDir();
+    const traces = await readJsonArtifacts<{
+      selected_state: string;
+      scope: { records: string[] };
+      technical_vs_product: { lane: string };
+    }>(outputDir, "cleanup_crew_diagnostic_traces");
+    const continueReceipts = await readJsonArtifacts<{
+      selected_state: string;
+      repair_action: string;
+    }>(outputDir, "cleanup_crew_continue_receipts");
+
+    expect(traces).toContainEqual(
+      expect.objectContaining({
+        selected_state: "CONTINUE_AFTER_RUNTIME_PROOF_REPAIR",
+        technical_vs_product: expect.objectContaining({ lane: "technical" }),
+        scope: expect.objectContaining({
+          records: expect.arrayContaining([
+            "activation-proof-gap-continuity",
+            "activation_status:continuation_blocked",
+            "manual:yield-resume:fail:missing smoke proof",
+          ]),
+        }),
+      }),
+    );
+    expect(continueReceipts).toContainEqual(
+      expect.objectContaining({
+        selected_state: "CONTINUE_AFTER_RUNTIME_PROOF_REPAIR",
+        repair_action:
+          "repair the failing runtime proof checks and allow activation continuation recovery to retry",
+      }),
+    );
+  });
+
+  it("persists Continuity Gate stop evidence when restart recovery expires unresolved", async () => {
+    const record = await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-expired-continuity",
+        now: 100,
+        ttlMs: 1,
+        route: { sessionKey: "main" },
+        requiredChecks: ["http_health"],
+      },
+      { stateDir },
+    );
+
+    await resumeActivationContinuation(record, {
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      check: async (_record, check) => passCheck(check),
+      deliver: () => {},
+    });
+
+    const outputDir = continuityGateOutputDir();
+    const stopReports = await readJsonArtifacts<{
+      stop_state: string;
+      plain_text_question: string;
+    }>(outputDir, "cleanup_crew_stop_reports");
+    const traces = await readJsonArtifacts<{
+      selected_state: string;
+      technical_vs_product: { lane: string };
+      scope: { records: string[] };
+    }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+    expect(stopReports).toContainEqual(
+      expect.objectContaining({
+        stop_state: "STOP_TRUE_UNKNOWN_BLOCKER",
+        plain_text_question: "No operator action requested unless a human decision is required.",
+      }),
+    );
+    expect(traces).toContainEqual(
+      expect.objectContaining({
+        selected_state: "STOP_TRUE_UNKNOWN_BLOCKER",
+        technical_vs_product: expect.objectContaining({ lane: "true_unknown" }),
+        scope: expect.objectContaining({
+          records: expect.arrayContaining([
+            "activation-expired-continuity",
+            "activation_status:expired_before_recovery",
+          ]),
+        }),
+      }),
+    );
+  });
+
+  it("persists diagnostic-only Continuity Gate evidence for answer-only restart recovery overrides", async () => {
+    const record = await testing.createContinuationRecord({
+      id: "activation-answer-only-continuity",
+      now: 100,
+      route: { sessionKey: "main" },
+      requiredChecks: ["http_health"],
+    });
+    await testing.writeStore({ version: 1, records: [record] }, stateDir);
+
+    const check = vi.fn(async (_record, checkName: ActivationContinuationCheckName) =>
+      passCheck(checkName),
+    );
+    const deliver = vi.fn();
+
+    const result = await resumeActivationContinuation(record, {
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      continuityGate: {
+        outputDir: continuityGateOutputDir(),
+        now: "2026-07-04T23:10:00.000Z",
+        userInstruction: "inspect only",
+      },
+      check,
+      deliver,
+    });
+
+    const store = await testing.readStore(stateDir);
+    const outputDir = continuityGateOutputDir();
+    const traces = await readJsonArtifacts<{
+      selected_state: string;
+      scope: { records: string[] };
+    }>(outputDir, "cleanup_crew_diagnostic_traces");
+
+    expect(traces).toContainEqual(
+      expect.objectContaining({
+        selected_state: "STOP_USER_ANSWER_ONLY_OVERRIDE",
+        scope: expect.objectContaining({
+          records: expect.arrayContaining(["activation-answer-only-continuity"]),
+        }),
+      }),
+    );
+    expect(result.status).toBe("pending_restart");
+    expect(store.records[0]).toMatchObject({
+      id: "activation-answer-only-continuity",
+      status: "pending_restart",
+    });
+    expect(store.records[0]?.closeoutPath).toBeUndefined();
+    expect(store.records[0]?.blockerPath).toBeUndefined();
+    expect(check).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    await expect(fs.readdir(exportsDir)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      fs.readdir(path.join(outputDir, "cleanup_crew_continue_receipts")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      fs.readdir(path.join(outputDir, "cleanup_crew_stop_reports")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not persist a Continuity Gate repair receipt for successful completed recovery", async () => {
+    const record = await testing.createContinuationRecord({
+      id: "activation-success-continuity",
+      now: 100,
+      route: { sessionKey: "main" },
+      requiredChecks: ["http_health"],
+    });
+    await testing.writeStore({ version: 1, records: [record] }, stateDir);
+
+    const result = await resumeActivationContinuation(record, {
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      continuityGate: {
+        outputDir: continuityGateOutputDir(),
+        now: "2026-07-04T23:11:00.000Z",
+      },
+      check: async (_record, check) => passCheck(check),
+      deliver: () => {},
+    });
+
+    expect(result.status).toBe("continuation_completed");
+    await expect(fs.stat(result.closeoutPath ?? "")).resolves.toBeTruthy();
+    await expect(
+      fs.readdir(path.join(continuityGateOutputDir(), "cleanup_crew_continue_receipts")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      fs.readdir(path.join(continuityGateOutputDir(), "cleanup_crew_decision_records")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("blocks instead of completing when no visible delivery route exists", async () => {

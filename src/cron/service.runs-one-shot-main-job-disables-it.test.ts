@@ -482,7 +482,10 @@ describe("CronService", () => {
     await cron.run(job.id, "force");
 
     expect(runHeartbeatOnce).toHaveBeenCalledTimes(1);
-    expect(runHeartbeatOnce.mock.calls[0]?.[0]).toMatchObject({
+    const heartbeatCall = runHeartbeatOnce.mock.calls[0] as unknown as
+      | [Record<string, unknown>]
+      | undefined;
+    expect(heartbeatCall?.[0]).toMatchObject({
       source: "cron",
       intent: "immediate",
       reason: `cron:${job.id}`,

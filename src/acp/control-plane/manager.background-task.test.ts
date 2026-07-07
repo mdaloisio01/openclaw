@@ -24,20 +24,23 @@ import type { AcpSessionManagerDeps } from "./manager.types.js";
 
 function makeDeps(entries: Record<string, Partial<SessionEntry>>): AcpSessionManagerDeps {
   return {
-    listAcpSessions: () => [],
+    listAcpSessions: async () => [],
     readSessionEntry: ({ sessionKey }: { sessionKey: string }) => {
       const entry = entries[sessionKey];
       return entry
         ? {
+            cfg: {} as OpenClawConfig,
+            storePath: "test-acp-session-store.json",
             sessionKey,
+            storeSessionKey: sessionKey,
             entry: entry as SessionEntry,
           }
-        : undefined;
+        : null;
     },
     upsertSessionMeta: async () => {
       throw new Error("not used");
     },
-    getRuntimeBackend: () => undefined,
+    getRuntimeBackend: () => null,
     requireRuntimeBackend: () => {
       throw new Error("not used");
     },
@@ -62,8 +65,8 @@ describe("acp background-task continuation linkage", () => {
       },
     });
     const blockedClose = finishFlow({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
+      flowId: flow!.flowId,
+      expectedRevision: flow!.revision,
       endedAt: 200,
     });
     if (blockedClose.applied || !blockedClose.current) {
@@ -184,8 +187,8 @@ describe("acp background-task continuation linkage", () => {
       },
     });
     const blockedFlow = recordFlowLawfulStop({
-      flowId: flow.flowId,
-      expectedRevision: flow.revision,
+      flowId: flow!.flowId,
+      expectedRevision: flow!.revision,
       reason: "blocker",
       detail: "Waiting on ACP blocker.",
       updatedAt: 300,

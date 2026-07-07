@@ -10,6 +10,7 @@ import {
 } from "openclaw/plugin-sdk/number-runtime";
 import type {
   MemoryCommandOptions,
+  MemoryFlushProofCommandOptions,
   MemoryPromoteCommandOptions,
   MemoryPromoteExplainOptions,
   MemoryRemBackfillOptions,
@@ -69,6 +70,11 @@ async function runMemoryRemHarness(opts: MemoryRemHarnessOptions) {
 async function runMemoryRemBackfill(opts: MemoryRemBackfillOptions) {
   const runtime = await loadMemoryCliRuntime();
   await runtime.runMemoryRemBackfill(opts);
+}
+
+async function runMemoryFlushProof(opts: MemoryFlushProofCommandOptions) {
+  const runtime = await loadMemoryCliRuntime();
+  await runtime.runMemoryFlushProofCommand(opts);
 }
 
 function invalidCliArgument(message: string): Error & { code: string; exitCode: number } {
@@ -231,6 +237,16 @@ export function registerMemoryCli(program: Command) {
     .option("--json", "Print JSON")
     .action(async (selectorArg: string | undefined, opts: MemoryPromoteExplainOptions) => {
       await runMemoryPromoteExplain(selectorArg, opts);
+    });
+
+  memory
+    .command("flush-proof", { hidden: true })
+    .description("Internal proof: append through the memory-triggered flush write path")
+    .option("--agent <id>", "Agent id (default: default agent)")
+    .option("--content <text>", "Proof note content to append")
+    .option("--json", "Print JSON")
+    .action(async (opts: MemoryFlushProofCommandOptions) => {
+      await runMemoryFlushProof(opts);
     });
 
   memory

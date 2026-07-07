@@ -189,7 +189,7 @@ describe("task domain view mappers", () => {
       makeTask({
         runtime: "cli",
         status: "succeeded",
-        parentFlowId: flow.flowId,
+        parentFlowId: flow!.flowId,
         parentTaskId: "task-parent",
       }),
     );

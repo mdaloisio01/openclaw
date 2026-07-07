@@ -20,6 +20,11 @@ export {
   resolveSessionAgentIds,
 } from "../agents/agent-scope.js";
 export { resolveMemorySearchConfig } from "../agents/memory-search.js";
+export {
+  runMemoryFlushProof,
+  type MemoryFlushProofOptions,
+  type MemoryFlushProofResult,
+} from "../commands/memory-flush-proof.js";
 export { parseNonNegativeByteSize } from "../config/byte-size.js";
 export { getRuntimeConfig, loadConfig } from "../config/config.js";
 export type { OpenClawConfig } from "../config/config.js";
