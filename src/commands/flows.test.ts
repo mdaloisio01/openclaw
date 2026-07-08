@@ -14,6 +14,7 @@ import {
 import type { TaskRecord } from "../tasks/task-registry.types.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
+  flowsBlockedRowsCommand,
   flowsCancelCommand,
   flowsLawfulStopCommand,
   flowsListCommand,
@@ -190,6 +191,73 @@ describe("flows commands", () => {
           },
         ],
       });
+    });
+  });
+
+  it("classifies blocked TaskFlow rows without mutating state", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      const gieFlow = createManagedTaskFlow({
+        ownerKey: "gie-phase1-sadb-runtime",
+        controllerId: "will-orchestrator/gie",
+        goal: "Dispatch GIE Phase 1 SADB runtime implementation",
+        status: "blocked",
+        currentStep: "blocked_sadb_child_lost_backing_session_missing",
+        blockedSummary: "SADB child is lost because backing session is missing.",
+        createdAt: 100,
+        updatedAt: 100,
+      });
+      const historicalFlow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/flows-command",
+        goal: "Grant review slice",
+        status: "blocked",
+        blockedSummary: "CHILD_RESULT_REJECTED :: Grant closeout failed (rejected_proof_missing).",
+        createdAt: 200,
+        updatedAt: 200,
+      });
+      const staleFlow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/flows-command",
+        goal: "Foreground Cleanup Crew production mission",
+        status: "blocked",
+        currentStep: "foreground_cleanup_crew_lost_child_reconciled",
+        blockedSummary: "lost child reconciled",
+        createdAt: 300,
+        updatedAt: 300,
+      });
+
+      const runtime = createRuntime();
+      await flowsBlockedRowsCommand({ json: true }, runtime);
+
+      expect(runtime.log).not.toHaveBeenCalled();
+      const payload = jsonRoundTrip(vi.mocked(runtime.writeJson).mock.calls[0]?.[0]);
+
+      expect(payload).toMatchObject({
+        count: 3,
+        byClassification: {
+          current_lawful_blocker: 0,
+          historical_closeout_proof_debt: 1,
+          superseded: 1,
+          requires_new_work_order: 1,
+          unsupported_manual_review: 0,
+        },
+      });
+      expect(payload.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            flowId: gieFlow.flowId,
+            classification: "requires_new_work_order",
+          }),
+          expect.objectContaining({
+            flowId: historicalFlow.flowId,
+            classification: "historical_closeout_proof_debt",
+          }),
+          expect.objectContaining({
+            flowId: staleFlow.flowId,
+            classification: "superseded",
+          }),
+        ]),
+      );
     });
   });
 

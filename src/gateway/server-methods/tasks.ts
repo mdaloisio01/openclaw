@@ -24,6 +24,7 @@ import { getTaskById, listTaskRecords, listTasksForFlowId } from "../../tasks/ru
 import {
   completeTaskRunByRunId,
   failTaskRunByRunId,
+  finalizeTaskRunByRunId,
   recordTaskRunProgressByRunId,
   runTaskInFlowForOwner,
 } from "../../tasks/task-executor.js";
@@ -953,12 +954,12 @@ export const tasksHandlers: GatewayRequestHandlers = {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, resolved.message));
       return;
     }
+    const status = optionalStringField(input.status) ?? "succeeded";
     const backingSession = validateProductionChildBackingSession(resolved.task);
-    if (!backingSession.ok) {
+    if (status === "succeeded" && !backingSession.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, backingSession.message));
       return;
     }
-    const status = optionalStringField(input.status) ?? "succeeded";
     const now = Date.now();
     const parentContinuation = getTaskFlowProductionContinuation(resolved.flow);
     const nextExecutableLaunch = readNextExecutableLaunchProof(input.nextExecutableLaunch);
@@ -986,7 +987,9 @@ export const tasksHandlers: GatewayRequestHandlers = {
     const common = {
       runId: resolved.runId,
       runtime: readTaskRuntime(input.runtime),
-      sessionKey: optionalStringField(input.sessionKey) ?? backingSession.childSessionKey,
+      sessionKey:
+        optionalStringField(input.sessionKey) ??
+        (backingSession.ok ? backingSession.childSessionKey : undefined),
       endedAt: now,
       lastEventAt: now,
       progressSummary: optionalStringField(input.progressSummary),
@@ -995,20 +998,27 @@ export const tasksHandlers: GatewayRequestHandlers = {
     const updated =
       status === "succeeded"
         ? completeTaskRunByRunId(common)
-        : status === "failed" || status === "timed_out" || status === "cancelled"
-          ? failTaskRunByRunId({
+        : status === "blocked" || status === "rejected"
+          ? finalizeTaskRunByRunId({
               ...common,
-              status,
-              error: optionalStringField(input.error),
+              status: "failed",
+              error: optionalStringField(input.error) ?? status,
+              terminalOutcome: "blocked",
             })
-          : null;
+          : status === "failed" || status === "timed_out" || status === "cancelled"
+            ? failTaskRunByRunId({
+                ...common,
+                status,
+                error: optionalStringField(input.error),
+              })
+            : null;
     if (!updated) {
       respond(
         false,
         undefined,
         errorShape(
           ErrorCodes.INVALID_REQUEST,
-          "child_task_terminal_status_invalid: expected succeeded, failed, timed_out, or cancelled",
+          "child_task_terminal_status_invalid: expected succeeded, failed, timed_out, cancelled, blocked, or rejected",
         ),
       );
       return;

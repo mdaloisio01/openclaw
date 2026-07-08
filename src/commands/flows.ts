@@ -28,6 +28,14 @@ const STATUS_PAD = 10;
 const MODE_PAD = 14;
 const REV_PAD = 6;
 const CTRL_PAD = 20;
+const BLOCKED_CLASS_PAD = 32;
+
+type BlockedFlowClassification =
+  | "current_lawful_blocker"
+  | "historical_closeout_proof_debt"
+  | "superseded"
+  | "requires_new_work_order"
+  | "unsupported_manual_review";
 
 function formatFlowLookupMiss(lookup: string): string {
   return `TaskFlow not found: ${lookup}. Run ${formatCliCommand("openclaw tasks flow list")} to see recent flow ids.`;
@@ -172,6 +180,106 @@ function summarizeFlowState(flow: TaskFlowRecord): string | null {
   return null;
 }
 
+function classifyBlockedFlow(flow: TaskFlowRecord): {
+  classification: BlockedFlowClassification;
+  reason: string;
+  supportedAction: string;
+} {
+  if (flow.status !== "blocked") {
+    return {
+      classification: "unsupported_manual_review",
+      reason: "flow is not blocked",
+      supportedAction: "inspect separately",
+    };
+  }
+  const combined = [
+    flow.ownerKey,
+    flow.controllerId,
+    flow.currentStep,
+    flow.blockedSummary,
+    flow.goal,
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+  if (
+    combined.includes("child_result_rejected") ||
+    combined.includes("grant closeout failed") ||
+    combined.includes("rejected_proof_missing") ||
+    combined.includes("rejected_closeout_missing_truth")
+  ) {
+    return {
+      classification: "historical_closeout_proof_debt",
+      reason: "blocked row records a prior Grant/review closeout rejection",
+      supportedAction: "leave classified unless a separate archival cleanup work order exists",
+    };
+  }
+  if (
+    combined.includes("stale_validation_flow_reconciled") ||
+    combined.includes("lost_child_reconciled") ||
+    combined.includes("stale orphaned") ||
+    combined.includes("reconciled")
+  ) {
+    return {
+      classification: "superseded",
+      reason: "blocked row records a reconciled stale flow",
+      supportedAction: "preserve; do not restart",
+    };
+  }
+  if (
+    combined.includes("gie-phase1") ||
+    combined.includes("sadb") ||
+    combined.includes("blocked_child_task_dispatch_surface_unavailable") ||
+    combined.includes("blocked_child_task_finalization_backing_session_missing") ||
+    combined.includes("blocked_sadb_child_lost_backing_session_missing")
+  ) {
+    return {
+      classification: "requires_new_work_order",
+      reason: "blocked row represents current GIE/SADB repair debt",
+      supportedAction: "route to the active GIE/SADB repair build plan",
+    };
+  }
+  if (getTaskFlowProductionContinuation(flow)?.lawfulStopReason) {
+    return {
+      classification: "current_lawful_blocker",
+      reason: "production continuation has a lawful stop reason",
+      supportedAction: "respect blocker; do not restart",
+    };
+  }
+  return {
+    classification: "unsupported_manual_review",
+    reason: "blocked row did not match a known safe classification",
+    supportedAction: "manual review before any mutation",
+  };
+}
+
+function formatBlockedFlowRows(
+  rows: Array<{
+    flow: TaskFlowRecord;
+    classification: ReturnType<typeof classifyBlockedFlow>;
+  }>,
+  rich: boolean,
+) {
+  const header = [
+    "TaskFlow".padEnd(ID_PAD),
+    "Class".padEnd(BLOCKED_CLASS_PAD),
+    "Updated".padEnd(24),
+    "Reason",
+  ].join(" ");
+  const lines = [rich ? theme.heading(header) : header];
+  for (const row of rows) {
+    lines.push(
+      [
+        shortToken(row.flow.flowId).padEnd(ID_PAD),
+        row.classification.classification.padEnd(BLOCKED_CLASS_PAD),
+        formatFlowTimestamp(row.flow.updatedAt).padEnd(24),
+        safeFlowDisplayText(row.classification.reason, 100),
+      ].join(" "),
+    );
+  }
+  return lines;
+}
+
 export async function flowsListCommand(
   opts: { json?: boolean; status?: string },
   runtime: RuntimeEnv,
@@ -210,6 +318,62 @@ export async function flowsListCommand(
   }
   const rich = isRich();
   for (const line of formatFlowRows(flows, rich)) {
+    runtime.log(line);
+  }
+}
+
+export async function flowsBlockedRowsCommand(opts: { json?: boolean }, runtime: RuntimeEnv) {
+  const rows = listTaskFlowRecords()
+    .filter((flow) => flow.status === "blocked")
+    .map((flow) => ({
+      flow,
+      classification: classifyBlockedFlow(flow),
+      taskSummary: getFlowTaskSummary(flow.flowId),
+    }));
+  const byClassification = rows.reduce<Record<BlockedFlowClassification, number>>(
+    (acc, row) => {
+      acc[row.classification.classification] += 1;
+      return acc;
+    },
+    {
+      current_lawful_blocker: 0,
+      historical_closeout_proof_debt: 0,
+      superseded: 0,
+      requires_new_work_order: 0,
+      unsupported_manual_review: 0,
+    },
+  );
+
+  if (opts.json) {
+    writeRuntimeJson(runtime, {
+      count: rows.length,
+      byClassification,
+      rows: rows.map((row) => ({
+        flowId: row.flow.flowId,
+        ownerKey: row.flow.ownerKey,
+        controllerId: row.flow.controllerId,
+        currentStep: row.flow.currentStep ?? null,
+        updatedAt: row.flow.updatedAt,
+        blockedSummary: row.flow.blockedSummary ?? null,
+        taskSummary: row.taskSummary,
+        ...row.classification,
+      })),
+    });
+    return;
+  }
+
+  runtime.log(info(`Blocked TaskFlows: ${rows.length}`));
+  runtime.log(
+    info(
+      `Classification: current ${byClassification.current_lawful_blocker} · historical ${byClassification.historical_closeout_proof_debt} · superseded ${byClassification.superseded} · work-order ${byClassification.requires_new_work_order} · manual ${byClassification.unsupported_manual_review}`,
+    ),
+  );
+  if (rows.length === 0) {
+    runtime.log("No blocked TaskFlows found.");
+    return;
+  }
+  const rich = isRich();
+  for (const line of formatBlockedFlowRows(rows, rich)) {
     runtime.log(line);
   }
 }

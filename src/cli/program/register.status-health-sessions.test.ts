@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   tasksNotifyCommand: vi.fn(),
   tasksCancelCommand: vi.fn(),
   flowsListCommand: vi.fn(),
+  flowsBlockedRowsCommand: vi.fn(),
   flowsShowCommand: vi.fn(),
   flowsCancelCommand: vi.fn(),
   flowsStartProductionCommand: vi.fn(),
@@ -46,6 +47,7 @@ const tasksShowCommand = mocks.tasksShowCommand;
 const tasksNotifyCommand = mocks.tasksNotifyCommand;
 const tasksCancelCommand = mocks.tasksCancelCommand;
 const flowsListCommand = mocks.flowsListCommand;
+const flowsBlockedRowsCommand = mocks.flowsBlockedRowsCommand;
 const flowsShowCommand = mocks.flowsShowCommand;
 const flowsCancelCommand = mocks.flowsCancelCommand;
 const flowsStartProductionCommand = mocks.flowsStartProductionCommand;
@@ -120,6 +122,7 @@ vi.mock("../../commands/tasks.js", () => ({
 
 vi.mock("../../commands/flows.js", () => ({
   flowsListCommand: mocks.flowsListCommand,
+  flowsBlockedRowsCommand: mocks.flowsBlockedRowsCommand,
   flowsShowCommand: mocks.flowsShowCommand,
   flowsCancelCommand: mocks.flowsCancelCommand,
   flowsStartProductionCommand: mocks.flowsStartProductionCommand,
@@ -490,6 +493,9 @@ describe("registerStatusHealthSessionsCommands", () => {
   it("routes tasks flow commands through the TaskFlow handlers", async () => {
     await runCli(["tasks", "flow", "list", "--json", "--status", "blocked"]);
     expectCommandOptions(flowsListCommand, {});
+
+    await runCli(["tasks", "flow", "blocked-report", "--json"]);
+    expectCommandOptions(flowsBlockedRowsCommand, {});
 
     await runCli(["tasks", "flow", "show", "flow-123", "--json"]);
     expectCommandOptions(flowsShowCommand, {

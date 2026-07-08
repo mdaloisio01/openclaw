@@ -742,6 +742,22 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     });
 
   tasksFlowCmd
+    .command("blocked-report")
+    .description("Classify blocked TaskFlow rows without mutating state")
+    .option("--json", "Output as JSON", false)
+    .action(async (opts) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsBlockedRowsCommand } = await loadFlowsCommands();
+        await flowsBlockedRowsCommand(
+          {
+            json: Boolean(opts.json),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowCmd
     .command("show")
     .description("Show one TaskFlow by flow id or owner key")
     .argument("<lookup>", "Flow id or owner key")

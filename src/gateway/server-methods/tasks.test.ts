@@ -705,6 +705,110 @@ describe("tasks gateway handlers", () => {
     expect(completed.calls[0]?.[2]?.message).toContain("child_task_backing_session_missing");
   });
 
+  it("records a blocked production child closeout when backing child session is missing", async () => {
+    const authorityPath = await writeTestBuildPlan("phase1-sadb-child-blocked-plan.md");
+    const started = await runTaskHandler("tasks.startProductionFlow", {
+      ownerKey: "gie-phase1-sadb-runtime",
+      controllerId: "will-orchestrator/gie",
+      goal: "Dispatch Phase 1 SADB runtime implementation",
+      sliceId: "gie-phase1-sadb-runtime",
+      sliceOwner: "SADB",
+      authorityPath,
+      authorityBasis: "Phase 1 policy-law decision",
+      buildItem: "Phase 1 - Hard-Rule Policy Engine",
+      requiredOwnerLane: "sadb_decomposition_review",
+      attemptedOwnerLane: "sadb_decomposition_review",
+      attemptedExecutor: "sadb_decomposition_review",
+      executorRole: "sadb_lane_execution",
+      lawfulRouteRequired: "SADB executes through governed lane path",
+    });
+    const flowId = String(started.payload?.flow?.flowId);
+    const task = createTaskRecord({
+      runtime: "cli",
+      ownerKey: "gie-phase1-sadb-runtime",
+      requesterSessionKey: "gie-phase1-sadb-runtime",
+      scopeKind: "session",
+      parentFlowId: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      label: "Phase 1 SADB runtime implementation",
+      task: "Run SADB decomposition",
+      status: "running",
+      deliveryStatus: "session_queued",
+      notifyPolicy: "done_only",
+      startedAt: Date.now(),
+      lastEventAt: Date.now(),
+    });
+
+    const completed = await runTaskHandler("tasks.completeTaskInFlow", {
+      lookup: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      runtime: "cli",
+      status: "blocked",
+      terminalSummary: "SADB backing session disappeared before closeout delivery.",
+    });
+
+    expect(completed.calls[0]?.[0]).toBe(true);
+    expect(completed.payload?.task?.status).toBe("failed");
+    expect(getTaskById(task.taskId)).toMatchObject({
+      status: "failed",
+      terminalOutcome: "blocked",
+      terminalSummary: "SADB backing session disappeared before closeout delivery.",
+    });
+  });
+
+  it("records a rejected production child closeout when backing child session is missing", async () => {
+    const authorityPath = await writeTestBuildPlan("phase1-sadb-child-rejected-plan.md");
+    const started = await runTaskHandler("tasks.startProductionFlow", {
+      ownerKey: "gie-phase1-sadb-runtime",
+      controllerId: "will-orchestrator/gie",
+      goal: "Dispatch Phase 1 SADB runtime implementation",
+      sliceId: "gie-phase1-sadb-runtime",
+      sliceOwner: "SADB",
+      authorityPath,
+      authorityBasis: "Phase 1 policy-law decision",
+      buildItem: "Phase 1 - Hard-Rule Policy Engine",
+      requiredOwnerLane: "sadb_decomposition_review",
+      attemptedOwnerLane: "sadb_decomposition_review",
+      attemptedExecutor: "sadb_decomposition_review",
+      executorRole: "sadb_lane_execution",
+      lawfulRouteRequired: "SADB executes through governed lane path",
+    });
+    const flowId = String(started.payload?.flow?.flowId);
+    const task = createTaskRecord({
+      runtime: "cli",
+      ownerKey: "gie-phase1-sadb-runtime",
+      requesterSessionKey: "gie-phase1-sadb-runtime",
+      scopeKind: "session",
+      parentFlowId: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      label: "Phase 1 SADB runtime implementation",
+      task: "Run SADB decomposition",
+      status: "running",
+      deliveryStatus: "session_queued",
+      notifyPolicy: "done_only",
+      startedAt: Date.now(),
+      lastEventAt: Date.now(),
+    });
+
+    const completed = await runTaskHandler("tasks.completeTaskInFlow", {
+      lookup: flowId,
+      runId: "gie-phase1-sadb-child-run",
+      runtime: "cli",
+      status: "rejected",
+      error: "Grant closeout missing proof fields.",
+      terminalSummary: "Rejected: missing proof fields.",
+    });
+
+    expect(completed.calls[0]?.[0]).toBe(true);
+    expect(completed.payload?.task?.status).toBe("failed");
+    expect(getTaskById(task.taskId)).toMatchObject({
+      status: "failed",
+      error: "Grant closeout missing proof fields.",
+      terminalOutcome: "blocked",
+      terminalSummary: "Rejected: missing proof fields.",
+    });
+  });
+
   it("blocks production child success without continuation launch proof", async () => {
     const authorityPath = await writeTestBuildPlan("phase1-sadb-continuation-required.md");
     const started = await runTaskHandler("tasks.startProductionFlow", {
