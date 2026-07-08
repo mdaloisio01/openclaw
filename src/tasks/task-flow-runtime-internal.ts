@@ -9,6 +9,7 @@ export {
   deleteTaskFlowRecordById,
   failFlow,
   finishFlow,
+  getTaskFlowActiveProductionContinuation,
   getTaskFlowById,
   listTaskFlowRecords,
   listTaskFlowsForOwnerKey,

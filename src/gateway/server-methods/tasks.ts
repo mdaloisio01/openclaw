@@ -9,11 +9,16 @@ import {
   validateTasksGetParams,
   validateTasksListParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import {
+  createActiveProductionDispatchReceipt,
+  evaluateActiveProductionFinality,
+} from "../../continuity/active-production-continuation-controller.js";
 import { runRuntimeAssetGuardPreflight } from "../../infra/runtime-asset-guard-preflight.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import {
   ACTIVE_WORK_WATCHDOG_CRON_JOB_ID,
   ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME,
+  reconcileProductionWatchdogCron,
 } from "../../tasks/active-production-watchdog-lifecycle.js";
 import { cancelDetachedTaskRunById } from "../../tasks/detached-task-runtime.js";
 import {
@@ -32,6 +37,7 @@ import type { ProductionContinuationStopReason } from "../../tasks/task-flow-reg
 import {
   createManagedTaskFlow,
   finishFlow,
+  getTaskFlowActiveProductionContinuation,
   getTaskFlowById,
   getTaskFlowProductionContinuation,
   recordFlowLawfulStop,
@@ -961,28 +967,39 @@ export const tasksHandlers: GatewayRequestHandlers = {
       return;
     }
     const now = Date.now();
-    const parentContinuation = getTaskFlowProductionContinuation(resolved.flow);
+    const activeProductionContinuation = getTaskFlowActiveProductionContinuation(resolved.flow);
     const nextExecutableLaunch = readNextExecutableLaunchProof(input.nextExecutableLaunch);
-    const requiresContinuationProof =
-      status === "succeeded" &&
-      parentContinuation?.activeProductionRun === true &&
-      parentContinuation.lawfulWholeRunCompletion !== true &&
-      parentContinuation.blockerPresent !== true &&
-      parentContinuation.ownerDecisionRequired !== true &&
-      parentContinuation.restartOrReloadRequired !== true &&
-      parentContinuation.hardStopPresent !== true &&
-      parentContinuation.safetyStopPresent !== true &&
-      parentContinuation.nextExecutableUnitLaunched !== true;
-    if (requiresContinuationProof && !nextExecutableLaunch) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          "child_task_completion_requires_continuation_proof: active production child success must include nextExecutableLaunch proof or record a lawful production stop before local success can be accepted",
-        ),
-      );
-      return;
+    if (status === "succeeded" && activeProductionContinuation?.activeProductionRun === true) {
+      const receipt =
+        nextExecutableLaunch && activeProductionContinuation.nextAction
+          ? createActiveProductionDispatchReceipt({
+              action: {
+                ...activeProductionContinuation.nextAction,
+                summary: nextExecutableLaunch.detail,
+                dispatchProofRef: nextExecutableLaunch.detail,
+              },
+              dispatchedAt: now,
+              proofRef: nextExecutableLaunch.detail,
+            })
+          : undefined;
+      const finality = evaluateActiveProductionFinality({
+        state: {
+          ...activeProductionContinuation,
+          dispatchReceipts: receipt
+            ? [...activeProductionContinuation.dispatchReceipts, receipt]
+            : activeProductionContinuation.dispatchReceipts,
+        },
+        attemptedFinalKind: "task_success",
+        now,
+      });
+      if (!finality.allowed) {
+        const message =
+          finality.result === "hard_boundary"
+            ? `child_task_completion_requires_lawful_stop: active production child success is blocked by ${finality.boundary}; record a blocked/rejected child closeout or a lawful production stop instead`
+            : "child_task_completion_requires_continuation_proof: active production child success must include nextExecutableLaunch proof or record a lawful production stop before local success can be accepted";
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, message));
+        return;
+      }
     }
     const common = {
       runId: resolved.runId,
@@ -1243,6 +1260,24 @@ export const tasksHandlers: GatewayRequestHandlers = {
           errorShape(
             ErrorCodes.UNAVAILABLE,
             "failed to finish disposable probe flow after lawful stop",
+          ),
+        );
+        return;
+      }
+
+      const closeReconcile = await reconcileProductionWatchdogCron({ cron: context.cron });
+      if (!closeReconcile.ok) {
+        respond(
+          false,
+          {
+            flowId: finished.flow.flowId,
+            initialEnabled: initial.enabled,
+            afterOpenEnabled,
+            lifecycleCloseReconcile: closeReconcile,
+          },
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            `watchdog lifecycle close reconcile failed: ${closeReconcile.action}`,
           ),
         );
         return;

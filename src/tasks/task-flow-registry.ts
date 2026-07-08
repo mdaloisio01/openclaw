@@ -9,6 +9,10 @@ import {
   type TaskFlowRegistryObserverEvent,
 } from "./task-flow-registry.store.js";
 import type {
+  ActiveProductionBoundary,
+  ActiveProductionContinuationReceipt,
+  ActiveProductionContinuationState,
+  ActiveProductionNextAction,
   TaskFlowRecord,
   TaskFlowStatus,
   TaskFlowSyncMode,
@@ -199,6 +203,7 @@ export type BlindTestSliceCreateResult =
 type ManagedControllerState = {
   kind?: string;
   productionContinuation?: ProductionContinuationState;
+  activeProductionContinuation?: JsonValue;
   [key: string]: JsonValue | undefined;
 };
 
@@ -648,6 +653,113 @@ function updateContinuationAfterNextLaunch(
   return next;
 }
 
+function mapContinuationStopReasonToBoundary(
+  reason: ProductionContinuationStopReason | undefined,
+): ActiveProductionBoundary {
+  switch (reason) {
+    case "blocker":
+      return "technical_repair";
+    case "owner_decision":
+      return "operator_product_decision_required";
+    case "restart_or_reload":
+      return "runtime_restart_recovery";
+    case "hard_stop":
+      return "technical_impossibility";
+    case "safety_stop":
+      return "unsafe_destructive_action_required";
+    case "whole_run_complete":
+      return "complete";
+    default:
+      return "plan_next_step";
+  }
+}
+
+function latestContinuationEventDetail(
+  state: ProductionContinuationState,
+  type: ProductionContinuationEventType,
+): string | undefined {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index];
+    if (event?.type === type && event.detail?.trim()) {
+      return event.detail.trim();
+    }
+  }
+  return undefined;
+}
+
+function latestContinuationEventTime(
+  state: ProductionContinuationState,
+  type: ProductionContinuationEventType,
+): number | undefined {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index];
+    if (event?.type === type) {
+      return event.at;
+    }
+  }
+  return undefined;
+}
+
+function buildActiveProductionContinuationFromLegacy(params: {
+  flow: TaskFlowRecord;
+  continuation: ProductionContinuationState;
+}): ActiveProductionContinuationState {
+  const { flow, continuation } = params;
+  const broaderBuildOpen =
+    continuation.parentRunOpen === true && continuation.lawfulWholeRunCompletion !== true;
+  const boundary = broaderBuildOpen
+    ? mapContinuationStopReasonToBoundary(continuation.lawfulStopReason)
+    : "complete";
+  const actionId = `${flow.flowId}:next-executable`;
+  const launchDetail =
+    latestContinuationEventDetail(continuation, "NEXT_EXECUTABLE_UNIT_LAUNCHED") ??
+    latestContinuationEventDetail(continuation, "NEXT_EXECUTABLE_UNIT_IDENTIFIED") ??
+    flow.currentStep ??
+    "Continue active production run";
+  const nextAction: ActiveProductionNextAction | undefined =
+    broaderBuildOpen && boundary !== "complete"
+      ? {
+          actionId,
+          owner: flow.ownerKey,
+          summary: launchDetail,
+          boundary,
+          surface: "taskflow_child",
+          ...(continuation.nextExecutableUnitLaunched ? { dispatchProofRef: launchDetail } : {}),
+        }
+      : undefined;
+  const launchedAt = latestContinuationEventTime(continuation, "NEXT_EXECUTABLE_UNIT_LAUNCHED");
+  const dispatchReceipts: ActiveProductionContinuationReceipt[] =
+    nextAction && continuation.nextExecutableUnitLaunched && launchedAt
+      ? [
+          {
+            receiptId: `${actionId}:dispatch:${launchedAt}`,
+            actionId,
+            surface: nextAction.surface,
+            boundary,
+            dispatchedAt: launchedAt,
+            owner: nextAction.owner,
+            summary: nextAction.summary,
+            proofRef: nextAction.dispatchProofRef ?? launchDetail,
+          },
+        ]
+      : [];
+  return {
+    activeProductionRun: true,
+    broaderBuildOpen,
+    status: !broaderBuildOpen
+      ? "complete"
+      : hasLawfulStopState(continuation)
+        ? "hard_boundary"
+        : dispatchReceipts.length > 0
+          ? "dispatched"
+          : "dispatch_required",
+    boundary,
+    ...(nextAction ? { nextAction } : {}),
+    dispatchReceipts,
+    ...(dispatchReceipts[0] ? { lastDispatchReceiptId: dispatchReceipts[0].receiptId } : {}),
+  };
+}
+
 function buildBlindTestReworkState(params: {
   current: BlindTestSliceState;
   stage: BlindTestFailureStage;
@@ -694,6 +806,12 @@ function attachProductionContinuationToStateJson(params: {
   continuation?: ProductionContinuationState;
 }): JsonValue | undefined {
   const baseState = params.stateJson === undefined ? params.flow.stateJson : params.stateJson;
+  const activeProductionContinuation = params.continuation?.activeProductionRun
+    ? buildActiveProductionContinuationFromLegacy({
+        flow: params.flow,
+        continuation: params.continuation,
+      })
+    : undefined;
   if (isBlindTestSliceFlow(params.flow)) {
     const blindState =
       (baseState !== undefined ? normalizeBlindTestSliceState(baseState) : null) ??
@@ -704,12 +822,14 @@ function attachProductionContinuationToStateJson(params: {
     return {
       ...blindState,
       ...(params.continuation ? { continuation: params.continuation } : {}),
+      ...(activeProductionContinuation ? { activeProductionContinuation } : {}),
     };
   }
   if (isRecord(baseState)) {
     return {
       ...cloneStructuredValue(baseState),
       ...(params.continuation ? { productionContinuation: params.continuation } : {}),
+      ...(activeProductionContinuation ? { activeProductionContinuation } : {}),
     };
   }
   if (!params.continuation) {
@@ -718,6 +838,7 @@ function attachProductionContinuationToStateJson(params: {
   return {
     kind: "managed_controller_state",
     productionContinuation: params.continuation,
+    ...(activeProductionContinuation ? { activeProductionContinuation } : {}),
   };
 }
 
@@ -738,6 +859,16 @@ export function getTaskFlowProductionContinuation(
     return null;
   }
   return normalizeProductionContinuationState(managedState.productionContinuation);
+}
+
+export function getTaskFlowActiveProductionContinuation(
+  flow: TaskFlowRecord,
+): ActiveProductionContinuationState | null {
+  const continuation = getTaskFlowProductionContinuation(flow);
+  if (!continuation?.activeProductionRun) {
+    return null;
+  }
+  return buildActiveProductionContinuationFromLegacy({ flow, continuation });
 }
 
 function buildGuardBlockedResult(
