@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import { GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE } from "../governance/governed-final-release-decision.js";
 import { onDiagnosticEvent, resetDiagnosticEventsForTest } from "../infra/diagnostic-events.js";
+import { setReplyPayloadMetadata } from "./reply-payload.js";
 import type { ReplyDispatchBeforeDeliver, ReplyDispatcher } from "./reply/reply-dispatcher.js";
 import { buildTestCtx } from "./reply/test-ctx.js";
 
@@ -86,6 +88,21 @@ function createDispatcher(record: string[]): ReplyDispatcher {
       record.push("waitForIdle");
     },
   };
+}
+
+function markGovernedFinalPayload(text = "unvalidated governed final") {
+  return setReplyPayloadMetadata(
+    { text },
+    {
+      governedFinalRelease: {
+        missionId: "mission-release",
+        runId: "run-123",
+        contractId: "contract-release",
+        contractHash: "contract-hash",
+        payloadHash: "payload-hash-1",
+      },
+    },
+  );
 }
 
 function lastTypingDispatcherOptions(): Parameters<CreateReplyDispatcherWithTypingFn>[0] {
@@ -383,6 +400,52 @@ describe("withReplyDispatcher", () => {
     );
   });
 
+  it("withholds governed WebChat final payloads at the dispatcher before-delivery seam", async () => {
+    hoisted.getGlobalHookRunnerMock.mockReturnValue({
+      hasHooks: vi.fn(() => false),
+      runMessageSending: vi.fn(async () => undefined),
+    });
+    hoisted.createReplyDispatcherMock.mockReturnValueOnce(createDispatcher([]));
+    hoisted.dispatchReplyFromConfigMock.mockResolvedValueOnce({ text: "ok" });
+
+    await dispatchInboundMessageWithDispatcher({
+      ctx: buildTestCtx({
+        Surface: "webchat",
+        Provider: "webchat",
+        SessionKey: "agent:test:session",
+      }),
+      cfg: {} as OpenClawConfig,
+      dispatcherOptions: {
+        deliver: async () => undefined,
+      },
+      replyOptions: { runId: "run-123" },
+      replyResolver: async () => ({ text: "ok" }),
+    });
+
+    const dispatcherOptions = requireReplyDispatcherOptions();
+    if (!dispatcherOptions?.beforeDeliver) {
+      throw new Error("expected beforeDeliver hook");
+    }
+
+    const payload = setReplyPayloadMetadata(
+      { text: "unvalidated governed final" },
+      {
+        governedFinalRelease: {
+          missionId: "mission-release",
+          runId: "run-123",
+          contractId: "contract-release",
+          contractHash: "contract-hash",
+          payloadHash: "payload-hash-1",
+        },
+      },
+    );
+
+    await expect(dispatcherOptions.beforeDeliver(payload, { kind: "final" })).resolves.toEqual({
+      text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE,
+      isStatusNotice: true,
+    });
+  });
+
   it("runs message_sending after reply_payload_sending for inbound dispatcher delivery", async () => {
     const runReplyPayloadSending = vi.fn(async ({ payload }: { payload: { text?: string } }) => ({
       payload: {
@@ -529,6 +592,44 @@ describe("withReplyDispatcher", () => {
     );
   });
 
+  it("withholds governed WebChat final payloads on prebuilt dispatchers with appended hooks", async () => {
+    hoisted.getGlobalHookRunnerMock.mockReturnValue({
+      hasHooks: vi.fn(() => false),
+      runMessageSending: vi.fn(async () => undefined),
+      runReplyPayloadSending: vi.fn(async () => undefined),
+    });
+    hoisted.dispatchReplyFromConfigMock.mockResolvedValueOnce({ text: "ok" });
+    const installedHooks: ReplyDispatchBeforeDeliver[] = [];
+    const dispatcher = {
+      ...createDispatcher([]),
+      appendBeforeDeliver: vi.fn((hook: ReplyDispatchBeforeDeliver) => {
+        installedHooks.push(hook);
+      }),
+    };
+
+    await dispatchInboundMessage({
+      ctx: buildTestCtx({
+        Surface: "webchat",
+        Provider: "webchat",
+        SessionKey: "agent:test:session",
+      }),
+      cfg: {} as OpenClawConfig,
+      dispatcher,
+      replyOptions: { runId: "run-123" },
+      replyResolver: async () => ({ text: "ok" }),
+    });
+
+    const installedHook = installedHooks[0];
+    if (!installedHook) {
+      throw new Error("expected installed beforeDeliver hook");
+    }
+
+    await expect(installedHook(markGovernedFinalPayload(), { kind: "final" })).resolves.toEqual({
+      text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE,
+      isStatusNotice: true,
+    });
+  });
+
   it("installs reply_payload_sending hooks before lazy plugin availability is known", async () => {
     hoisted.getGlobalHookRunnerMock.mockReturnValue({
       hasHooks: vi.fn(() => false),
@@ -639,6 +740,42 @@ describe("withReplyDispatcher", () => {
       "agent:test:telegram:direct:8231046597",
     );
     expect(dispatcherOptions.silentReplyContext?.surface).toBe("telegram");
+  });
+
+  it("withholds governed WebChat final payloads on buffered dispatchers", async () => {
+    hoisted.createReplyDispatcherWithTypingMock.mockReturnValueOnce({
+      dispatcher: createDispatcher([]),
+      replyOptions: {},
+      markDispatchIdle: vi.fn(),
+      markRunComplete: vi.fn(),
+    });
+    hoisted.dispatchReplyFromConfigMock.mockResolvedValueOnce({ text: "ok" });
+
+    await dispatchInboundMessageWithBufferedDispatcher({
+      ctx: buildTestCtx({
+        Surface: "webchat",
+        Provider: "webchat",
+        SessionKey: "agent:test:webchat",
+      }),
+      cfg: {} as OpenClawConfig,
+      dispatcherOptions: {
+        deliver: async () => undefined,
+      },
+      replyOptions: { runId: "run-123" },
+      replyResolver: async () => ({ text: "ok" }),
+    });
+
+    const dispatcherOptions = lastTypingDispatcherOptions();
+    if (!dispatcherOptions.beforeDeliver) {
+      throw new Error("expected beforeDeliver hook");
+    }
+
+    await expect(
+      dispatcherOptions.beforeDeliver(markGovernedFinalPayload(), { kind: "final" }),
+    ).resolves.toEqual({
+      text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE,
+      isStatusNotice: true,
+    });
   });
 
   it("passes explicit direct conversation type for generic silent-reply policy keys", async () => {

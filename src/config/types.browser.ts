@@ -47,6 +47,11 @@ export type BrowserSsrFPolicyConfig = {
    * Supports exact hosts and "*.example.com" wildcard subdomains.
    */
   hostnameAllowlist?: string[];
+  /**
+   * Exact HTTP origins allowed for browser navigation.
+   * Example: ["http://localhost:18789"]
+   */
+  allowedOrigins?: string[];
 };
 export type BrowserConfig = {
   enabled?: boolean;

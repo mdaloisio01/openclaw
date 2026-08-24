@@ -37,6 +37,7 @@ function createState(overrides: Partial<ChatState> = {}): ChatState {
 
 afterEach(() => {
   resetChatAttachmentPayloadStoreForTest();
+  localStorage.removeItem("openclaw.webchat.send-attempt-ledger.v1");
 });
 
 function createDeferred<T>() {
@@ -1448,6 +1449,71 @@ describe("sendChatMessage", () => {
     expect(sendParams.sessionKey).toBe("main");
     expect(sendParams.sessionId).toBe("session-before-reconnect");
     expect(sendParams.message).toBe("continue");
+    expect(sendParams.clientSendAttemptId).toBe(sendParams.idempotencyKey);
+    expect(typeof sendParams.clientSendAttemptAtMs).toBe("number");
+  });
+
+  it("keeps a durable WebChat send-attempt row when server acknowledgement fails", async () => {
+    const request = vi.fn().mockRejectedValue(new Error("network down"));
+    const state = createState({
+      connected: true,
+      client: { request } as unknown as ChatState["client"],
+    });
+
+    await expect(
+      requestChatSend(state, {
+        message: "run a read-only inventory",
+        runId: "run-no-ack",
+      }),
+    ).rejects.toThrow("network down");
+
+    const rows = JSON.parse(
+      localStorage.getItem("openclaw.webchat.send-attempt-ledger.v1") ?? "[]",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      attemptId: "run-no-ack",
+      sessionKey: "main",
+      messageSnippet: "run a read-only inventory",
+    });
+    expect(typeof rows[0].attemptedAtMs).toBe("number");
+    expect(typeof rows[0].messageHash).toBe("string");
+  });
+
+  it("forwards prior unacknowledged WebChat send attempts and clears them after ack", async () => {
+    localStorage.setItem(
+      "openclaw.webchat.send-attempt-ledger.v1",
+      JSON.stringify([
+        {
+          attemptId: "run-prior-no-ack",
+          attemptedAtMs: 123,
+          sessionKey: "main",
+          messageHash: "hash-prior",
+          messageSnippet: "prior inventory",
+        },
+      ]),
+    );
+    const request = vi.fn().mockResolvedValue({ runId: "run-current", status: "started" });
+    const state = createState({
+      connected: true,
+      client: { request } as unknown as ChatState["client"],
+    });
+
+    await requestChatSend(state, {
+      message: "continue",
+      runId: "run-current",
+    });
+
+    const sendParams = requireRecord(request.mock.calls[0]?.[1]);
+    expect(sendParams.clientPendingSendAttempts).toEqual([
+      expect.objectContaining({
+        attemptId: "run-prior-no-ack",
+        attemptedAtMs: 123,
+        messageHash: "hash-prior",
+        messageSnippet: "prior inventory",
+      }),
+    ]);
+    expect(localStorage.getItem("openclaw.webchat.send-attempt-ledger.v1")).toBe("[]");
   });
 
   it("does not reuse another global agent's visible session id for queued sends", async () => {

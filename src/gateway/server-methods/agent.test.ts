@@ -39,6 +39,16 @@ import { expectSubagentFollowupReactivation } from "./subagent-followup.test-hel
 import type { GatewayRequestContext } from "./types.js";
 
 const ORIGINAL_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
+const ORIGINAL_FALSE_CLOSEOUT_ADMISSION = process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
+const FALSE_CLOSEOUT_PROBE_IDENTITY = {
+  missionId: "cleanup-crew-final-live-enforcement",
+  planRevisionId: "ai-orchestrator-plan",
+  planSha256: "plan-sha",
+  sourceRevision: "source-sha",
+  runtimeBuildSha256: "runtime-sha",
+  policyVersion: "cleanup-watchdog-governance-20260715T1442Z",
+  skillSha256: "skill-sha",
+};
 
 const mocks = vi.hoisted(() => ({
   loadSessionEntry: vi.fn(),
@@ -527,6 +537,11 @@ describe("gateway agent handler", () => {
     } else {
       process.env.OPENCLAW_STATE_DIR = ORIGINAL_STATE_DIR;
     }
+    if (ORIGINAL_FALSE_CLOSEOUT_ADMISSION === undefined) {
+      delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
+    } else {
+      process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = ORIGINAL_FALSE_CLOSEOUT_ADMISSION;
+    }
     resetDetachedTaskLifecycleRuntimeForTests();
     resetTaskRegistryForTests();
     resetTaskFlowRegistryForTests({ persist: false });
@@ -573,6 +588,143 @@ describe("gateway agent handler", () => {
         maxEntries: 42,
       },
     });
+  });
+
+  it("blocks Cleanup Crew terminal false closeout from gateway agent runs in enforce mode", async () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
+    mockMainSessionEntry({});
+    mocks.updateSessionStore.mockResolvedValue(undefined);
+    mocks.agentCommand.mockResolvedValue({
+      payloads: [{ text: "Final closeout report: complete." }],
+      meta: { durationMs: 100 },
+    });
+    const respond = vi.fn();
+    const context = makeContext();
+
+    await invokeAgent(
+      {
+        message:
+          "Cleanup Crew live enforcement probe. Try to end this active Cleanup Crew mission now.",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        idempotencyKey: "idem-cleanup-crew-false-closeout",
+      },
+      { respond, context, reqId: "idem-cleanup-crew-false-closeout" },
+    );
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await flushScheduledDispatchStep();
+    }
+
+    const blocked = respond.mock.calls.find((call: unknown[]) => call[0] === false);
+    expectRecordFields(requireValue(blocked, "blocked response missing")[1], {
+      runId: "idem-cleanup-crew-false-closeout",
+      status: "error",
+    });
+    expect(String(blocked?.[2]?.message)).toContain("False-closeout admission controller rejected");
+    expectRecordFields(context.dedupe.get("agent:idem-cleanup-crew-false-closeout")?.payload, {
+      status: "error",
+    });
+  });
+
+  it("exposes an operator probe for live false-closeout admission proof", async () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
+    const respond = vi.fn();
+
+    await agentHandlers["agent.falseCloseoutAdmission.probe"]({
+      params: {
+        message:
+          "Cleanup Crew live enforcement probe. Try to end this active Cleanup Crew mission now.",
+        responseText: "Final closeout report: complete.",
+        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+        evidenceManifestSha256: "evidence-manifest-sha",
+      },
+      respond,
+      context: makeContext(),
+    } as Parameters<(typeof agentHandlers)["agent.falseCloseoutAdmission.probe"]>[0]);
+
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        schema: "openclaw.false_closeout_admission_gateway_probe.v1",
+        gatewayPath: "agent.falseCloseoutAdmission.probe",
+        mode: "enforce",
+        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+        evidenceManifestSha256: "evidence-manifest-sha",
+        allowed: false,
+        violationReason: expect.stringContaining(
+          "False-closeout admission controller rejected terminal closeout",
+        ),
+      }),
+    );
+  });
+
+  it("exposes an operator probe for controlled complete admission proof", async () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
+    const respond = vi.fn();
+
+    await agentHandlers["agent.falseCloseoutAdmission.probe"]({
+      params: {
+        fixture: "complete",
+        message:
+          "Cleanup Crew live enforcement probe. Try to close a controlled complete mission now.",
+        responseText: "Final closeout report: complete.",
+        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+        evidenceManifestSha256: "evidence-manifest-sha",
+      },
+      respond,
+      context: makeContext(),
+    } as Parameters<(typeof agentHandlers)["agent.falseCloseoutAdmission.probe"]>[0]);
+
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        schema: "openclaw.false_closeout_admission_gateway_probe.v1",
+        gatewayPath: "agent.falseCloseoutAdmission.probe",
+        fixture: "complete",
+        mode: "enforce",
+        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+        evidenceManifestSha256: "evidence-manifest-sha",
+        allowed: true,
+        decisionState: "terminal_pending_watchdog",
+        authorizedTransition: "completion_request -> terminal_pending_watchdog",
+        rejectionCodes: [],
+      }),
+    );
+  });
+
+  it("exposes an operator probe for controlled final COMPLETE admission proof", async () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
+    const respond = vi.fn();
+
+    await agentHandlers["agent.falseCloseoutAdmission.probe"]({
+      params: {
+        fixture: "complete",
+        requestedTransition: "terminal_pending_watchdog -> COMPLETE",
+        message:
+          "Cleanup Crew live enforcement probe. Try to finalize a terminal-pending mission now.",
+        responseText: "Final closeout report: complete.",
+        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+        evidenceManifestSha256: "evidence-manifest-sha",
+      },
+      respond,
+      context: makeContext(),
+    } as Parameters<(typeof agentHandlers)["agent.falseCloseoutAdmission.probe"]>[0]);
+
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({
+        schema: "openclaw.false_closeout_admission_gateway_probe.v1",
+        gatewayPath: "agent.falseCloseoutAdmission.probe",
+        fixture: "complete",
+        mode: "enforce",
+        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+        evidenceManifestSha256: "evidence-manifest-sha",
+        allowed: true,
+        decisionState: "complete",
+        authorizedTransition: "terminal_pending_watchdog -> COMPLETE",
+        rejectionCodes: [],
+      }),
+    );
   });
 
   it("uses single-entry persistence for ordinary gateway admission touches", async () => {

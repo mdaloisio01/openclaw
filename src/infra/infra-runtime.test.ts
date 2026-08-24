@@ -664,6 +664,34 @@ describe("infra runtime", () => {
       }
     });
 
+    it("keeps an operator restart request deferred past the configured timeout until work drains", async () => {
+      const emitSpy = vi.spyOn(process, "emit");
+      const handler = () => {};
+      process.on("SIGUSR1", handler);
+      try {
+        setRuntimeConfigSnapshot({ gateway: { reload: { deferralTimeoutMs: 1_000 } } });
+        let pending = 1;
+        setPreRestartDeferralCheck(() => pending);
+        scheduleGatewaySigusr1Restart({
+          delayMs: 0,
+          reason: "gateway.restart.request",
+          deferralTimeoutMs: 0,
+        });
+
+        await vi.advanceTimersByTimeAsync(0);
+        expect(emitSpy).not.toHaveBeenCalledWith("SIGUSR1");
+
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(emitSpy).not.toHaveBeenCalledWith("SIGUSR1");
+
+        pending = 0;
+        await vi.advanceTimersByTimeAsync(500);
+        expect(emitSpy).toHaveBeenCalledWith("SIGUSR1");
+      } finally {
+        process.removeListener("SIGUSR1", handler);
+      }
+    });
+
     it("emits SIGUSR1 after explicit deferral timeout even if still pending", async () => {
       const emitSpy = vi.spyOn(process, "emit");
       const handler = () => {};

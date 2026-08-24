@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { getActiveEmbeddedRunCount } from "../agents/embedded-agent-runner/run-state.js";
 import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
+import { CLEANUP_WATCHDOG_POLICY_VERSION } from "../governance/cleanup-watchdog-policy.js";
 import { getTotalQueueSize } from "../process/command-queue.js";
 import {
   getInspectableActiveTaskRestartBlockers,
@@ -11,6 +12,15 @@ import {
   type RestartEmitHooks,
   type ScheduledRestart,
 } from "./restart.js";
+
+export const SAFE_GATEWAY_RESTART_POST_RESTART_PROOF = [
+  "runtime_identity_loaded",
+  "mission_resumption_valid_executor_or_durable_wait",
+  "watchdog_clean_with_execution_or_continuation_coverage",
+] as const;
+
+export type SafeGatewayRestartPostRestartProof =
+  (typeof SAFE_GATEWAY_RESTART_POST_RESTART_PROOF)[number];
 
 export type SafeGatewayRestartCounts = {
   queueSize: number;
@@ -34,6 +44,10 @@ export type SafeGatewayRestartBuildCheck = {
 };
 
 export type SafeGatewayRestartPreflight = {
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  restartReadinessGate: "runtime_preflight";
+  missionResumptionGate: "post_restart_proof_required";
+  postRestartProofRequired: readonly SafeGatewayRestartPostRestartProof[];
   safe: boolean;
   counts: SafeGatewayRestartCounts;
   blockers: SafeGatewayRestartBlocker[];
@@ -203,6 +217,10 @@ export function createSafeGatewayRestartPreflight(
       ? "safe to restart now"
       : `restart deferred: ${blockers.map((blocker) => blocker.message).join("; ")}`;
   return {
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    restartReadinessGate: "runtime_preflight",
+    missionResumptionGate: "post_restart_proof_required",
+    postRestartProofRequired: SAFE_GATEWAY_RESTART_POST_RESTART_PROOF,
     safe: counts.totalActive === 0 && build.ok,
     counts,
     blockers,
@@ -230,9 +248,19 @@ export function requestSafeGatewayRestart(
     };
   }
   const skipDeferral = opts.skipDeferral === true;
+  if (skipDeferral && (preflight.counts.pendingReplies > 0 || preflight.counts.embeddedRuns > 0)) {
+    return {
+      ok: false,
+      status: "blocked",
+      preflight,
+      error:
+        "forced gateway restart blocked: active source turn work has pending replies or embedded runs",
+    };
+  }
   const restart = scheduleGatewaySigusr1Restart({
     delayMs: opts.delayMs ?? 0,
     reason: opts.reason ?? "gateway.restart.safe",
+    deferralTimeoutMs: 0,
     ...(opts.emitHooks ? { emitHooks: opts.emitHooks } : {}),
     ...(skipDeferral ? { skipDeferral: true } : {}),
   });

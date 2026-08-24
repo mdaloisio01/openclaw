@@ -1,10 +1,14 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resolveDefaultAgentDir } from "../agents/agent-scope.js";
 import { AUTH_PROFILE_FILENAME } from "../agents/auth-profiles/constants.js";
+import { createConfigIO, readConfigFileSnapshot } from "../config/config.js";
+import { VERSION } from "../version.js";
 import { testing as controlPlaneRateLimitTesting } from "./control-plane-rate-limit.js";
+import { prepareConfigWriteCandidateForControlPlane } from "./server-methods/config.js";
 import {
   connectOk,
   installGatewayTestHooks,
@@ -17,6 +21,7 @@ import {
 installGatewayTestHooks({ scope: "suite" });
 
 const CONFIG_SECRETREF_RPC_TIMEOUT_MS = 20_000;
+const TEST_ACTIVATION_AT = "2026-07-14T12:00:00.000Z";
 
 let startedServer: Awaited<ReturnType<typeof startServerWithClient>> | null = null;
 let sharedTempRoot: string;
@@ -75,18 +80,139 @@ async function getConfigHash() {
   return String(current.payload?.hash);
 }
 
+type ConfigWriteTool = "config.set" | "config.patch" | "config.apply";
+
+function canonicalConfigRaw(config: unknown): string {
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function stampedCandidateForManifest(config: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...config,
+    meta: {
+      ...((config.meta as Record<string, unknown> | undefined) ?? {}),
+      lastTouchedVersion: VERSION,
+      lastTouchedAt: TEST_ACTIVATION_AT,
+    },
+  };
+}
+
+async function controlPlaneEnvelope(raw: string, tool: ConfigWriteTool) {
+  const snapshot = await readConfigFileSnapshot();
+  const prepared = prepareConfigWriteCandidateForControlPlane({ raw, snapshot });
+  const candidate = prepared.writeConfig;
+  const candidateRaw = canonicalConfigRaw(stampedCandidateForManifest(candidate));
+  const candidateSha256 = crypto.createHash("sha256").update(candidateRaw, "utf-8").digest("hex");
+  return {
+    controlPlaneManifest: {
+      manifestId: `manifest-${tool}`,
+      objective: "gateway config integration test",
+      activationTimestamp: TEST_ACTIVATION_AT,
+      candidateSha256,
+      allowedFiles: [createConfigIO().configPath],
+      allowedConfigPaths: [
+        "agents",
+        "browser",
+        "commands",
+        "gateway",
+        "memory",
+        "messages",
+        "meta",
+        "models",
+        "plugins",
+        "secrets",
+        "tools",
+      ],
+      forbiddenFiles: ["/tmp/forbidden-openclaw.json"],
+      allowedServices: ["openclaw-gateway.service"],
+      allowedRestartScope: "gateway",
+      allowedAgents: ["unknown-actor", "test"],
+      allowedTools: [tool],
+      approvalClasses: [
+        "agents",
+        "auth",
+        "browser",
+        "control",
+        "exec",
+        "memory",
+        "models",
+        "plugins",
+        "runtime",
+        "secrets",
+      ],
+      requiredEvidence: ["integration-test"],
+      rollbackAssets: ["/tmp/openclaw.json.rollback"],
+      stopConditions: ["manifest mismatch"],
+      doneCriteria: ["write accepted"],
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+    controlPlaneApproval: {
+      approvalId: `approval-${tool}-${candidateSha256}`,
+      manifestId: `manifest-${tool}`,
+      candidateSha256,
+      approvalClasses: [
+        "agents",
+        "auth",
+        "browser",
+        "control",
+        "exec",
+        "memory",
+        "models",
+        "plugins",
+        "runtime",
+        "secrets",
+      ],
+      approved: true,
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+  };
+}
+
+async function withConfigManifest<T extends { raw: unknown }>(
+  params: T,
+  tool: ConfigWriteTool,
+): Promise<T> {
+  if (typeof params.raw !== "string") {
+    return params;
+  }
+  try {
+    return {
+      ...params,
+      ...(await controlPlaneEnvelope(params.raw, tool)),
+    };
+  } catch {
+    return params;
+  }
+}
+
 async function sendConfigApply(params: { raw: unknown; baseHash?: string }, timeoutMs?: number) {
-  return await rpcReq(requireWs(), "config.apply", params, timeoutMs);
+  return await rpcReq(
+    requireWs(),
+    "config.apply",
+    await withConfigManifest(params, "config.apply"),
+    timeoutMs,
+  );
 }
 
 async function sendConfigSet(params: { raw: string; baseHash?: string }, timeoutMs?: number) {
-  return await rpcReq(requireWs(), "config.set", params, timeoutMs);
+  return await rpcReq(
+    requireWs(),
+    "config.set",
+    await withConfigManifest(params, "config.set"),
+    timeoutMs,
+  );
 }
 
-function configRawPayload(config: unknown, baseHash?: string) {
+async function configRawPayload(
+  config: unknown,
+  baseHash?: string,
+  tool: ConfigWriteTool = "config.set",
+) {
+  const raw = JSON.stringify(config, null, 2);
   return {
-    raw: JSON.stringify(config, null, 2),
+    raw,
     baseHash,
+    ...(await controlPlaneEnvelope(raw, tool)),
   };
 }
 
@@ -157,7 +283,7 @@ describe("gateway config methods", () => {
     const nextConfig = configWithGatewayTokenSecretRef(current.config, missingEnvVar);
 
     const res = await sendConfigSet(
-      configRawPayload(nextConfig, current.hash),
+      await configRawPayload(nextConfig, current.hash),
       CONFIG_SECRETREF_RPC_TIMEOUT_MS,
     );
     expect(res.ok).toBe(false);
@@ -175,7 +301,7 @@ describe("gateway config methods", () => {
       path?: string;
       config?: Record<string, unknown>;
     }>(requireWs(), "config.set", {
-      ...configRawPayload(current.config, current.hash),
+      ...(await configRawPayload(current.config, current.hash)),
     });
 
     expect(res.ok).toBe(true);
@@ -195,7 +321,7 @@ describe("gateway config methods", () => {
       ok?: boolean;
       config?: Record<string, unknown>;
     }>(requireWs(), "config.set", {
-      ...configRawPayload(nextConfig, current.hash),
+      ...(await configRawPayload(nextConfig, current.hash)),
     });
     expect(res.error).toBeUndefined();
     expect(res.ok).toBe(true);
@@ -204,8 +330,9 @@ describe("gateway config methods", () => {
       config?: Record<string, unknown>;
     }>(requireWs(), "config.get", {});
     expect(after.ok).toBe(true);
-    expect(res.payload?.config).toEqual(after.payload?.config);
-    requireConfigObject(res.payload?.config, "response config");
+    const responseConfig = requireConfigObject(res.payload?.config, "response config");
+    expect(responseConfig.gateway).toEqual({ port: 19001 });
+    expect(responseConfig.meta).toEqual(after.payload?.config?.meta);
   });
 
   it("accepts runtime-shaped config.set when bundled provider baseUrl was only defaulted", async () => {
@@ -240,7 +367,7 @@ describe("gateway config methods", () => {
         ok?: boolean;
         error?: { message?: string };
       }>(requireWs(), "config.set", {
-        ...configRawPayload(nextConfig, current.hash),
+        ...(await configRawPayload(nextConfig, current.hash)),
       });
 
       expect(res.error).toBeUndefined();
@@ -264,9 +391,11 @@ describe("gateway config methods", () => {
           profiles: {
             remote: {
               cdpUrl: "https://alice:secret@chrome.remote.example.com?token=profile-secret",
+              color: "#2563eb",
             },
             local: {
               cdpUrl: "ws://127.0.0.1:9222",
+              color: "#16a34a",
             },
           },
         },
@@ -310,7 +439,7 @@ describe("gateway config methods", () => {
     const res = await rpcReq<{ ok?: boolean; error?: { message?: string } }>(
       requireWs(),
       "config.set",
-      configRawPayload(current.config, current.hash),
+      await configRawPayload(current.config, current.hash),
     );
 
     expect(res.ok).toBe(true);
@@ -471,7 +600,7 @@ describe("gateway config.apply", () => {
     const nextConfig = configWithGatewayTokenSecretRef(current.config, missingEnvVar);
 
     const res = await sendConfigApply(
-      configRawPayload(nextConfig, current.hash),
+      await configRawPayload(nextConfig, current.hash),
       CONFIG_SECRETREF_RPC_TIMEOUT_MS,
     );
     expect(res.ok).toBe(false);
@@ -492,7 +621,9 @@ describe("gateway config.apply", () => {
 
     const current = await getCurrentConfigObject();
 
-    const res = await sendConfigApply(configRawPayload(current.config, current.hash));
+    const res = await sendConfigApply(
+      await configRawPayload(current.config, current.hash, "config.apply"),
+    );
     expect(res.ok).toBe(true);
     expect(res.error).toBeUndefined();
   });

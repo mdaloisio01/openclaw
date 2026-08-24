@@ -8,6 +8,7 @@ import {
 } from "../tasks/task-flow-registry.js";
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
 import {
+  createTaskRecord,
   resetTaskRegistryDeliveryRuntimeForTests,
   resetTaskRegistryForTests,
 } from "../tasks/task-registry.js";
@@ -21,6 +22,7 @@ import {
   flowsResumeProductionCommand,
   flowsShowCommand,
   flowsStartProductionCommand,
+  flowsSupersedeForegroundCleanupCrewExecutorCommand,
 } from "./flows.js";
 
 const runRuntimeAssetGuardPreflight = vi.hoisted(() =>
@@ -441,8 +443,7 @@ describe("flows commands", () => {
           goal: "GIE authority mirror decision",
           sliceId: "gie-authority-mirror-decision-2026-06-22T0236Z",
           sliceOwner: "Will / Top-Level Governance",
-          authorityPath:
-            "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/gie_build_state_interpretation_after_sadb_sampler_takeover_2026-06-19T0514Z.md",
+          authorityPath: `${process.cwd()}/AGENTS.md`,
           authorityBasis: "controlling build-state interpretation",
           buildItem: "GIE authority mirror decision",
           requiredOwnerLane: "Will / Top-Level Governance",
@@ -613,6 +614,99 @@ describe("flows commands", () => {
         lawfulStopReason: "blocker",
         continuationRequiredAfterLocalSuccess: false,
       });
+    });
+  });
+
+  it("supersedes foreground Cleanup Crew executor through the supported command", async () => {
+    await withTaskFlowCommandStateDir(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "cleanup-crew/foreground-production",
+        goal: "Foreground Cleanup Crew production mission",
+        status: "blocked",
+        currentStep: "governance_remediation_current_truth_reconciliation",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+          currentUnitStatus: "blocked",
+          blockerPresent: true,
+          nextExecutableUnitLaunched: true,
+          lawfulStopReason: "blocker",
+        },
+      });
+      const lostTask = createTaskRecord({
+        runtime: "cli",
+        taskKind: "foreground_cleanup_crew_execution",
+        sourceId: "cleanup-crew:foreground",
+        requesterSessionKey: "agent:orchestrator:main",
+        ownerKey: "agent:orchestrator:main",
+        scopeKind: "session",
+        parentFlowId: flow.flowId,
+        runId: "foreground-cleanup-crew:lost",
+        label: "Lost foreground executor",
+        task: "Lost foreground executor",
+        status: "lost",
+        deliveryStatus: "session_queued",
+        notifyPolicy: "silent",
+        startedAt: 100,
+        lastEventAt: 200,
+        endedAt: 200,
+        childSessionKey: "agent:orchestrator:main",
+        terminalSummary: "backing session missing",
+      });
+      const replacementTask = createTaskRecord({
+        runtime: "subagent",
+        taskKind: "foreground_cleanup_crew_execution",
+        sourceId: "cleanup-crew:foreground:supersession",
+        requesterSessionKey: "agent:orchestrator:main",
+        ownerKey: "agent:orchestrator:main",
+        scopeKind: "session",
+        childSessionKey: "agent:orchestrator:subagent:replacement",
+        runId: "foreground-cleanup-crew:replacement",
+        label: "Replacement foreground executor",
+        task: "Replacement foreground executor",
+        status: "running",
+        deliveryStatus: "not_applicable",
+        notifyPolicy: "silent",
+        startedAt: 300,
+        lastEventAt: 300,
+        progressSummary: "Replacement worker heartbeat confirmed",
+      });
+      expect(lostTask).not.toBeNull();
+      expect(replacementTask).not.toBeNull();
+
+      const runtime = createRuntime();
+      await flowsSupersedeForegroundCleanupCrewExecutorCommand(
+        {
+          lookup: flow.flowId,
+          lostTaskId: lostTask!.taskId,
+          replacementTaskId: replacementTask!.taskId,
+          ownerKey: "agent:orchestrator:main",
+          sessionKey: "agent:orchestrator:main",
+          currentStep: "active_no_worker_forensic_repair_and_executor_recovery",
+          detail: "active_no_worker replacement executor",
+          json: true,
+        },
+        runtime,
+      );
+
+      expect(runtime.error).not.toHaveBeenCalled();
+      const payload = vi.mocked(runtime.writeJson).mock.calls[0]?.[0] as {
+        result: { flow: TaskFlowRecord; task: TaskRecord; status: string };
+      };
+      expect(payload.result.status).toBe("superseded");
+      expect(payload.result.flow.status).toBe("running");
+      expect(payload.result.task.parentFlowId).toBe(flow.flowId);
+      const continuation = getTaskFlowProductionContinuation(payload.result.flow);
+      expect(continuation).toMatchObject({
+        activeProductionRun: true,
+        parentRunOpen: true,
+        currentUnitStatus: "started",
+        blockerPresent: false,
+        nextExecutableUnitLaunched: true,
+        continuationViolation: false,
+      });
+      expect(continuation?.lawfulStopReason).toBeUndefined();
     });
   });
 });

@@ -125,7 +125,7 @@ export function flowRequiresActiveWorkWatchdog(flow: TaskFlowRecord): boolean {
     return false;
   }
   if (continuation.lawfulStopReason && !continuation.continuationViolation) {
-    return false;
+    return continuation.parentRunOpen === true && continuation.nextExecutableUnitLaunched === true;
   }
   if (
     (flow.status === "succeeded" ||

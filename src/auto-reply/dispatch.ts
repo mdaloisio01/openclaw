@@ -22,6 +22,7 @@ import { withReplyDispatcher } from "./dispatch-dispatcher.js";
 import { dispatchReplyFromConfig } from "./reply/dispatch-from-config.js";
 import type { DispatchFromConfigResult } from "./reply/dispatch-from-config.types.js";
 import type { GetReplyFromConfig } from "./reply/get-reply.types.js";
+import { buildGovernedWebChatFinalReleaseBeforeDeliver } from "./reply/governed-webchat-release-adapter.js";
 import { finalizeInboundContext } from "./reply/inbound-context.js";
 import {
   createReplyDispatcher,
@@ -348,6 +349,15 @@ function buildReplyPayloadSendingBeforeDeliver(
   };
 }
 
+function buildGovernedWebChatReleaseBeforeDeliver(
+  ctx: MsgContext | FinalizedMsgContext,
+): ReplyDispatchBeforeDeliver | undefined {
+  const finalized = finalizeInboundContext(ctx);
+  return buildGovernedWebChatFinalReleaseBeforeDeliver({
+    channel: finalized.Surface ?? finalized.Provider ?? finalized.OriginatingChannel,
+  });
+}
+
 function installReplyPayloadSendingBeforeDeliver(
   dispatcher: ReplyDispatcher,
   ctx: MsgContext | FinalizedMsgContext,
@@ -356,7 +366,10 @@ function installReplyPayloadSendingBeforeDeliver(
   if (replyPayloadSendingDispatchers.has(dispatcher)) {
     return;
   }
-  const beforeDeliver = buildReplyPayloadSendingBeforeDeliver(ctx, opts);
+  const beforeDeliver = combineBeforeDeliverHooks(
+    buildReplyPayloadSendingBeforeDeliver(ctx, opts),
+    buildGovernedWebChatReleaseBeforeDeliver(ctx),
+  );
   if (!beforeDeliver || !dispatcher.appendBeforeDeliver) {
     return;
   }
@@ -513,12 +526,18 @@ export async function dispatchInboundMessageWithBufferedDispatcher(params: {
   const replyPayloadBeforeDeliver = buildReplyPayloadSendingBeforeDeliver(finalized, {
     runId: params.replyOptions?.runId,
   });
+  const governedWebChatBeforeDeliver = buildGovernedWebChatReleaseBeforeDeliver(finalized);
   const globalBeforeDeliver = combineBeforeDeliverHooks(
     replyPayloadBeforeDeliver,
     buildMessageSendingBeforeDeliver(finalized),
+    governedWebChatBeforeDeliver,
   );
   const configuredBeforeDeliver = params.dispatcherOptions.beforeDeliver
-    ? combineBeforeDeliverHooks(params.dispatcherOptions.beforeDeliver, replyPayloadBeforeDeliver)
+    ? combineBeforeDeliverHooks(
+        params.dispatcherOptions.beforeDeliver,
+        replyPayloadBeforeDeliver,
+        governedWebChatBeforeDeliver,
+      )
     : globalBeforeDeliver;
   const beforeDeliver: ReplyDispatchBeforeDeliver | undefined =
     foregroundReplyFence || configuredBeforeDeliver
@@ -602,12 +621,18 @@ export async function dispatchInboundMessageWithDispatcher(params: {
   const replyPayloadBeforeDeliver = buildReplyPayloadSendingBeforeDeliver(params.ctx, {
     runId: params.replyOptions?.runId,
   });
+  const governedWebChatBeforeDeliver = buildGovernedWebChatReleaseBeforeDeliver(params.ctx);
   const globalBeforeDeliver = combineBeforeDeliverHooks(
     replyPayloadBeforeDeliver,
     buildMessageSendingBeforeDeliver(params.ctx),
+    governedWebChatBeforeDeliver,
   );
   const composedBeforeDeliver = params.dispatcherOptions.beforeDeliver
-    ? combineBeforeDeliverHooks(params.dispatcherOptions.beforeDeliver, replyPayloadBeforeDeliver)
+    ? combineBeforeDeliverHooks(
+        params.dispatcherOptions.beforeDeliver,
+        replyPayloadBeforeDeliver,
+        governedWebChatBeforeDeliver,
+      )
     : globalBeforeDeliver;
   const dispatcher = createReplyDispatcher({
     ...params.dispatcherOptions,

@@ -264,6 +264,25 @@ export type ConfigWriteOptions = {
    */
   lastTouchedVersionOverride?: string;
   /**
+   * Internal deterministic timestamp for governed writes that must approve and
+   * later verify the exact persisted payload.
+   */
+  lastTouchedAtOverride?: string;
+  /**
+   * Control-plane manifest/approval context for protected config mutations.
+   * Required when writing the live protected control-plane config.
+   */
+  controlPlane?: {
+    manifest?: unknown;
+    approval?: unknown;
+    actor?: string;
+    tool?: string;
+    requestedServices?: readonly string[];
+    restartScope?: "none" | "gateway";
+    auditSinkAvailable?: boolean;
+    rollbackSinkAvailable?: boolean;
+  };
+  /**
    * Internal hook used by the exported runtime-aware writer after validation
    * has produced the exact source config that will be committed.
    */
@@ -970,8 +989,8 @@ function warnOnConfigMiskeys(raw: unknown, logger: Pick<typeof console, "warn">)
   }
 }
 
-function stampConfigVersion(cfg: OpenClawConfig, version?: string): OpenClawConfig {
-  return stampConfigWriteMetadata(cfg, new Date().toISOString(), version);
+function stampConfigVersion(cfg: OpenClawConfig, version?: string, now?: string): OpenClawConfig {
+  return stampConfigWriteMetadata(cfg, now ?? new Date().toISOString(), version);
 }
 
 function warnIfConfigFromFuture(cfg: OpenClawConfig, logger: Pick<typeof console, "warn">): void {
@@ -2201,6 +2220,7 @@ export function createConfigIO(
     const stampedOutputConfig = stampConfigVersion(
       outputConfig,
       options.lastTouchedVersionOverride,
+      options.lastTouchedAtOverride,
     );
     const json = JSON.stringify(stampedOutputConfig, null, 2).trimEnd().concat("\n");
     const nextHash = hashConfigRaw(json);
@@ -2622,6 +2642,7 @@ export async function writeConfigFile(
     skipPluginValidation: options.skipPluginValidation,
     preservedLegacyRootKeys: options.preservedLegacyRootKeys,
     lastTouchedVersionOverride: options.lastTouchedVersionOverride,
+    lastTouchedAtOverride: options.lastTouchedAtOverride,
     preCommitRuntimePreflight: async (sourceConfig) => {
       runtimePreflightResult = await preflightRuntimeSnapshotWrite({
         nextSourceConfig: sourceConfig,

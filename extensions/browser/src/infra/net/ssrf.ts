@@ -1,6 +1,7 @@
 export {
   SsrFBlockedError,
   isPrivateNetworkAllowedByPolicy,
+  resolveSsrFPolicyForUrl,
   resolvePinnedHostnameWithPolicy,
   type LookupFn,
   type SsrFPolicy,

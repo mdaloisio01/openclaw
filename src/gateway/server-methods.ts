@@ -593,7 +593,7 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
     loadHandlers: loadUsageHandlers,
   }),
   ...createLazyCoreHandlers({
-    methods: ["agent", "agent.identity.get", "agent.wait"],
+    methods: ["agent", "agent.falseCloseoutAdmission.probe", "agent.identity.get", "agent.wait"],
     loadHandlers: loadAgentHandlers,
   }),
   ...createLazyCoreHandlers({

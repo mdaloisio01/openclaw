@@ -3186,6 +3186,65 @@ describe("dispatchReplyFromConfig", () => {
     );
   });
 
+  it("preserves an approval blocker when later non-terminal updates are emitted", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+      _cfg?: OpenClawConfig,
+    ) => {
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Verify package hashes"],
+      });
+      await opts?.onApprovalEvent?.({
+        phase: "requested",
+        status: "unavailable",
+        message: "waiting on approval",
+      });
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Readiness report emitted"],
+      });
+      return {
+        text: "STATUS: blocked\nOpen/closed truth: build still open; waiting on approval.",
+        isError: true,
+      } satisfies ReplyPayload;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "STATUS: blocked\nOpen/closed truth: build still open; waiting on approval.",
+      isError: true,
+    });
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("BLOCKED_CLOSEOUT"),
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        { type: "BLOCKER_STATE", detail: "true:approval_unavailable" },
+        { type: "BLOCKER_STATE", detail: "true:approval_unavailable" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
   it("suppresses generic patch working statuses when verbose is enabled", async () => {
     setNoAbort();
     const cfg = {

@@ -25,6 +25,7 @@ export {
   root,
   safeEqualSecret,
   sanitizeUntrustedFileName,
+  resolveSsrFPolicyForUrl,
   resolveStrictExistingPathsWithinRoot,
   resolveWritablePathWithinRoot,
   FsSafeError,

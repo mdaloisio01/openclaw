@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { getReplyPayloadMetadata } from "../reply-payload.js";
 import {
   buildPrivateMessageToolFinalDeliveryError,
+  resolvePrivateMessageToolFinalRepairText,
   shouldWarnAboutPrivateMessageToolFinal,
 } from "./private-message-tool-final.js";
 
@@ -68,6 +69,24 @@ describe("shouldWarnAboutPrivateMessageToolFinal", () => {
 
   it("does not flag when delivery was intentionally denied by send policy", () => {
     expect(shouldWarnAboutPrivateMessageToolFinal({ ...base, sendPolicyDenied: true })).toBe(false);
+  });
+
+  it("captures trimmed repair text for private finals that missed the message tool", () => {
+    expect(
+      resolvePrivateMessageToolFinalRepairText({
+        ...base,
+        finalText: "  Visible answer  ",
+      }),
+    ).toBe("Visible answer");
+  });
+
+  it("does not create repair text when the source reply was already delivered", () => {
+    expect(
+      resolvePrivateMessageToolFinalRepairText({
+        ...base,
+        successfulSourceReplyDelivery: true,
+      }),
+    ).toBeUndefined();
   });
 
   it("builds a visible delivery error without exposing the private final body", () => {

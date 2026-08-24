@@ -35,7 +35,6 @@ import {
   type DeferredPluginToolApproval,
 } from "../agent-tools.before-tool-call.js";
 import { stableStringify } from "../stable-stringify.js";
-import { resolveToolLoopDetectionConfig } from "../tool-loop-detection-config.js";
 import { normalizeToolName } from "../tool-policy.js";
 import { callGatewayTool } from "../tools/gateway.js";
 import { runAgentHarnessAfterToolCallHook } from "./hook-helpers.js";
@@ -555,25 +554,16 @@ export function buildNativeHookRelayCommand(params: {
   ]);
 }
 
-function nativePreToolUseMayRunLoopDetection(registration: NativeHookRelayRegistration): boolean {
-  if (!registration.sessionKey) {
-    return false;
-  }
-  const loopDetection = resolveToolLoopDetectionConfig({
-    cfg: registration.config,
-    agentId: registration.agentId,
-  });
-  return loopDetection?.enabled !== false;
-}
-
 function nativeHookRelayEventHasLocalWork(
   registration: NativeHookRelayRegistration,
   event: NativeHookRelayEvent,
 ): boolean {
   if (event === "pre_tool_use") {
     // Avoid spawning a native hook relay for every Codex tool call when there
-    // is no before_tool_call hook, trusted-tool policy, or loop detector work.
-    return hasBeforeToolCallPolicy() || nativePreToolUseMayRunLoopDetection(registration);
+    // is no before_tool_call hook or trusted-tool policy. Loop detection is
+    // enforced by the app-server path and does not need a full CLI hook worker.
+    void registration;
+    return hasBeforeToolCallPolicy();
   }
   if (event === "post_tool_use") {
     return hasGlobalHooks("after_tool_call");

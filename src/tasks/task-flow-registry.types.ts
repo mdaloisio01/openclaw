@@ -16,6 +16,7 @@ export type TaskFlowStatus =
   | "running"
   | "waiting"
   | "blocked"
+  | "terminal_pending_watchdog"
   | "succeeded"
   | "failed"
   | "cancelled"
@@ -104,6 +105,7 @@ const TASK_FLOW_STATUSES = new Set<TaskFlowStatus>([
   "running",
   "waiting",
   "blocked",
+  "terminal_pending_watchdog",
   "succeeded",
   "failed",
   "cancelled",

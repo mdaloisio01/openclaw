@@ -724,8 +724,10 @@ describe("task-flow-registry", () => {
         throw new Error("Expected lawful whole-run completion update to apply");
       }
       const lawfulContinuation = getTaskFlowProductionContinuation(lawfulStop.flow);
+      expect(lawfulStop.flow.status).toBe("terminal_pending_watchdog");
       expect(lawfulContinuation?.lawfulWholeRunCompletion).toBe(true);
       expect(lawfulContinuation?.lawfulStopReason).toBe("whole_run_complete");
+      expect(lawfulContinuation?.parentRunOpen).toBe(false);
 
       const closed = finishFlow({
         flowId: created.flowId,

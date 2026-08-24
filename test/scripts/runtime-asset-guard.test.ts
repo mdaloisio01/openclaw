@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  applyRuntimeBackupPolicy,
   ensureRuntimeAssets,
   restoreControlUiFromSnapshotIfMissing,
   restoreRuntimeAssets,
@@ -46,6 +47,12 @@ function writeDistFile(rootDir: string, relativePath: string, source: string) {
   const filePath = path.join(rootDir, "dist", relativePath);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, source);
+}
+
+function writePreviousBackup(backupRoot: string, label: string, marker: string) {
+  const previousRoot = path.join(backupRoot, label);
+  fs.mkdirSync(path.join(previousRoot, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(previousRoot, "dist", "marker.txt"), `${marker}\n`);
 }
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -177,6 +184,172 @@ describe("runtime asset guard", () => {
         importerFile: "dist/entry.js",
         missingTargetFile: "dist/gone-Co028f3a.js",
         importSpecifier: "./gone-Co028f3a.js",
+      });
+      expect(fs.existsSync(path.join(backupRoot, "last-known-good"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("keeps only the configured number of previous runtime backups", () => {
+    const { backupRoot, cleanup } = makeTempRoot();
+    try {
+      fs.mkdirSync(backupRoot, { recursive: true });
+      for (let index = 1; index <= 8; index += 1) {
+        writePreviousBackup(backupRoot, `previous-2026-07-23T00000${index}Z`, `old-${index}`);
+      }
+
+      const policy = applyRuntimeBackupPolicy({ backupRoot, previousRetention: 5 });
+
+      expect(policy.previousRemoved.map((item) => path.basename(item.path))).toEqual([
+        "previous-2026-07-23T000001Z",
+        "previous-2026-07-23T000002Z",
+        "previous-2026-07-23T000003Z",
+      ]);
+      expect(policy.previousRemaining).toEqual([
+        "previous-2026-07-23T000008Z",
+        "previous-2026-07-23T000007Z",
+        "previous-2026-07-23T000006Z",
+        "previous-2026-07-23T000005Z",
+        "previous-2026-07-23T000004Z",
+      ]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("removes stale partial runtime snapshot directories", () => {
+    const { backupRoot, cleanup } = makeTempRoot();
+    try {
+      fs.mkdirSync(path.join(backupRoot, "last-known-good.next-old", "dist"), {
+        recursive: true,
+      });
+      fs.mkdirSync(path.join(backupRoot, "last-known-good.tmp-old", "dist"), {
+        recursive: true,
+      });
+      fs.mkdirSync(path.join(backupRoot, "partial-old", "dist"), { recursive: true });
+      writePreviousBackup(backupRoot, "previous-2026-07-23T000009Z", "valid");
+
+      const policy = applyRuntimeBackupPolicy({ backupRoot });
+
+      expect(policy.partialRemoved.map((item) => path.basename(item.path)).sort()).toEqual([
+        "last-known-good.next-old",
+        "last-known-good.tmp-old",
+        "partial-old",
+      ]);
+      expect(fs.existsSync(path.join(backupRoot, "previous-2026-07-23T000009Z"))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("blocks snapshots when backup storage is below free byte or inode reserve", () => {
+    const { rootDir, backupRoot, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+
+      const snapshot = snapshotRuntimeAssets({
+        rootDir,
+        backupRoot,
+        minFreeBytes: 1024,
+        minFreeInodes: 100,
+        statfs: () => ({ bsize: 1, bavail: 100, ffree: 10 }),
+      });
+
+      expect(snapshot).toMatchObject({
+        ok: false,
+        action: "snapshot",
+        blocker: "runtime_backup_resource_limit",
+        reason: "backup root below minimum free byte or inode reserve",
+      });
+      expect(fs.existsSync(path.join(backupRoot, "last-known-good"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("blocks snapshots when runtime tree exceeds configured snapshot entry limit", () => {
+    const { rootDir, backupRoot, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+
+      const snapshot = snapshotRuntimeAssets({
+        rootDir,
+        backupRoot,
+        maxSnapshotEntries: 1,
+      });
+
+      expect(snapshot).toMatchObject({
+        ok: false,
+        blocker: "runtime_backup_resource_limit",
+        reason: "snapshot tree exceeds configured maximum",
+      });
+      expect(fs.existsSync(path.join(backupRoot, "last-known-good"))).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not create new previous backups from successful ensure calls by default", () => {
+    const { rootDir, backupRoot, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+      expect(snapshotRuntimeAssets({ rootDir, backupRoot, requireUi: true }).ok).toBe(true);
+
+      for (let index = 0; index < 100; index += 1) {
+        const ensure = ensureRuntimeAssets({ rootDir, backupRoot, requireUi: true });
+        expect(ensure.ok).toBe(true);
+        expect(ensure.snapshot).toBeUndefined();
+      }
+
+      expect(
+        fs
+          .readdirSync(backupRoot, { withFileTypes: true })
+          .filter((dirent) => dirent.isDirectory() && dirent.name.startsWith("previous-")),
+      ).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("honors explicit ensure snapshot opt-in while retaining only five previous backups", () => {
+    const { rootDir, backupRoot, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+
+      for (let index = 0; index < 8; index += 1) {
+        const ensure = ensureRuntimeAssets({
+          rootDir,
+          backupRoot,
+          requireUi: true,
+          snapshot: true,
+          previousRetention: 5,
+        });
+        expect(ensure.ok).toBe(true);
+      }
+
+      expect(
+        fs
+          .readdirSync(backupRoot, { withFileTypes: true })
+          .filter((dirent) => dirent.isDirectory() && dirent.name.startsWith("previous-")),
+      ).toHaveLength(5);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not snapshot when another runtime snapshot lock is present", () => {
+    const { rootDir, backupRoot, cleanup } = makeTempRoot();
+    try {
+      writeRuntimeAssets(rootDir);
+      fs.mkdirSync(backupRoot, { recursive: true });
+      fs.writeFileSync(path.join(backupRoot, ".runtime-asset-guard.lock"), "other-pid\n");
+
+      const snapshot = snapshotRuntimeAssets({ rootDir, backupRoot });
+
+      expect(snapshot).toMatchObject({
+        ok: false,
+        blocker: "runtime_backup_snapshot_in_progress",
       });
       expect(fs.existsSync(path.join(backupRoot, "last-known-good"))).toBe(false);
     } finally {

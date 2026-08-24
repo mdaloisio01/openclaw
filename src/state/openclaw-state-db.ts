@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import {
@@ -100,14 +100,22 @@ function ensureOpenClawStatePermissions(pathname: string, env: NodeJS.ProcessEnv
   const dirExisted = existsSync(dir);
   mkdirSync(dir, { recursive: true, mode: OPENCLAW_STATE_DIR_MODE });
   if (isDefaultStateDatabase || !dirExisted) {
-    chmodSync(dir, OPENCLAW_STATE_DIR_MODE);
+    chmodIfModeDiffers(dir, OPENCLAW_STATE_DIR_MODE);
   }
   for (const suffix of OPENCLAW_STATE_SIDECAR_SUFFIXES) {
     const candidate = `${pathname}${suffix}`;
     if (existsSync(candidate)) {
-      chmodSync(candidate, OPENCLAW_STATE_FILE_MODE);
+      chmodIfModeDiffers(candidate, OPENCLAW_STATE_FILE_MODE);
     }
   }
+}
+
+function chmodIfModeDiffers(pathname: string, mode: number): void {
+  const currentMode = statSync(pathname).mode & 0o777;
+  if (currentMode === mode) {
+    return;
+  }
+  chmodSync(pathname, mode);
 }
 
 function tableHasColumn(db: DatabaseSync, tableName: string, columnName: string): boolean {

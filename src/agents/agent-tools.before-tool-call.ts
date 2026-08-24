@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -7,6 +8,11 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
+import {
+  evaluateMissionSpecificToolEnforcement,
+  type MissionSpecificToolEnforcementAuthority,
+} from "../governance/mission-specific-tool-enforcement.js";
+import type { TrustedHostPolicy } from "../governance/protected-action-policy.js";
 import {
   diagnosticErrorCategory,
   diagnosticHttpStatusCode,
@@ -25,6 +31,12 @@ import {
   buildDirtyTreeHygieneReport,
   type DirtyTreeHygieneReport,
 } from "../infra/dirty-tree-hygiene.js";
+import {
+  evaluateRootMutationGuard,
+  validateGovernedBuildWorkspaceMetadata,
+  type GovernedBuildWorkspaceMetadata,
+  type RootMutationGuardContext,
+} from "../infra/governed-build-workspace.js";
 import {
   DEFAULT_PLUGIN_APPROVAL_TIMEOUT_MS,
   MAX_PLUGIN_APPROVAL_TIMEOUT_MS,
@@ -123,6 +135,16 @@ export type HookContext = {
     missionId?: string;
     nextAnalysisOwner?: string;
   };
+  governedBuildWorkspace?: RootMutationGuardContext;
+  governedMissionToolEnforcement?: {
+    active: boolean;
+    conversationClassification?: "ordinary" | "governed" | "ambiguous";
+    expectedCurrentStep: string;
+    trustedHostPolicy: TrustedHostPolicy;
+    supervisorWrapperRequired?: boolean;
+    supervisorWrapperActive?: boolean;
+    authority?: MissionSpecificToolEnforcementAuthority;
+  };
   sandbox?: {
     root: string;
     bridge: SandboxFsBridge;
@@ -135,7 +157,9 @@ type HookBlockedReason =
   | "plugin-approval"
   | "tool-loop"
   | "dirty-tree-hygiene"
-  | "cleanup-crew-analysis-mode";
+  | "cleanup-crew-analysis-mode"
+  | "governed-build-root-mutation-guard"
+  | "governed-mission-tool-enforcement";
 type HookOutcome =
   | {
       blocked: true;
@@ -258,6 +282,19 @@ function getStringParam(params: unknown, keys: string[]): string | undefined {
   return undefined;
 }
 
+function getBooleanParam(params: unknown, keys: string[]): boolean | undefined {
+  if (!isPlainObject(params)) {
+    return undefined;
+  }
+  for (const key of keys) {
+    const value = params[key];
+    if (typeof value === "boolean") {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function withStringParam(params: unknown, nextValue: string): unknown {
   if (!isPlainObject(params)) {
     return params;
@@ -313,6 +350,14 @@ function isReadOnlyDiagnosticShellCommand(command: string): boolean {
     return false;
   }
   return READ_ONLY_DIAGNOSTIC_COMMAND_RE.test(trimmed);
+}
+
+function isReadOnlyDiagnosticToolCall(toolName: string, params: unknown): boolean {
+  if (!isShellTool(toolName)) {
+    return false;
+  }
+  const command = getStringParam(params, ["cmd", "command", "script", "input"]);
+  return command ? isReadOnlyDiagnosticShellCommand(command) : false;
 }
 
 export type GatewaySelfRestartCommand =
@@ -485,6 +530,264 @@ function isSourceModifyingToolCall(toolName: string, params: unknown): boolean {
     return false;
   }
   return !isReadOnlyDiagnosticShellCommand(command);
+}
+
+function resolveMutationTargetPaths(params: unknown, ctx?: HookContext): string[] {
+  const paths = new Set<string>();
+  for (const candidate of readToolPathCandidates(params, ctx)) {
+    paths.add(candidate);
+  }
+  if (isPlainObject(params)) {
+    for (const key of ["paths", "files", "filePaths"]) {
+      const value = params[key];
+      if (!Array.isArray(value)) {
+        continue;
+      }
+      for (const entry of value) {
+        if (typeof entry !== "string") {
+          continue;
+        }
+        const resolved = resolveRelativeToolPath(entry, ctx);
+        if (resolved) {
+          paths.add(resolved);
+        }
+      }
+    }
+  }
+  return [...paths].toSorted((left, right) => left.localeCompare(right));
+}
+
+function resolveProtectedActionTargetPath(params: unknown, ctx?: HookContext): string | undefined {
+  const [firstPath] = resolveMutationTargetPaths(params, ctx);
+  if (!firstPath) {
+    return undefined;
+  }
+  const sourceRelative = path.relative(OPENCLAW_SOURCE_REPO_DIR, firstPath).replace(/\\/gu, "/");
+  if (sourceRelative && !sourceRelative.startsWith("../") && sourceRelative !== "..") {
+    return sourceRelative;
+  }
+  return firstPath.replace(/\\/gu, "/");
+}
+
+function resolveGovernedMissionToolEnforcementBlock(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+}): HookOutcome | undefined {
+  const enforcement = args.ctx?.governedMissionToolEnforcement;
+  if (enforcement?.active !== true) {
+    return undefined;
+  }
+  const command = getStringParam(args.params, ["cmd", "command", "script", "input"]);
+  const gatewayMethod = isPlainObject(args.params)
+    ? getStringParam(args.params, ["method", "gatewayMethod", "action"])
+    : undefined;
+  const childRuntime = getStringParam(args.params, ["runtime", "childRuntime"]);
+  const targetPath = resolveProtectedActionTargetPath(args.params, args.ctx);
+  const decision = evaluateMissionSpecificToolEnforcement({
+    actionId:
+      args.ctx?.runId && args.ctx?.sessionKey
+        ? `${args.ctx.sessionKey}:${args.ctx.runId}:${args.toolName}`
+        : args.toolName,
+    actor: {
+      actorId: args.ctx?.agentId ?? "unknown",
+      ...(args.ctx?.sessionKey ? { sessionKey: args.ctx.sessionKey } : {}),
+      ...(args.ctx?.runId ? { runId: args.ctx.runId } : {}),
+    },
+    toolName: args.toolName,
+    target: `tool:${args.toolName}`,
+    signals: {
+      toolName: args.toolName,
+      ...(targetPath ? { targetPath } : {}),
+      ...(gatewayMethod ? { gatewayMethod } : {}),
+      ...(command ? { command } : {}),
+      ...(hasInterpreterCommand(command) ? { commandInterpreter: true } : {}),
+      ...(hasElevatedExecMode(args.params) ? { elevatedMode: true } : {}),
+      ...(isChildDelegationToolCall(args.toolName, args.params)
+        ? { childDelegation: true, ...(childRuntime ? { childRuntime } : {}) }
+        : {}),
+      ...(enforcement.supervisorWrapperRequired === true
+        ? { supervisorWrapperRequired: true }
+        : {}),
+      ...(enforcement.supervisorWrapperActive === true ? { supervisorWrapperPresent: true } : {}),
+    },
+    conversationClassification: enforcement.conversationClassification ?? "ordinary",
+    trustedHostPolicy: enforcement.trustedHostPolicy,
+    authority: enforcement.authority
+      ? { ...enforcement.authority, expectedCurrentStep: enforcement.expectedCurrentStep }
+      : undefined,
+    now: new Date().toISOString(),
+  });
+  if (decision.decision === "ALLOW") {
+    return undefined;
+  }
+  return {
+    blocked: true,
+    kind: "veto",
+    deniedReason: "governed-mission-tool-enforcement",
+    reason: [
+      "Governed mission tool enforcement blocked this tool call.",
+      `Reason: ${decision.reasonCode}.`,
+      `Obligations: ${decision.obligations.join(", ") || "none"}.`,
+    ].join(" "),
+    params: args.params,
+  };
+}
+
+function hasInterpreterCommand(command: string | undefined): boolean {
+  return /(^|\s)(bash|sh|zsh|fish|python3?|node|tsx|ts-node|ruby|perl|php)(\s|$)/u.test(
+    command ?? "",
+  );
+}
+
+function isChildDelegationToolCall(toolName: string, params: unknown): boolean {
+  if (
+    !matchesToolName(toolName, [
+      "sessions_spawn",
+      "spawn_agent",
+      "subagent",
+      "subagents",
+      "create_task",
+      "task_spawn",
+    ])
+  ) {
+    return false;
+  }
+  if (!isPlainObject(params)) {
+    return true;
+  }
+  return (
+    typeof params.task === "string" ||
+    typeof params.prompt === "string" ||
+    typeof params.agentId === "string" ||
+    typeof params.runtime === "string"
+  );
+}
+
+function hasElevatedExecMode(params: unknown): boolean {
+  const sandboxPermission = getStringParam(params, [
+    "sandbox_permissions",
+    "sandboxPermissions",
+    "sandbox_permission",
+  ]);
+  if (sandboxPermission === "require_escalated" || sandboxPermission === "elevated") {
+    return true;
+  }
+  const sandbox = getStringParam(params, ["sandbox"]);
+  return (
+    sandbox === "require" || getBooleanParam(params, ["elevated", "requireEscalated"]) === true
+  );
+}
+
+function resolveGovernedBuildWorkspaceRootMutationBlock(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+  governedBuildWorkspace?: RootMutationGuardContext;
+}): HookOutcome | undefined {
+  const decision = evaluateRootMutationGuard({
+    context: args.governedBuildWorkspace ?? args.ctx?.governedBuildWorkspace,
+    cwd: args.ctx?.cwd,
+    targetPaths: resolveMutationTargetPaths(args.params, args.ctx),
+    sourceModifying: isSourceModifyingToolCall(args.toolName, args.params),
+    readOnlyDiagnostic: isReadOnlyDiagnosticToolCall(args.toolName, args.params),
+  });
+  if (decision.allowed) {
+    return undefined;
+  }
+  return {
+    blocked: true,
+    kind: "veto",
+    deniedReason: "governed-build-root-mutation-guard",
+    reason: decision.message,
+    params: args.params,
+  };
+}
+
+const DEFAULT_MARK_FACING_EXPORT_ROOTS = [
+  "/home/will/.openclaw/workspace-orchestrator/file_hub/exports",
+  "/home/will/.openclaw/workspace/file_hub/exports",
+];
+
+function buildRootMutationGuardContextFromMetadata(
+  metadata: GovernedBuildWorkspaceMetadata,
+): RootMutationGuardContext {
+  return {
+    active: true,
+    buildId: metadata.buildId,
+    sourceRoot: metadata.sourceRoot,
+    worktreePath: metadata.worktreePath,
+    allowedWriteScopes: metadata.allowedWriteScopes,
+    markFacingExportRoots: DEFAULT_MARK_FACING_EXPORT_ROOTS,
+  };
+}
+
+async function readGovernedBuildWorkspaceMetadata(
+  metadataPath: string,
+): Promise<GovernedBuildWorkspaceMetadata | undefined> {
+  try {
+    const parsed = JSON.parse(
+      await fs.readFile(metadataPath, "utf8"),
+    ) as Partial<GovernedBuildWorkspaceMetadata>;
+    const validation = validateGovernedBuildWorkspaceMetadata(parsed);
+    if (!validation.valid) {
+      log.warn(
+        `Ignoring invalid governed build workspace metadata at ${metadataPath}: ${validation.errors.join("; ")}`,
+      );
+      return undefined;
+    }
+    return parsed as GovernedBuildWorkspaceMetadata;
+  } catch (err) {
+    if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+      return undefined;
+    }
+    log.warn(`Failed to read governed build workspace metadata at ${metadataPath}: ${String(err)}`);
+    return undefined;
+  }
+}
+
+async function findGovernedBuildWorkspaceMetadataPath(
+  startPath?: string,
+): Promise<string | undefined> {
+  const trimmed = startPath?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  let current = path.resolve(trimmed);
+  for (;;) {
+    const candidate = path.join(current, "workspace.json");
+    try {
+      const stat = await fs.stat(candidate);
+      if (stat.isFile()) {
+        return candidate;
+      }
+    } catch {
+      // Keep walking toward the filesystem root.
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return undefined;
+    }
+    current = parent;
+  }
+}
+
+async function resolveGovernedBuildWorkspaceContext(
+  ctx?: HookContext,
+): Promise<RootMutationGuardContext | undefined> {
+  if (ctx?.governedBuildWorkspace) {
+    return ctx.governedBuildWorkspace;
+  }
+  const explicitMetadataPath = process.env.OPENCLAW_GOVERNED_BUILD_WORKSPACE_METADATA?.trim();
+  const metadataPath =
+    explicitMetadataPath ||
+    (await findGovernedBuildWorkspaceMetadataPath(ctx?.cwd)) ||
+    (await findGovernedBuildWorkspaceMetadataPath(ctx?.workspaceDir));
+  if (!metadataPath) {
+    return undefined;
+  }
+  const metadata = await readGovernedBuildWorkspaceMetadata(metadataPath);
+  return metadata ? buildRootMutationGuardContextFromMetadata(metadata) : undefined;
 }
 
 function formatDirtyTreeHygieneBlockMessage(report: DirtyTreeHygieneReport): string {
@@ -770,9 +1073,28 @@ function readToolPathCandidates(params: unknown, ctx?: HookContext): string[] {
     return [];
   }
   const candidates = typeof params.path === "string" ? [params.path] : [];
+  if (typeof params.patch === "string") {
+    candidates.push(...readApplyPatchPathCandidates(params.patch));
+  }
   return candidates
     .map((candidate) => resolveRelativeToolPath(candidate, ctx))
     .filter((candidate): candidate is string => Boolean(candidate));
+}
+
+function readApplyPatchPathCandidates(patch: string): string[] {
+  const paths: string[] = [];
+  for (const line of patch.split(/\r?\n/u)) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/u);
+    if (match?.[1]) {
+      paths.push(match[1].trim());
+      continue;
+    }
+    const moveMatch = line.match(/^\*\*\* Move to: (.+)$/u);
+    if (moveMatch?.[1]) {
+      paths.push(moveMatch[1].trim());
+    }
+  }
+  return paths;
 }
 
 function skillInstructionPaths(snapshot: SkillSnapshot | undefined): Map<string, SkillUsageMatch> {
@@ -1315,6 +1637,26 @@ export async function runBeforeToolCallHook(args: {
   });
   if (cleanupCrewAnalysisBlock) {
     return cleanupCrewAnalysisBlock;
+  }
+
+  const governedMissionToolBlock = resolveGovernedMissionToolEnforcementBlock({
+    toolName,
+    params,
+    ctx: args.ctx,
+  });
+  if (governedMissionToolBlock) {
+    return governedMissionToolBlock;
+  }
+
+  const governedBuildWorkspace = await resolveGovernedBuildWorkspaceContext(args.ctx);
+  const governedBuildWorkspaceBlock = resolveGovernedBuildWorkspaceRootMutationBlock({
+    toolName,
+    params,
+    ctx: args.ctx,
+    governedBuildWorkspace,
+  });
+  if (governedBuildWorkspaceBlock) {
+    return governedBuildWorkspaceBlock;
   }
 
   const gatewayRestartCheckpoint = await resolveGatewaySelfRestartCheckpoint({

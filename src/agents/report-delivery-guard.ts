@@ -1,3 +1,19 @@
+import {
+  CLEANUP_CREW_CANONICAL_OUTCOMES,
+  CLEANUP_CREW_EXTERNAL_DEPENDENCY_CLASSES,
+  CLEANUP_CREW_GOVERNANCE_REASON_CODES,
+  CLEANUP_CREW_IMPACT_LEVELS,
+  CLEANUP_CREW_OWNER_DECISION_CLASSES,
+  CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+} from "../continuity/continuity-gate-v2.js";
+import {
+  CLEANUP_WATCHDOG_CLEAN_DIMENSIONS,
+  CLEANUP_WATCHDOG_POLICY_VERSION,
+  getCleanupWatchdogPriority,
+  type CleanupWatchdogFindingCategory,
+  type CleanupWatchdogPriorityCode,
+} from "../governance/cleanup-watchdog-policy.js";
+
 export const REPORT_DELIVERY_GUARD_STATES = [
   "not_required",
   "report_delivery_satisfied",
@@ -31,6 +47,8 @@ export type ReportDeliveryGuardFacts = {
 
 export type ReportDeliveryGuardDecision = {
   state: ReportDeliveryGuardState;
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  canonicalPriority?: CleanupWatchdogPriorityCode;
   allowed: boolean;
   reportDeliveryComplete: boolean;
   milestoneReportComplete: boolean;
@@ -49,6 +67,23 @@ export const REQUIRED_MILESTONE_REPORT_FIELDS = [
 ] as const;
 
 export type RequiredMilestoneReportField = (typeof REQUIRED_MILESTONE_REPORT_FIELDS)[number];
+
+export const CLEANUP_CREW_CANONICAL_POLICY_PROMPT = [
+  `Cleanup Crew watchdog governance policy version: ${CLEANUP_WATCHDOG_POLICY_VERSION}.`,
+  `Cleanup Crew canonical policy version: ${CLEANUP_CREW_POLICY_SCHEMA_VERSION}.`,
+  `Canonical outcomes: ${CLEANUP_CREW_CANONICAL_OUTCOMES.join(", ")}.`,
+  `Canonical impact levels: ${CLEANUP_CREW_IMPACT_LEVELS.join(", ")}.`,
+  `Closed owner-decision classes: ${CLEANUP_CREW_OWNER_DECISION_CLASSES.join(", ")}.`,
+  `External-dependency classes: ${CLEANUP_CREW_EXTERNAL_DEPENDENCY_CLASSES.join(", ")}.`,
+  `Reason codes: ${CLEANUP_CREW_GOVERNANCE_REASON_CODES.join(", ")}.`,
+  "Malformed or unknown policy input fails closed as ACTION_BLOCKED with MALFORMED_POLICY_INPUT.",
+  "OWNER_DECISION_REQUIRED requires a closed owner-decision class; do not use it for ordinary technical uncertainty.",
+  "MISSION_ABORTED requires a mission-bound exhaustion receipt covering every continuation class.",
+  `Watchdog active worker recovery priority: ${getCleanupWatchdogPriority("active_no_worker")}.`,
+  `Report-delivery debt priority: ${getCleanupWatchdogPriority("pending_report_delivery")}.`,
+  `Watchdog CLEAN requires dimensions: ${CLEANUP_WATCHDOG_CLEAN_DIMENSIONS.join(", ")}.`,
+  "Changing a mission to blocked, suppressing duplicate delivery, or proving runtime readiness without mission resumption cannot make watchdog CLEAN.",
+].join("\n");
 
 export const CLEANUP_CREW_MILESTONE_REPORT_MOMENTS = [
   "build_complete",
@@ -96,6 +131,8 @@ export type CleanupCrewStageTransitionDecision = {
     | "route_grant_fail_repair"
     | "proof_unproven_recovery_required"
     | "blocked_by_sop";
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  canonicalPriority?: CleanupWatchdogPriorityCode;
   shouldContinue: boolean;
   allowedToAdvance: boolean;
   requiredReportDelivered: boolean;
@@ -103,8 +140,52 @@ export type CleanupCrewStageTransitionDecision = {
   nextAction: string;
 };
 
+export type CleanupCrewReportDeliveryRepairFacts = {
+  missionId?: string;
+  reportId?: string;
+  reportGenerated?: boolean;
+  reportArtifactPath?: string;
+  reportBodyDeliveredInChat?: boolean;
+  deliveryFailed?: boolean;
+  registryRowPresent?: boolean;
+  repairWorkScheduled?: boolean;
+  verifiedLaterSettlementProof?: string;
+  parentMissionOpen?: boolean;
+  attemptedMissionCloseout?: boolean;
+};
+
+export type CleanupCrewReportDeliveryRepairDecision = {
+  schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1";
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  canonicalPriority?: CleanupWatchdogPriorityCode;
+  missionId: string;
+  reportId: string;
+  state:
+    | "not_required"
+    | "delivery_satisfied_continue"
+    | "schedule_delivery_repair_work"
+    | "repair_work_pending"
+    | "settlement_proof_required"
+    | "settled_by_later_verified_delivery"
+    | "invalid_report_delivery_state";
+  allowedToAdvance: boolean;
+  allowedToCloseMission: boolean;
+  missionRemainsOpen: boolean;
+  registryWorkRequired: boolean;
+  repairWorkRequired: boolean;
+  acknowledgementAllowed: boolean;
+  nextAction: string;
+  validationErrors: string[];
+};
+
 function hasPath(value: string | undefined): boolean {
   return typeof value === "string" && value.trim().length > 0;
+}
+
+function deliveryPriority(
+  category: CleanupWatchdogFindingCategory | undefined,
+): CleanupWatchdogPriorityCode | undefined {
+  return category ? getCleanupWatchdogPriority(category) : undefined;
 }
 
 function milestoneRequired(facts: ReportDeliveryGuardFacts): boolean {
@@ -122,6 +203,8 @@ export function resolveReportDeliveryGuard(
   if (reportRequired && !hasPath(facts.reportArtifactPath)) {
     return {
       state: "blocked_missing_report_path",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_report_delivery"),
       allowed: false,
       reportDeliveryComplete: false,
       milestoneReportComplete: false,
@@ -136,6 +219,8 @@ export function resolveReportDeliveryGuard(
   ) {
     return {
       state: "blocked_private_only_report",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_report_delivery"),
       allowed: false,
       reportDeliveryComplete: false,
       milestoneReportComplete: false,
@@ -150,6 +235,8 @@ export function resolveReportDeliveryGuard(
   ) {
     return {
       state: "pending_report_delivery",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_report_delivery"),
       allowed: false,
       reportDeliveryComplete: false,
       milestoneReportComplete: false,
@@ -160,6 +247,8 @@ export function resolveReportDeliveryGuard(
   if (milestoneRequired(facts) && facts.milestoneReportDelivered !== true) {
     return {
       state: "pending_milestone_report",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_milestone_report"),
       allowed: false,
       reportDeliveryComplete: reportRequired,
       milestoneReportComplete: false,
@@ -171,6 +260,7 @@ export function resolveReportDeliveryGuard(
     const artifactOnly = facts.explicitArtifactOnlyAllowed === true;
     return {
       state: "report_delivery_satisfied",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
       allowed: true,
       reportDeliveryComplete: true,
       milestoneReportComplete: !milestoneRequired(facts) || facts.milestoneReportDelivered === true,
@@ -180,6 +270,7 @@ export function resolveReportDeliveryGuard(
 
   return {
     state: "not_required",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
     allowed: true,
     reportDeliveryComplete: false,
     milestoneReportComplete: !milestoneRequired(facts) || facts.milestoneReportDelivered === true,
@@ -213,6 +304,7 @@ export function resolveCleanupCrewStageTransition(
   if (facts.explicitStopRequest === true) {
     return {
       state: "stop_after_explicit_stop",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
       shouldContinue: false,
       allowedToAdvance: false,
       requiredReportDelivered,
@@ -224,6 +316,8 @@ export function resolveCleanupCrewStageTransition(
   if (!requiredReportDelivered) {
     return {
       state: "pending_milestone_report",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_milestone_report"),
       shouldContinue: false,
       allowedToAdvance: false,
       requiredReportDelivered: false,
@@ -235,6 +329,7 @@ export function resolveCleanupCrewStageTransition(
   if (facts.explicitReportOnlyRequest === true) {
     return {
       state: "stop_after_report_only_request",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
       shouldContinue: false,
       allowedToAdvance: false,
       requiredReportDelivered,
@@ -246,6 +341,7 @@ export function resolveCleanupCrewStageTransition(
   if (facts.sopBlockerPresent === true) {
     return {
       state: "blocked_by_sop",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
       shouldContinue: false,
       allowedToAdvance: false,
       requiredReportDelivered,
@@ -257,6 +353,8 @@ export function resolveCleanupCrewStageTransition(
   if (facts.watchdogNeedsReview === true) {
     return {
       state: "pause_for_watchdog_needs_review",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("active_no_worker"),
       shouldContinue: true,
       allowedToAdvance: false,
       requiredReportDelivered,
@@ -269,6 +367,8 @@ export function resolveCleanupCrewStageTransition(
   if (facts.grantFailed === true) {
     return {
       state: "route_grant_fail_repair",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("review_required_for_safe_work"),
       shouldContinue: true,
       allowedToAdvance: false,
       requiredReportDelivered,
@@ -280,6 +380,8 @@ export function resolveCleanupCrewStageTransition(
   if (facts.proofInterruptedOrAborted === true) {
     return {
       state: "proof_unproven_recovery_required",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("missing_correctness_proof"),
       shouldContinue: true,
       allowedToAdvance: false,
       requiredReportDelivered,
@@ -290,10 +392,171 @@ export function resolveCleanupCrewStageTransition(
 
   return {
     state: "continue_after_visibility_report",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
     shouldContinue: true,
     allowedToAdvance: true,
     requiredReportDelivered,
     milestoneReportFormat,
     nextAction: "continue to the next lawful Cleanup Crew stage",
+  };
+}
+
+/**
+ * Keeps report delivery and mission completion separate. A generated report
+ * may require visible delivery or later verified settlement, but delivery
+ * failure is not a parent-mission closeout and not a reason to drop
+ * authorized continuation work.
+ */
+export function resolveCleanupCrewReportDeliveryRepair(
+  facts: CleanupCrewReportDeliveryRepairFacts,
+): CleanupCrewReportDeliveryRepairDecision {
+  const missionId = facts.missionId?.trim() || "unknown";
+  const reportId = facts.reportId?.trim() || "unknown";
+  const validationErrors: string[] = [];
+  const reportRequired = facts.reportGenerated === true || facts.deliveryFailed === true;
+
+  if (!reportRequired) {
+    return {
+      schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId,
+      reportId,
+      state: "not_required",
+      allowedToAdvance: true,
+      allowedToCloseMission: facts.parentMissionOpen === true ? false : true,
+      missionRemainsOpen: facts.parentMissionOpen === true,
+      registryWorkRequired: false,
+      repairWorkRequired: false,
+      acknowledgementAllowed: true,
+      nextAction: "continue; no report delivery obligation is present",
+      validationErrors,
+    };
+  }
+
+  if (missionId === "unknown") {
+    validationErrors.push("mission_id_missing");
+  }
+  if (reportId === "unknown") {
+    validationErrors.push("report_id_missing");
+  }
+  if (facts.reportGenerated === true && !hasPath(facts.reportArtifactPath)) {
+    validationErrors.push("report_artifact_path_missing");
+  }
+  if (facts.parentMissionOpen !== true) {
+    validationErrors.push("parent_mission_open_proof_missing");
+  }
+  if (facts.attemptedMissionCloseout === true) {
+    validationErrors.push("report_delivery_attempted_parent_closeout");
+  }
+
+  if (validationErrors.length > 0) {
+    return {
+      schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_report_delivery"),
+      missionId,
+      reportId,
+      state: "invalid_report_delivery_state",
+      allowedToAdvance: false,
+      allowedToCloseMission: false,
+      missionRemainsOpen: true,
+      registryWorkRequired: true,
+      repairWorkRequired: true,
+      acknowledgementAllowed: false,
+      nextAction: "repair report-delivery state before acknowledging or advancing",
+      validationErrors,
+    };
+  }
+
+  if (facts.reportBodyDeliveredInChat === true) {
+    return {
+      schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId,
+      reportId,
+      state: "delivery_satisfied_continue",
+      allowedToAdvance: true,
+      allowedToCloseMission: false,
+      missionRemainsOpen: true,
+      registryWorkRequired: false,
+      repairWorkRequired: false,
+      acknowledgementAllowed: true,
+      nextAction: "record visible report delivery proof and continue authorized mission work",
+      validationErrors,
+    };
+  }
+
+  if (facts.verifiedLaterSettlementProof && facts.registryRowPresent === true) {
+    return {
+      schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId,
+      reportId,
+      state: "settled_by_later_verified_delivery",
+      allowedToAdvance: true,
+      allowedToCloseMission: false,
+      missionRemainsOpen: true,
+      registryWorkRequired: true,
+      repairWorkRequired: false,
+      acknowledgementAllowed: true,
+      nextAction:
+        "settle the delivery registry row with later verified proof and continue authorized mission work",
+      validationErrors,
+    };
+  }
+
+  if (facts.verifiedLaterSettlementProof && facts.registryRowPresent !== true) {
+    return {
+      schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_report_delivery"),
+      missionId,
+      reportId,
+      state: "settlement_proof_required",
+      allowedToAdvance: false,
+      allowedToCloseMission: false,
+      missionRemainsOpen: true,
+      registryWorkRequired: true,
+      repairWorkRequired: true,
+      acknowledgementAllowed: false,
+      nextAction: "restore or identify the delivery registry row before settlement",
+      validationErrors,
+    };
+  }
+
+  if (facts.repairWorkScheduled === true && facts.registryRowPresent === true) {
+    return {
+      schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: deliveryPriority("pending_report_delivery"),
+      missionId,
+      reportId,
+      state: "repair_work_pending",
+      allowedToAdvance: false,
+      allowedToCloseMission: false,
+      missionRemainsOpen: true,
+      registryWorkRequired: true,
+      repairWorkRequired: true,
+      acknowledgementAllowed: false,
+      nextAction: "complete idempotent report-delivery repair work before acknowledgement",
+      validationErrors,
+    };
+  }
+
+  return {
+    schema: "openclaw.cleanup_crew_report_delivery_repair_decision.v1",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    canonicalPriority: deliveryPriority("pending_report_delivery"),
+    missionId,
+    reportId,
+    state: "schedule_delivery_repair_work",
+    allowedToAdvance: false,
+    allowedToCloseMission: false,
+    missionRemainsOpen: true,
+    registryWorkRequired: true,
+    repairWorkRequired: true,
+    acknowledgementAllowed: false,
+    nextAction: "create idempotent report-delivery repair work before acknowledgement",
+    validationErrors,
   };
 }

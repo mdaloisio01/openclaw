@@ -246,6 +246,43 @@ const respawnWithPackagedCompileCacheIfNeeded = () => {
 const waitingForCompileCacheRespawn =
   respawnWithoutCompileCacheIfNeeded() || respawnWithPackagedCompileCacheIfNeeded();
 
+const tryRunWorkspaceAcceptanceCommand = () => {
+  if (process.argv[2] !== "acceptance") {
+    return false;
+  }
+  const acceptanceArgs = process.argv.slice(3);
+  const resolvedArgs =
+    acceptanceArgs[0] === "verify" || acceptanceArgs[0] === "gate"
+      ? [
+          acceptanceArgs[0],
+          path.resolve(process.cwd(), acceptanceArgs[1] ?? ""),
+          ...acceptanceArgs.slice(2),
+        ]
+      : acceptanceArgs;
+  const workspaceRoot = process.env.OPENCLAW_WORKSPACE_ROOT || "/home/will/.openclaw/workspace";
+  const ironRoot = path.join(workspaceRoot, "IronRoot");
+  const child = spawn("python3", ["-m", "runtime.acceptance_spine_runtime", ...resolvedArgs], {
+    cwd: ironRoot,
+    stdio: "inherit",
+    env: process.env,
+  });
+  child.once("exit", (code, signal) => {
+    if (signal) {
+      process.exit(1);
+    }
+    process.exit(code ?? 1);
+  });
+  child.once("error", (error) => {
+    process.stderr.write(
+      `[openclaw] Failed to run acceptance verifier: ${
+        error instanceof Error ? (error.stack ?? error.message) : String(error)
+      }\n`,
+    );
+    process.exit(1);
+  });
+  return true;
+};
+
 // https://nodejs.org/api/module.html#module-compile-cache
 if (
   !waitingForCompileCacheRespawn &&
@@ -644,7 +681,9 @@ const tryOutputPrecomputedCommandHelp = () => {
 };
 
 if (!waitingForCompileCacheRespawn) {
-  if (!isHelpFastPathDisabled() && (await tryOutputBareRootHelp())) {
+  if (tryRunWorkspaceAcceptanceCommand()) {
+    // OK
+  } else if (!isHelpFastPathDisabled() && (await tryOutputBareRootHelp())) {
     // OK
   } else if (!isHelpFastPathDisabled() && tryOutputPrecomputedCommandHelp()) {
     // OK

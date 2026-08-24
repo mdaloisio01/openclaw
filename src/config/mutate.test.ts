@@ -142,6 +142,33 @@ describe("config mutate helpers", () => {
     );
   });
 
+  it("rejects protected live control-plane mutations without manifest context", async () => {
+    const snapshot = createSnapshot({
+      hash: "protected-source-hash",
+      path: "/home/will/.openclaw/control-plane/live/openclaw.json",
+      sourceConfig: { gateway: { auth: { mode: "token", token: "old" } } },
+    });
+    ioMocks.readConfigFileSnapshotForWrite.mockResolvedValue({
+      snapshot,
+      writeOptions: { expectedConfigPath: snapshot.path },
+    });
+
+    await expect(
+      mutateConfigFile({
+        baseHash: snapshot.hash,
+        base: "source",
+        mutate(draft) {
+          draft.gateway = {
+            ...draft.gateway,
+            auth: { mode: "token", token: "new" },
+          };
+        },
+      }),
+    ).rejects.toThrow("protected config mutation requires a manifest");
+
+    expect(ioMocks.writeConfigFile).not.toHaveBeenCalled();
+  });
+
   it("retries transform mutations on stale config conflicts", async () => {
     const initial = createSnapshot({
       hash: "hash-1",

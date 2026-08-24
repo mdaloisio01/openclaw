@@ -46,7 +46,7 @@ describe("resolveGatewayInteractiveSurfaceAuth", () => {
     });
   });
 
-  it("falls back to OPENCLAW_GATEWAY_TOKEN when the remote token ref is unresolved", async () => {
+  it("does not fall back to OPENCLAW_GATEWAY_TOKEN when the configured remote token ref is unresolved", async () => {
     await expect(
       resolveGatewayInteractiveSurfaceAuth({
         config: {
@@ -60,8 +60,73 @@ describe("resolveGatewayInteractiveSurfaceAuth", () => {
         surface: "remote",
       }),
     ).resolves.toEqual({
-      token: "env-token",
+      failureReason: expect.stringContaining("gateway.remote.token"),
+    });
+  });
+
+  it("allows explicit remote auth to replace an unresolved configured remote token ref", async () => {
+    await expect(
+      resolveGatewayInteractiveSurfaceAuth({
+        config: {
+          ...remoteGatewayConfig({
+            token: { source: "env", provider: "default", id: "MISSING_REMOTE_TOKEN" },
+          }),
+        },
+        env: {
+          OPENCLAW_GATEWAY_TOKEN: "env-token",
+        },
+        explicitAuth: {
+          token: "explicit-token",
+        },
+        surface: "remote",
+      }),
+    ).resolves.toEqual({
+      token: "explicit-token",
       password: undefined,
+    });
+  });
+
+  it("does not fall back to env password when the configured local password ref is unresolved", async () => {
+    await expect(
+      resolveGatewayInteractiveSurfaceAuth({
+        config: {
+          gateway: {
+            auth: {
+              mode: "password",
+              password: { source: "env", provider: "default", id: "MISSING_GATEWAY_PASSWORD" },
+            },
+          },
+        },
+        env: {
+          OPENCLAW_GATEWAY_PASSWORD: "env-password",
+        },
+        surface: "local",
+      }),
+    ).resolves.toEqual({
+      failureReason: expect.stringContaining("gateway.auth.password"),
+    });
+  });
+
+  it("does not fall back to env token when the configured local token ref is unresolved", async () => {
+    await expect(
+      resolveGatewayInteractiveSurfaceAuth({
+        config: {
+          gateway: {
+            auth: {
+              mode: "token",
+              token: { source: "env", provider: "default", id: "MISSING_GATEWAY_TOKEN" },
+            },
+          },
+        },
+        env: {
+          OPENCLAW_GATEWAY_TOKEN: "env-token",
+        },
+        surface: "local",
+      }),
+    ).resolves.toEqual({
+      failureReason: expect.stringContaining("gateway.auth.token"),
+      password: undefined,
+      token: undefined,
     });
   });
 });

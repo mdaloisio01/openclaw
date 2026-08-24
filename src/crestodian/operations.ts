@@ -11,6 +11,11 @@ import type { RuntimeEnv } from "../runtime.js";
 import type { TuiResult } from "../tui/tui-types.js";
 import { resolveUserPath, shortenHomePath } from "../utils.js";
 import { appendCrestodianAuditEntry, resolveCrestodianAuditPath } from "./audit.js";
+import {
+  applyCrestodianConfigSetThroughCommonChangeRegistry,
+  type CrestodianConfigSetCommonChangeAdapter,
+  type CrestodianConfigSetCommonChangeContext,
+} from "./common-change-config-set-adapter.js";
 import type { CrestodianOverview } from "./overview.js";
 
 type ConfigModule = typeof import("../config/config.js");
@@ -91,6 +96,8 @@ export type CrestodianCommandDeps = {
     value?: string;
     cliOptions: ConfigSetOptions;
   }) => Promise<void>;
+  applyConfigSetCommonChange?: CrestodianConfigSetCommonChangeAdapter;
+  configSetCommonChange?: CrestodianConfigSetCommonChangeContext;
   runDoctor?: (runtime: RuntimeEnv, options: DoctorOptions) => Promise<void>;
   runGatewayRestart?: () => Promise<void>;
   runGatewayStart?: () => Promise<void>;
@@ -825,7 +832,6 @@ export async function executeCrestodianOperation(
     }
     logQueued(runtime, "config.set");
     const { readConfigFileSnapshot } = await loadConfigModule();
-    const before = await readConfigFileSnapshot();
     const runConfigSet =
       opts.deps?.runConfigSet ??
       (async (setOpts: { path?: string; value?: string; cliOptions: ConfigSetOptions }) => {
@@ -835,21 +841,28 @@ export async function executeCrestodianOperation(
           runtime: createNoExitRuntime(runtime),
         });
       });
-    await runConfigSet({
-      path: operation.path,
-      value: operation.value,
-      cliOptions: {},
+    const applyConfigSetCommonChange =
+      opts.deps?.applyConfigSetCommonChange ?? applyCrestodianConfigSetThroughCommonChangeRegistry;
+    const applied = await applyConfigSetCommonChange({
+      operation: {
+        path: operation.path,
+        value: operation.value,
+      },
+      commonChange: opts.deps?.configSetCommonChange,
+      readConfigFileSnapshot,
+      runConfigSet,
     });
-    const after = await readConfigFileSnapshot();
     await appendCrestodianAuditEntry({
       operation: "config.set",
       summary: `Set config ${operation.path}`,
-      configPath: after.path || before.path || undefined,
-      configHashBefore: before.hash ?? null,
-      configHashAfter: after.hash ?? null,
+      configPath: applied.after.path || applied.before.path || undefined,
+      configHashBefore: applied.before.hash ?? null,
+      configHashAfter: applied.after.hash ?? null,
       details: {
         ...opts.auditDetails,
         path: operation.path,
+        commonChangeOperationId: applied.operationId,
+        lifecycleBoundary: "post_action_pending",
       },
     });
     runtime.log("[crestodian] done: config.set");

@@ -127,7 +127,7 @@ describe("gateway.restart.request handler", () => {
       activationContinuation: {
         id: "activation-live",
         sessionKey: "main",
-        requiredChecks: ["http_health"],
+        requiredChecks: ["http_health", "visible_delivery", "visible route configured"],
         objective: "activate patched gateway",
         hardStopRules: ["do not resume GIE/SADB"],
         expectedRuntime: { commit: "abc" },
@@ -138,7 +138,7 @@ describe("gateway.restart.request handler", () => {
       expect.objectContaining({
         id: "activation-live",
         route: { sessionKey: "main" },
-        requiredChecks: ["http_health"],
+        requiredChecks: ["http_health", "visible_delivery", "delivery_route"],
         objective: "activate patched gateway",
         hardStopRules: ["do not resume GIE/SADB"],
         expectedRuntime: { commit: "abc" },

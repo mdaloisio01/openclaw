@@ -1,9 +1,13 @@
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { markReplyPayloadAsProgressHeartbeat } from "../reply-payload.js";
+import type {
+  CloseoutAdmissionInput,
+  MissionIdentity,
+} from "../../governance/mission-manifest.types.js";
+import { markReplyPayloadAsProgressHeartbeat, setReplyPayloadMetadata } from "../reply-payload.js";
 import { HEARTBEAT_TOKEN, SILENT_REPLY_TOKEN } from "../tokens.js";
 import {
   allowTerminalCloseout,
@@ -15,6 +19,7 @@ import {
   resolveCleanupCrewFinalResponseGate,
   testing as activeRunContinuationTesting,
 } from "./active-run-continuation-guard.js";
+import { buildRuntimeCloseoutAdmissionInput } from "./false-closeout-admission-producer.js";
 import { createReplyDispatcher, waitForReplyDispatcherIdle } from "./reply-dispatcher.js";
 import { createReplyToModeFilter } from "./reply-threading.js";
 
@@ -58,6 +63,68 @@ const PACKET_A_MILESTONE_REPORT = [
   "SAFETY CHECK: milestone only; Cleanup Crew continues",
   "BLOCKERS: none",
 ].join("\n");
+
+const FALSE_CLOSEOUT_IDENTITY: MissionIdentity = {
+  missionId: "mission-false-closeout",
+  planRevisionId: "plan-r1",
+  planSha256: "plan-sha",
+  sourceRevision: "source-sha",
+  runtimeBuildSha256: "runtime-sha",
+  policyVersion: "policy-v1",
+  skillSha256: "skill-sha",
+};
+
+function falseCloseoutAdmissionInput(mode: "shadow" | "enforce" | "off"): CloseoutAdmissionInput {
+  return {
+    manifest: {
+      schema: "openclaw.mission_manifest.v1",
+      ...FALSE_CLOSEOUT_IDENTITY,
+      mode,
+      scopeHash: "full-scope",
+      authorizedScopeHash: "full-scope",
+      planRevisionAuthorized: true,
+      createdAt: "2026-07-16T19:00:00Z",
+    },
+    requirements: [
+      { id: "REQ-1", text: "require real proof", required: true, gateIds: ["gate-1"] },
+    ],
+    gates: [{ id: "gate-1", requirementId: "REQ-1", kind: "requirement", required: true }],
+    receipts: [],
+    runtimeState: {
+      parentStatus: "running",
+      activeExecutorCount: 1,
+      staleExecutorCount: 0,
+      openSessionCount: 0,
+      openRunCount: 1,
+      openLeaseCount: 0,
+      openContinuationCount: 0,
+      pendingDeliveryCount: 0,
+    },
+    watchdog: {
+      label: "NEEDS_REVIEW",
+      suspiciousCount: 1,
+      checkedAt: "2026-07-16T19:00:00Z",
+      postTerminal: false,
+    },
+    repairWork: { openCount: 1, openIds: ["repair-open"] },
+    completionRequest: {
+      schema: "openclaw.completion_request.v1",
+      ...FALSE_CLOSEOUT_IDENTITY,
+      requestedAt: "2026-07-16T19:00:00Z",
+      claimedScopeHash: "narrow-scope",
+      closeoutText: "complete",
+      evidenceManifestSha256: "evidence-sha",
+    },
+    nextExecutableStepExists: true,
+    reportContradictions: ["closeout contradicts runtime"],
+    now: "2026-07-16T19:00:00Z",
+  };
+}
+
+afterEach(() => {
+  delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
+  delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE;
+});
 
 describe("createReplyDispatcher", () => {
   it("drops empty payloads and exact silent tokens without media", async () => {
@@ -380,6 +447,46 @@ describe("createReplyDispatcher", () => {
     );
   });
 
+  it("keeps a lawful blocker across later non-terminal updates", async () => {
+    const dispatcher = {
+      sendToolResult: vi.fn(() => true),
+      sendBlockReply: vi.fn(() => true),
+      sendFinalReply: vi.fn(() => true),
+      waitForIdle: vi.fn(async () => {}),
+      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      markComplete: vi.fn(),
+    };
+    installActiveRunContinuationGuard(dispatcher);
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "plan:Inspect code");
+    recordLawfulBlocker(dispatcher, "approval_blocked");
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "readiness_report");
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "phase_report");
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "final_response_preparation");
+
+    expect(allowTerminalCloseout(dispatcher, "sendFinalReply").allowed).toBe(true);
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("BLOCKED_CLOSEOUT"),
+      }),
+    );
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "BLOCKER_STATE", detail: "true:approval_blocked" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "readiness_report" },
+        { type: "BLOCKER_STATE", detail: "true:approval_blocked" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "phase_report" },
+        { type: "BLOCKER_STATE", detail: "true:approval_blocked" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "final_response_preparation" },
+        { type: "BLOCKER_STATE", detail: "true:approval_blocked" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
   it("emits a blocked closeout during settle when continuation is impossible", async () => {
     const dispatcher = {
       sendToolResult: vi.fn(() => true),
@@ -455,6 +562,12 @@ describe("createReplyDispatcher", () => {
       allowed: false,
       repairableBlocker: true,
       nextRepairPathKnown: true,
+      typedDecisionReceipt: {
+        outcome: "REPAIR_AND_CONTINUE",
+        impact: "ACTION",
+        reason_code: "TECHNICAL_REPAIR",
+        next_action: "continue_cleanup_repair_through_canonical_policy",
+      },
     });
   });
 
@@ -524,6 +637,62 @@ describe("createReplyDispatcher", () => {
       allowed: false,
       hardBlockerNamedWithProof: false,
       blockerArtifactPresent: false,
+      typedDecisionReceipt: {
+        outcome: "ACTION_BLOCKED",
+        impact: "MISSION",
+        reason_code: "AUTHORITY_CONFLICT",
+        next_action: "record_lawful_blocker_artifact_before_terminal_closeout",
+      },
+    });
+  });
+
+  it("uses the Phase 5 typed B0 adapter instead of local-only blocker policy", () => {
+    const decision = resolveCleanupCrewFinalResponseGate({
+      activeCleanupCrewMission: true,
+      responseText: [
+        "STATUS: blocked",
+        "BLOCKER: proof source unavailable",
+        "NEXT ACTION: alternate lawful proof path and continue cleanup repair",
+      ].join("\n"),
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      repairableBlocker: true,
+      nextRepairPathKnown: true,
+      typedDecisionReceipt: {
+        policy_version: "cleanup-crew-governance-final-20260714T1454Z",
+        phase: "phase5_mechanical_policy_unification_b0_adapter",
+        outcome: "REPAIR_AND_CONTINUE",
+        reason_code: "TECHNICAL_REPAIR",
+        validation: { ok: true, errors: [] },
+      },
+    });
+  });
+
+  it("does not allow terminal closeout from hard-blocker text unless the typed receipt is hard-terminal", () => {
+    expect(
+      resolveCleanupCrewFinalResponseGate({
+        activeCleanupCrewMission: true,
+        responseText: [
+          "STATUS: blocked",
+          "BLOCKER: proof source unavailable",
+          "WHY CONTINUATION IS NOT LAWFUL: first proof source is unavailable",
+          "PROOF: alternate lawful proof path exists",
+          "BLOCKER_ARTIFACT: /tmp/local-proof-artifact.json",
+          "NEXT ACTION: alternate lawful proof path and continue cleanup repair",
+        ].join("\n"),
+      }),
+    ).toMatchObject({
+      allowed: false,
+      repairableBlocker: true,
+      nextRepairPathKnown: true,
+      hardBlockerNamedWithProof: false,
+      typedDecisionReceipt: {
+        outcome: "REPAIR_AND_CONTINUE",
+        reason_code: "TECHNICAL_REPAIR",
+        next_action: "continue_cleanup_repair_through_canonical_policy",
+      },
     });
   });
 
@@ -599,6 +768,129 @@ describe("createReplyDispatcher", () => {
           type: "NON_TERMINAL_BUILD_UPDATE_EMITTED",
           detail: "cleanup_crew_milestone_visibility_report",
         },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
+  it("records false-closeout admission rejection in shadow mode without blocking final delivery", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher);
+    const payload = setReplyPayloadMetadata(
+      { text: "Final closeout report: complete." },
+      { falseCloseoutAdmission: falseCloseoutAdmissionInput("shadow") },
+    );
+
+    expect(allowTerminalCloseout(dispatcher, "sendFinalReply", payload).allowed).toBe(true);
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("FALSE_CLOSEOUT_SHADOW_REJECTED"),
+        isStatusNotice: true,
+      }),
+    );
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "FALSE_CLOSEOUT_ADMISSION_SHADOW_REJECTED" }),
+        expect.objectContaining({ type: "TERMINAL_CLOSEOUT_ALLOWED" }),
+      ]),
+    );
+  });
+
+  it("blocks false-closeout admission rejection in enforce mode", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher);
+    const payload = setReplyPayloadMetadata(
+      { text: "Final closeout report: complete." },
+      { falseCloseoutAdmission: falseCloseoutAdmissionInput("enforce") },
+    );
+
+    const decision = allowTerminalCloseout(dispatcher, "sendFinalReply", payload);
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.violationReason).toContain("False-closeout admission controller rejected");
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "FALSE_CLOSEOUT_ADMISSION_ENFORCED_REJECTED" }),
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
+  it("records false-closeout admission rejection as an audited bypass in off mode", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher);
+    const payload = setReplyPayloadMetadata(
+      { text: "Final closeout report: complete." },
+      { falseCloseoutAdmission: falseCloseoutAdmissionInput("off") },
+    );
+
+    expect(allowTerminalCloseout(dispatcher, "sendFinalReply", payload).allowed).toBe(true);
+    expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("FALSE_CLOSEOUT_SHADOW_REJECTED"),
+      }),
+    );
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "FALSE_CLOSEOUT_ADMISSION_OFF_BYPASSED",
+          detail: expect.stringContaining("off_bypassed_rejected"),
+        }),
+        expect.objectContaining({ type: "TERMINAL_CLOSEOUT_ALLOWED" }),
+      ]),
+    );
+  });
+
+  it("auto-produces false-closeout admission input for Cleanup Crew terminal replies in shadow mode", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        activeCleanupCrewMission: true,
+        currentTurnText: "Report only; do not continue the Cleanup Crew mission in this reply.",
+        falseCloseoutAdmissionMode: "shadow",
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+
+    expect(
+      allowTerminalCloseout(dispatcher, "sendFinalReply", {
+        text: "Final closeout report: complete.",
+      }).allowed,
+    ).toBe(true);
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("FALSE_CLOSEOUT_SHADOW_REJECTED"),
+        isStatusNotice: true,
+      }),
+    );
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "FALSE_CLOSEOUT_ADMISSION_SHADOW_REJECTED" }),
+        expect.objectContaining({ type: "TERMINAL_CLOSEOUT_ALLOWED" }),
+      ]),
+    );
+  });
+
+  it("auto-produces and blocks Cleanup Crew terminal false closeout in enforce mode", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        activeCleanupCrewMission: true,
+        currentTurnText: "Run the Cleanup Crew mission until it is truthfully closed.",
+        falseCloseoutAdmissionMode: "enforce",
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+
+    const decision = allowTerminalCloseout(dispatcher, "sendFinalReply", {
+      text: "Final closeout report: complete.",
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.violationReason).toContain("False-closeout admission controller rejected");
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "FALSE_CLOSEOUT_ADMISSION_ENFORCED_REJECTED" }),
         expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
       ]),
     );
@@ -737,6 +1029,48 @@ describe("createReplyDispatcher", () => {
     expect(deliver).toHaveBeenCalledTimes(2);
 
     vi.useRealTimers();
+  });
+});
+
+describe("buildRuntimeCloseoutAdmissionInput", () => {
+  it("uses the canonical false-closeout admission env flag for runtime activation", () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
+
+    const input = buildRuntimeCloseoutAdmissionInput({
+      activeCleanupCrewMission: true,
+      terminalAttempt: true,
+      currentTurnText: "Run Cleanup Crew until live enforcement is proven.",
+      responseText: "Final closeout report: complete.",
+    });
+
+    expect(input?.manifest.mode).toBe("enforce");
+  });
+
+  it("keeps the legacy mode env flag as fallback", () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE = "enforce";
+
+    const input = buildRuntimeCloseoutAdmissionInput({
+      activeCleanupCrewMission: true,
+      terminalAttempt: true,
+      currentTurnText: "Run Cleanup Crew until live enforcement is proven.",
+      responseText: "Final closeout report: complete.",
+    });
+
+    expect(input?.manifest.mode).toBe("enforce");
+  });
+
+  it("lets an explicit runtime mode override env activation", () => {
+    process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
+
+    const input = buildRuntimeCloseoutAdmissionInput({
+      activeCleanupCrewMission: true,
+      terminalAttempt: true,
+      mode: "shadow",
+      currentTurnText: "Run Cleanup Crew until live enforcement is proven.",
+      responseText: "Final closeout report: complete.",
+    });
+
+    expect(input?.manifest.mode).toBe("shadow");
   });
 });
 

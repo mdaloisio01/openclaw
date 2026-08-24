@@ -72,6 +72,19 @@ export type ActivationContinuationParent = {
   runId?: string;
 };
 
+export type ActivationContinuationGovernedRestartBinding = {
+  parentMissionId: string;
+  currentPhase: string;
+  executableStep: string;
+  sessionKey: string;
+  runId: string;
+  restartRequestId: string;
+  continuationIdentity: string;
+  continuationRevision: number;
+  receiptId: string;
+  nextAction: string;
+};
+
 export type ActivationContinuationProof = {
   sideEffectCompleted: boolean;
   parentTurnInterrupted: boolean;
@@ -94,6 +107,7 @@ export type ActivationContinuationRecord = {
   };
   route: ActivationContinuationRoute;
   parent?: ActivationContinuationParent;
+  governedRestart?: ActivationContinuationGovernedRestartBinding;
   expectedRuntime?: ActivationContinuationExpectedRuntime;
   requiredChecks: ActivationContinuationCheckName[];
   objective: string;
@@ -121,6 +135,7 @@ export type ActivationContinuationCreateInput = {
   ttlMs?: number;
   route?: ActivationContinuationRoute;
   parent?: ActivationContinuationParent;
+  governedRestart?: ActivationContinuationGovernedRestartBinding;
   expectedRuntime?: ActivationContinuationExpectedRuntime;
   requiredChecks?: ActivationContinuationCheckName[];
   objective?: string;
@@ -253,9 +268,6 @@ function normalizeCheckName(value: unknown): ActivationContinuationCheckName | n
   ) {
     return "runtime_identity";
   }
-  if (lower === "delivery_route" || lower.includes("visible") || lower.includes("delivery")) {
-    return "delivery_route";
-  }
   if (lower === "log_scan" || lower.includes("log")) {
     return "log_scan";
   }
@@ -269,6 +281,9 @@ function normalizeCheckName(value: unknown): ActivationContinuationCheckName | n
   }
   if (lower === "visible_delivery" || lower.includes("visible source delivery")) {
     return "visible_delivery";
+  }
+  if (lower === "delivery_route" || lower.includes("visible") || lower.includes("delivery")) {
+    return "delivery_route";
   }
   if (
     raw === "systemd" ||
@@ -310,6 +325,56 @@ function normalizeHardStopRules(values: unknown): string[] {
   return rules.length > 0 ? [...new Set(rules)] : [...DEFAULT_HARD_STOP_RULES];
 }
 
+function normalizeGovernedRestartBinding(
+  value: unknown,
+): ActivationContinuationGovernedRestartBinding | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Partial<ActivationContinuationGovernedRestartBinding>;
+  const parentMissionId = normalizeString(record.parentMissionId, 240);
+  const currentPhase = normalizeString(record.currentPhase, 240);
+  const executableStep = normalizeString(record.executableStep, 500);
+  const sessionKey = normalizeString(record.sessionKey, 240);
+  const runId = normalizeString(record.runId, 240);
+  const restartRequestId = normalizeString(record.restartRequestId, 240);
+  const continuationIdentity = normalizeString(record.continuationIdentity, 240);
+  const receiptId = normalizeString(record.receiptId, 240);
+  const nextAction = normalizeString(record.nextAction, 1_000);
+  const continuationRevision =
+    typeof record.continuationRevision === "number" &&
+    Number.isInteger(record.continuationRevision) &&
+    record.continuationRevision > 0
+      ? record.continuationRevision
+      : undefined;
+  if (
+    !parentMissionId ||
+    !currentPhase ||
+    !executableStep ||
+    !sessionKey ||
+    !runId ||
+    !restartRequestId ||
+    !continuationIdentity ||
+    !receiptId ||
+    !nextAction ||
+    continuationRevision == null
+  ) {
+    return undefined;
+  }
+  return {
+    parentMissionId,
+    currentPhase,
+    executableStep,
+    sessionKey,
+    runId,
+    restartRequestId,
+    continuationIdentity,
+    continuationRevision,
+    receiptId,
+    nextAction,
+  };
+}
+
 function parseRecord(value: unknown): ActivationContinuationRecord | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -339,6 +404,9 @@ function parseRecord(value: unknown): ActivationContinuationRecord | null {
     },
     route: record.route ?? {},
     ...(record.parent ? { parent: record.parent } : {}),
+    ...(normalizeGovernedRestartBinding(record.governedRestart)
+      ? { governedRestart: normalizeGovernedRestartBinding(record.governedRestart) }
+      : {}),
     ...(record.expectedRuntime ? { expectedRuntime: record.expectedRuntime } : {}),
     requiredChecks: normalizeRequiredChecks(record.requiredChecks),
     objective: normalizeString(record.objective, 1_000) ?? "gateway activation continuation",
@@ -400,6 +468,9 @@ function createContinuationRecord(
     },
     route: input.route ?? {},
     ...(input.parent ? { parent: input.parent } : {}),
+    ...(normalizeGovernedRestartBinding(input.governedRestart)
+      ? { governedRestart: normalizeGovernedRestartBinding(input.governedRestart) }
+      : {}),
     ...(input.expectedRuntime ? { expectedRuntime: input.expectedRuntime } : {}),
     requiredChecks: normalizeRequiredChecks(input.requiredChecks),
     objective: input.objective?.trim() || "gateway activation continuation",

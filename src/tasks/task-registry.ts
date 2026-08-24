@@ -2490,6 +2490,80 @@ export function linkTaskToFlowById(params: { taskId: string; flowId: string }): 
   });
 }
 
+export function adoptActiveTaskFromMirroredFlowById(params: {
+  taskId: string;
+  mirroredFlowId: string;
+  targetFlowId: string;
+}): TaskRecord | null {
+  ensureTaskRegistryReady();
+  const mirroredFlowId = params.mirroredFlowId.trim();
+  const targetFlowId = params.targetFlowId.trim();
+  if (!mirroredFlowId || !targetFlowId || mirroredFlowId === targetFlowId) {
+    return null;
+  }
+  const current = tasks.get(params.taskId);
+  if (!current) {
+    return null;
+  }
+  if (current.parentFlowId?.trim() !== mirroredFlowId) {
+    return null;
+  }
+  if (current.scopeKind !== "session" || !isActiveTaskStatus(current.status)) {
+    return null;
+  }
+  if (!normalizeOptionalString(current.childSessionKey)) {
+    return null;
+  }
+  const mirroredFlow = getTaskFlowById(mirroredFlowId);
+  if (!mirroredFlow || mirroredFlow.syncMode !== "task_mirrored") {
+    return null;
+  }
+  const targetFlow = getTaskFlowById(targetFlowId);
+  if (!targetFlow || targetFlow.syncMode !== "managed") {
+    return null;
+  }
+  if (targetFlow.cancelRequestedAt != null || isTerminalFlowStatus(targetFlow.status)) {
+    return null;
+  }
+  return updateTask(params.taskId, {
+    parentFlowId: targetFlowId,
+  });
+}
+
+export function bindActiveSessionTaskToManagedFlowById(params: {
+  taskId: string;
+  targetFlowId: string;
+}): TaskRecord | null {
+  ensureTaskRegistryReady();
+  const targetFlowId = params.targetFlowId.trim();
+  if (!targetFlowId) {
+    return null;
+  }
+  const current = tasks.get(params.taskId);
+  if (!current) {
+    return null;
+  }
+  if (current.parentFlowId?.trim()) {
+    return null;
+  }
+  if (current.scopeKind !== "session" || !isActiveTaskStatus(current.status)) {
+    return null;
+  }
+  if (!normalizeOptionalString(current.childSessionKey)) {
+    return null;
+  }
+  const targetFlow = getTaskFlowById(targetFlowId);
+  if (!targetFlow || targetFlow.syncMode !== "managed") {
+    return null;
+  }
+  if (targetFlow.cancelRequestedAt != null || isTerminalFlowStatus(targetFlow.status)) {
+    return null;
+  }
+  return updateTask(params.taskId, {
+    parentFlowId: targetFlowId,
+  });
+}
+
 export async function cancelTaskById(params: {
   cfg: OpenClawConfig;
   taskId: string;

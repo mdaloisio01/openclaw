@@ -35,6 +35,13 @@ import {
 } from "../../agents/agent-scope.js";
 import { rewriteTranscriptEntriesInSessionFile } from "../../agents/embedded-agent-runner/transcript-rewrite.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../agents/harness/hook-helpers.js";
+import {
+  classifyOwnerRequestIntakeMessage,
+  createOwnerRequestIntakeRecord,
+  markOwnerRequestChatOnlyExempted,
+  markOwnerRequestPromptPersisted,
+  type OwnerRequestIntakeRecord,
+} from "../../agents/owner-request-intake-ledger.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import type { AgentMessage } from "../../agents/runtime/index.js";
 import { ensureSandboxWorkspaceForSession } from "../../agents/sandbox/context.js";
@@ -2990,6 +2997,16 @@ export const chatHandlers: GatewayRequestHandlers = {
       timeoutMs?: number;
       systemInputProvenance?: InputProvenance;
       systemProvenanceReceipt?: string;
+      clientSendAttemptId?: string;
+      clientSendAttemptAtMs?: number;
+      clientPendingSendAttempts?: Array<{
+        attemptId?: string;
+        attemptedAtMs?: number;
+        sessionKey?: string;
+        agentId?: string;
+        messageHash?: string;
+        messageSnippet?: string;
+      }>;
       idempotencyKey: string;
     };
     const explicitOriginResult = normalizeExplicitChatSendOrigin({
@@ -3220,6 +3237,87 @@ export const chatHandlers: GatewayRequestHandlers = {
     const explicitOriginTargetsPlugin = explicitOriginTargetsPluginBinding(
       explicitOriginResult.value,
     );
+    for (const pendingAttempt of Array.isArray(p.clientPendingSendAttempts)
+      ? p.clientPendingSendAttempts
+      : []) {
+      const pendingAttemptId = normalizeOptionalText(pendingAttempt.attemptId);
+      if (!pendingAttemptId) {
+        continue;
+      }
+      const pendingMessage =
+        normalizeOptionalText(pendingAttempt.messageSnippet) || "[webchat pending send attempt]";
+      const pendingClassification = classifyOwnerRequestIntakeMessage(pendingMessage);
+      try {
+        createOwnerRequestIntakeRecord({
+          message: `${pendingAttempt.messageHash ?? ""}:${pendingMessage}`,
+          sourceSessionKey: pendingAttempt.sessionKey ?? sessionKey,
+          sourceSessionId: backingSessionId,
+          sourceChannel: "webchat",
+          sourceProvider: client?.connect?.client?.id,
+          clientSendAttemptId: pendingAttemptId,
+          clientSendAttemptAtMs: pendingAttempt.attemptedAtMs,
+          classification: pendingClassification.classification,
+          expectedDurability: pendingClassification.expectedDurability,
+          governed: pendingClassification.governed,
+          status: "client_send_attempt",
+          lastExecutableAction: "webchat durably recorded client send attempt",
+          nextExecutableAction: "server acknowledgement missing; repair or notify owner",
+          nowMs:
+            typeof pendingAttempt.attemptedAtMs === "number" &&
+            Number.isFinite(pendingAttempt.attemptedAtMs)
+              ? pendingAttempt.attemptedAtMs
+              : now,
+        });
+      } catch (error) {
+        context.logGateway.warn("owner-request-intake-pending-attempt-failed", {
+          error: formatForLog(error),
+          clientSendAttemptId: pendingAttemptId,
+        });
+      }
+    }
+    const intakeClassification = classifyOwnerRequestIntakeMessage(rawMessage);
+    let ownerRequestIntake: OwnerRequestIntakeRecord | undefined;
+    try {
+      ownerRequestIntake = createOwnerRequestIntakeRecord({
+        message: rawMessage,
+        sourceSessionKey: sessionKey,
+        sourceSessionId: backingSessionId,
+        sourceChannel: isWebchatClient(client?.connect?.client) ? "webchat" : "gateway",
+        sourceProvider: client?.connect?.client?.id,
+        clientSendAttemptId: p.clientSendAttemptId,
+        clientSendAttemptAtMs: p.clientSendAttemptAtMs,
+        classification: intakeClassification.classification,
+        expectedDurability: intakeClassification.expectedDurability,
+        governed: intakeClassification.governed,
+        status: intakeClassification.governed ? "server_acknowledged" : "chat_only_exempted",
+        lastExecutableAction: "server acknowledged chat.send owner request",
+        nextExecutableAction: intakeClassification.governed
+          ? "persist prompt and register durable mission or lawful exemption"
+          : "complete chat-only reply",
+        nowMs: now,
+      });
+      if (!intakeClassification.governed) {
+        markOwnerRequestChatOnlyExempted({
+          requestId: ownerRequestIntake.requestId,
+          reason: intakeClassification.reason,
+        });
+      }
+    } catch (error) {
+      if (intakeClassification.governed) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.UNAVAILABLE,
+            `failed to persist governed owner request intake: ${formatForLog(error)}`,
+          ),
+        );
+        return;
+      }
+      context.logGateway.warn(
+        `chat-only owner request intake telemetry failed: ${formatForLog(error)}`,
+      );
+    }
     if (normalizedAttachments.length > 0) {
       try {
         await measureDiagnosticsTimelineSpan(
@@ -3510,7 +3608,12 @@ export const chatHandlers: GatewayRequestHandlers = {
         await measureDiagnosticsTimelineSpan(
           "gateway.chat_send.persist_user_transcript",
           async () => {
-            await userTurnRecorder.persistFallback();
+            const persisted = await userTurnRecorder.persistFallback();
+            if (persisted && ownerRequestIntake?.governed) {
+              markOwnerRequestPromptPersisted({
+                requestId: ownerRequestIntake.requestId,
+              });
+            }
           },
           {
             phase: "agent-turn",

@@ -12,6 +12,12 @@ import { extractDeliveryInfo } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { GatewayClientRequestError } from "../../gateway/client.js";
 import {
+  markActivationContinuationCommandNotStarted,
+  persistActivationContinuationBeforeRestart,
+  type ActivationContinuationCheckName,
+  type ActivationContinuationCreateInput,
+} from "../../infra/activation-continuation.js";
+import {
   buildRestartSuccessContinuation,
   formatDoctorNonInteractiveHint,
   removeRestartSentinelFile,
@@ -144,6 +150,122 @@ function parseGatewayConfigMutationRaw(
 
 function normalizeGatewayConfigPath(path: string): string {
   return path.startsWith("tools.bash.") ? path.replace(/^tools\.bash\./, "tools.exec.") : path;
+}
+
+function normalizeStringArray(value: unknown, maxLength: number): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const normalized = value
+    .map((entry) => normalizeOptionalString(entry)?.slice(0, maxLength))
+    .filter((entry): entry is string => Boolean(entry));
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeExpectedRuntime(
+  value: unknown,
+): ActivationContinuationCreateInput["expectedRuntime"] {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const commit = normalizeOptionalString(value.commit)?.slice(0, 80);
+  const version = normalizeOptionalString(value.version)?.slice(0, 80);
+  const builtAt = normalizeOptionalString(value.builtAt)?.slice(0, 120);
+  return commit || version || builtAt
+    ? {
+        ...(commit ? { commit } : {}),
+        ...(version ? { version } : {}),
+        ...(builtAt ? { builtAt } : {}),
+      }
+    : undefined;
+}
+
+function normalizeActivationContinuationParent(
+  value: unknown,
+): ActivationContinuationCreateInput["parent"] {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+  const sessionKey = normalizeOptionalString(value.sessionKey)?.slice(0, 240);
+  const runId = normalizeOptionalString(value.runId)?.slice(0, 120);
+  return sessionKey || runId
+    ? {
+        ...(sessionKey ? { sessionKey } : {}),
+        ...(runId ? { runId } : {}),
+      }
+    : undefined;
+}
+
+function buildGatewayToolActivationContinuation(params: {
+  deliveryContext: RestartSentinelPayload["deliveryContext"];
+  note?: string;
+  raw: Record<string, unknown>;
+  reason?: string;
+  sessionKey?: string;
+  threadId?: string | number;
+  continuationMessage?: string;
+}): ActivationContinuationCreateInput | undefined {
+  if (!params.sessionKey) {
+    return undefined;
+  }
+  const rawContinuation = isPlainObject(params.raw.activationContinuation)
+    ? params.raw.activationContinuation
+    : isPlainObject(params.raw.continuation)
+      ? params.raw.continuation
+      : {};
+  const objective =
+    normalizeOptionalString(rawContinuation.objective)?.slice(0, 1_000) ??
+    normalizeOptionalString(rawContinuation.originalObjective)?.slice(0, 1_000) ??
+    params.continuationMessage ??
+    params.note ??
+    params.reason ??
+    "gateway restart continuation";
+  const expectedRuntime =
+    normalizeExpectedRuntime(rawContinuation.expectedRuntime) ??
+    normalizeExpectedRuntime(rawContinuation.expectedBuild) ??
+    normalizeExpectedRuntime(params.raw.expectedRuntime) ??
+    normalizeExpectedRuntime(params.raw.expectedBuild);
+  const requiredChecks = normalizeStringArray(
+    rawContinuation.requiredChecks ?? params.raw.requiredChecks,
+    160,
+  ) as ActivationContinuationCheckName[] | undefined;
+  const hardStopRules = normalizeStringArray(
+    rawContinuation.hardStopRules ?? params.raw.hardStopRules,
+    240,
+  );
+  const parent =
+    normalizeActivationContinuationParent(rawContinuation.parent) ??
+    normalizeActivationContinuationParent(params.raw.parent) ??
+    ({
+      sessionKey: params.sessionKey,
+      ...(normalizeOptionalString(rawContinuation.parentRunId)?.slice(0, 120)
+        ? { runId: normalizeOptionalString(rawContinuation.parentRunId)?.slice(0, 120) }
+        : {}),
+    } satisfies NonNullable<ActivationContinuationCreateInput["parent"]>);
+  return {
+    ...(normalizeOptionalString(rawContinuation.id)?.slice(0, 120)
+      ? { id: normalizeOptionalString(rawContinuation.id)?.slice(0, 120) }
+      : {}),
+    route: {
+      sessionKey: params.sessionKey,
+      ...(params.deliveryContext
+        ? {
+            deliveryContext: {
+              ...params.deliveryContext,
+              ...(params.threadId !== undefined ? { threadId: params.threadId } : {}),
+            },
+          }
+        : {}),
+    },
+    parent,
+    ...(expectedRuntime ? { expectedRuntime } : {}),
+    ...(requiredChecks ? { requiredChecks } : {}),
+    objective,
+    ...(hardStopRules ? { hardStopRules } : {}),
+    requestedRestartAction: {
+      ...(params.reason ? { reason: params.reason } : {}),
+    },
+  };
 }
 
 function readKeyedArrayEntries(list: unknown): {
@@ -357,6 +479,13 @@ const GatewayToolSchema = Type.Object({
   delayMs: optionalNonNegativeIntegerSchema(),
   reason: Type.Optional(Type.String()),
   continuationMessage: Type.Optional(Type.String()),
+  activationContinuation: Type.Optional(Type.Unknown()),
+  continuation: Type.Optional(Type.Unknown()),
+  expectedRuntime: Type.Optional(Type.Unknown()),
+  expectedBuild: Type.Optional(Type.Unknown()),
+  requiredChecks: Type.Optional(Type.Array(Type.String())),
+  hardStopRules: Type.Optional(Type.Array(Type.String())),
+  parent: Type.Optional(Type.Unknown()),
   // config.get, config.schema.lookup, config.apply, update.run
   ...gatewayCallOptionSchemaProperties(),
   // config.schema.lookup
@@ -364,6 +493,8 @@ const GatewayToolSchema = Type.Object({
   // config.apply, config.patch
   raw: Type.Optional(Type.String()),
   baseHash: Type.Optional(Type.String()),
+  controlPlaneManifest: Type.Optional(Type.Unknown()),
+  controlPlaneApproval: Type.Optional(Type.Unknown()),
   // config.apply, config.patch, update.run
   sessionKey: Type.Optional(Type.String()),
   note: Type.Optional(Type.String()),
@@ -401,6 +532,20 @@ export function createGatewayTool(opts?: {
         // Extract channel + threadId for routing after restart.
         // Uses generic :thread: parsing plus plugin-owned session grammars.
         const { deliveryContext, threadId } = extractDeliveryInfo(sessionKey);
+        const activationContinuation = buildGatewayToolActivationContinuation({
+          deliveryContext,
+          note,
+          raw: params,
+          reason,
+          sessionKey,
+          threadId,
+          continuationMessage,
+        });
+        let activationContinuationId: string | undefined;
+        if (activationContinuation) {
+          const record = await persistActivationContinuationBeforeRestart(activationContinuation);
+          activationContinuationId = record.id;
+        }
         const payload: RestartSentinelPayload = {
           kind: "restart",
           status: "ok",
@@ -432,6 +577,9 @@ export function createGatewayTool(opts?: {
             },
             afterEmitRejected: async () => {
               await removeRestartSentinelFile(sentinelPath);
+              if (activationContinuationId) {
+                await markActivationContinuationCommandNotStarted(activationContinuationId);
+              }
             },
           },
         });
@@ -460,6 +608,8 @@ export function createGatewayTool(opts?: {
         sessionKey: string | undefined;
         note: string | undefined;
         restartDelayMs: number | undefined;
+        controlPlaneManifest: unknown;
+        controlPlaneApproval: unknown;
       }> => {
         const raw = readStringParam(params, "raw", { required: true });
         const snapshot = await callGatewayTool("config.get", gatewayOpts, {});
@@ -473,7 +623,14 @@ export function createGatewayTool(opts?: {
         if (!baseHash) {
           throw new Error("Missing baseHash from config snapshot.");
         }
-        return { raw, baseHash, snapshotConfig, ...resolveGatewayWriteMeta() };
+        return {
+          raw,
+          baseHash,
+          snapshotConfig,
+          controlPlaneManifest: params.controlPlaneManifest,
+          controlPlaneApproval: params.controlPlaneApproval,
+          ...resolveGatewayWriteMeta(),
+        };
       };
 
       if (action === "config.get") {
@@ -501,8 +658,16 @@ export function createGatewayTool(opts?: {
         }
       }
       if (action === "config.apply") {
-        const { raw, baseHash, snapshotConfig, sessionKey, note, restartDelayMs } =
-          await resolveConfigWriteParams();
+        const {
+          raw,
+          baseHash,
+          snapshotConfig,
+          sessionKey,
+          note,
+          restartDelayMs,
+          controlPlaneManifest,
+          controlPlaneApproval,
+        } = await resolveConfigWriteParams();
         assertGatewayConfigMutationAllowed({
           action: "config.apply",
           currentConfig: snapshotConfig,
@@ -514,12 +679,22 @@ export function createGatewayTool(opts?: {
           sessionKey,
           note,
           restartDelayMs,
+          controlPlaneManifest,
+          controlPlaneApproval,
         });
         return jsonResult({ ok: true, result: stripConfigWriteResultPayload(result) });
       }
       if (action === "config.patch") {
-        const { raw, baseHash, snapshotConfig, sessionKey, note, restartDelayMs } =
-          await resolveConfigWriteParams();
+        const {
+          raw,
+          baseHash,
+          snapshotConfig,
+          sessionKey,
+          note,
+          restartDelayMs,
+          controlPlaneManifest,
+          controlPlaneApproval,
+        } = await resolveConfigWriteParams();
         assertGatewayConfigMutationAllowed({
           action: "config.patch",
           currentConfig: snapshotConfig,
@@ -531,6 +706,8 @@ export function createGatewayTool(opts?: {
           sessionKey,
           note,
           restartDelayMs,
+          controlPlaneManifest,
+          controlPlaneApproval,
         });
         return jsonResult({ ok: true, result: stripConfigWriteResultPayload(result) });
       }

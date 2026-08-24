@@ -55,6 +55,12 @@ export const DirListToolSchema = Type.Object({
         "Pagination token from a previous dir_list call. Omit to start from the beginning.",
     }),
   ),
+  query: Type.Optional(
+    Type.String({
+      description:
+        "Optional case-insensitive filename filter. Use this to search large directories without rendering every entry.",
+    }),
+  ),
   maxEntries: optionalPositiveIntegerSchema({
     description: `Max entries per page. Default ${DIR_LIST_DEFAULT_MAX_ENTRIES}, hard ceiling ${DIR_LIST_HARD_MAX_ENTRIES}.`,
   }),
@@ -67,7 +73,7 @@ export const DIR_LIST_TOOL_DESCRIPTOR: FileTransferToolDescriptor = {
   label: "Directory List",
   name: "dir_list",
   description:
-    "Retrieve a structured directory listing from a paired node. Returns file and subdirectory metadata (name, path, size, mimeType, isDir, mtime) without transferring file content. Use this to discover what files exist before fetching them with file_fetch. Pagination is offset-based; pass nextPageToken from the previous result. Requires operator opt-in: gateway.nodes.allowCommands must include 'dir.list' AND plugins.entries.file-transfer.config.nodes.<node>.allowReadPaths must match the directory path. Without policy configured, every call is denied.",
+    "Retrieve a structured directory listing from a paired node. Returns file and subdirectory metadata (name, path, size, mimeType, isDir, mtime) without transferring file content. Use this to discover what files exist before fetching them with file_fetch. Pagination is cursor-based; pass nextPageToken from the previous result. Optional query filters filenames case-insensitively for large directories. Requires operator opt-in: gateway.nodes.allowCommands must include 'dir.list' AND plugins.entries.file-transfer.config.nodes.<node>.allowReadPaths must match the directory path. Without policy configured, every call is denied.",
   parameters: DirListToolSchema,
 };
 

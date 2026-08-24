@@ -630,7 +630,8 @@ describe("createGatewayCloseHandler", () => {
     expect(chatAbortControllers.size).toBe(1);
   });
 
-  it("aborts active runs immediately when restart drain budget is exhausted", async () => {
+  it("uses a nonzero restart reply drain floor before aborting active runs", async () => {
+    vi.useFakeTimers();
     const controller = new AbortController();
     const chatAbortControllers = new Map([
       [
@@ -650,18 +651,22 @@ describe("createGatewayCloseHandler", () => {
       }),
     );
 
-    const result = await close({
+    const closePromise = close({
       reason: "gateway restarting",
       restartExpectedMs: 123,
       drainTimeoutMs: 0,
     });
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(controller.signal.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await closePromise;
 
     expect(result.warnings).toContain("restart-reply-drain");
     expect(controller.signal.aborted).toBe(true);
     expect(chatAbortControllers.size).toBe(0);
     expect(
       mocks.logWarn.mock.calls.some(([message]) =>
-        String(message).includes("restart reply drain timed out after 0ms"),
+        String(message).includes("restart reply drain timed out after 10000ms"),
       ),
     ).toBe(true);
   });

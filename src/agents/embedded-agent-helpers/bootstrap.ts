@@ -98,10 +98,15 @@ const BOOTSTRAP_HEAD_RATIO = 0.75;
 const BOOTSTRAP_TAIL_RATIO = 0.25;
 const MIN_BOOTSTRAP_TRIMMED_CONTENT_CHARS = 16;
 const AGENTS_BOOTSTRAP_FILENAME = "AGENTS.md";
+const USER_BOOTSTRAP_FILENAME = "USER.md";
 const AGENTS_POLICY_DIGEST_RATIO = 0.35;
 const AGENTS_POLICY_HEAD_RATIO = 0.45;
 const AGENTS_POLICY_TAIL_RATIO = 0.15;
 const AGENTS_POLICY_DIGEST_MAX_LINE_CHARS = 240;
+const POLICY_DIGEST_PATTERN =
+  /\b(?:AGENTS\.md|USER\.md|scoped|required|must|never|do not|before subtree|read scoped|owner|security|secret|credential|test|validation|command|commit|push|github|pr|sop|cleanup crew|message_tool|visible reply|delivery|deliver|restart|continuation|checkpoint|recovery|recover|taskflow|watchdog|production|trinity|policy version|active_no_worker|pending_report_delivery|worker_coverage|clean|mission resumption|fencing|duplicate suppression|blocked|blocked_verified|lost|recovering|superseded)\b/iu;
+const HIGH_PRIORITY_POLICY_DIGEST_PATTERN =
+  /\b(?:AGENTS\.md|USER\.md|scoped|required|must|never|do not|before subtree|read scoped|security|secret|credential|sop|message_tool|visible reply|delivery|deliver|restart|continuation|checkpoint|recovery|recover|policy version|active_no_worker|worker_coverage|mission resumption|fencing|duplicate suppression)\b/iu;
 
 function formatBootstrapPerfMs(value: number): string {
   return Number.isFinite(value) ? value.toFixed(1) : "n/a";
@@ -156,17 +161,19 @@ export function resolveBootstrapPromptTruncationWarningMode(
   return DEFAULT_BOOTSTRAP_PROMPT_TRUNCATION_WARNING_MODE;
 }
 
-function isAgentsBootstrapFile(fileName: string | undefined): boolean {
-  return fileName?.toLowerCase() === AGENTS_BOOTSTRAP_FILENAME.toLowerCase();
+function isPolicyDigestBootstrapFile(fileName: string | undefined): boolean {
+  const normalized = fileName?.toLowerCase();
+  return (
+    normalized === AGENTS_BOOTSTRAP_FILENAME.toLowerCase() ||
+    normalized === USER_BOOTSTRAP_FILENAME.toLowerCase()
+  );
 }
 
 function isPolicyDigestCandidate(line: string): boolean {
   if (/^(?:#{1,6}|\s*[-*+]|\s*\d+[.)])\s+\S/u.test(line)) {
     return true;
   }
-  return /\b(?:AGENTS\.md|scoped|required|must|never|do not|before subtree|read scoped|owner|security|secret|credential|test|validation|command|commit|push|github|pr)\b/iu.test(
-    line,
-  );
+  return POLICY_DIGEST_PATTERN.test(line);
 }
 
 function normalizePolicyDigestLine(line: string): string {
@@ -186,8 +193,6 @@ function buildAgentsPolicyDigest(content: string, budget: number): PolicyDigest 
     .split(/\r?\n/u)
     .map((line, index) => ({ index, line: normalizePolicyDigestLine(line) }))
     .filter(({ line }) => line.length > 0 && isPolicyDigestCandidate(line));
-  const highPriorityPattern =
-    /\b(?:AGENTS\.md|scoped|required|must|never|do not|before subtree|read scoped|security|secret|credential)\b/iu;
   const selected = new Set<number>();
   let used = 0;
   const trySelect = (candidate: { index: number; line: string }) => {
@@ -200,7 +205,7 @@ function buildAgentsPolicyDigest(content: string, budget: number): PolicyDigest 
   };
 
   for (const candidate of candidates) {
-    if (highPriorityPattern.test(candidate.line)) {
+    if (HIGH_PRIORITY_POLICY_DIGEST_PATTERN.test(candidate.line)) {
       trySelect(candidate);
     }
   }
@@ -220,7 +225,11 @@ function buildAgentsPolicyDigest(content: string, budget: number): PolicyDigest 
   };
 }
 
-function trimAgentsBootstrapContent(content: string, maxChars: number): TrimBootstrapResult {
+function trimPolicyBootstrapContent(
+  content: string,
+  fileName: string,
+  maxChars: number,
+): TrimBootstrapResult {
   const trimmed = content.trimEnd();
   if (trimmed.length <= maxChars) {
     return {
@@ -238,11 +247,11 @@ function trimAgentsBootstrapContent(content: string, maxChars: number): TrimBoot
   const render = () =>
     [
       trimmed.slice(0, headChars),
-      `[...truncated, read ${AGENTS_BOOTSTRAP_FILENAME} for full content...]`,
-      digest.text ? "[Policy digest from AGENTS.md]" : "",
+      `[...truncated, read ${fileName} for full content...]`,
+      digest.text ? `[Policy digest from ${fileName}]` : "",
       digest.text,
       digest.omittedLines > 0 ? `[...${digest.omittedLines} more policy lines omitted...]` : "",
-      `…(truncated ${AGENTS_BOOTSTRAP_FILENAME}: kept ${headChars}+policy ${digest.text.length}+${tailChars} chars of ${trimmed.length})…`,
+      `…(truncated ${fileName}: kept ${headChars}+policy ${digest.text.length}+${tailChars} chars of ${trimmed.length})…`,
       tailChars > 0 ? trimmed.slice(-tailChars) : "",
     ]
       .filter((part) => part.length > 0)
@@ -284,8 +293,8 @@ function trimBootstrapContent(
       originalLength: trimmed.length,
     };
   }
-  if (isAgentsBootstrapFile(fileName)) {
-    return trimAgentsBootstrapContent(content, maxChars);
+  if (isPolicyDigestBootstrapFile(fileName)) {
+    return trimPolicyBootstrapContent(content, fileName, maxChars);
   }
 
   const markerTemplate = (headChars: number, tailChars: number) =>

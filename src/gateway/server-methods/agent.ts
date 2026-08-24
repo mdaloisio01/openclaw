@@ -1,5 +1,6 @@
-import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
@@ -46,6 +47,13 @@ import {
   resolveIngressWorkspaceOverrideForSpawnedRun,
 } from "../../agents/spawned-context.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
+import { setReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
+import {
+  allowTerminalCloseout,
+  installActiveRunContinuationGuard,
+  recordActiveRunStarted,
+} from "../../auto-reply/reply/active-run-continuation-guard.js";
+import type { ReplyPayload } from "../../auto-reply/types.js";
 import { agentCommandFromIngress } from "../../commands/agent.js";
 import {
   evaluateSessionFreshness,
@@ -64,6 +72,18 @@ import {
 } from "../../config/sessions.js";
 import { resolveMaintenanceConfigFromInput } from "../../config/sessions/store-maintenance.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  evaluateFalseCloseoutAdmission,
+  resolveFalseCloseoutAdmissionMode,
+} from "../../governance/false-closeout-admission-controller.js";
+import { buildRuntimeCloseoutAdmissionInput } from "../../governance/false-closeout-runtime-evidence.js";
+import type {
+  CloseoutAdmissionInput,
+  CompletionTransition,
+  EvidenceReceipt,
+  MissionIdentity,
+  MissionMode,
+} from "../../governance/mission-manifest.types.js";
 import { registerAgentRunContext } from "../../infra/agent-events.js";
 import { formatUncaughtError, readErrorName } from "../../infra/errors.js";
 import {
@@ -665,6 +685,279 @@ function resolveGatewayAgentParentContinuationLink(sessionKey?: string): {
   };
 }
 
+function isCleanupCrewGatewayAgentTurn(message: string | undefined): boolean {
+  return /\bcleanup[-\s]?crew\b/i.test(message ?? "");
+}
+
+function normalizeGatewayAgentTerminalPayloads(
+  payloads: readonly (Omit<ReplyPayload, "mediaUrl"> & { mediaUrl?: string | null })[] | undefined,
+): ReplyPayload[] | undefined {
+  return payloads?.map((payload) => {
+    const { mediaUrl, ...rest } = payload;
+    return {
+      ...rest,
+      ...(typeof mediaUrl === "string" ? { mediaUrl } : {}),
+    };
+  });
+}
+
+function admitGatewayAgentTerminalPayloads(params: {
+  message: string | undefined;
+  payloads: readonly ReplyPayload[] | undefined;
+  forceGuardEvaluation?: boolean;
+  activeCleanupCrewMission?: boolean;
+  cleanupCrewCurrentTurnText?: string;
+}): { allowed: boolean; violationReason?: string } {
+  if (!params.forceGuardEvaluation && !isCleanupCrewGatewayAgentTurn(params.message)) {
+    return { allowed: true };
+  }
+  const dispatcher = {
+    sendToolResult: () => true,
+    sendBlockReply: () => true,
+    sendFinalReply: () => true,
+    waitForIdle: async () => undefined,
+    getQueuedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+    getFailedCounts: () => ({ tool: 0, block: 0, final: 0 }),
+    markComplete: () => undefined,
+  };
+  installActiveRunContinuationGuard(dispatcher, {
+    cleanupCrewFinalResponse: {
+      activeCleanupCrewMission:
+        params.activeCleanupCrewMission ?? isCleanupCrewGatewayAgentTurn(params.message),
+      currentTurnText: params.cleanupCrewCurrentTurnText ?? params.message,
+    },
+  });
+  recordActiveRunStarted(dispatcher);
+  for (const payload of params.payloads ?? []) {
+    const decision = allowTerminalCloseout(dispatcher, "sendFinalReply", payload);
+    if (!decision.allowed) {
+      return decision;
+    }
+  }
+  return { allowed: true };
+}
+
+function readFalseCloseoutAdmissionProbeParams(params: unknown): {
+  message: string;
+  responseText: string;
+  fixture: "negative" | "complete";
+  identity?: MissionIdentity;
+  evidenceManifestSha256?: string;
+  requestedTransition?: CompletionTransition;
+} {
+  const record =
+    typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {};
+  const message =
+    normalizeOptionalString(record.message) ??
+    "Cleanup Crew live enforcement probe. Try to end this active Cleanup Crew mission now.";
+  const responseText =
+    normalizeOptionalString(record.responseText) ?? "Final closeout report: complete.";
+  const fixture = normalizeOptionalString(record.fixture) === "complete" ? "complete" : "negative";
+  const identity = readMissionIdentityFromRecord(record.identity);
+  const evidenceManifestSha256 = normalizeOptionalString(record.evidenceManifestSha256);
+  const transition = normalizeOptionalString(record.requestedTransition);
+  const requestedTransition =
+    transition === "completion_request -> terminal_pending_watchdog" ||
+    transition === "terminal_pending_watchdog -> COMPLETE"
+      ? transition
+      : undefined;
+  return { message, responseText, fixture, identity, evidenceManifestSha256, requestedTransition };
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function sha256FileIfPresent(filePath: string): string | undefined {
+  try {
+    return sha256Text(readFileSync(filePath, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function readBuildInfoCommit(): string | undefined {
+  try {
+    const parsed = JSON.parse(
+      readFileSync(path.resolve(process.cwd(), "dist", "build-info.json"), "utf8"),
+    ) as {
+      commit?: unknown;
+    };
+    return normalizeOptionalString(parsed.commit);
+  } catch {
+    return undefined;
+  }
+}
+
+function readMissionIdentityFromRecord(value: unknown): MissionIdentity | undefined {
+  const record =
+    typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+  if (!record) {
+    return undefined;
+  }
+  const identity = {
+    missionId: normalizeOptionalString(record.missionId),
+    planRevisionId: normalizeOptionalString(record.planRevisionId),
+    planSha256: normalizeOptionalString(record.planSha256),
+    sourceRevision: normalizeOptionalString(record.sourceRevision),
+    runtimeBuildSha256: normalizeOptionalString(record.runtimeBuildSha256),
+    policyVersion: normalizeOptionalString(record.policyVersion),
+    skillSha256: normalizeOptionalString(record.skillSha256),
+  };
+  if (Object.values(identity).some((entry) => !entry)) {
+    return undefined;
+  }
+  return identity as MissionIdentity;
+}
+
+function buildDefaultFalseCloseoutProbeIdentity(fixture: "negative" | "complete"): MissionIdentity {
+  const planPath =
+    "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/ai_orchestrator_false_closeout_final_live_enforcement_implementation_plan_2026-07-16T2057Z.md";
+  const planSha256 = sha256FileIfPresent(planPath) ?? `plan-${fixture}-probe-sha`;
+  const runtimeBuildSha256 =
+    sha256FileIfPresent(path.resolve(process.cwd(), "dist", "build-info.json")) ??
+    `runtime-${fixture}-probe-sha`;
+  return {
+    missionId: `cleanup-crew-live-${fixture}-probe`,
+    planRevisionId:
+      "ai_orchestrator_false_closeout_final_live_enforcement_implementation_plan_2026-07-16T2057Z",
+    planSha256,
+    sourceRevision: readBuildInfoCommit() ?? `source-${fixture}-probe-sha`,
+    runtimeBuildSha256,
+    policyVersion: "cleanup-watchdog-governance-20260715T1442Z",
+    skillSha256: planSha256,
+  };
+}
+
+function buildCompleteCloseoutAdmissionFixture(params: {
+  mode: MissionMode;
+  responseText: string;
+  identity?: MissionIdentity;
+  evidenceManifestSha256?: string;
+  requestedTransition?: CompletionTransition;
+}): CloseoutAdmissionInput {
+  const now = new Date().toISOString();
+  const identity = params.identity ?? buildDefaultFalseCloseoutProbeIdentity("complete");
+  const evidenceManifestSha256 = params.evidenceManifestSha256 ?? "evidence-positive-probe-sha";
+  const receipt = (gateId: string): EvidenceReceipt => ({
+    schema: "openclaw.evidence_receipt.v1",
+    ...identity,
+    receiptId: `receipt-${gateId}`,
+    gateId,
+    status: "passed",
+    producedAt: now,
+    artifactSha256: `artifact-${gateId}-sha`,
+  });
+  return {
+    manifest: {
+      schema: "openclaw.mission_manifest.v1",
+      ...identity,
+      mode: params.mode,
+      scopeHash: "scope-positive-probe",
+      authorizedScopeHash: "scope-positive-probe",
+      planRevisionAuthorized: true,
+      createdAt: now,
+    },
+    requirements: [
+      {
+        id: "REQ-POSITIVE-PROBE",
+        text: "controlled complete fixture gates must pass",
+        required: true,
+        gateIds: ["gate-positive-probe"],
+      },
+    ],
+    gates: [
+      {
+        id: "gate-positive-probe",
+        requirementId: "REQ-POSITIVE-PROBE",
+        kind: "requirement",
+        required: true,
+      },
+    ],
+    receipts: [receipt("gate-positive-probe")],
+    testManifest: {
+      schema: "openclaw.test_manifest.v1",
+      ...identity,
+      requestedFiles: ["positive-probe.test.ts"],
+      expectedTotal: 1,
+    },
+    testResults: [{ file: "positive-probe.test.ts", passed: 1, failed: 0 }],
+    rollbackReceipt: {
+      schema: "openclaw.rollback_receipt.v1",
+      ...identity,
+      executed: true,
+      producedAt: now,
+      targetStateSha256: "rollback-positive-probe-sha",
+    },
+    restorationReceipt: {
+      schema: "openclaw.restoration_receipt.v1",
+      ...identity,
+      executed: true,
+      producedAt: now,
+      restoredStateSha256: "restoration-positive-probe-sha",
+    },
+    grantApproval: {
+      schema: "openclaw.grant_approval.v1",
+      ...identity,
+      approved: true,
+      approvedAt: now,
+      evidenceManifestSha256,
+      reviewer: "Grant",
+    },
+    exportManifest: {
+      schema: "openclaw.export_manifest.v1",
+      ...identity,
+      items: [
+        {
+          path: "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/positive-probe.json",
+          sha256: "export-positive-probe-sha",
+          sizeBytes: 1,
+          required: true,
+        },
+      ],
+    },
+    runtimeState: {
+      parentStatus:
+        params.requestedTransition === "terminal_pending_watchdog -> COMPLETE"
+          ? "terminal_pending_watchdog"
+          : "running",
+      activeExecutorCount: 0,
+      staleExecutorCount: 0,
+      openSessionCount: 0,
+      openRunCount: 0,
+      openLeaseCount: 0,
+      openContinuationCount: 0,
+      pendingDeliveryCount: 0,
+    },
+    watchdog: {
+      label: "CLEAN",
+      suspiciousCount: 0,
+      checkedAt: now,
+      postTerminal: true,
+    },
+    repairWork: { openCount: 0, openIds: [] },
+    completionRequest: {
+      schema: "openclaw.completion_request.v1",
+      ...identity,
+      requestedAt: now,
+      claimedScopeHash: "scope-positive-probe",
+      closeoutText: params.responseText,
+      evidenceManifestSha256,
+      requestedTransition:
+        params.requestedTransition ?? "completion_request -> terminal_pending_watchdog",
+      previousDecisionReceiptSha256:
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      transitionalWatchdogReceiptSha256:
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+      parentExecutorSnapshotSha256:
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    },
+    nextExecutableStepExists: false,
+    reportContradictions: [],
+    now,
+  };
+}
+
 async function registerPluginSubagentRunFromGateway(params: {
   cfg: OpenClawConfig;
   runId: string;
@@ -949,12 +1242,43 @@ function dispatchAgentRunFromGateway(params: {
     .then((result) => {
       const aborted = result?.meta?.aborted === true;
       const timeoutAttribution = readAgentRunTimeoutAttribution(result?.meta);
+      const falseCloseoutAdmission = admitGatewayAgentTerminalPayloads({
+        message: params.ingressOpts.message,
+        payloads: normalizeGatewayAgentTerminalPayloads(result?.payloads),
+      });
       if (taskTracked) {
         tryFinalizeTrackedAgentTask({
           runId: params.runId,
-          status: aborted ? "timed_out" : "succeeded",
-          terminalSummary: aborted ? "aborted" : "completed",
+          status: aborted ? "timed_out" : falseCloseoutAdmission.allowed ? "succeeded" : "failed",
+          terminalSummary: aborted
+            ? "aborted"
+            : falseCloseoutAdmission.allowed
+              ? "completed"
+              : falseCloseoutAdmission.violationReason,
         });
+      }
+      if (!falseCloseoutAdmission.allowed) {
+        const violationReason =
+          falseCloseoutAdmission.violationReason ??
+          "False-closeout admission controller rejected terminal closeout";
+        const payload = {
+          runId: params.runId,
+          status: "error" as const,
+          summary: violationReason,
+        };
+        const error = errorShape(ErrorCodes.INVALID_REQUEST, violationReason);
+        setGatewayDedupeEntries({
+          dedupe: params.context.dedupe,
+          keys: params.dedupeKeys,
+          entry: {
+            ts: Date.now(),
+            ok: false,
+            payload,
+            error,
+          },
+        });
+        params.respond(false, payload, error, { runId: params.runId });
+        return;
       }
       const payload = {
         runId: params.runId,
@@ -1049,6 +1373,73 @@ function yieldAfterAgentAcceptedAck(): Promise<void> {
 }
 
 export const agentHandlers: GatewayRequestHandlers = {
+  "agent.falseCloseoutAdmission.probe": ({ params, respond }) => {
+    const probe = readFalseCloseoutAdmissionProbeParams(params);
+    const mode =
+      probe.fixture === "complete"
+        ? resolveFalseCloseoutAdmissionMode(
+            process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION ??
+              process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE,
+          )
+        : undefined;
+    const identity = probe.identity ?? buildDefaultFalseCloseoutProbeIdentity(probe.fixture);
+    const evidenceManifestSha256 =
+      probe.evidenceManifestSha256 ?? `evidence-${probe.fixture}-probe-sha`;
+    const falseCloseoutAdmission =
+      probe.fixture === "complete"
+        ? buildCompleteCloseoutAdmissionFixture({
+            mode: mode ?? "shadow",
+            responseText: probe.responseText,
+            identity,
+            evidenceManifestSha256,
+            requestedTransition: probe.requestedTransition,
+          })
+        : buildRuntimeCloseoutAdmissionInput({
+            activeCleanupCrewMission: true,
+            terminalAttempt: true,
+            currentTurnText: probe.message,
+            responseText: probe.responseText,
+            mode: resolveFalseCloseoutAdmissionMode(
+              process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION ??
+                process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE,
+            ),
+            identity,
+            evidenceManifestSha256,
+            activeRunStarted: true,
+            executionRunningNow: true,
+            pendingContinuationRequirement: true,
+            nextExecutableStepStarted: false,
+          });
+    const payload = falseCloseoutAdmission
+      ? setReplyPayloadMetadata({ text: probe.responseText }, { falseCloseoutAdmission })
+      : { text: probe.responseText };
+    const decision = admitGatewayAgentTerminalPayloads({
+      message: probe.message,
+      payloads: [payload],
+      forceGuardEvaluation: probe.fixture === "complete",
+      activeCleanupCrewMission: probe.fixture === "complete" ? false : undefined,
+      cleanupCrewCurrentTurnText: probe.fixture === "complete" ? "" : undefined,
+    });
+    const fixtureDecision = falseCloseoutAdmission
+      ? evaluateFalseCloseoutAdmission(falseCloseoutAdmission)
+      : undefined;
+    respond(true, {
+      ok: true,
+      schema: "openclaw.false_closeout_admission_gateway_probe.v1",
+      gatewayPath: "agent.falseCloseoutAdmission.probe",
+      fixture: probe.fixture,
+      mode: mode ?? process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION ?? "shadow",
+      allowed: decision.allowed,
+      violationReason: decision.violationReason,
+      decisionState: fixtureDecision?.state,
+      authorizedTransition: fixtureDecision?.authorizedTransition,
+      rejectionCodes: fixtureDecision?.rejectionCodes,
+      message: probe.message,
+      responseText: probe.responseText,
+      identity,
+      evidenceManifestSha256,
+    });
+  },
   agent: async ({ params, respond, context, client, isWebchatConnect }) => {
     const p = params;
     if (!validateAgentParams(p)) {

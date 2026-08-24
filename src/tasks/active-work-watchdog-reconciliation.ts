@@ -1,3 +1,10 @@
+import {
+  CLEANUP_WATCHDOG_POLICY_VERSION,
+  type CleanupWatchdogFindingCategory,
+  type CleanupWatchdogPriorityCode,
+  getCleanupWatchdogPriority,
+} from "../governance/cleanup-watchdog-policy.js";
+
 export const WATCHDOG_RECONCILIATION_CLASSES = [
   "true active worker",
   "stale blocked flow",
@@ -35,6 +42,8 @@ export type WatchdogReceiptLike = {
   checked_at?: string;
   label?: string;
   status?: string;
+  policy_version?: string;
+  clean_dimensions_required?: string[];
   summary?: {
     items_suspicious?: number;
   };
@@ -46,6 +55,8 @@ export type WatchdogReceiptLike = {
 export type WatchdogReconciledItem = {
   entityType: string;
   entityId: string;
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  canonicalPriority?: CleanupWatchdogPriorityCode;
   classification: WatchdogReconciliationClass;
   repairRoute: "observe_active" | "cleanup_crew_repair" | "lawful_owner_route" | "blocker_artifact";
   validationRequired: "rerun_watchdog";
@@ -65,6 +76,8 @@ export type WatchdogReconciledItem = {
 
 export type WatchdogCleanupCrewRecoveryBridge = {
   schema: "openclaw.watchdog_cleanup_crew_recovery_bridge.v1";
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  canonicalPriority?: CleanupWatchdogPriorityCode;
   stoppageReceipt: {
     stoppageClass: "watchdog_needs_review" | "watchdog_monitor_disabled";
     suspectedAffectedSurface: string;
@@ -88,7 +101,14 @@ export type WatchdogCleanupCrewRecoveryBridge = {
   resume: {
     requiresPlanReload: true;
     command: "rerun_system_wide_active_work_watchdog";
-    proofTarget: "WATCHDOG STATUS: CLEAN | suspicious_count=0";
+    proofTarget: "WATCHDOG STATUS: CLEAN | suspicious_count=0 plus worker/continuation/delivery/runtime/record-integrity/repair-closure/policy-version coverage";
+  };
+  durableRepairWork: {
+    required: true;
+    idempotencyKey: string;
+    createBeforeAlertAcknowledgement: true;
+    acknowledgementRule: "acknowledge_only_after_repair_completion_and_fresh_clean_watchdog";
+    duplicateAlertHandling: "reuse_pending_repair_work";
   };
 };
 
@@ -194,6 +214,44 @@ function routeForClassification(
   return "cleanup_crew_repair";
 }
 
+function canonicalCategoryForItem(
+  item: WatchdogReceiptItem,
+  classification: WatchdogReconciliationClass,
+): CleanupWatchdogFindingCategory | undefined {
+  const category = normalize(item.category);
+  if (category === "active_no_worker") return "active_no_worker";
+  if (category === "pending_report_delivery") return "pending_report_delivery";
+  if (category === "pending_milestone_report") return "pending_milestone_report";
+  if (category === "source_delivery_stale" || category === "source_delivery_failed") {
+    return "pending_report_delivery";
+  }
+  if (category === "lost") return "lost_ownership";
+  if (category === "stale") return "corrupted_state";
+  if (category === "queued_no_dispatch") return "corrupted_continuation";
+  if (category === "already_completed_not_closed_cleanly" || category === "needs_final_delivery") {
+    return "missing_correctness_proof";
+  }
+  if (category === "monitor_disabled") return "runtime_recovery_failure";
+  if (category === "blocked_lawful" || category === "waiting_on_owner") {
+    return "review_required_for_safe_work";
+  }
+  if (classification === "cron/watchdog state mismatch") return "runtime_recovery_failure";
+  if (classification === "corrupted taskflow pointer") return "corrupted_pointer";
+  if (classification === "orphaned task") return "lost_ownership";
+  if (classification === "missing closeout") return "missing_correctness_proof";
+  if (classification === "real production blocker") return "review_required_for_safe_work";
+  if (classification === "stale running state") return "corrupted_state";
+  return undefined;
+}
+
+function canonicalPriorityForItem(
+  item: WatchdogReceiptItem,
+  classification: WatchdogReconciliationClass,
+): CleanupWatchdogPriorityCode | undefined {
+  const category = canonicalCategoryForItem(item, classification);
+  return category ? getCleanupWatchdogPriority(category) : undefined;
+}
+
 function resolveHardStopReason(item: WatchdogReceiptItem): string | undefined {
   const recommendationCode = normalize(item.suggested_next_step?.recommendation_code);
   const recommendation = normalize(item.suggested_next_step?.recommendation);
@@ -211,10 +269,32 @@ function resolveHardStopReason(item: WatchdogReceiptItem): string | undefined {
   ) {
     return "unsafe_duplicate_worker_restart_requires_proof";
   }
-  if (item.suggested_next_step?.owner_approval_required === true) {
+  if (
+    item.suggested_next_step?.owner_approval_required === true &&
+    (recommendationCode.includes("owner_decision_required") ||
+      recommendationCode.includes("prepare_owner_approved_replay") ||
+      recommendationCode.includes("triage_pending_delivery_debt") ||
+      combined.includes("ask mark") ||
+      combined.includes("owner decision"))
+  ) {
     return "owner_decision_required_before_worker_relaunch";
   }
   return undefined;
+}
+
+function buildRepairWorkIdempotencyKey(params: {
+  item: WatchdogReceiptItem;
+  classification: WatchdogReconciliationClass;
+  stoppageClass: "watchdog_needs_review" | "watchdog_monitor_disabled";
+}): string {
+  const entityType = stringValue(params.item.entity_type, "watchdog")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_");
+  const entityId = stringValue(params.item.entity_id, "unknown")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_");
+  const classification = params.classification.toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+  return `watchdog:${params.stoppageClass}:${entityType}:${entityId}:${classification}`;
 }
 
 function buildRecoveryFlags(
@@ -241,8 +321,11 @@ function buildCleanupCrewRecoveryBridge(params: {
   const entityType = stringValue(params.item.entity_type, "watchdog");
   const entityId = stringValue(params.item.entity_id, "unknown");
   const surface = `${entityType}:${entityId}:${params.classification}`;
+  const canonicalPriority = canonicalPriorityForItem(params.item, params.classification);
   return {
     schema: "openclaw.watchdog_cleanup_crew_recovery_bridge.v1",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    ...(canonicalPriority ? { canonicalPriority } : {}),
     stoppageReceipt: {
       stoppageClass: params.stoppageClass,
       suspectedAffectedSurface: surface,
@@ -289,7 +372,15 @@ function buildCleanupCrewRecoveryBridge(params: {
     resume: {
       requiresPlanReload: true,
       command: "rerun_system_wide_active_work_watchdog",
-      proofTarget: "WATCHDOG STATUS: CLEAN | suspicious_count=0",
+      proofTarget:
+        "WATCHDOG STATUS: CLEAN | suspicious_count=0 plus worker/continuation/delivery/runtime/record-integrity/repair-closure/policy-version coverage",
+    },
+    durableRepairWork: {
+      required: true,
+      idempotencyKey: buildRepairWorkIdempotencyKey(params),
+      createBeforeAlertAcknowledgement: true,
+      acknowledgementRule: "acknowledge_only_after_repair_completion_and_fresh_clean_watchdog",
+      duplicateAlertHandling: "reuse_pending_repair_work",
     },
   };
 }
@@ -328,6 +419,8 @@ export function resolveWatchdogNeedsReviewReconciliation(
         {
           entityType: "watchdog_monitor",
           entityId: flowSummary,
+          policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+          canonicalPriority: getCleanupWatchdogPriority("runtime_recovery_failure"),
           classification: "cron/watchdog state mismatch",
           repairRoute: "cleanup_crew_repair",
           validationRequired: "rerun_watchdog",
@@ -398,6 +491,7 @@ export function resolveWatchdogNeedsReviewReconciliation(
 
   const items = suspiciousItems.map((item) => {
     const classification = classifyWatchdogSuspiciousItem(item);
+    const canonicalPriority = canonicalPriorityForItem(item, classification);
     const recoveryFlags = buildRecoveryFlags(item, classification);
     const reason = stringValue(item.reason, "watchdog NEEDS_REVIEW item requires reconciliation");
     const cleanupCrewRecoveryBridge =
@@ -412,6 +506,8 @@ export function resolveWatchdogNeedsReviewReconciliation(
     return {
       entityType: stringValue(item.entity_type, "unknown"),
       entityId: stringValue(item.entity_id, "unknown"),
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      ...(canonicalPriority ? { canonicalPriority } : {}),
       classification,
       repairRoute: routeForClassification(classification),
       validationRequired: "rerun_watchdog" as const,

@@ -438,7 +438,7 @@ describe("runReplyAgent pending final delivery capture", () => {
     return JSON.parse(raw).main as SessionEntry;
   }
 
-  it("does not persist message-tool-only final replies for heartbeat replay", async () => {
+  it("persists message-tool-only private final misses as delivery repair state", async () => {
     const sessionEntry: SessionEntry = {
       sessionId: "session",
       updatedAt: Date.now(),
@@ -447,7 +447,7 @@ describe("runReplyAgent pending final delivery capture", () => {
     const storePath = await createSessionStoreFile(sessionEntry);
     state.runEmbeddedAgentMock.mockResolvedValueOnce({
       payloads: [{ text: "private final" }],
-      meta: {},
+      meta: { finalAssistantVisibleText: "private final" },
     });
 
     const { run } = createMinimalRun({
@@ -461,8 +461,11 @@ describe("runReplyAgent pending final delivery capture", () => {
     await run();
 
     const stored = await readStoredMainSession(storePath);
-    expect(stored.pendingFinalDelivery).toBeUndefined();
-    expect(stored.pendingFinalDeliveryText).toBeUndefined();
+    expect(stored.pendingFinalDelivery).toBe(true);
+    expect(stored.pendingFinalDeliveryText).toBe("private final");
+    expect(stored.pendingFinalDeliveryLastError).toBe(
+      "message_tool_only final reply missed required delivery tool",
+    );
   });
 
   it("does not persist sendPolicy-denied final replies for heartbeat replay", async () => {

@@ -845,12 +845,14 @@ describe("browser config", () => {
         allowPrivateNetwork: true,
         allowedHostnames: [" localhost ", ""],
         hostnameAllowlist: [" *.trusted.example ", " "],
+        allowedOrigins: [" http://localhost:18789 ", ""],
       },
     } as unknown as BrowserConfig);
     expect(resolved.ssrfPolicy).toEqual({
       dangerouslyAllowPrivateNetwork: true,
       allowedHostnames: ["localhost"],
       hostnameAllowlist: ["*.trusted.example"],
+      allowedOrigins: ["http://localhost:18789"],
     });
   });
 
@@ -882,11 +884,13 @@ describe("browser config", () => {
       ssrfPolicy: {
         allowedHostnames: ["example.com"],
         hostnameAllowlist: ["*.example.com"],
+        allowedOrigins: ["http://localhost:18789"],
       },
     } as unknown as BrowserConfig);
     expect(resolved.ssrfPolicy).toEqual({
       allowedHostnames: ["example.com"],
       hostnameAllowlist: ["*.example.com"],
+      allowedOrigins: ["http://localhost:18789"],
     });
   });
 

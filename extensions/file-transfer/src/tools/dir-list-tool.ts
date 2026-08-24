@@ -27,6 +27,8 @@ export function createDirListTool(): AnyAgentTool {
         typeof params.pageToken === "string" && params.pageToken.trim()
           ? params.pageToken.trim()
           : undefined;
+      const query =
+        typeof params.query === "string" && params.query.trim() ? params.query.trim() : undefined;
 
       const { nodeId, nodeDisplayName, payload, startedAt } = await invokeNodeToolPayload({
         node,
@@ -36,6 +38,7 @@ export function createDirListTool(): AnyAgentTool {
           path: dirPath,
           pageToken,
           maxEntries,
+          query,
         },
         requestedPath: dirPath,
       });
@@ -51,8 +54,9 @@ export function createDirListTool(): AnyAgentTool {
 
       const fileCount = entries.filter((e) => !e.isDir).length;
       const dirCount = entries.filter((e) => e.isDir).length;
+      const queryNote = query ? ` matching "${query}"` : "";
       const truncatedNote = truncated ? " (more entries available — pass nextPageToken)" : "";
-      const summary = `Listed ${canonicalPath}: ${fileCount} file${fileCount !== 1 ? "s" : ""}, ${dirCount} subdir${dirCount !== 1 ? "s" : ""}${truncatedNote}`;
+      const summary = `Listed ${canonicalPath}${queryNote}: ${fileCount} file${fileCount !== 1 ? "s" : ""}, ${dirCount} subdir${dirCount !== 1 ? "s" : ""}${truncatedNote}`;
 
       await appendFileTransferAudit({
         op: "dir.list",

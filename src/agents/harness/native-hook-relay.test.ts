@@ -565,7 +565,7 @@ describe("native hook relay registry", () => {
     );
   });
 
-  it("keeps pre-tool relays active when native loop detection is not disabled", () => {
+  it("omits pre-tool relays when loop detection is the only local work", () => {
     const relay = registerNativeHookRelay({
       provider: "codex",
       sessionId: "session-1",
@@ -578,11 +578,7 @@ describe("native hook relay registry", () => {
       },
     });
 
-    expect(relay.shouldRelayEvent("pre_tool_use")).toBe(true);
-    expect(relay.commandForEvent("pre_tool_use")).toBe(
-      "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
-        `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --timeout 1234`,
-    );
+    expect(relay.shouldRelayEvent("pre_tool_use")).toBe(false);
   });
 
   it("omits pre-tool relays when native loop detection is explicitly disabled", () => {

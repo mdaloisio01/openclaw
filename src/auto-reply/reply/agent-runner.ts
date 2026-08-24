@@ -102,6 +102,7 @@ import { drainPendingToolTasks } from "./pending-tool-task-drain.js";
 import { readPostCompactionContext } from "./post-compaction-context.js";
 import {
   buildPrivateMessageToolFinalDeliveryError,
+  resolvePrivateMessageToolFinalRepairText,
   shouldWarnAboutPrivateMessageToolFinal,
   warnPrivateMessageToolFinal,
 } from "./private-message-tool-final.js";
@@ -2479,6 +2480,7 @@ export async function runReplyAgent(params: {
       // message_tool_only, no tool call can be intentional silence, and
       // finalDeliveryText also includes verbose/status/usage metadata.
       const assistantFinalText = rawAssistantText ?? "";
+      let privateMessageToolFinalDeliveryText: string | undefined;
       if (
         shouldWarnAboutPrivateMessageToolFinal({
           sourceReplyDeliveryMode: sourceReplyPolicy.sourceReplyDeliveryMode,
@@ -2496,9 +2498,17 @@ export async function runReplyAgent(params: {
             activeSessionEntry?.channel,
           finalTextLength: assistantFinalText.trim().length,
         });
+        privateMessageToolFinalDeliveryText = resolvePrivateMessageToolFinalRepairText({
+          sourceReplyDeliveryMode: sourceReplyPolicy.sourceReplyDeliveryMode,
+          sendPolicyDenied: sourceReplyPolicy.sendPolicyDenied,
+          successfulSourceReplyDelivery,
+          finalText: assistantFinalText,
+        });
         finalPayloads = [buildPrivateMessageToolFinalDeliveryError()];
       }
-      const pendingText = sourceReplyPolicy.suppressDelivery ? "" : finalDeliveryText;
+      const pendingText =
+        privateMessageToolFinalDeliveryText ??
+        (sourceReplyPolicy.suppressDelivery ? "" : finalDeliveryText);
       const agentId = followupRun.run.agentId;
       const heartbeatAgentCfg = agentId ? resolveAgentConfig(cfg, agentId)?.heartbeat : undefined;
       const heartbeatAckMaxChars = Math.max(
@@ -2535,6 +2545,12 @@ export async function runReplyAgent(params: {
             pendingFinalDeliveryText: resolvedPendingText,
             pendingFinalDeliveryContext,
             pendingFinalDeliveryCreatedAt: Date.now(),
+            ...(privateMessageToolFinalDeliveryText
+              ? {
+                  pendingFinalDeliveryLastError:
+                    "message_tool_only final reply missed required delivery tool",
+                }
+              : {}),
             updatedAt: Date.now(),
           },
         });

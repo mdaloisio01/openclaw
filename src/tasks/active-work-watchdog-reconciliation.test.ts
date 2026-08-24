@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { CLEANUP_WATCHDOG_POLICY_VERSION } from "../governance/cleanup-watchdog-policy.js";
 import {
   classifyWatchdogSuspiciousItem,
   resolveWatchdogNeedsReviewReconciliation,
@@ -72,6 +73,8 @@ describe("active work watchdog reconciliation", () => {
       {
         entityType: "watchdog_monitor",
         entityId: "flow-cleanup-1",
+        policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+        canonicalPriority: "P4_RESTART_OR_RUNTIME_RECOVERY",
         classification: "cron/watchdog state mismatch",
         repairRoute: "cleanup_crew_repair",
         validationRequired: "rerun_watchdog",
@@ -86,6 +89,8 @@ describe("active work watchdog reconciliation", () => {
         nextExecutableCommand: "rerun_system_wide_active_work_watchdog",
         cleanupCrewRecoveryBridge: expect.objectContaining({
           schema: "openclaw.watchdog_cleanup_crew_recovery_bridge.v1",
+          policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+          canonicalPriority: "P4_RESTART_OR_RUNTIME_RECOVERY",
           stoppageReceipt: expect.objectContaining({
             stoppageClass: "watchdog_monitor_disabled",
             nextAnalysisOwner: "cleanup_crew_planning_dev_sop",
@@ -96,7 +101,8 @@ describe("active work watchdog reconciliation", () => {
           }),
           resume: expect.objectContaining({
             requiresPlanReload: true,
-            proofTarget: "WATCHDOG STATUS: CLEAN | suspicious_count=0",
+            proofTarget:
+              "WATCHDOG STATUS: CLEAN | suspicious_count=0 plus worker/continuation/delivery/runtime/record-integrity/repair-closure/policy-version coverage",
           }),
         }),
         reason:
@@ -184,6 +190,8 @@ describe("active work watchdog reconciliation", () => {
       {
         entityType: "flow_run",
         entityId: "flow-1",
+        policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+        canonicalPriority: "P3_CORRUPTED_STATE",
         classification: "stale running state",
         repairRoute: "cleanup_crew_repair",
         validationRequired: "rerun_watchdog",
@@ -209,6 +217,13 @@ describe("active work watchdog reconciliation", () => {
           planAmendment: expect.objectContaining({
             required: true,
             nextExecutableCommand: "rerun_system_wide_active_work_watchdog",
+          }),
+          durableRepairWork: expect.objectContaining({
+            required: true,
+            createBeforeAlertAcknowledgement: true,
+            acknowledgementRule:
+              "acknowledge_only_after_repair_completion_and_fresh_clean_watchdog",
+            duplicateAlertHandling: "reuse_pending_repair_work",
           }),
         }),
         reason: "flow lacks recent progress",
@@ -316,7 +331,7 @@ describe("active work watchdog reconciliation", () => {
     });
   });
 
-  it("keeps unsafe worker relaunch recommendations as hard stops for Mark decision", () => {
+  it("does not turn stale-worker investigation metadata into a false Mark approval gate", () => {
     const decision = resolveWatchdogNeedsReviewReconciliation({
       label: "NEEDS_REVIEW",
       summary: { items_suspicious: 1 },
@@ -343,10 +358,47 @@ describe("active work watchdog reconciliation", () => {
       repairRoute: "cleanup_crew_repair",
       pauseAdjacentProduction: true,
       routeToCleanupCrewRecovery: true,
+      cleanupRecoveryAllowed: true,
+      markDecisionRequired: false,
+      planAmendmentRequired: true,
+      cleanupCrewRecoveryBridge: expect.objectContaining({
+        durableRepairWork: expect.objectContaining({
+          idempotencyKey:
+            "watchdog:watchdog_needs_review:flow_run:flow-relaunch-risk:corrupted_taskflow_pointer",
+          createBeforeAlertAcknowledgement: true,
+        }),
+      }),
+    });
+    expect(decision.items[0]?.hardStopReason).toBeUndefined();
+  });
+
+  it("still hard-stops explicit owner-decision recommendations", () => {
+    const decision = resolveWatchdogNeedsReviewReconciliation({
+      label: "NEEDS_REVIEW",
+      summary: { items_suspicious: 1 },
+      decisions: {
+        suspicious_items: [
+          {
+            entity_type: "flow_run",
+            entity_id: "flow-owner-decision",
+            category: "waiting_on_owner",
+            reason: "owner decision is required before work can proceed",
+            suggested_next_step: {
+              recommendation_code: "owner_decision_required",
+              recommendation: "Ask Mark for the pending owner decision.",
+              owner_approval_required: true,
+            },
+          },
+        ],
+      },
+    });
+
+    expect(decision.items[0]).toMatchObject({
+      classification: "real production blocker",
+      routeToCleanupCrewRecovery: true,
       cleanupRecoveryAllowed: false,
       markDecisionRequired: true,
       hardStopReason: "owner_decision_required_before_worker_relaunch",
-      planAmendmentRequired: true,
     });
     expect(decision.items[0]?.cleanupCrewRecoveryBridge).toBeUndefined();
   });

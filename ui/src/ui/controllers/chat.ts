@@ -797,6 +797,104 @@ export type ChatSendAck = {
   status: ChatSendAckStatus;
 };
 
+const WEBCHAT_SEND_ATTEMPT_LEDGER_KEY = "openclaw.webchat.send-attempt-ledger.v1";
+const WEBCHAT_SEND_ATTEMPT_MAX_ROWS = 25;
+
+type WebchatSendAttemptRecord = {
+  attemptId: string;
+  attemptedAtMs: number;
+  sessionKey: string;
+  agentId?: string;
+  messageHash: string;
+  messageSnippet?: string;
+};
+
+function getBrowserStorage(): Storage | undefined {
+  try {
+    return globalThis.localStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+function fingerprintText(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}:${value.length}`;
+}
+
+function readWebchatSendAttemptLedger(): WebchatSendAttemptRecord[] {
+  const storage = getBrowserStorage();
+  if (!storage) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(storage.getItem(WEBCHAT_SEND_ATTEMPT_LEDGER_KEY) ?? "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((record): record is WebchatSendAttemptRecord =>
+          Boolean(
+            record &&
+            typeof record === "object" &&
+            typeof record.attemptId === "string" &&
+            typeof record.attemptedAtMs === "number" &&
+            typeof record.sessionKey === "string" &&
+            typeof record.messageHash === "string",
+          ),
+        )
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeWebchatSendAttemptLedger(records: WebchatSendAttemptRecord[]): void {
+  const storage = getBrowserStorage();
+  if (!storage) {
+    return;
+  }
+  try {
+    storage.setItem(
+      WEBCHAT_SEND_ATTEMPT_LEDGER_KEY,
+      JSON.stringify(records.slice(-WEBCHAT_SEND_ATTEMPT_MAX_ROWS)),
+    );
+  } catch {
+    // Client-side telemetry must not block the user's send path.
+  }
+}
+
+function recordWebchatSendAttempt(params: {
+  attemptId: string;
+  attemptedAtMs: number;
+  sessionKey: string;
+  agentId?: string;
+  message: string;
+}): WebchatSendAttemptRecord[] {
+  const pending = readWebchatSendAttemptLedger().filter(
+    (record) => record.attemptId !== params.attemptId,
+  );
+  const record: WebchatSendAttemptRecord = {
+    attemptId: params.attemptId,
+    attemptedAtMs: params.attemptedAtMs,
+    sessionKey: params.sessionKey,
+    ...(params.agentId ? { agentId: params.agentId } : {}),
+    messageHash: fingerprintText(params.message),
+    ...(params.message.trim() ? { messageSnippet: params.message.trim().slice(0, 160) } : {}),
+  };
+  const next = [...pending, record].slice(-WEBCHAT_SEND_ATTEMPT_MAX_ROWS);
+  writeWebchatSendAttemptLedger(next);
+  return pending;
+}
+
+function clearWebchatSendAttempts(attemptIds: readonly string[]): void {
+  const ids = new Set(attemptIds);
+  writeWebchatSendAttemptLedger(
+    readWebchatSendAttemptLedger().filter((record) => !ids.has(record.attemptId)),
+  );
+}
+
 function normalizeChatSendAck(payload: unknown, fallbackRunId: string): ChatSendAck {
   if (!payload || typeof payload !== "object") {
     return { runId: fallbackRunId, status: "started" };
@@ -834,16 +932,32 @@ export async function requestChatSend(
     canReuseCurrentSessionId && typeof currentSessionId === "string" && currentSessionId.trim()
       ? currentSessionId.trim()
       : undefined;
+  const clientSendAttemptAtMs = Date.now();
+  const clientPendingSendAttempts = recordWebchatSendAttempt({
+    attemptId: params.runId,
+    attemptedAtMs: clientSendAttemptAtMs,
+    sessionKey,
+    ...(selectedAgentId ? { agentId: selectedAgentId } : {}),
+    message: params.message,
+  });
   const payload = await state.client!.request("chat.send", {
     sessionKey,
     ...(isGlobalSessionKey(sessionKey) && selectedAgentId ? { agentId: selectedAgentId } : {}),
     ...(sessionId ? { sessionId } : {}),
     message: params.message,
     deliver: false,
+    clientSendAttemptId: params.runId,
+    clientSendAttemptAtMs,
+    ...(clientPendingSendAttempts.length > 0 ? { clientPendingSendAttempts } : {}),
     idempotencyKey: params.runId,
     attachments: buildApiAttachments(params.attachments),
   });
-  return normalizeChatSendAck(payload, params.runId);
+  const ack = normalizeChatSendAck(payload, params.runId);
+  clearWebchatSendAttempts([
+    ack.runId,
+    ...clientPendingSendAttempts.map((attempt) => attempt.attemptId),
+  ]);
+  return ack;
 }
 
 type AssistantMessageNormalizationOptions = {

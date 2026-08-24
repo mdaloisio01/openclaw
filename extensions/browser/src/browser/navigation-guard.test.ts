@@ -154,6 +154,38 @@ describe("browser navigation guard", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("allows private loopback only for exact configured origins", async () => {
+    const lookupFn = createLookupFn("127.0.0.1");
+    const ssrfPolicy = {
+      dangerouslyAllowPrivateNetwork: false,
+      allowedOrigins: ["http://localhost:18789", "http://127.0.0.1:18789"],
+    };
+
+    await expect(
+      assertBrowserNavigationAllowed({
+        url: "http://localhost:18789/",
+        lookupFn,
+        ssrfPolicy,
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      assertBrowserNavigationAllowed({
+        url: "http://127.0.0.1:18789/",
+        lookupFn,
+        ssrfPolicy,
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      assertBrowserNavigationAllowed({
+        url: "http://localhost:18790/",
+        lookupFn,
+        ssrfPolicy,
+      }),
+    ).rejects.toThrow(/dns rebinding protections are unavailable/i);
+  });
+
   it("allows wildcard-allowlisted hostnames in strict mode", async () => {
     const lookupFn = createLookupFn("93.184.216.34");
     await expect(

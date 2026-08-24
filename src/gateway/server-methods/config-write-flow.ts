@@ -147,6 +147,16 @@ function shouldScheduleDirectConfigRestart(params: {
   return false;
 }
 
+export function resolveGatewayConfigWriteRestartScope(params: {
+  changedPaths: string[];
+  nextConfig: OpenClawConfig;
+}): { restartScope: "none" | "gateway"; requestedServices: string[] } {
+  if (!shouldScheduleDirectConfigRestart(params)) {
+    return { restartScope: "none", requestedServices: [] };
+  }
+  return { restartScope: "gateway", requestedServices: ["openclaw-gateway.service"] };
+}
+
 function resolveConfigRestartRequest(params: unknown): {
   sessionKey: string | undefined;
   note: string | undefined;
@@ -218,7 +228,12 @@ export async function commitGatewayConfigWrite(params: {
   nextConfig: OpenClawConfig;
   context?: GatewayRequestContext;
   disconnectSharedAuthClients?: boolean;
-}): Promise<{ path: string; config: OpenClawConfig; queueFollowUp: () => void }> {
+}): Promise<{
+  path: string;
+  config: OpenClawConfig;
+  persistedHash: string | null;
+  queueFollowUp: () => void;
+}> {
   const result = await replaceConfigFile({
     nextConfig: params.nextConfig,
     writeOptions: {
@@ -233,6 +248,7 @@ export async function commitGatewayConfigWrite(params: {
   return {
     path: resolveGatewayConfigPath(params.snapshot),
     config: result.nextConfig,
+    persistedHash: result.persistedHash,
     queueFollowUp: () => {
       // Defer generation refresh/disconnect until after the RPC response so
       // the writer receives the success payload before its connection is closed.
@@ -269,21 +285,23 @@ export async function resolveGatewayConfigRestartWriteResult(params: {
     note,
   });
   const sentinelPath = await tryWriteRestartSentinelPayload(payload);
-  const restart = shouldScheduleDirectConfigRestart({
+  const restartScope = resolveGatewayConfigWriteRestartScope({
     changedPaths: params.changedPaths,
     nextConfig: params.nextConfig,
-  })
-    ? scheduleGatewaySigusr1Restart({
-        delayMs: restartDelayMs,
-        reason: params.mode,
-        audit: {
-          actor: params.actor.actor,
-          deviceId: params.actor.deviceId,
-          clientIp: params.actor.clientIp,
-          changedPaths: params.changedPaths,
-        },
-      })
-    : undefined;
+  });
+  const restart =
+    restartScope.restartScope === "gateway"
+      ? scheduleGatewaySigusr1Restart({
+          delayMs: restartDelayMs,
+          reason: params.mode,
+          audit: {
+            actor: params.actor.actor,
+            deviceId: params.actor.deviceId,
+            clientIp: params.actor.clientIp,
+            changedPaths: params.changedPaths,
+          },
+        })
+      : undefined;
   if (restart?.coalesced) {
     params.context?.logGateway?.warn(
       `${params.mode} restart coalesced ${formatControlPlaneActor(params.actor)} delayMs=${restart.delayMs}`,

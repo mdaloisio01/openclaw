@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { testing, registerNativeHookRelay } from "../../agents/harness/native-hook-relay.js";
-import { nativeHookRelayHandlers } from "./native-hook-relay.js";
+import {
+  nativeHookRelayHandlers,
+  testing as nativeHookGatewayTesting,
+} from "./native-hook-relay.js";
 
 const POST_TOOL_USE_PAYLOAD = {
   hook_event_name: "PostToolUse",
@@ -10,6 +13,7 @@ const POST_TOOL_USE_PAYLOAD = {
 
 afterEach(() => {
   testing.clearNativeHookRelaysForTests();
+  nativeHookGatewayTesting.resetNativeHookInvocationStateForTests();
 });
 
 describe("native hook relay gateway method", () => {
@@ -70,6 +74,42 @@ describe("native hook relay gateway method", () => {
 
     expectInvalidRequest(respond, "native hook relay bridge stale registration");
     expect(testing.getNativeHookRelayInvocationsForTests()).toStrictEqual([]);
+  });
+
+  it("caps concurrent native hook invocations at two active slots", async () => {
+    const releaseFirst = await nativeHookGatewayTesting.acquireNativeHookInvocationSlotForTests();
+    const releaseSecond = await nativeHookGatewayTesting.acquireNativeHookInvocationSlotForTests();
+    let thirdRelease: (() => void) | undefined;
+
+    const third = nativeHookGatewayTesting
+      .acquireNativeHookInvocationSlotForTests()
+      .then((release) => {
+        thirdRelease = release;
+      });
+    await Promise.resolve();
+
+    expect(nativeHookGatewayTesting.getNativeHookInvocationLimitForTests()).toBe(2);
+    expect(nativeHookGatewayTesting.getNativeHookInvocationStateForTests()).toEqual({
+      active: 2,
+      pending: 1,
+    });
+    expect(thirdRelease).toBeUndefined();
+
+    releaseFirst();
+    await third;
+
+    expect(thirdRelease).toBeDefined();
+    expect(nativeHookGatewayTesting.getNativeHookInvocationStateForTests()).toEqual({
+      active: 2,
+      pending: 0,
+    });
+
+    releaseSecond();
+    thirdRelease?.();
+    expect(nativeHookGatewayTesting.getNativeHookInvocationStateForTests()).toEqual({
+      active: 0,
+      pending: 0,
+    });
   });
 });
 

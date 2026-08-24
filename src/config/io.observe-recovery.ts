@@ -629,8 +629,21 @@ function readConfigFingerprintForPathSync(
   }
 }
 
-export function resolveLastKnownGoodConfigPath(configPath: string): string {
-  return `${configPath}.last-good`;
+export function resolveLastKnownGoodConfigPath(
+  configPath: string,
+  deps?: Pick<ObserveRecoveryDeps, "env" | "homedir">,
+): string {
+  if (!deps) {
+    return `${configPath}.last-good`;
+  }
+  const override = deps.env.OPENCLAW_CONFIG_LAST_GOOD_DIR?.trim();
+  const root = override || path.join(resolveStateDir(deps.env, deps.homedir), "config-last-good");
+  const key = crypto
+    .createHash("sha256")
+    .update(path.resolve(configPath))
+    .digest("hex")
+    .slice(0, 24);
+  return path.join(root, `${path.basename(configPath)}.${key}.last-good`);
 }
 
 function isSensitiveConfigPath(pathLabel: string): boolean {
@@ -900,7 +913,8 @@ export async function promoteConfigSnapshotToLastKnownGood(params: {
     stat: stat as ConfigStatMetadataSource,
     observedAt: now,
   });
-  const lastGoodPath = resolveLastKnownGoodConfigPath(snapshot.path);
+  const lastGoodPath = resolveLastKnownGoodConfigPath(snapshot.path, deps);
+  await deps.fs.promises.mkdir(path.dirname(lastGoodPath), { recursive: true, mode: 0o700 });
   await deps.fs.promises.writeFile(lastGoodPath, snapshot.raw, {
     encoding: "utf-8",
     mode: 0o600,
@@ -943,7 +957,7 @@ export async function recoverConfigFromLastKnownGood(params: {
   if (!promoted?.hash) {
     return false;
   }
-  const lastGoodPath = resolveLastKnownGoodConfigPath(snapshot.path);
+  const lastGoodPath = resolveLastKnownGoodConfigPath(snapshot.path, deps);
   const backupRaw = await deps.fs.promises.readFile(lastGoodPath, "utf-8").catch(() => null);
   if (!backupRaw || hashConfigRaw(backupRaw) !== promoted.hash) {
     return false;

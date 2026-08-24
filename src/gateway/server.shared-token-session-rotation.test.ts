@@ -1,5 +1,9 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createConfigIO, readConfigFileSnapshot } from "../config/config.js";
+import { VERSION } from "../version.js";
+import { prepareConfigWriteCandidateForControlPlane } from "./server-methods/config.js";
 import {
   loadGatewayConfig,
   openAuthenticatedGatewayWs,
@@ -18,6 +22,7 @@ installGatewayTestHooks({ scope: "suite" });
 const ORIGINAL_GATEWAY_AUTH = testState.gatewayAuth;
 const OLD_TOKEN = "shared-token-session-old";
 const NEW_TOKEN = "shared-token-session-new";
+const TEST_ACTIVATION_AT = "2026-07-14T12:00:00.000Z";
 
 let server: Awaited<ReturnType<typeof startGatewayServer>>;
 let port = 0;
@@ -62,6 +67,7 @@ beforeAll(async () => {
     const setRes = await rpcReq(ws, "config.set", {
       baseHash: current.hash,
       raw: JSON.stringify(nextConfig, null, 2),
+      ...(await controlPlaneEnvelope(JSON.stringify(nextConfig, null, 2))),
     });
     configSetRotationCase = {
       closed: await closed,
@@ -92,6 +98,50 @@ function buildConfigSetWithRotatedToken(config: Record<string, unknown>): Record
   gateway.reload = reload;
   next.gateway = gateway;
   return next;
+}
+
+async function controlPlaneEnvelope(raw: string) {
+  const snapshot = await readConfigFileSnapshot();
+  const prepared = prepareConfigWriteCandidateForControlPlane({ raw, snapshot });
+  const stampedConfig = {
+    ...prepared.writeConfig,
+    meta: {
+      ...toRecord(prepared.writeConfig.meta),
+      lastTouchedVersion: VERSION,
+      lastTouchedAt: TEST_ACTIVATION_AT,
+    },
+  };
+  const candidateRaw = `${JSON.stringify(stampedConfig, null, 2)}\n`;
+  const candidateSha256 = crypto.createHash("sha256").update(candidateRaw, "utf-8").digest("hex");
+  return {
+    controlPlaneManifest: {
+      manifestId: "manifest-config.set",
+      objective: "gateway shared token session rotation test",
+      activationTimestamp: TEST_ACTIVATION_AT,
+      candidateSha256,
+      allowedFiles: [createConfigIO().configPath],
+      allowedConfigPaths: ["gateway", "meta"],
+      forbiddenFiles: ["/tmp/forbidden-openclaw.json"],
+      allowedServices: ["openclaw-gateway.service"],
+      allowedRestartScope: "gateway",
+      allowedAgents: ["unknown-actor", "test"],
+      allowedTools: ["config.set"],
+      approvalClasses: ["auth", "control", "runtime"],
+      requiredEvidence: ["integration-test"],
+      rollbackAssets: ["/tmp/openclaw.json.rollback"],
+      stopConditions: ["manifest mismatch"],
+      doneCriteria: ["write accepted"],
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+    controlPlaneApproval: {
+      approvalId: `approval-config.set-${candidateSha256}`,
+      manifestId: "manifest-config.set",
+      candidateSha256,
+      approvalClasses: ["auth", "control", "runtime"],
+      approved: true,
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+  };
 }
 
 describe("gateway shared token session rotation", () => {

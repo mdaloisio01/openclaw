@@ -1,6 +1,6 @@
+import fs from "node:fs/promises";
 import path from "node:path";
 import { parseStrictNonNegativeInteger } from "openclaw/plugin-sdk/number-runtime";
-import { root } from "openclaw/plugin-sdk/security-runtime";
 import { mimeFromExtension } from "../shared/mime.js";
 import {
   classifyFsSafeReadError,
@@ -16,6 +16,7 @@ type DirListParams = {
   path?: unknown;
   pageToken?: unknown;
   maxEntries?: unknown;
+  query?: unknown;
   followSymlinks?: unknown;
 };
 
@@ -34,6 +35,7 @@ type DirListOk = {
   entries: DirListEntry[];
   nextPageToken?: string;
   truncated: boolean;
+  query?: string;
 };
 
 type DirListErrCode =
@@ -64,7 +66,34 @@ function parsePageOffset(input: unknown): number {
   if (typeof input !== "string") {
     return 0;
   }
-  return parseStrictNonNegativeInteger(input) ?? 0;
+  return Math.min(parseStrictNonNegativeInteger(input) ?? 0, DIR_LIST_HARD_MAX_ENTRIES);
+}
+
+function readQuery(input: unknown): string | undefined {
+  if (typeof input !== "string") {
+    return undefined;
+  }
+  const trimmed = input.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function encodeNamePageToken(name: string): string {
+  return `after:${Buffer.from(name, "utf8").toString("base64url")}`;
+}
+
+function decodeNamePageToken(input: unknown): string | undefined {
+  if (typeof input !== "string" || !input.startsWith("after:")) {
+    return undefined;
+  }
+  const encodedName = input.slice("after:".length);
+  if (!encodedName) {
+    return undefined;
+  }
+  try {
+    return Buffer.from(encodedName, "base64url").toString("utf8");
+  } catch {
+    return undefined;
+  }
 }
 
 function classifyFsError(err: unknown): DirListErrCode {
@@ -82,6 +111,50 @@ function classifyFsError(err: unknown): DirListErrCode {
   return "READ_ERROR";
 }
 
+async function collectDirectoryPage(input: {
+  canonical: string;
+  maxEntries: number;
+  pageToken: unknown;
+  query: string | undefined;
+}): Promise<{ names: string[]; truncated: boolean }> {
+  const afterName = decodeNamePageToken(input.pageToken);
+  const legacyOffset = afterName === undefined ? parsePageOffset(input.pageToken) : 0;
+  const query = input.query?.toLocaleLowerCase();
+  const selectionLimit = input.maxEntries + 1;
+  const selectedNames: string[] = [];
+
+  const dir = await fs.opendir(input.canonical);
+  try {
+    for await (const dirent of dir) {
+      const name = dirent.name;
+      if (afterName !== undefined && name.localeCompare(afterName) <= 0) {
+        continue;
+      }
+      if (query && !name.toLocaleLowerCase().includes(query)) {
+        continue;
+      }
+
+      selectedNames.push(name);
+      selectedNames.sort((left, right) => left.localeCompare(right));
+      if (selectedNames.length > legacyOffset + selectionLimit) {
+        selectedNames.pop();
+      }
+    }
+  } finally {
+    await dir.close().catch(() => {});
+  }
+
+  const pageNames =
+    afterName === undefined && legacyOffset > 0
+      ? selectedNames.slice(legacyOffset, legacyOffset + selectionLimit)
+      : selectedNames.slice(0, selectionLimit);
+
+  return {
+    names: pageNames.slice(0, input.maxEntries),
+    truncated: pageNames.length > input.maxEntries,
+  };
+}
+
 export async function handleDirList(params: DirListParams): Promise<DirListResult> {
   const requestedPath = readAbsolutePath(params.path);
   if (typeof requestedPath !== "string") {
@@ -89,7 +162,7 @@ export async function handleDirList(params: DirListParams): Promise<DirListResul
   }
 
   const maxEntries = clampMaxEntries(params.maxEntries);
-  const offset = parsePageOffset(params.pageToken);
+  const query = readQuery(params.query);
 
   const followSymlinks = params.followSymlinks === true;
 
@@ -108,10 +181,14 @@ export async function handleDirList(params: DirListParams): Promise<DirListResul
     return directory;
   }
 
-  let listedEntries: { name: string; isDirectory: boolean; size: number; mtimeMs: number }[];
+  let page: { names: string[]; truncated: boolean };
   try {
-    const dirRoot = await root(canonical);
-    listedEntries = await dirRoot.list(".", { withFileTypes: true });
+    page = await collectDirectoryPage({
+      canonical,
+      maxEntries,
+      pageToken: params.pageToken,
+      query,
+    });
   } catch (err) {
     const code = classifyFsError(err);
     return {
@@ -122,25 +199,24 @@ export async function handleDirList(params: DirListParams): Promise<DirListResul
     };
   }
 
-  listedEntries.sort((a, b) => a.name.localeCompare(b.name));
-
-  const total = listedEntries.length;
-  const page = listedEntries.slice(offset, offset + maxEntries);
-  const truncated = offset + maxEntries < total;
-  const nextPageToken = truncated ? String(offset + maxEntries) : undefined;
+  const nextPageToken =
+    page.truncated && page.names.length > 0
+      ? encodeNamePageToken(page.names[page.names.length - 1] ?? "")
+      : undefined;
 
   const entries: DirListEntry[] = [];
-  for (const entry of page) {
-    const entryPath = path.join(canonical, entry.name);
-    const isDir = entry.isDirectory;
+  for (const name of page.names) {
+    const entryPath = path.join(canonical, name);
+    const stats = await fs.lstat(entryPath);
+    const isDir = stats.isDirectory();
 
     entries.push({
-      name: entry.name,
+      name,
       path: entryPath,
-      size: isDir ? 0 : entry.size,
-      mimeType: isDir ? "inode/directory" : mimeFromExtension(entry.name),
+      size: isDir ? 0 : stats.size,
+      mimeType: isDir ? "inode/directory" : mimeFromExtension(name),
       isDir,
-      mtime: entry.mtimeMs,
+      mtime: stats.mtimeMs,
     });
   }
 
@@ -149,6 +225,7 @@ export async function handleDirList(params: DirListParams): Promise<DirListResul
     path: canonical,
     entries,
     nextPageToken,
-    truncated,
+    truncated: page.truncated,
+    ...(query ? { query } : {}),
   };
 }

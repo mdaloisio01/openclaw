@@ -3,6 +3,7 @@ import type { SourceReplyDeliveryMode } from "../get-reply-options.types.js";
 import { markReplyPayloadForSourceSuppressionDelivery } from "../reply-payload.js";
 import { isSilentReplyText } from "../tokens.js";
 import type { ReplyPayload } from "../types.js";
+import { sanitizePendingFinalDeliveryText } from "./pending-final-delivery.js";
 
 const privateFinalReplyLogger = createSubsystemLogger("source-reply/private-final");
 
@@ -30,6 +31,18 @@ export function shouldWarnAboutPrivateMessageToolFinal(params: {
     return false;
   }
   return true;
+}
+
+export function resolvePrivateMessageToolFinalRepairText(params: {
+  sourceReplyDeliveryMode: SourceReplyDeliveryMode | undefined;
+  sendPolicyDenied: boolean;
+  successfulSourceReplyDelivery: boolean;
+  finalText: string;
+}): string | undefined {
+  if (!shouldWarnAboutPrivateMessageToolFinal(params)) {
+    return undefined;
+  }
+  return sanitizePendingFinalDeliveryText(params.finalText) || undefined;
 }
 
 /**

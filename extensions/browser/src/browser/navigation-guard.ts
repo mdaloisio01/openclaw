@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 import {
   isPrivateNetworkAllowedByPolicy,
+  resolveSsrFPolicyForUrl,
   resolvePinnedHostnameWithPolicy,
   type LookupFn,
   type SsrFPolicy,
@@ -117,9 +118,11 @@ export async function assertBrowserNavigationAllowed(
   // Browser proxy routing hides the final connect target from this process.
   // Only block when the browser profile is known to be proxy-routed; Gateway
   // provider proxy env alone is not proof of browser page proxy behavior.
+  const effectiveSsrFPolicy = resolveSsrFPolicyForUrl(parsed, opts.ssrfPolicy);
+
   if (
     opts.browserProxyMode === "explicit-browser-proxy" &&
-    !isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy)
+    !isPrivateNetworkAllowedByPolicy(effectiveSsrFPolicy)
   ) {
     throw new InvalidBrowserNavigationUrlError(
       "Navigation blocked: strict browser SSRF policy cannot be enforced while this browser profile is proxy-routed",
@@ -133,9 +136,9 @@ export async function assertBrowserNavigationAllowed(
   if (
     opts.ssrfPolicy &&
     opts.ssrfPolicy.dangerouslyAllowPrivateNetwork === false &&
-    !isPrivateNetworkAllowedByPolicy(opts.ssrfPolicy) &&
+    !isPrivateNetworkAllowedByPolicy(effectiveSsrFPolicy) &&
     !isIpLiteralHostname(parsed.hostname) &&
-    !isExplicitlyAllowedBrowserHostname(parsed.hostname, opts.ssrfPolicy)
+    !isExplicitlyAllowedBrowserHostname(parsed.hostname, effectiveSsrFPolicy)
   ) {
     throw new InvalidBrowserNavigationUrlError(
       "Navigation blocked: strict browser SSRF policy requires an IP-literal URL because browser DNS rebinding protections are unavailable for hostname-based navigation",
@@ -144,7 +147,7 @@ export async function assertBrowserNavigationAllowed(
 
   await resolvePinnedHostnameWithPolicy(parsed.hostname, {
     lookupFn: opts.lookupFn,
-    policy: opts.ssrfPolicy,
+    policy: effectiveSsrFPolicy,
   });
 }
 

@@ -77,6 +77,23 @@ export const ChatSendParamsSchema = Type.Object(
     timeoutMs: Type.Optional(Type.Integer({ minimum: 0 })),
     systemInputProvenance: Type.Optional(InputProvenanceSchema),
     systemProvenanceReceipt: Type.Optional(Type.String()),
+    clientSendAttemptId: Type.Optional(NonEmptyString),
+    clientSendAttemptAtMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    clientPendingSendAttempts: Type.Optional(
+      Type.Array(
+        Type.Object(
+          {
+            attemptId: NonEmptyString,
+            attemptedAtMs: Type.Integer({ minimum: 0 }),
+            sessionKey: Type.Optional(NonEmptyString),
+            agentId: Type.Optional(NonEmptyString),
+            messageHash: Type.Optional(NonEmptyString),
+            messageSnippet: Type.Optional(Type.String({ maxLength: 160 })),
+          },
+          { additionalProperties: false },
+        ),
+      ),
+    ),
     idempotencyKey: NonEmptyString,
   },
   { additionalProperties: false },

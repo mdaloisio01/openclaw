@@ -1,6 +1,8 @@
+import crypto from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { RestartSentinelPayload } from "../../infra/restart-sentinel.js";
+import { VERSION } from "../../version.js";
 import {
   createConfigHandlerHarness,
   createConfigWriteSnapshot,
@@ -34,13 +36,25 @@ vi.mock("../../config/config.js", async () => {
     writeConfigFile: writeConfigFileMock,
     replaceConfigFile: async (params: { nextConfig: OpenClawConfig; writeOptions?: unknown }) => {
       await writeConfigFileMock(params.nextConfig, params.writeOptions);
-      const persistedConfig = persistedConfigResultMock(params.nextConfig);
+      const writeOptions = (params.writeOptions ?? {}) as {
+        lastTouchedAtOverride?: string;
+        lastTouchedVersionOverride?: string;
+      };
+      const persistedConfig = persistedConfigResultMock({
+        ...params.nextConfig,
+        meta: {
+          ...params.nextConfig.meta,
+          lastTouchedVersion: writeOptions.lastTouchedVersionOverride ?? VERSION,
+          lastTouchedAt: writeOptions.lastTouchedAtOverride ?? new Date().toISOString(),
+        },
+      });
+      const persistedRaw = `${JSON.stringify(persistedConfig, null, 2)}\n`;
       return {
         path: "/tmp/openclaw.json",
         previousHash: "base-hash",
         snapshot: createConfigWriteSnapshot(params.nextConfig),
         nextConfig: persistedConfig,
-        persistedHash: "next-hash",
+        persistedHash: crypto.createHash("sha256").update(persistedRaw, "utf-8").digest("hex"),
         afterWrite: { mode: "auto" },
         followUp: { mode: "auto", requiresRestart: false },
       };
@@ -76,11 +90,90 @@ vi.mock("../../infra/restart-sentinel.js", async () => {
 
 const { configHandlers } = await import("./config.js");
 
+const TEST_ACTIVATION_AT = "2026-07-14T12:00:00.000Z";
 const GATEWAY_CONFIG_WRITE_OPTIONS = {
   runtimeRefresh: {
     includeAuthStoreRefs: false,
   },
+  lastTouchedAtOverride: TEST_ACTIVATION_AT,
 };
+
+let previousConfigForManifest: OpenClawConfig = {};
+
+function canonicalConfigRaw(config: OpenClawConfig): string {
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function hashConfig(config: OpenClawConfig): string {
+  return crypto.createHash("sha256").update(canonicalConfigRaw(config), "utf-8").digest("hex");
+}
+
+function stampedCandidateForManifest(config: OpenClawConfig): OpenClawConfig {
+  return {
+    ...config,
+    meta: {
+      ...config.meta,
+      lastTouchedVersion: VERSION,
+      lastTouchedAt: TEST_ACTIVATION_AT,
+    },
+  };
+}
+
+function controlPlaneEnvelope(params: {
+  candidateConfig: OpenClawConfig;
+  tool: "config.set" | "config.patch";
+  allowedRestartScope?: "none" | "gateway";
+}) {
+  const candidateSha256 = hashConfig(stampedCandidateForManifest(params.candidateConfig));
+  return {
+    controlPlaneManifest: {
+      manifestId: `manifest-${params.tool}`,
+      objective: "test config write",
+      activationTimestamp: TEST_ACTIVATION_AT,
+      candidateSha256,
+      allowedFiles: ["/tmp/openclaw.json"],
+      allowedConfigPaths: ["gateway", "meta"],
+      forbiddenFiles: ["/tmp/forbidden-openclaw.json"],
+      allowedServices: ["openclaw-gateway.service"],
+      allowedRestartScope: params.allowedRestartScope ?? "gateway",
+      allowedAgents: ["unknown-actor"],
+      allowedTools: [params.tool],
+      approvalClasses: ["auth", "runtime", "control"],
+      requiredEvidence: ["test"],
+      rollbackAssets: ["/tmp/openclaw.json.rollback"],
+      stopConditions: ["manifest mismatch"],
+      doneCriteria: ["write accepted"],
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+    controlPlaneApproval: {
+      approvalId: `approval-${params.tool}`,
+      manifestId: `manifest-${params.tool}`,
+      candidateSha256,
+      approvalClasses: ["auth", "runtime", "control"],
+      approved: true,
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+  };
+}
+
+function mergePatchForTest(base: unknown, patch: unknown): unknown {
+  if (!patch || typeof patch !== "object" || Array.isArray(patch)) {
+    return patch;
+  }
+  const baseRecord =
+    base && typeof base === "object" && !Array.isArray(base)
+      ? (base as Record<string, unknown>)
+      : {};
+  const next: Record<string, unknown> = { ...baseRecord };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === null) {
+      delete next[key];
+    } else {
+      next[key] = mergePatchForTest(baseRecord[key], value);
+    }
+  }
+  return next;
+}
 
 function tokenAuthConfig(token: string): OpenClawConfig {
   return {
@@ -124,6 +217,7 @@ function hotReloadConfig(): OpenClawConfig {
 }
 
 function mockPreviousConfig(config: OpenClawConfig): void {
+  previousConfigForManifest = config;
   readConfigFileSnapshotForWriteMock.mockResolvedValue(createConfigWriteSnapshot(config));
 }
 
@@ -138,6 +232,10 @@ async function runConfigPatch(
       raw: typeof raw === "string" ? raw : JSON.stringify(raw),
       restartDelayMs: params.restartDelayMs ?? 1_000,
       ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+      ...controlPlaneEnvelope({
+        candidateConfig: mergePatchForTest(previousConfigForManifest, raw) as OpenClawConfig,
+        tool: "config.patch",
+      }),
     },
   });
 
@@ -152,9 +250,13 @@ function expectNoDirectRestart(): void {
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date(TEST_ACTIVATION_AT));
+  previousConfigForManifest = {};
   validateConfigObjectWithPluginsMock.mockImplementation((config: OpenClawConfig) => ({
     ok: true,
     config,
@@ -169,6 +271,28 @@ beforeEach(() => {
 });
 
 describe("config shared auth disconnects", () => {
+  it("rejects protected config writes without a control-plane manifest", async () => {
+    mockPreviousConfig(hotReloadConfig());
+    const { options, respond } = createConfigHandlerHarness({
+      method: "config.patch",
+      params: {
+        baseHash: "base-hash",
+        raw: JSON.stringify({ gateway: { port: 19001 } }),
+      },
+    });
+
+    await configHandlers["config.patch"](options);
+
+    expect(writeConfigFileMock).not.toHaveBeenCalled();
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({
+        message: expect.stringContaining("control-plane manifest rejected (malformed_manifest)"),
+      }),
+    );
+  });
+
   it("returns the persisted config from config.set write results", async () => {
     const prevConfig: OpenClawConfig = {
       gateway: {
@@ -180,15 +304,7 @@ describe("config shared auth disconnects", () => {
         port: 19001,
       },
     };
-    const persistedConfig: OpenClawConfig = {
-      gateway: {
-        port: 19001,
-      },
-      meta: {
-        lastTouchedVersion: "test",
-      },
-    };
-    persistedConfigResultMock.mockReturnValueOnce(persistedConfig);
+    const persistedConfig = stampedCandidateForManifest(submittedConfig);
     readConfigFileSnapshotForWriteMock.mockResolvedValue(createConfigWriteSnapshot(prevConfig));
 
     const { options, respond } = createConfigHandlerHarness({
@@ -196,6 +312,7 @@ describe("config shared auth disconnects", () => {
       params: {
         raw: JSON.stringify(submittedConfig, null, 2),
         baseHash: "base-hash",
+        ...controlPlaneEnvelope({ candidateConfig: submittedConfig, tool: "config.set" }),
       },
     });
 
@@ -214,6 +331,55 @@ describe("config shared auth disconnects", () => {
     );
   });
 
+  it("rejects post-write drift and blocks restart follow-up", async () => {
+    mockPreviousConfig(hotReloadConfig());
+    persistedConfigResultMock.mockReturnValueOnce({
+      ...stampedCandidateForManifest({
+        gateway: {
+          reload: {
+            mode: "hot",
+          },
+          port: 19001,
+        },
+      }),
+      gateway: {
+        reload: {
+          mode: "hot",
+        },
+        port: 19002,
+      },
+    });
+
+    const nextConfig: OpenClawConfig = {
+      gateway: {
+        reload: {
+          mode: "hot",
+        },
+        port: 19001,
+      },
+    };
+    const { options, respond } = createConfigHandlerHarness({
+      method: "config.patch",
+      params: {
+        baseHash: "base-hash",
+        raw: JSON.stringify({ gateway: { port: 19001 } }),
+        ...controlPlaneEnvelope({ candidateConfig: nextConfig, tool: "config.patch" }),
+      },
+    });
+
+    await configHandlers["config.patch"](options);
+    await flushConfigHandlerMicrotasks();
+
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({
+        message: expect.stringContaining("control-plane post-write validation failed"),
+      }),
+    );
+    expect(scheduleGatewaySigusr1RestartMock).not.toHaveBeenCalled();
+  });
+
   it("does not disconnect shared-auth clients for config.set auth writes without restart", async () => {
     const nextConfig = tokenAuthConfig("new-token");
     mockPreviousConfig(tokenAuthConfig("old-token"));
@@ -223,6 +389,7 @@ describe("config shared auth disconnects", () => {
       params: {
         raw: JSON.stringify(nextConfig, null, 2),
         baseHash: "base-hash",
+        ...controlPlaneEnvelope({ candidateConfig: nextConfig, tool: "config.set" }),
       },
     });
 

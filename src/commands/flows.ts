@@ -8,8 +8,12 @@ import { info } from "../globals.js";
 import { runRuntimeAssetGuardPreflight } from "../infra/runtime-asset-guard-preflight.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
+import {
+  ensureForegroundCleanupCrewTaskFlow,
+  supersedeForegroundCleanupCrewExecutor,
+} from "../tasks/foreground-cleanup-crew-taskflow.js";
 import { evaluateProductionOwnerLaneGuard } from "../tasks/production-owner-lane-guard.js";
-import { listTasksForFlowId } from "../tasks/runtime-internal.js";
+import { listTasksForFlowId, resolveTaskForLookupToken } from "../tasks/runtime-internal.js";
 import { cancelFlowById, getFlowTaskSummary } from "../tasks/task-executor.js";
 import type { ProductionContinuationStopReason } from "../tasks/task-flow-registry.js";
 import type { TaskFlowRecord, TaskFlowStatus } from "../tasks/task-flow-registry.types.js";
@@ -683,4 +687,114 @@ export async function flowsLawfulStopCommand(
     return;
   }
   runtime.log(`Recorded lawful stop for production TaskFlow ${result.flowId}: ${reason}.`);
+}
+
+export async function flowsSupersedeForegroundCleanupCrewExecutorCommand(
+  opts: {
+    lookup: string;
+    lostTaskId?: string;
+    replacementTaskId?: string;
+    ownerKey?: string;
+    sessionKey?: string;
+    currentStep?: string;
+    detail?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const flow = resolveTaskFlowForLookupToken(opts.lookup);
+  if (!flow) {
+    failCommand(runtime, formatFlowLookupMiss(opts.lookup));
+    return;
+  }
+  const lostTaskId = requireCliString(opts.lostTaskId, "--lost-task-id", runtime);
+  const replacementLookup = requireCliString(
+    opts.replacementTaskId,
+    "--replacement-task-id",
+    runtime,
+  );
+  const ownerKey = requireCliString(opts.ownerKey, "--owner-key", runtime);
+  const sessionKey = requireCliString(opts.sessionKey, "--session-key", runtime);
+  const currentStep = requireCliString(opts.currentStep, "--current-step", runtime);
+  if (!lostTaskId || !replacementLookup || !ownerKey || !sessionKey || !currentStep) {
+    return;
+  }
+  const replacementTask = resolveTaskForLookupToken(replacementLookup);
+  if (!replacementTask) {
+    failCommand(runtime, `Replacement executor task not found: ${replacementLookup}.`);
+    return;
+  }
+  const result = supersedeForegroundCleanupCrewExecutor({
+    flowId: flow.flowId,
+    lostTaskId,
+    replacementTaskId: replacementTask.taskId,
+    ownerKey,
+    sessionKey,
+    currentStep,
+    detail: normalizeOptionalString(opts.detail),
+  });
+  if (result.status === "blocked") {
+    failCommand(
+      runtime,
+      `Foreground Cleanup Crew executor supersession blocked: ${result.reason}.`,
+    );
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, { result });
+    return;
+  }
+  runtime.log(
+    `Foreground Cleanup Crew executor ${result.status} for TaskFlow ${result.flow.flowId}: ${result.task.taskId}.`,
+  );
+}
+
+export async function flowsAttachForegroundCleanupCrewExecutionCommand(
+  opts: {
+    ownerKey?: string;
+    sessionKey?: string;
+    currentTurnText?: string;
+    currentStep?: string;
+    authorityPath?: string;
+    authorityBasis?: string;
+    ownerLane?: string;
+    json?: boolean;
+  },
+  runtime: RuntimeEnv,
+) {
+  const ownerKey = requireCliString(opts.ownerKey, "--owner-key", runtime);
+  const sessionKey = requireCliString(opts.sessionKey, "--session-key", runtime);
+  if (!ownerKey || !sessionKey) {
+    return;
+  }
+  if (ownerKey !== sessionKey) {
+    failCommand(
+      runtime,
+      "Foreground Cleanup Crew execution attachment requires owner-key and session-key to match.",
+    );
+    return;
+  }
+  const result = ensureForegroundCleanupCrewTaskFlow({
+    sessionKey,
+    currentTurnText:
+      normalizeOptionalString(opts.currentTurnText) ??
+      "Cleanup Crew production repair build runtime watchdog recovery.",
+    authorityPath: normalizeOptionalString(opts.authorityPath),
+    authorityBasis: normalizeOptionalString(opts.authorityBasis),
+    ownerLane: normalizeOptionalString(opts.ownerLane),
+    stageId:
+      normalizeOptionalString(opts.currentStep) ??
+      "foreground_cleanup_crew_current_session_execution",
+  });
+  if (result.status === "blocked" || result.status === "skipped") {
+    failCommand(runtime, `Foreground Cleanup Crew execution attachment blocked: ${result.reason}.`);
+    return;
+  }
+  if (opts.json) {
+    writeRuntimeJson(runtime, { result });
+    return;
+  }
+  runtime.log(
+    `Foreground Cleanup Crew execution ${result.status} for TaskFlow ${result.flow.flowId}: ${result.taskId ?? "no-task"}.`,
+  );
 }

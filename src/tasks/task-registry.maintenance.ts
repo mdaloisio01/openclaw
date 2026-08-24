@@ -73,6 +73,12 @@ const TASK_RECONCILE_GRACE_MS = 5 * 60_000;
 const CHILDLESS_CODEX_NATIVE_RECONCILE_GRACE_MS = 30 * 60_000;
 const TASK_STALE_RUNNING_MS = 30 * 60_000;
 const TASK_SWEEP_INTERVAL_MS = 60_000;
+const FOREGROUND_CLEANUP_CREW_TASK_KIND = "foreground_cleanup_crew_execution";
+const FOREGROUND_CLEANUP_CREW_SOURCE_IDS = new Set([
+  "cleanup-crew:foreground",
+  "cleanup-crew:foreground:supersession",
+]);
+const FOREGROUND_CLEANUP_CREW_RUN_ID_PREFIX = "foreground-cleanup-crew:";
 
 /**
  * Number of tasks to process before yielding to the event loop.
@@ -479,6 +485,14 @@ function hasCliRunIdentity(task: TaskRecord): boolean {
   return [task.sourceId, task.runId].some((candidate) => Boolean(candidate?.trim()));
 }
 
+function isForegroundCleanupCrewProjectionTask(task: TaskRecord): boolean {
+  return (
+    task.taskKind === FOREGROUND_CLEANUP_CREW_TASK_KIND ||
+    FOREGROUND_CLEANUP_CREW_SOURCE_IDS.has(task.sourceId?.trim() ?? "") ||
+    task.runId?.trim().startsWith(FOREGROUND_CLEANUP_CREW_RUN_ID_PREFIX) === true
+  );
+}
+
 function hasBackingSession(task: TaskRecord, context?: BackingSessionLookupContext): boolean {
   if (task.runtime === "cron") {
     if (!taskRegistryMaintenanceRuntime.isRuntimeAuthoritative()) {
@@ -490,6 +504,9 @@ function hasBackingSession(task: TaskRecord, context?: BackingSessionLookupConte
 
   if (task.runtime === "cli" && hasActiveCliRun(task)) {
     return true;
+  }
+  if (task.runtime === "cli" && isForegroundCleanupCrewProjectionTask(task)) {
+    return Boolean(findTaskSessionEntry(task, context));
   }
   if (task.runtime === "cli" && hasCliRunIdentity(task)) {
     return false;

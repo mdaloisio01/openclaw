@@ -298,6 +298,72 @@ describe("task-registry maintenance issue #60299", () => {
     expect(getInspectableActiveTaskRestartBlockers()).toHaveLength(0);
   });
 
+  it("keeps a stale foreground Cleanup Crew projection live when its source session exists", async () => {
+    const childSessionKey = "agent:orchestrator:main";
+    const staleAt = Date.now() - 45 * 60_000;
+    const task = makeStaleTask({
+      runtime: "cli",
+      taskKind: "foreground_cleanup_crew_execution",
+      sourceId: "cleanup-crew:foreground",
+      ownerKey: childSessionKey,
+      requesterSessionKey: childSessionKey,
+      childSessionKey,
+      runId: "foreground-cleanup-crew:flow-1:executor:123",
+      createdAt: staleAt,
+      startedAt: staleAt,
+      lastEventAt: staleAt,
+    });
+
+    const { currentTasks } = createTaskRegistryMaintenanceHarness({
+      tasks: [task],
+      sessionStore: { [childSessionKey]: { sessionId: "main-session", updatedAt: Date.now() } },
+    });
+
+    expectMaintenanceCounts(previewTaskRegistryMaintenance(), { reconciled: 0 });
+    expect(getTaskRegistryMaintenanceDiagnostics().staleRunningTasks).toContainEqual(
+      expect.objectContaining({
+        taskId: task.taskId,
+        decision: "retained",
+        reason: "backing_session_present",
+      }),
+    );
+    expectMaintenanceCounts(await runTaskRegistryMaintenance(), { reconciled: 0 });
+    expectTaskStatus(currentTasks, task.taskId, "running");
+  });
+
+  it("marks a stale foreground Cleanup Crew projection lost when its source session is gone", async () => {
+    const childSessionKey = "agent:orchestrator:main";
+    const staleAt = Date.now() - 45 * 60_000;
+    const task = makeStaleTask({
+      runtime: "cli",
+      taskKind: "foreground_cleanup_crew_execution",
+      sourceId: "cleanup-crew:foreground",
+      ownerKey: childSessionKey,
+      requesterSessionKey: childSessionKey,
+      childSessionKey,
+      runId: "foreground-cleanup-crew:flow-1:executor:123",
+      createdAt: staleAt,
+      startedAt: staleAt,
+      lastEventAt: staleAt,
+    });
+
+    const { currentTasks } = createTaskRegistryMaintenanceHarness({
+      tasks: [task],
+      sessionStore: {},
+    });
+
+    expectMaintenanceCounts(previewTaskRegistryMaintenance(), { reconciled: 1 });
+    expect(getTaskRegistryMaintenanceDiagnostics().staleRunningTasks).toContainEqual(
+      expect.objectContaining({
+        taskId: task.taskId,
+        decision: "would_reconcile",
+        reason: "backing_session_missing",
+      }),
+    );
+    expectMaintenanceCounts(await runTaskRegistryMaintenance(), { reconciled: 1 });
+    expectTaskStatus(currentTasks, task.taskId, "lost");
+  });
+
   it("keeps a running ACP task live while a prompt turn is still in flight", async () => {
     const childSessionKey = "agent:claude:acp:in-flight-turn";
     const task = makeStaleTask({

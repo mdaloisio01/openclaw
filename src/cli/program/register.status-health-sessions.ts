@@ -721,6 +721,68 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     });
 
   tasksFlowCmd
+    .command("attach-foreground-cleanup-crew-execution")
+    .description(
+      "Attach the current foreground Cleanup Crew execution to its active parent TaskFlow",
+    )
+    .requiredOption("--owner-key <key>", "Expected parent owner key")
+    .requiredOption("--session-key <key>", "Foreground executor session key")
+    .option("--current-turn-text <text>", "Cleanup Crew production turn text")
+    .option("--current-step <step>", "Current executable step")
+    .option("--authority-path <path>", "Authority or build-plan path")
+    .option("--authority-basis <text>", "Authority basis")
+    .option("--owner-lane <lane>", "Owner lane")
+    .option("--json", "Output as JSON", false)
+    .action(async (opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsAttachForegroundCleanupCrewExecutionCommand } = await loadFlowsCommands();
+        await flowsAttachForegroundCleanupCrewExecutionCommand(
+          {
+            ownerKey: opts.ownerKey as string | undefined,
+            sessionKey: opts.sessionKey as string | undefined,
+            currentTurnText: opts.currentTurnText as string | undefined,
+            currentStep: opts.currentStep as string | undefined,
+            authorityPath: opts.authorityPath as string | undefined,
+            authorityBasis: opts.authorityBasis as string | undefined,
+            ownerLane: opts.ownerLane as string | undefined,
+            json: hasJsonOption(opts, command),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowCmd
+    .command("supersede-foreground-cleanup-crew-executor")
+    .description("Replace a lost foreground Cleanup Crew executor under the same parent mission")
+    .argument("<lookup>", "Flow id or owner key")
+    .requiredOption("--lost-task-id <id>", "Lost child task id being superseded")
+    .requiredOption("--replacement-task-id <id>", "Active replacement task id or run id to bind")
+    .requiredOption("--owner-key <key>", "Expected parent owner key")
+    .requiredOption("--session-key <key>", "Replacement executor session key")
+    .requiredOption("--current-step <step>", "Exact executable step the replacement owns")
+    .option("--detail <text>", "Supersession detail")
+    .option("--json", "Output as JSON", false)
+    .action(async (lookup, opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsSupersedeForegroundCleanupCrewExecutorCommand } = await loadFlowsCommands();
+        await flowsSupersedeForegroundCleanupCrewExecutorCommand(
+          {
+            lookup,
+            lostTaskId: opts.lostTaskId as string | undefined,
+            replacementTaskId: opts.replacementTaskId as string | undefined,
+            ownerKey: opts.ownerKey as string | undefined,
+            sessionKey: opts.sessionKey as string | undefined,
+            currentStep: opts.currentStep as string | undefined,
+            detail: opts.detail as string | undefined,
+            json: hasJsonOption(opts, command),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowCmd
     .command("list")
     .description("List tracked TaskFlows")
     .option("--json", "Output as JSON", false)

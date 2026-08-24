@@ -59,6 +59,34 @@ describe("install integrity guard", () => {
     });
   });
 
+  it("allows clean tracked shrinkwrap when git status exits zero with a sandbox spawn warning", () => {
+    withTempRoot((rootDir) => {
+      fs.writeFileSync(path.join(rootDir, "npm-shrinkwrap.json"), "{}\n");
+
+      expect(
+        assertNoNpmInstallArtifacts({
+          rootDir,
+          operation: "runtime build",
+          spawnSync: () =>
+            ({
+              status: 0,
+              stdout: "",
+              stderr: "",
+              error: new Error("spawnSync git EPERM"),
+            }) as never,
+        }),
+      ).toMatchObject({
+        ok: true,
+        artifacts: [],
+        warnings: [
+          expect.objectContaining({
+            relativePath: "npm-shrinkwrap.json",
+          }),
+        ],
+      });
+    });
+  });
+
   it("fails local build preflight when root npm-shrinkwrap.json is modified or untracked", () => {
     withTempRoot((rootDir) => {
       fs.writeFileSync(path.join(rootDir, "npm-shrinkwrap.json"), "{}\n");

@@ -333,13 +333,13 @@ describe("tasks gateway handlers", () => {
       ok: true,
       initialEnabled: false,
       afterOpenEnabled: true,
-      afterCloseEnabled: false,
+      afterCloseEnabled: true,
       flowStatus: "succeeded",
     });
     expect(cron.update).toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
       enabled: true,
     });
-    expect(cron.update).toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
+    expect(cron.update).not.toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
       enabled: false,
     });
     const flowId = payload?.flowId;
@@ -444,8 +444,8 @@ describe("tasks gateway handlers", () => {
     );
 
     expect(stopped.calls[0]?.[0]).toBe(true);
-    await waitForCronEnabled(cron, false);
-    expect(cron.update).toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
+    await waitForCronEnabled(cron, true);
+    expect(cron.update).not.toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
       enabled: false,
     });
     const stoppedFlow = getTaskFlowById(flowId);

@@ -50,6 +50,23 @@ export type ActiveProductionFinalityInput = {
   now?: number;
 };
 
+export type ActiveProductionRuntimeProbeSnapshot = {
+  capturedAt: number;
+  activeToolAgeMs?: number;
+  pendingReplyCount?: number;
+  restartRecoveryFailureCount?: number;
+  eventLoopUtilization?: number;
+  eventLoopDelayP99Ms?: number;
+  eventLoopDelayMaxMs?: number;
+  activeEmbeddedRunCount?: number;
+};
+
+export type ActiveProductionRuntimeProbeEvaluation = {
+  boundary: ActiveProductionBoundary;
+  continuationRequired: boolean;
+  reasons: string[];
+};
+
 const HARD_BOUNDARIES = new Set<ActiveProductionBoundary>([
   "operator_product_decision_required",
   "operator_scope_decision_required",
@@ -217,6 +234,52 @@ export function evaluateActiveProductionFinality(
     result: "continuation_required",
     boundary,
     reason: `${attemptedFinalKind}: broader build is open and continuation dispatch proof is missing`,
+  };
+}
+
+function normalizeRuntimeProbeCount(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function normalizeRuntimeProbeMetric(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function evaluateActiveProductionRuntimeProbes(
+  snapshot: ActiveProductionRuntimeProbeSnapshot,
+): ActiveProductionRuntimeProbeEvaluation {
+  const reasons: string[] = [];
+  if (normalizeRuntimeProbeMetric(snapshot.activeToolAgeMs) > 0) {
+    reasons.push(`active_tool_age_ms=${Math.floor(snapshot.activeToolAgeMs!)}`);
+  }
+  if (normalizeRuntimeProbeCount(snapshot.pendingReplyCount) > 0) {
+    reasons.push(`pending_reply_count=${normalizeRuntimeProbeCount(snapshot.pendingReplyCount)}`);
+  }
+  if (normalizeRuntimeProbeCount(snapshot.restartRecoveryFailureCount) > 0) {
+    reasons.push(
+      `restart_recovery_failure_count=${normalizeRuntimeProbeCount(
+        snapshot.restartRecoveryFailureCount,
+      )}`,
+    );
+  }
+  if (normalizeRuntimeProbeMetric(snapshot.eventLoopUtilization) > 0) {
+    reasons.push(`event_loop_utilization=${snapshot.eventLoopUtilization}`);
+  }
+  if (normalizeRuntimeProbeMetric(snapshot.eventLoopDelayP99Ms) > 0) {
+    reasons.push(`event_loop_delay_p99_ms=${Math.floor(snapshot.eventLoopDelayP99Ms!)}`);
+  }
+  if (normalizeRuntimeProbeMetric(snapshot.eventLoopDelayMaxMs) > 0) {
+    reasons.push(`event_loop_delay_max_ms=${Math.floor(snapshot.eventLoopDelayMaxMs!)}`);
+  }
+  if (normalizeRuntimeProbeCount(snapshot.activeEmbeddedRunCount) > 0) {
+    reasons.push(
+      `active_embedded_run_count=${normalizeRuntimeProbeCount(snapshot.activeEmbeddedRunCount)}`,
+    );
+  }
+  return {
+    boundary: reasons.length > 0 ? "runtime_restart_recovery" : "none",
+    continuationRequired: reasons.length > 0,
+    reasons,
   };
 }
 

@@ -1967,6 +1967,61 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     });
   });
 
+  it("does not redeliver subagent completion after durable final delivery proof exists", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [{ text: "Tests passed and the PR is ready for review." }],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+    const sharedParams = {
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-4",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-thread-delivered-source-turn-replay",
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "thread completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        } satisfies AgentInternalEvent,
+      ],
+    };
+
+    const first = await deliverSlackThreadAnnouncement(sharedParams);
+    const second = await deliverSlackThreadAnnouncement(sharedParams);
+
+    expectRecordFields(first, {
+      delivered: true,
+      path: "direct",
+    });
+    expectRecordFields(second, {
+      delivered: true,
+      path: "direct",
+    });
+    expect(callGateway).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "subagent_completion_direct_final_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
+  });
+
   it("does not raw-send grouped child results when requester-agent output is empty", async () => {
     const callGateway = createGatewayMock({
       result: {

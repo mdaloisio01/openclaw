@@ -75,10 +75,60 @@ export type MainSessionRestartRecoveryStatusRecord = {
   artifactPath?: string;
 };
 
+export type MainSessionRestartRecoveryAccounting = {
+  scannedCheckpoints: number;
+  candidateSessions: number;
+  ineligibleSessions: number;
+  ineligibleRunningWithoutAbortMarker: number;
+  ineligibleNonRunningSessions: number;
+  skippedNonMainSessions: number;
+  recoveredSessions: number;
+  failedSessions: number;
+  skippedSessions: number;
+};
+
+export type MainSessionRestartRecoveryResult = {
+  recovered: number;
+  failed: number;
+  skipped: number;
+  accounting?: MainSessionRestartRecoveryAccounting;
+};
+
 type MainSessionRestartRecoveryStatusStore = {
   version: 1;
   records: MainSessionRestartRecoveryStatusRecord[];
 };
+
+function createRestartRecoveryAccounting(
+  scannedCheckpoints = 0,
+): MainSessionRestartRecoveryAccounting {
+  return {
+    scannedCheckpoints,
+    candidateSessions: 0,
+    ineligibleSessions: 0,
+    ineligibleRunningWithoutAbortMarker: 0,
+    ineligibleNonRunningSessions: 0,
+    skippedNonMainSessions: 0,
+    recoveredSessions: 0,
+    failedSessions: 0,
+    skippedSessions: 0,
+  };
+}
+
+function addRestartRecoveryAccounting(
+  target: MainSessionRestartRecoveryAccounting,
+  source: MainSessionRestartRecoveryAccounting,
+): void {
+  target.scannedCheckpoints += source.scannedCheckpoints;
+  target.candidateSessions += source.candidateSessions;
+  target.ineligibleSessions += source.ineligibleSessions;
+  target.ineligibleRunningWithoutAbortMarker += source.ineligibleRunningWithoutAbortMarker;
+  target.ineligibleNonRunningSessions += source.ineligibleNonRunningSessions;
+  target.skippedNonMainSessions += source.skippedNonMainSessions;
+  target.recoveredSessions += source.recoveredSessions;
+  target.failedSessions += source.failedSessions;
+  target.skippedSessions += source.skippedSessions;
+}
 
 function resolveRecoveryStatusPath(stateDir = resolveStateDir()): string {
   return path.join(stateDir, RECOVERY_STATUS_FILENAME);
@@ -772,8 +822,11 @@ async function recoverStore(params: {
   resumedSessionKeys: Set<string>;
   checkpoints: ActiveWorkCheckpoint[];
   stateDir?: string;
-}): Promise<{ recovered: number; failed: number; skipped: number }> {
+}): Promise<
+  MainSessionRestartRecoveryResult & { accounting: MainSessionRestartRecoveryAccounting }
+> {
   const result = { recovered: 0, failed: 0, skipped: 0 };
+  const accounting = createRestartRecoveryAccounting();
   const started = performance.now();
   log.info(`scanning restart recovery store: ${params.storePath}`);
   let store: Record<string, SessionEntry>;
@@ -788,24 +841,41 @@ async function recoverStore(params: {
   } catch (err) {
     log.warn(`failed to load session store ${params.storePath}: ${String(err)}`);
     result.failed++;
-    return result;
+    accounting.failedSessions++;
+    return { ...result, accounting };
   }
 
   const entries = Object.entries(store).toSorted(([a], [b]) => a.localeCompare(b));
   let candidateRows = 0;
   for (const [sessionKey, entry] of entries) {
-    if (!entry || entry.status !== "running" || entry.abortedLastRun !== true) {
+    if (!entry) {
+      accounting.ineligibleSessions++;
+      accounting.ineligibleNonRunningSessions++;
+      continue;
+    }
+    if (entry.status !== "running") {
+      accounting.ineligibleSessions++;
+      accounting.ineligibleNonRunningSessions++;
+      continue;
+    }
+    if (entry.abortedLastRun !== true) {
+      accounting.ineligibleSessions++;
+      accounting.ineligibleRunningWithoutAbortMarker++;
       continue;
     }
     candidateRows++;
+    accounting.candidateSessions++;
     if (shouldSkipMainRecovery(entry, sessionKey)) {
       log.info(`skipped interrupted main session recovery: ${sessionKey} (non-main session)`);
       result.skipped++;
+      accounting.skippedSessions++;
+      accounting.skippedNonMainSessions++;
       continue;
     }
     if (params.resumedSessionKeys.has(sessionKey)) {
       log.info(`skipped interrupted main session recovery: ${sessionKey} (already resumed)`);
       result.skipped++;
+      accounting.skippedSessions++;
       continue;
     }
     log.info(`selected interrupted main session for restart recovery: ${sessionKey}`);
@@ -842,6 +912,7 @@ async function recoverStore(params: {
           deliverySucceeded: deliveredNotice,
         });
         result.failed++;
+        accounting.failedSessions++;
         continue;
       }
       if (!checkpoint.safeToAutoResume || checkpoint.requiresOperatorReview) {
@@ -872,6 +943,7 @@ async function recoverStore(params: {
           deliverySucceeded: deliveredNotice,
         });
         result.failed++;
+        accounting.failedSessions++;
         continue;
       }
       const resumed = await resumeMainSession({
@@ -891,6 +963,7 @@ async function recoverStore(params: {
         });
         params.resumedSessionKeys.add(sessionKey);
         result.recovered++;
+        accounting.recoveredSessions++;
       } else {
         await updateActiveWorkCheckpointStatus({
           checkpoint,
@@ -909,6 +982,7 @@ async function recoverStore(params: {
           deliverySucceeded: false,
         });
         result.failed++;
+        accounting.failedSessions++;
       }
       continue;
     }
@@ -928,6 +1002,7 @@ async function recoverStore(params: {
     } catch (err) {
       log.warn(`failed to read transcript for ${sessionKey}: ${String(err)}`);
       result.failed++;
+      accounting.failedSessions++;
       continue;
     }
 
@@ -956,6 +1031,7 @@ async function recoverStore(params: {
         reason: resumeBlockReason,
       });
       result.failed++;
+      accounting.failedSessions++;
       continue;
     }
 
@@ -970,6 +1046,7 @@ async function recoverStore(params: {
     if (resumed) {
       params.resumedSessionKeys.add(sessionKey);
       result.recovered++;
+      accounting.recoveredSessions++;
     } else {
       await updateRecoveryStatus({
         stateDir: params.stateDir,
@@ -981,6 +1058,7 @@ async function recoverStore(params: {
         deliverySucceeded: false,
       });
       result.failed++;
+      accounting.failedSessions++;
     }
   }
 
@@ -989,7 +1067,9 @@ async function recoverStore(params: {
     const message =
       `[perf:main-session-restart-recovery] storePath=${JSON.stringify(params.storePath)} ` +
       `durationMs=${formatRestartRecoveryPerfMs(durationMs)} storeBytes=${storeBytes ?? "unknown"} ` +
-      `storeEntries=${entries.length} candidateRows=${candidateRows} ` +
+      `storeEntries=${entries.length} candidateRows=${candidateRows} ineligible=${accounting.ineligibleSessions} ` +
+      `runningWithoutAbortMarker=${accounting.ineligibleRunningWithoutAbortMarker} ` +
+      `nonRunning=${accounting.ineligibleNonRunningSessions} nonMain=${accounting.skippedNonMainSessions} ` +
       `recovered=${result.recovered} failed=${result.failed} skipped=${result.skipped}`;
     if (durationMs >= 1_000) {
       log.warn(message);
@@ -997,7 +1077,7 @@ async function recoverStore(params: {
       log.info(message);
     }
   }
-  return result;
+  return { ...result, accounting };
 }
 
 async function resolveRestartRecoveryStorePaths(params: {
@@ -1031,16 +1111,18 @@ async function resolveRestartRecoveryStorePaths(params: {
 export async function recoverRestartAbortedMainSessions(
   params: {
     cfg?: OpenClawConfig;
+    includeAccounting?: boolean;
     stateDir?: string;
     resumedSessionKeys?: Set<string>;
   } = {},
-): Promise<{ recovered: number; failed: number; skipped: number }> {
+): Promise<MainSessionRestartRecoveryResult> {
   const started = performance.now();
   const result = { recovered: 0, failed: 0, skipped: 0 };
   const resumedSessionKeys = params.resumedSessionKeys ?? new Set<string>();
   const checkpoints = await listActiveWorkCheckpoints({
     stateDir: params.stateDir,
   });
+  const accounting = createRestartRecoveryAccounting(checkpoints.length);
 
   for (const storePath of await resolveRestartRecoveryStorePaths(params)) {
     const storeResult = await recoverStore({
@@ -1053,6 +1135,7 @@ export async function recoverRestartAbortedMainSessions(
     result.recovered += storeResult.recovered;
     result.failed += storeResult.failed;
     result.skipped += storeResult.skipped;
+    addRestartRecoveryAccounting(accounting, storeResult.accounting);
   }
 
   if (result.recovered > 0 || result.failed > 0) {
@@ -1066,14 +1149,18 @@ export async function recoverRestartAbortedMainSessions(
       `[perf:main-session-restart-recovery] phase=complete durationMs=${formatRestartRecoveryPerfMs(
         durationMs,
       )} recovered=${result.recovered} failed=${result.failed} skipped=${result.skipped} ` +
-      `checkpoints=${checkpoints.length}`;
+      `checkpoints=${checkpoints.length} candidateSessions=${accounting.candidateSessions} ` +
+      `ineligibleSessions=${accounting.ineligibleSessions} ` +
+      `runningWithoutAbortMarker=${accounting.ineligibleRunningWithoutAbortMarker} ` +
+      `nonRunningSessions=${accounting.ineligibleNonRunningSessions} ` +
+      `skippedNonMainSessions=${accounting.skippedNonMainSessions}`;
     if (durationMs >= 1_000) {
       log.warn(message);
     } else {
       log.info(message);
     }
   }
-  return result;
+  return params.includeAccounting ? { ...result, accounting } : result;
 }
 
 export function scheduleRestartAbortedMainSessionRecovery(

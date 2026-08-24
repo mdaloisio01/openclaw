@@ -22,10 +22,15 @@ const RUNTIME_ASSETS = [
 ];
 const UI_ASSETS = ["dist/control-ui/index.html"];
 const BACKUP_ROOT_NAMES = ["dist", "dist-runtime"];
+const DEFAULT_PREVIOUS_BACKUP_RETENTION = 5;
+const DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024;
+const DEFAULT_MIN_FREE_INODES = 25_000;
 const INTERNAL_IMPORT_MISSING_BLOCKER = "runtime_internal_import_missing";
 const REQUIRED_ASSET_MISSING_BLOCKER = "runtime_required_asset_missing";
 const BUILD_INFO_BLOCKER = "runtime_build_info_invalid";
 const ROOT_MISMATCH_BLOCKER = "runtime_guard_root_mismatch";
+const BACKUP_RESOURCE_BLOCKER = "runtime_backup_resource_limit";
+const BACKUP_LOCK_BLOCKER = "runtime_backup_snapshot_in_progress";
 const VALIDATION_OPERATION_DEFAULT = "production preflight";
 const PLUGIN_SDK_ALIAS_PREFIXES = [
   "openclaw/plugin-sdk/",
@@ -38,6 +43,63 @@ const SCRIPT_ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 
 function nowStamp() {
   return new Date().toISOString().replaceAll(":", "").replaceAll(".", "");
+}
+
+function mkdirRecursiveWithParentRetry(dirPath) {
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    fs.mkdirSync(path.dirname(dirPath), { recursive: true });
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+function parseNonNegativeInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallback;
+  }
+  return Math.floor(parsed);
+}
+
+function resolvePreviousBackupRetention(params = {}) {
+  return parseNonNegativeInteger(
+    params.previousRetention ?? process.env.OPENCLAW_RUNTIME_GUARD_PREVIOUS_RETENTION,
+    DEFAULT_PREVIOUS_BACKUP_RETENTION,
+  );
+}
+
+function resolveResourceLimits(params = {}) {
+  return {
+    previousRetention: resolvePreviousBackupRetention(params),
+    minFreeBytes: parseNonNegativeInteger(
+      params.minFreeBytes ?? process.env.OPENCLAW_RUNTIME_GUARD_MIN_FREE_BYTES,
+      DEFAULT_MIN_FREE_BYTES,
+    ),
+    minFreeInodes: parseNonNegativeInteger(
+      params.minFreeInodes ?? process.env.OPENCLAW_RUNTIME_GUARD_MIN_FREE_INODES,
+      DEFAULT_MIN_FREE_INODES,
+    ),
+    maxSnapshotBytes: parseNonNegativeInteger(
+      params.maxSnapshotBytes ?? process.env.OPENCLAW_RUNTIME_GUARD_MAX_SNAPSHOT_BYTES,
+      Number.POSITIVE_INFINITY,
+    ),
+    maxSnapshotEntries: parseNonNegativeInteger(
+      params.maxSnapshotEntries ?? process.env.OPENCLAW_RUNTIME_GUARD_MAX_SNAPSHOT_ENTRIES,
+      Number.POSITIVE_INFINITY,
+    ),
+    maxPreviousBytes: parseNonNegativeInteger(
+      params.maxPreviousBytes ?? process.env.OPENCLAW_RUNTIME_GUARD_MAX_PREVIOUS_BYTES,
+      Number.POSITIVE_INFINITY,
+    ),
+    maxPreviousEntries: parseNonNegativeInteger(
+      params.maxPreviousEntries ?? process.env.OPENCLAW_RUNTIME_GUARD_MAX_PREVIOUS_ENTRIES,
+      Number.POSITIVE_INFINITY,
+    ),
+  };
 }
 
 export function resolveRuntimeGuardRootDir(params = {}) {
@@ -328,6 +390,207 @@ function copyExistingRoot({ fromRoot, toRoot, name }) {
   return true;
 }
 
+function listPreviousBackupCandidates(backupRoot) {
+  try {
+    return fs
+      .readdirSync(backupRoot, { withFileTypes: true })
+      .filter((dirent) => dirent.isDirectory() && dirent.name.startsWith("previous-"))
+      .map((dirent) => ({ label: dirent.name, path: path.join(backupRoot, dirent.name) }))
+      .sort((a, b) => b.label.localeCompare(a.label));
+  } catch {
+    return [];
+  }
+}
+
+function cleanupPartialRuntimeBackups(backupRoot) {
+  const removed = [];
+  let dirents = [];
+  try {
+    dirents = fs.readdirSync(backupRoot, { withFileTypes: true });
+  } catch {
+    return removed;
+  }
+
+  for (const dirent of dirents) {
+    if (!dirent.isDirectory()) {
+      continue;
+    }
+    const isPartial =
+      dirent.name.startsWith("last-known-good.tmp-") ||
+      dirent.name.startsWith("last-known-good.next-") ||
+      dirent.name.startsWith("partial-");
+    if (!isPartial) {
+      continue;
+    }
+    const target = path.join(backupRoot, dirent.name);
+    fs.rmSync(target, { recursive: true, force: true });
+    removed.push({ label: dirent.name, path: target });
+  }
+  return removed;
+}
+
+function measureTree(rootPath) {
+  const summary = { bytes: 0, entries: 0 };
+  if (!fs.existsSync(rootPath)) {
+    return summary;
+  }
+  const visit = (filePath) => {
+    const stat = fs.lstatSync(filePath);
+    summary.entries += 1;
+    summary.bytes += stat.size;
+    if (!stat.isDirectory()) {
+      return;
+    }
+    for (const dirent of fs.readdirSync(filePath, { withFileTypes: true })) {
+      visit(path.join(filePath, dirent.name));
+    }
+  };
+  visit(rootPath);
+  return summary;
+}
+
+function measureRuntimeRoots(rootDir) {
+  const summary = { bytes: 0, entries: 0 };
+  for (const name of BACKUP_ROOT_NAMES) {
+    const measured = measureTree(path.join(rootDir, name));
+    summary.bytes += measured.bytes;
+    summary.entries += measured.entries;
+  }
+  return summary;
+}
+
+function getBackupStorageStats(targetPath, params = {}) {
+  const statfs = params.statfs ?? fs.statfsSync;
+  try {
+    const stats = statfs(targetPath);
+    const blockSize = Number(stats.bsize ?? stats.frsize ?? 0);
+    const freeBlocks = Number(stats.bavail ?? stats.bfree ?? 0);
+    const freeFiles = Number(stats.ffree ?? Number.POSITIVE_INFINITY);
+    return {
+      freeBytes: Number.isFinite(blockSize * freeBlocks) ? blockSize * freeBlocks : 0,
+      freeInodes: Number.isFinite(freeFiles) ? freeFiles : Number.POSITIVE_INFINITY,
+    };
+  } catch {
+    return {
+      freeBytes: Number.POSITIVE_INFINITY,
+      freeInodes: Number.POSITIVE_INFINITY,
+    };
+  }
+}
+
+function removePreviousBackup(candidate) {
+  fs.rmSync(candidate.path, { recursive: true, force: true });
+  return { label: candidate.label, path: candidate.path };
+}
+
+export function applyRuntimeBackupPolicy(params = {}) {
+  const backupRoot = resolveBackupRoot(params);
+  const limits = resolveResourceLimits(params);
+  mkdirRecursiveWithParentRetry(backupRoot);
+  const partialRemoved = cleanupPartialRuntimeBackups(backupRoot);
+  const removed = [];
+  let previous = listPreviousBackupCandidates(backupRoot);
+
+  while (previous.length > limits.previousRetention) {
+    const oldest = previous.pop();
+    if (oldest) {
+      removed.push(removePreviousBackup(oldest));
+    }
+  }
+
+  let previousUsage = previous.reduce(
+    (summary, candidate) => {
+      const measured = measureTree(candidate.path);
+      summary.bytes += measured.bytes;
+      summary.entries += measured.entries;
+      return summary;
+    },
+    { bytes: 0, entries: 0 },
+  );
+
+  while (
+    previous.length > 0 &&
+    (previousUsage.bytes > limits.maxPreviousBytes ||
+      previousUsage.entries > limits.maxPreviousEntries)
+  ) {
+    const oldest = previous.pop();
+    if (!oldest) {
+      break;
+    }
+    const measured = measureTree(oldest.path);
+    removed.push(removePreviousBackup(oldest));
+    previousUsage = {
+      bytes: Math.max(0, previousUsage.bytes - measured.bytes),
+      entries: Math.max(0, previousUsage.entries - measured.entries),
+    };
+  }
+
+  return {
+    ok: true,
+    action: "runtime-backup-policy",
+    backupRoot,
+    limits,
+    partialRemoved,
+    previousRemoved: removed,
+    previousRemaining: listPreviousBackupCandidates(backupRoot).map((candidate) => candidate.label),
+  };
+}
+
+function preflightRuntimeSnapshotResources({ rootDir, backupRoot, params = {} }) {
+  const limits = resolveResourceLimits(params);
+  const snapshotUsage = measureRuntimeRoots(rootDir);
+  if (
+    snapshotUsage.bytes > limits.maxSnapshotBytes ||
+    snapshotUsage.entries > limits.maxSnapshotEntries
+  ) {
+    return {
+      ok: false,
+      blocker: BACKUP_RESOURCE_BLOCKER,
+      reason: "snapshot tree exceeds configured maximum",
+      limits,
+      snapshotUsage,
+    };
+  }
+
+  const storage = getBackupStorageStats(backupRoot, params);
+  if (storage.freeBytes < limits.minFreeBytes || storage.freeInodes < limits.minFreeInodes) {
+    return {
+      ok: false,
+      blocker: BACKUP_RESOURCE_BLOCKER,
+      reason: "backup root below minimum free byte or inode reserve",
+      limits,
+      snapshotUsage,
+      storage,
+    };
+  }
+
+  return { ok: true, limits, snapshotUsage, storage };
+}
+
+function acquireSnapshotLock(backupRoot) {
+  const lockPath = path.join(backupRoot, ".runtime-asset-guard.lock");
+  try {
+    const fd = fs.openSync(lockPath, "wx");
+    fs.writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`);
+    return {
+      ok: true,
+      lockPath,
+      release: () => {
+        try {
+          fs.closeSync(fd);
+        } finally {
+          fs.rmSync(lockPath, { force: true });
+        }
+      },
+    };
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return { ok: false, blocker: BACKUP_LOCK_BLOCKER, lockPath };
+    }
+    throw error;
+  }
+}
+
 function moveAsideIfPresent(targetPath) {
   if (!fs.existsSync(targetPath)) {
     return undefined;
@@ -376,9 +639,39 @@ export function snapshotRuntimeAssets(params = {}) {
     };
   }
 
-  fs.mkdirSync(backupRoot, { recursive: true });
-  const tempRoot = path.join(backupRoot, `last-known-good.tmp-${nowStamp()}`);
-  fs.mkdirSync(tempRoot, { recursive: true });
+  mkdirRecursiveWithParentRetry(backupRoot);
+  const policyBefore = applyRuntimeBackupPolicy({ ...params, backupRoot });
+  const resourcePreflight = preflightRuntimeSnapshotResources({ rootDir, backupRoot, params });
+  if (!resourcePreflight.ok) {
+    return {
+      ok: false,
+      action: "snapshot",
+      rootDir,
+      backupRoot,
+      blocker: resourcePreflight.blocker,
+      reason: resourcePreflight.reason,
+      limits: resourcePreflight.limits,
+      snapshotUsage: resourcePreflight.snapshotUsage,
+      storage: resourcePreflight.storage,
+      policyBefore,
+    };
+  }
+
+  const lock = acquireSnapshotLock(backupRoot);
+  if (!lock.ok) {
+    return {
+      ok: false,
+      action: "snapshot",
+      rootDir,
+      backupRoot,
+      blocker: lock.blocker,
+      lockPath: lock.lockPath,
+      policyBefore,
+    };
+  }
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-runtime-assets-"));
+  let nextRoot;
 
   const copied = [];
   try {
@@ -425,10 +718,15 @@ export function snapshotRuntimeAssets(params = {}) {
     );
 
     const latestRoot = path.join(backupRoot, "last-known-good");
+    mkdirRecursiveWithParentRetry(path.dirname(latestRoot));
+    nextRoot = path.join(backupRoot, `last-known-good.next-${nowStamp()}`);
+    fs.cpSync(tempRoot, nextRoot, { recursive: true });
     if (fs.existsSync(latestRoot)) {
       fs.renameSync(latestRoot, path.join(backupRoot, `previous-${nowStamp()}`));
     }
-    fs.renameSync(tempRoot, latestRoot);
+    fs.renameSync(nextRoot, latestRoot);
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+    const policyAfter = applyRuntimeBackupPolicy({ ...params, backupRoot });
     return {
       ok: true,
       action: "snapshot",
@@ -436,6 +734,9 @@ export function snapshotRuntimeAssets(params = {}) {
       backupRoot,
       copied,
       path: latestRoot,
+      resourcePreflight,
+      policyBefore,
+      policyAfter,
     };
   } catch (error) {
     try {
@@ -443,7 +744,16 @@ export function snapshotRuntimeAssets(params = {}) {
     } catch {
       // Ignore cleanup failures; the original runtime tree was not modified.
     }
+    if (nextRoot) {
+      try {
+        fs.rmSync(nextRoot, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup failures; the caller gets the original copy/promote error.
+      }
+    }
     throw error;
+  } finally {
+    lock.release();
   }
 }
 
@@ -618,9 +928,9 @@ export function ensureRuntimeAssets(params = {}) {
   const validation = validateRuntimeAssets({ ...params, operation });
   if (validation.ok) {
     const snapshot =
-      params.snapshot === false
-        ? undefined
-        : snapshotRuntimeAssets({ ...params, operation: "snapshot" });
+      params.snapshot === true
+        ? snapshotRuntimeAssets({ ...params, operation: "snapshot" })
+        : undefined;
     return {
       ok: true,
       action: "ensure",
@@ -646,15 +956,24 @@ function parseArgs(argv) {
     requireUi: false,
     rootDir: undefined,
     backupRoot: undefined,
-    snapshot: true,
+    snapshot: undefined,
     operation: undefined,
     expectedRoot: undefined,
     cwdRoot: false,
+    previousRetention: undefined,
+    minFreeBytes: undefined,
+    minFreeInodes: undefined,
+    maxSnapshotBytes: undefined,
+    maxSnapshotEntries: undefined,
+    maxPreviousBytes: undefined,
+    maxPreviousEntries: undefined,
   };
   for (let index = 1; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--require-ui") {
       options.requireUi = true;
+    } else if (arg === "--snapshot") {
+      options.snapshot = true;
     } else if (arg === "--no-snapshot") {
       options.snapshot = false;
     } else if (arg === "--root") {
@@ -667,6 +986,20 @@ function parseArgs(argv) {
       options.expectedRoot = argv[++index];
     } else if (arg === "--cwd-root") {
       options.cwdRoot = true;
+    } else if (arg === "--previous-retention") {
+      options.previousRetention = argv[++index];
+    } else if (arg === "--min-free-bytes") {
+      options.minFreeBytes = argv[++index];
+    } else if (arg === "--min-free-inodes") {
+      options.minFreeInodes = argv[++index];
+    } else if (arg === "--max-snapshot-bytes") {
+      options.maxSnapshotBytes = argv[++index];
+    } else if (arg === "--max-snapshot-entries") {
+      options.maxSnapshotEntries = argv[++index];
+    } else if (arg === "--max-previous-bytes") {
+      options.maxPreviousBytes = argv[++index];
+    } else if (arg === "--max-previous-entries") {
+      options.maxPreviousEntries = argv[++index];
     } else {
       throw new Error(`Unknown runtime asset guard argument: ${arg}`);
     }
@@ -715,6 +1048,8 @@ if (isMainModule()) {
       result = restoreControlUiFromSnapshotIfMissing(options);
     } else if (options.command === "ensure") {
       result = ensureRuntimeAssets(options);
+    } else if (options.command === "policy") {
+      result = applyRuntimeBackupPolicy(options);
     } else {
       throw new Error(`Unknown runtime asset guard command: ${options.command}`);
     }

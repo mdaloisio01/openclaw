@@ -661,9 +661,8 @@ describe("config observe recovery", () => {
       await expect(
         promoteConfigSnapshotToLastKnownGood({ deps, snapshot, logger: deps.logger }),
       ).resolves.toBe(true);
-      await expect(fsp.readFile(resolveLastKnownGoodConfigPath(configPath), "utf-8")).resolves.toBe(
-        snapshot.raw,
-      );
+      const lastGoodPath = resolveLastKnownGoodConfigPath(configPath, deps);
+      await expect(fsp.readFile(lastGoodPath, "utf-8")).resolves.toBe(snapshot.raw);
 
       const brokenRaw = "{ gateway: { mode: 123 } }\n";
       await fsp.writeFile(configPath, brokenRaw, "utf-8");
@@ -685,7 +684,30 @@ describe("config observe recovery", () => {
       expectWarnContaining(warn, "Rejected validation details: gateway.mode: Expected string.");
       const observe = await readLastObserveEvent(auditPath);
       expect(observe?.restoredFromBackup).toBe(true);
-      expect(observe?.restoredBackupPath).toBe(resolveLastKnownGoodConfigPath(configPath));
+      expect(observe?.restoredBackupPath).toBe(lastGoodPath);
+    });
+  });
+
+  it("stores last-good config outside an unwritable live config directory", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps } = makeDeps(home);
+      const configPath = path.join(home, ".openclaw", "control-plane", "live", "openclaw.json");
+      const snapshot = await makeSnapshot(configPath, {
+        gateway: { mode: "local", auth: { mode: "token", token: "secret-token" } },
+      });
+      const configDir = path.dirname(configPath);
+      await fsp.chmod(configDir, 0o500);
+      try {
+        await expect(
+          promoteConfigSnapshotToLastKnownGood({ deps, snapshot, logger: deps.logger }),
+        ).resolves.toBe(true);
+        await expect(
+          fsp.readFile(resolveLastKnownGoodConfigPath(configPath, deps), "utf-8"),
+        ).resolves.toBe(snapshot.raw);
+        await expectPathMissing(resolveLastKnownGoodConfigPath(configPath));
+      } finally {
+        await fsp.chmod(configDir, 0o700).catch(() => {});
+      }
     });
   });
 
@@ -813,7 +835,7 @@ describe("config observe recovery", () => {
       await expect(
         promoteConfigSnapshotToLastKnownGood({ deps, snapshot, logger: deps.logger }),
       ).resolves.toBe(false);
-      await expectPathMissing(resolveLastKnownGoodConfigPath(configPath));
+      await expectPathMissing(resolveLastKnownGoodConfigPath(configPath, deps));
       expectWarnContaining(warn, "Config last-known-good promotion skipped");
     });
   });

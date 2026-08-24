@@ -91,6 +91,99 @@ describe("activation restart continuations", () => {
     });
   });
 
+  it("persists governed restart mission identity and next executable step", async () => {
+    const record = await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-governed-restart",
+        now: 10,
+        route: { sessionKey: "agent:orchestrator:main" },
+        parent: {
+          sessionKey: "agent:orchestrator:main",
+          runId: "parent-run-1",
+        },
+        governedRestart: {
+          parentMissionId: "763440db-1c9e-41ee-9adf-8e097af1db4e",
+          currentPhase: "Phase 9 durable continuation architecture",
+          executableStep: "governed_restart_loaded_runtime_validation",
+          sessionKey: "agent:orchestrator:main",
+          runId: "foreground-cleanup-crew:763440db:supersession:1",
+          restartRequestId: "restart-request-1",
+          continuationIdentity: "continuation-identity-1",
+          continuationRevision: 1,
+          receiptId: "receipt-1",
+          nextAction: "recover replacement executor and rerun watchdog",
+        },
+        objective: "activate patched gateway",
+        expectedRuntime: { commit: "abc" },
+        requiredChecks: ["http_health"],
+      },
+      { stateDir },
+    );
+
+    const store = await testing.readStore(stateDir);
+    expect(record.governedRestart).toMatchObject({
+      parentMissionId: "763440db-1c9e-41ee-9adf-8e097af1db4e",
+      executableStep: "governed_restart_loaded_runtime_validation",
+      continuationRevision: 1,
+      nextAction: "recover replacement executor and rerun watchdog",
+    });
+    expect(store.records[0]?.governedRestart).toEqual(record.governedRestart);
+  });
+
+  it("rejects incomplete governed restart bindings on store read", async () => {
+    const record = await testing.createContinuationRecord({
+      id: "activation-incomplete-governed-restart",
+      now: 10,
+      route: { sessionKey: "agent:orchestrator:main" },
+      governedRestart: {
+        parentMissionId: "mission",
+        currentPhase: "phase",
+        executableStep: "step",
+        sessionKey: "agent:orchestrator:main",
+        runId: "run",
+        restartRequestId: "restart",
+        continuationIdentity: "identity",
+        continuationRevision: 1,
+        receiptId: "receipt",
+        nextAction: "continue",
+      },
+    });
+    await testing.writeStore(
+      {
+        version: 1,
+        records: [
+          {
+            ...record,
+            governedRestart: {
+              parentMissionId: "mission",
+              currentPhase: "phase",
+            },
+          } as any,
+        ],
+      },
+      stateDir,
+    );
+
+    const store = await testing.readStore(stateDir);
+    expect(store.records[0]?.governedRestart).toBeUndefined();
+  });
+
+  it("keeps visible delivery proof separate from delivery route proof", async () => {
+    const record = await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-visible-proof",
+        now: 10,
+        route: { sessionKey: "main" },
+        objective: "activate patched gateway",
+        expectedRuntime: { commit: "abc" },
+        requiredChecks: ["visible_delivery", "delivery route is configured"],
+      },
+      { stateDir },
+    );
+
+    expect(record.requiredChecks).toEqual(["visible_delivery", "delivery_route"]);
+  });
+
   it("defaults restart continuations to the required runtime proof bundle", async () => {
     const record = await persistActivationContinuationBeforeRestart(
       {

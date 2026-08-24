@@ -387,6 +387,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Explicit hostname allowlist exceptions for SSRF policy checks on browser/network requests. Keep this list minimal and review entries regularly to avoid stale broad access.",
   "browser.ssrfPolicy.hostnameAllowlist":
     "Legacy/alternate hostname allowlist field used by SSRF policy consumers for explicit host exceptions. Use stable exact hostnames and avoid wildcard-like broad patterns.",
+  "browser.ssrfPolicy.allowedOrigins":
+    "Exact HTTP origins allowed for browser navigation. Prefer this over hostname-only exceptions when a local service must be limited to a specific port.",
   "browser.remoteCdpTimeoutMs":
     "Timeout in milliseconds for connecting to a remote CDP endpoint before failing the browser attach attempt. Increase for high-latency tunnels, or lower for faster failure detection.",
   "browser.remoteCdpHandshakeTimeoutMs":

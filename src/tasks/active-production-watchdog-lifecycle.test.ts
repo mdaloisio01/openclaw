@@ -166,7 +166,7 @@ describe("active production watchdog lifecycle", () => {
     });
   });
 
-  it("disables the watchdog cron after a lawful production stop", async () => {
+  it("disables the watchdog cron after a lawful production stop leaves no active production", async () => {
     await withTaskState(async () => {
       const cron = createCronHarness(true);
       const flow = createManagedTaskFlow({
@@ -201,15 +201,34 @@ describe("active production watchdog lifecycle", () => {
     });
   });
 
+  it("keeps unfinished lawful-stopped production flows under watchdog when a launched executor was lost", async () => {
+    await withTaskState(async () => {
+      const flow = createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog",
+        goal: "100% production run",
+        status: "blocked",
+        continuation: {
+          activeProductionRun: true,
+          parentRunOpen: true,
+          currentUnitStatus: "blocked",
+          blockerPresent: true,
+          lawfulStopReason: "blocker",
+          nextExecutableUnitLaunched: true,
+        },
+      });
+      expect(flow).not.toBeNull();
+
+      expect(flow && flowRequiresActiveWorkWatchdog(flow)).toBe(true);
+    });
+  });
+
   it("reacts to production flow creation through installed lifecycle observers", async () => {
     await withTaskState(async () => {
       const cron = createCronHarness(false);
       installProductionWatchdogLifecycleGate({ cron });
-      await vi.waitFor(() =>
-        expect(cron.update).not.toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
-          enabled: true,
-        }),
-      );
+      await vi.waitFor(() => expect(cron.job.enabled).toBe(false));
+      cron.update.mockClear();
 
       createManagedTaskFlow({
         ownerKey: "agent:orchestrator:main",
@@ -219,11 +238,10 @@ describe("active production watchdog lifecycle", () => {
         continuation: { activeProductionRun: true },
       });
 
-      await vi.waitFor(() =>
-        expect(cron.update).toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
-          enabled: true,
-        }),
-      );
+      await vi.waitFor(() => expect(cron.job.enabled).toBe(true));
+      expect(cron.update).not.toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
+        enabled: false,
+      });
       expect(cron.job.enabled).toBe(true);
     });
   });

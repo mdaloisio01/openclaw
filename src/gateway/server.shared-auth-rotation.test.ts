@@ -1,8 +1,16 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
+import { createConfigIO, readConfigFileSnapshot } from "../config/config.js";
+import { VERSION } from "../version.js";
+import { testing as controlPlaneRateLimitTesting } from "./control-plane-rate-limit.js";
+import {
+  prepareConfigPatchCandidateForControlPlane,
+  prepareConfigWriteCandidateForControlPlane,
+} from "./server-methods/config.js";
 import {
   loadGatewayConfig,
   openAuthenticatedGatewayWs,
@@ -26,6 +34,7 @@ const OLD_TOKEN = "shared-token-old";
 const NEW_TOKEN = "shared-token-new";
 const DEFERRED_RESTART_DELAY_MS = 1_000;
 const SECRET_REF_TOKEN_ID = "OPENCLAW_SHARED_AUTH_ROTATION_SECRET_REF";
+const TEST_ACTIVATION_AT = "2026-07-14T12:00:00.000Z";
 
 let port = 0;
 
@@ -152,20 +161,103 @@ async function closeWsAndWait(ws: WebSocket, timeoutMs = 2_000): Promise<void> {
   });
 }
 
-async function sendSharedTokenRotationPatch(ws: WebSocket): Promise<{ ok: boolean }> {
+type ConfigWriteTool = "config.patch" | "config.apply";
+
+function stampedCandidateForManifest(config: Record<string, unknown>): Record<string, unknown> {
+  return {
+    ...config,
+    meta: {
+      ...((config.meta as Record<string, unknown> | undefined) ?? {}),
+      lastTouchedVersion: VERSION,
+      lastTouchedAt: TEST_ACTIVATION_AT,
+    },
+  };
+}
+
+function controlPlaneEnvelopeForCandidate(config: Record<string, unknown>, tool: ConfigWriteTool) {
+  const candidateRaw = `${JSON.stringify(stampedCandidateForManifest(config), null, 2)}\n`;
+  const candidateSha256 = crypto.createHash("sha256").update(candidateRaw, "utf-8").digest("hex");
+  return {
+    controlPlaneManifest: {
+      manifestId: `manifest-${tool}`,
+      objective: "gateway shared auth rotation test",
+      activationTimestamp: TEST_ACTIVATION_AT,
+      candidateSha256,
+      allowedFiles: [createConfigIO().configPath],
+      allowedConfigPaths: ["gateway", "meta"],
+      forbiddenFiles: ["/tmp/forbidden-openclaw.json"],
+      allowedServices: ["openclaw-gateway.service"],
+      allowedRestartScope: "gateway",
+      allowedAgents: ["unknown-actor", "test"],
+      allowedTools: [tool],
+      approvalClasses: ["auth", "control", "runtime"],
+      requiredEvidence: ["integration-test"],
+      rollbackAssets: ["/tmp/openclaw.json.rollback"],
+      stopConditions: ["manifest mismatch"],
+      doneCriteria: ["write accepted"],
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+    controlPlaneApproval: {
+      approvalId: `approval-${tool}-${candidateSha256}`,
+      manifestId: `manifest-${tool}`,
+      candidateSha256,
+      approvalClasses: ["auth", "control", "runtime"],
+      approved: true,
+      expiresAt: "2999-01-01T00:00:00Z",
+    },
+  };
+}
+
+async function controlPlaneEnvelope(raw: string, tool: ConfigWriteTool) {
+  const snapshot = await readConfigFileSnapshot();
+  const prepared =
+    tool === "config.patch"
+      ? prepareConfigPatchCandidateForControlPlane({ raw, snapshot })
+      : prepareConfigWriteCandidateForControlPlane({ raw, snapshot });
+  return controlPlaneEnvelopeForCandidate(prepared.writeConfig, tool);
+}
+
+async function sendSharedTokenPatch(ws: WebSocket, token: string): Promise<{ ok: boolean }> {
   const current = await loadGatewayConfig(ws);
+  const raw = JSON.stringify({ gateway: { auth: { token } } });
   return await rpcReq(ws, "config.patch", {
     baseHash: current.hash,
-    raw: JSON.stringify({ gateway: { auth: { token: NEW_TOKEN } } }),
+    raw,
     restartDelayMs: DEFERRED_RESTART_DELAY_MS,
+    ...(await controlPlaneEnvelope(raw, "config.patch")),
   });
+}
+
+async function sendSharedTokenRotationPatch(ws: WebSocket): Promise<{ ok: boolean }> {
+  return sendSharedTokenPatch(ws, NEW_TOKEN);
+}
+
+async function resetSharedTokenToOld() {
+  for (const token of [OLD_TOKEN, NEW_TOKEN]) {
+    const ws = await openAuthenticatedGatewayWs(port, token).catch(() => null);
+    if (!ws) {
+      continue;
+    }
+    try {
+      const res = await sendSharedTokenPatch(ws, OLD_TOKEN);
+      if (!res.ok) {
+        throw new Error(`shared token reset failed: ${JSON.stringify(res)}`);
+      }
+      return;
+    } finally {
+      await closeWsAndWait(ws);
+    }
+  }
+  throw new Error("shared token reset failed: no token could authenticate");
 }
 
 async function applyCurrentConfig(ws: WebSocket) {
   const current = await loadGatewayConfig(ws);
+  const raw = JSON.stringify(current.config, null, 2);
   return await rpcReq(ws, "config.apply", {
     baseHash: current.hash,
-    raw: JSON.stringify(current.config, null, 2),
+    raw,
+    ...(await controlPlaneEnvelope(raw, "config.apply")),
   });
 }
 
@@ -262,6 +354,9 @@ describe("gateway shared auth rotation", () => {
     try {
       const closed = waitForGatewayWsClose(ws);
       const res = await sendSharedTokenRotationPatch(ws);
+      if (!res.ok) {
+        throw new Error(`shared token rotation patch failed: ${JSON.stringify(res)}`);
+      }
       sharedTokenRotationCase = {
         closed: await closed,
         ok: res.ok,
@@ -271,8 +366,10 @@ describe("gateway shared auth rotation", () => {
     }
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    controlPlaneRateLimitTesting.resetControlPlaneRateLimitState();
     testState.gatewayAuth = { mode: "token", token: OLD_TOKEN };
+    await resetSharedTokenToOld();
   });
 
   afterAll(async () => {

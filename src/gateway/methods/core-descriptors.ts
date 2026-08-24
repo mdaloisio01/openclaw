@@ -204,6 +204,7 @@ export const CORE_GATEWAY_METHOD_SPECS: readonly CoreGatewayMethodSpec[] = [
   { name: "message.action", scope: "operator.write" },
   { name: "send", scope: "operator.write" },
   { name: "agent", scope: "operator.write" },
+  { name: "agent.falseCloseoutAdmission.probe", scope: "operator.admin", advertise: false },
   { name: "agent.identity.get", scope: "operator.read" },
   { name: "agent.wait", scope: "operator.write", startup: true },
   { name: "chat.history", scope: "operator.read", startup: true },

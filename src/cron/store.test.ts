@@ -89,6 +89,19 @@ describe("resolveCronStorePath", () => {
     const result = resolveCronStorePath("~/cron/jobs.json");
     expect(result).toBe(path.resolve("/srv/openclaw-home", "cron", "jobs.json"));
   });
+
+  it("keeps the default store under mutable state when OPENCLAW_CONFIG_PATH points elsewhere", () => {
+    vi.stubEnv("HOME", "/home/openclaw-user");
+    vi.stubEnv(
+      "OPENCLAW_CONFIG_PATH",
+      "/home/openclaw-user/.openclaw/control-plane/live/openclaw.json",
+    );
+    vi.stubEnv("OPENCLAW_STATE_DIR", undefined);
+
+    expect(resolveCronStorePath()).toBe(
+      path.resolve("/home/openclaw-user", ".openclaw", "cron", "jobs.json"),
+    );
+  });
 });
 
 describe("cron store", () => {

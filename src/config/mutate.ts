@@ -9,6 +9,10 @@ import { replaceFileAtomic } from "../infra/replace-file.js";
 import { isPathInside } from "../security/scan-paths.js";
 import { isRecord } from "../utils.js";
 import { maintainConfigBackups } from "./backup-rotation.js";
+import {
+  evaluateControlPlaneActivation,
+  type ControlPlaneActivationDecision,
+} from "./control-plane-protection.js";
 import { INCLUDE_KEY } from "./includes.js";
 import { createInvalidConfigError, formatInvalidConfigDetails } from "./io.invalid-config.js";
 import {
@@ -19,6 +23,7 @@ import {
   type ConfigWriteOptions,
   type ConfigWriteResult,
 } from "./io.js";
+import { stampConfigWriteMetadata } from "./io.meta.js";
 import { applyUnsetPathsForWrite, resolveManagedUnsetPathsForWrite } from "./io.write-prepare.js";
 import { assertConfigWriteAllowedInCurrentMode } from "./nix-mode-write-guard.js";
 import { resolveConfigPath } from "./paths.js";
@@ -252,6 +257,82 @@ function hashFileRaw(raw: string | null): string {
     hash.update(raw, "utf-8");
   }
   return hash.digest("hex");
+}
+
+function isProtectedLiveControlPlaneConfigPath(configPath: string): boolean {
+  const normalized = path.normalize(configPath);
+  return normalized.endsWith(path.join(".openclaw", "control-plane", "live", "openclaw.json"));
+}
+
+function formatControlPlaneDecision(
+  decision: Extract<ControlPlaneActivationDecision, { ok: false }>,
+): string {
+  return `control-plane manifest rejected (${decision.code}): ${decision.reason}`;
+}
+
+function resolveControlPlaneActivationTimestamp(manifest: unknown): string | null {
+  if (!isRecord(manifest) || typeof manifest.activationTimestamp !== "string") {
+    return null;
+  }
+  const activationTimestamp = manifest.activationTimestamp.trim();
+  if (!activationTimestamp || !Number.isFinite(Date.parse(activationTimestamp))) {
+    return null;
+  }
+  return activationTimestamp;
+}
+
+function enforceControlPlaneManifestForProtectedMutation(params: {
+  snapshot: ConfigFileSnapshot;
+  nextConfig: OpenClawConfig;
+  writeOptions: ConfigWriteOptions;
+}): ConfigWriteOptions {
+  const controlPlane = params.writeOptions.controlPlane;
+  if (!isProtectedLiveControlPlaneConfigPath(params.snapshot.path) && !controlPlane) {
+    return params.writeOptions;
+  }
+  if (isDeepStrictEqual(params.snapshot.sourceConfig, params.nextConfig)) {
+    return params.writeOptions;
+  }
+  if (!controlPlane) {
+    throw new Error(
+      `control-plane manifest rejected (malformed_manifest): protected config mutation requires a manifest for ${params.snapshot.path}`,
+    );
+  }
+  const activationTimestamp = resolveControlPlaneActivationTimestamp(controlPlane.manifest);
+  if (!activationTimestamp) {
+    throw new Error(
+      "control-plane manifest rejected (malformed_manifest): activationTimestamp is required",
+    );
+  }
+  const stampedCandidate = stampConfigWriteMetadata(
+    params.nextConfig,
+    activationTimestamp,
+    params.writeOptions.lastTouchedVersionOverride,
+  );
+  const candidateRaw = formatJsonFileValue(stampedCandidate);
+  const decision = evaluateControlPlaneActivation({
+    beforeConfig: params.snapshot.sourceConfig,
+    candidateConfig: stampedCandidate,
+    candidateRaw,
+    manifest: controlPlane.manifest,
+    approval: controlPlane.approval,
+    now: new Date(),
+    candidatePath: params.snapshot.path,
+    stagingRoot: path.dirname(params.snapshot.path),
+    actor: controlPlane.actor ?? "unknown-actor",
+    tool: controlPlane.tool ?? "config.mutate",
+    requestedServices: [...(controlPlane.requestedServices ?? [])],
+    restartScope: controlPlane.restartScope ?? "none",
+    auditSinkAvailable: controlPlane.auditSinkAvailable ?? true,
+    rollbackSinkAvailable: controlPlane.rollbackSinkAvailable ?? true,
+  });
+  if (!decision.ok) {
+    throw new Error(formatControlPlaneDecision(decision));
+  }
+  return {
+    ...params.writeOptions,
+    lastTouchedAtOverride: activationTimestamp,
+  };
 }
 
 async function readFileRawIfExists(filePath: string): Promise<string | null> {
@@ -500,18 +581,26 @@ async function replaceConfigFileUnlocked(params: {
   const afterWrite = resolveConfigWriteAfterWrite(
     params.afterWrite ?? params.writeOptions?.afterWrite,
   );
+  const commitWriteOptions = enforceControlPlaneManifestForProtectedMutation({
+    snapshot,
+    nextConfig: params.nextConfig,
+    writeOptions: {
+      ...writeOptions,
+      ...params.writeOptions,
+      afterWrite,
+    },
+  });
   let writeResult = await tryWriteSingleTopLevelIncludeMutation({
     snapshot,
     nextConfig: params.nextConfig,
     afterWrite,
-    writeOptions: params.writeOptions ?? writeOptions,
+    writeOptions: commitWriteOptions,
     io: params.io,
   });
   if (!writeResult) {
     const fallbackWriteOptions: ConfigWriteOptions = {
       baseSnapshot: snapshot,
-      ...writeOptions,
-      ...params.writeOptions,
+      ...commitWriteOptions,
       afterWrite,
     };
     const ioPreCommitRuntimePreflight = params.io

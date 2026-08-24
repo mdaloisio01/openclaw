@@ -128,9 +128,6 @@ function normalizeCheckName(value: string): ActivationContinuationCheckName | nu
   ) {
     return "runtime_identity";
   }
-  if (lower === "delivery_route" || lower.includes("visible") || lower.includes("delivery")) {
-    return "delivery_route";
-  }
   if (lower === "log_scan" || lower.includes("log")) {
     return "log_scan";
   }
@@ -145,6 +142,9 @@ function normalizeCheckName(value: string): ActivationContinuationCheckName | nu
   }
   if (lower === "visible_delivery" || lower.includes("visible source delivery")) {
     return "visible_delivery";
+  }
+  if (lower === "delivery_route" || lower.includes("visible") || lower.includes("delivery")) {
+    return "delivery_route";
   }
   if (raw.startsWith("manual:")) {
     return raw.slice(0, 160) as ActivationContinuationCheckName;

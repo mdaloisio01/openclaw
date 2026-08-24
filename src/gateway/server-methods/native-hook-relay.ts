@@ -10,14 +10,41 @@ import {
 } from "./perf-logging.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
+const NATIVE_HOOK_MAX_CONCURRENT_INVOCATIONS = 2;
+
+let activeNativeHookInvocations = 0;
+const pendingNativeHookInvocations: Array<() => void> = [];
+
+async function acquireNativeHookInvocationSlot(): Promise<() => void> {
+  if (activeNativeHookInvocations < NATIVE_HOOK_MAX_CONCURRENT_INVOCATIONS) {
+    activeNativeHookInvocations += 1;
+    return releaseNativeHookInvocationSlot;
+  }
+  await new Promise<void>((resolve) => {
+    pendingNativeHookInvocations.push(resolve);
+  });
+  return releaseNativeHookInvocationSlot;
+}
+
+function releaseNativeHookInvocationSlot(): void {
+  const next = pendingNativeHookInvocations.shift();
+  if (next) {
+    next();
+    return;
+  }
+  activeNativeHookInvocations = Math.max(0, activeNativeHookInvocations - 1);
+}
+
 export const nativeHookRelayHandlers: GatewayRequestHandlers = {
   "nativeHook.invoke": async ({ params, respond, context }) => {
     const perf = createGatewayPerfStageTimer();
     const cpuStarted = process.cpuUsage();
+    let releaseSlot: (() => void) | undefined;
     try {
       // Relay invocations are one-shot bridges into a live native harness.
       // Require the current generation so stale clients cannot post into a
       // newly registered relay with the same id.
+      releaseSlot = await acquireNativeHookInvocationSlot();
       const result: NativeHookRelayProcessResponse = await invokeNativeHookRelay({
         provider: params.provider,
         relayId: params.relayId,
@@ -58,6 +85,21 @@ export const nativeHookRelayHandlers: GatewayRequestHandlers = {
           error instanceof Error ? error.message : "native hook relay failed",
         ),
       );
+    } finally {
+      releaseSlot?.();
     }
+  },
+};
+
+export const testing = {
+  acquireNativeHookInvocationSlotForTests: acquireNativeHookInvocationSlot,
+  getNativeHookInvocationLimitForTests: () => NATIVE_HOOK_MAX_CONCURRENT_INVOCATIONS,
+  getNativeHookInvocationStateForTests: () => ({
+    active: activeNativeHookInvocations,
+    pending: pendingNativeHookInvocations.length,
+  }),
+  resetNativeHookInvocationStateForTests: () => {
+    activeNativeHookInvocations = 0;
+    pendingNativeHookInvocations.length = 0;
   },
 };

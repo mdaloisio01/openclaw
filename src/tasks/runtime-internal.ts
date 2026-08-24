@@ -1,5 +1,7 @@
 export {
   cancelTaskById,
+  adoptActiveTaskFromMirroredFlowById,
+  bindActiveSessionTaskToManagedFlowById,
   createTaskRecord,
   deleteTaskRecordById,
   ensureTaskRegistryReady,

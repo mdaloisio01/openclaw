@@ -50,6 +50,7 @@ import type { AgentInternalEvent } from "./internal-events.js";
 import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
 import type { SourceTurnDeliveryFacts } from "./source-turn-delivery-state.js";
 import {
+  loadSourceTurnDeliveryRegistry,
   persistSourceTurnDeliveryState,
   type SourceTurnDeliveryRow,
 } from "./source-turn-delivery-store.js";
@@ -159,6 +160,31 @@ async function persistSubagentSourceTurnDeliveryState(params: {
       `[warn] subagent source-turn delivery state write failed: ${formatErrorMessage(error)}`,
     );
     return undefined;
+  }
+}
+
+async function sourceTurnDeliveryAlreadyFinalDelivered(params: {
+  registryPath?: string;
+  recordId: string;
+}): Promise<boolean> {
+  if (!params.registryPath) {
+    return false;
+  }
+  try {
+    const registry = await loadSourceTurnDeliveryRegistry(params.registryPath);
+    const row = registry.rows.find((candidate) => candidate.id === params.recordId);
+    return Boolean(
+      row?.finalDeliveryDelivered ||
+      row?.sourceTurnState === "final_delivered" ||
+      row?.sourceTurnState === "failure_delivered",
+    );
+  } catch (error) {
+    defaultRuntime.log(
+      `[warn] Failed to read source-turn delivery registry before subagent announce dispatch: ${formatErrorMessage(
+        error,
+      )}`,
+    );
+    return false;
   }
 }
 
@@ -1754,6 +1780,17 @@ export async function deliverSubagentAnnouncement(params: {
       facts,
       currentStage,
     });
+  if (
+    await sourceTurnDeliveryAlreadyFinalDelivered({
+      registryPath: sourceTurnDeliveryRegistryPath,
+      recordId: sourceTurnDeliveryRecordId,
+    })
+  ) {
+    return {
+      delivered: true,
+      path: "direct",
+    };
+  }
   await recordSourceTurnDeliveryState({}, "accepted");
 
   const result = await runSubagentAnnounceDispatch({

@@ -185,7 +185,7 @@ describe("Codex native hook relay config", () => {
     });
   });
 
-  it("keeps selected no-policy PreToolUse installed with an unavailable no-op marker", () => {
+  it("clears selected no-policy PreToolUse instead of installing a noop command", () => {
     expect(
       buildCodexNativeHookRelayConfig({
         relay: createRelay({ inactiveEvents: ["pre_tool_use"] }),
@@ -193,30 +193,8 @@ describe("Codex native hook relay config", () => {
       }),
     ).toEqual({
       "features.hooks": true,
-      "hooks.PreToolUse": [
-        {
-          hooks: [
-            {
-              type: "command",
-              command:
-                "openclaw hooks relay --provider codex --relay-id relay-1 --generation generation-1 --event pre_tool_use --pre-tool-use-unavailable noop",
-              timeout: 5,
-              async: false,
-              statusMessage: "OpenClaw native hook relay",
-            },
-          ],
-        },
-      ],
-      "hooks.state": {
-        "/<session-flags>/config.toml:pre_tool_use:0:0": {
-          enabled: true,
-          trusted_hash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-        },
-        "<session-flags>/config.toml:pre_tool_use:0:0": {
-          enabled: true,
-          trusted_hash: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-        },
-      },
+      "hooks.PreToolUse": [],
+      "hooks.state": {},
     });
   });
 

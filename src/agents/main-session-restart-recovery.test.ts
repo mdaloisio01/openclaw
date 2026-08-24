@@ -670,6 +670,68 @@ describe("main-session-restart-recovery", () => {
     expect(callGateway).not.toHaveBeenCalled();
   });
 
+  it("accounts for scanned checkpoints when no session is recovery-eligible", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:main": {
+        sessionId: "main-session",
+        updatedAt: Date.now() - 10_000,
+        status: "running",
+      },
+      "agent:main:done": {
+        sessionId: "done-session",
+        updatedAt: Date.now() - 10_000,
+        status: "done",
+      },
+    });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: "current process owns this" },
+      { role: "toolResult", content: "done" },
+    ]);
+    await writeActiveWorkCheckpoint({
+      stateDir: tmpDir,
+      input: {
+        sessionKey: "agent:main:main",
+        sessionId: "main-session",
+        runId: "run-main",
+        requestingAgentToolPath: "gateway",
+        restartCommand: "gateway.restart",
+        restartIntent: "gateway restart",
+        activeObjective: "Continue the governed build.",
+        currentPhase: "post-restart validation pending",
+        lastCompletedProof: "restart requested",
+        nextValidationStep: "check recovery eligibility accounting",
+        stopConditions: ["recovery dispatch fails"],
+        pendingApprovalState: "none",
+        safeToAutoResume: true,
+        requiresOperatorReview: false,
+      },
+    });
+
+    const result = await recoverRestartAbortedMainSessions({
+      includeAccounting: true,
+      stateDir: tmpDir,
+    });
+
+    expect(result).toEqual({
+      recovered: 0,
+      failed: 0,
+      skipped: 0,
+      accounting: {
+        scannedCheckpoints: 1,
+        candidateSessions: 0,
+        ineligibleSessions: 2,
+        ineligibleRunningWithoutAbortMarker: 1,
+        ineligibleNonRunningSessions: 1,
+        skippedNonMainSessions: 0,
+        recoveredSessions: 0,
+        failedSessions: 0,
+        skippedSessions: 0,
+      },
+    });
+    expect(callGateway).not.toHaveBeenCalled();
+  });
+
   it("prefers a structured restart checkpoint over transcript-tail guessing", async () => {
     const sessionsDir = await makeSessionsDir();
     await writeStore(sessionsDir, {

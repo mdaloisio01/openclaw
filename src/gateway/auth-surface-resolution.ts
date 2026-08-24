@@ -164,6 +164,14 @@ export async function resolveGatewayInteractiveSurfaceAuth(params: {
     : trimToUndefined(env.OPENCLAW_GATEWAY_PASSWORD);
 
   if (params.surface === "remote") {
+    const hasConfiguredRemoteToken = hasConfiguredSecretInput(
+      params.config.gateway?.remote?.token,
+      params.config.secrets?.defaults,
+    );
+    const hasConfiguredRemotePassword = hasConfiguredSecretInput(
+      params.config.gateway?.remote?.password,
+      params.config.secrets?.defaults,
+    );
     const remoteToken = explicitToken
       ? { value: explicitToken }
       : await resolveGatewayCredential({
@@ -173,18 +181,31 @@ export async function resolveGatewayInteractiveSurfaceAuth(params: {
           path: "gateway.remote.token",
           value: params.config.gateway?.remote?.token,
         });
-    const remotePassword =
-      explicitPassword || envPassword
-        ? { value: explicitPassword ?? envPassword }
-        : await resolveGatewayCredential({
+    const remotePassword = explicitPassword
+      ? { value: explicitPassword }
+      : hasConfiguredRemotePassword
+        ? await resolveGatewayCredential({
             config: params.config,
             env,
             diagnostics,
             path: "gateway.remote.password",
             value: params.config.gateway?.remote?.password,
-          });
-    const token = explicitToken ?? remoteToken.value ?? envToken;
-    const password = explicitPassword ?? envPassword ?? remotePassword.value;
+          })
+        : envPassword
+          ? { value: envPassword }
+          : await resolveGatewayCredential({
+              config: params.config,
+              env,
+              diagnostics,
+              path: "gateway.remote.password",
+              value: params.config.gateway?.remote?.password,
+            });
+    const token =
+      explicitToken ?? remoteToken.value ?? (hasConfiguredRemoteToken ? undefined : envToken);
+    const password =
+      explicitPassword ??
+      remotePassword.value ??
+      (hasConfiguredRemotePassword ? undefined : envPassword);
     return token || password
       ? { token, password }
       : {
@@ -222,7 +243,7 @@ export async function resolveGatewayInteractiveSurfaceAuth(params: {
           path: "gateway.auth.token",
           value: params.config.gateway?.auth?.token,
         });
-    const token = explicitToken ?? localToken.value ?? envToken;
+    const token = explicitToken ?? localToken.value ?? (hasConfiguredToken ? undefined : envToken);
     return {
       token,
       failureReason: token
@@ -232,17 +253,27 @@ export async function resolveGatewayInteractiveSurfaceAuth(params: {
   };
 
   const resolvePassword = async () => {
-    const localPassword =
-      explicitPassword || envPassword
-        ? { value: explicitPassword ?? envPassword }
-        : await resolveGatewayCredential({
+    const localPassword = explicitPassword
+      ? { value: explicitPassword }
+      : hasConfiguredPassword
+        ? await resolveGatewayCredential({
             config: params.config,
             env,
             diagnostics,
             path: "gateway.auth.password",
             value: params.config.gateway?.auth?.password,
-          });
-    const password = explicitPassword ?? envPassword ?? localPassword.value;
+          })
+        : envPassword
+          ? { value: envPassword }
+          : await resolveGatewayCredential({
+              config: params.config,
+              env,
+              diagnostics,
+              path: "gateway.auth.password",
+              value: params.config.gateway?.auth?.password,
+            });
+    const password =
+      explicitPassword ?? localPassword.value ?? (hasConfiguredPassword ? undefined : envPassword);
     return {
       password,
       failureReason: password

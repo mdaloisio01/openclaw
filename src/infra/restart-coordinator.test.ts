@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CLEANUP_WATCHDOG_POLICY_VERSION } from "../governance/cleanup-watchdog-policy.js";
 import {
+  SAFE_GATEWAY_RESTART_POST_RESTART_PROOF,
   createSafeGatewayRestartPreflight,
   requestSafeGatewayRestart,
 } from "./restart-coordinator.js";
@@ -31,6 +33,10 @@ describe("safe gateway restart coordinator", () => {
     const preflight = createSafeGatewayRestartPreflight(safeInspect());
 
     expect(preflight).toEqual({
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      restartReadinessGate: "runtime_preflight",
+      missionResumptionGate: "post_restart_proof_required",
+      postRestartProofRequired: SAFE_GATEWAY_RESTART_POST_RESTART_PROOF,
       safe: true,
       counts: {
         queueSize: 0,
@@ -66,6 +72,12 @@ describe("safe gateway restart coordinator", () => {
     );
 
     expect(preflight.safe).toBe(false);
+    expect(preflight.policyVersion).toBe(CLEANUP_WATCHDOG_POLICY_VERSION);
+    expect(preflight.postRestartProofRequired).toEqual([
+      "runtime_identity_loaded",
+      "mission_resumption_valid_executor_or_durable_wait",
+      "watchdog_clean_with_execution_or_continuation_coverage",
+    ]);
     expect(preflight.counts.totalActive).toBe(5);
     expect(preflight.blockers.map((blocker) => blocker.kind)).toEqual([
       "queue",
@@ -133,6 +145,7 @@ describe("safe gateway restart coordinator", () => {
     expect(result.status).toBe("deferred");
     expect(scheduleGatewaySigusr1Restart).toHaveBeenCalledWith({
       delayMs: 0,
+      deferralTimeoutMs: 0,
       reason: "test.safe",
     });
   });
@@ -178,9 +191,50 @@ describe("safe gateway restart coordinator", () => {
     expect(result.preflight.safe).toBe(false);
     expect(scheduleGatewaySigusr1Restart).toHaveBeenCalledWith({
       delayMs: 0,
+      deferralTimeoutMs: 0,
       reason: "test.skip-deferral",
       skipDeferral: true,
     });
+  });
+
+  it("blocks forced restart bypass while source-turn reply work is active", () => {
+    const result = requestSafeGatewayRestart({
+      reason: "test.skip-deferral.active-reply",
+      skipDeferral: true,
+      inspect: safeInspect({
+        getPendingReplies: () => 1,
+      }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: "blocked",
+      error:
+        "forced gateway restart blocked: active source turn work has pending replies or embedded runs",
+      preflight: {
+        counts: expect.objectContaining({ pendingReplies: 1 }),
+      },
+    });
+    expect(scheduleGatewaySigusr1Restart).not.toHaveBeenCalled();
+  });
+
+  it("blocks forced restart bypass while embedded source-turn work is active", () => {
+    const result = requestSafeGatewayRestart({
+      reason: "test.skip-deferral.embedded-run",
+      skipDeferral: true,
+      inspect: safeInspect({
+        getEmbeddedRuns: () => 1,
+      }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: "blocked",
+      preflight: {
+        counts: expect.objectContaining({ embeddedRuns: 1 }),
+      },
+    });
+    expect(scheduleGatewaySigusr1Restart).not.toHaveBeenCalled();
   });
 
   it("omits skipDeferral when not requested", () => {
@@ -201,6 +255,7 @@ describe("safe gateway restart coordinator", () => {
 
     expect(scheduleGatewaySigusr1Restart).toHaveBeenCalledWith({
       delayMs: 0,
+      deferralTimeoutMs: 0,
       reason: "test.no-skip",
     });
   });
@@ -225,6 +280,7 @@ describe("safe gateway restart coordinator", () => {
 
     expect(scheduleGatewaySigusr1Restart).toHaveBeenCalledWith({
       delayMs: 0,
+      deferralTimeoutMs: 0,
       reason: "test.continuation",
       emitHooks,
     });

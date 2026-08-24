@@ -1,3 +1,5 @@
+import type { GovernedFinalReleaseDecisionInput } from "../governance/governed-final-release-decision.js";
+import type { CloseoutAdmissionInput } from "../governance/mission-manifest.types.js";
 import type {
   InteractiveReply,
   MessagePresentation,
@@ -190,6 +192,10 @@ export type ReplyPayloadMetadata = {
     nextOwner?: string;
     executionRunningNow?: boolean;
   };
+  /** Optional deterministic false-closeout admission input for governed terminal replies. */
+  falseCloseoutAdmission?: CloseoutAdmissionInput;
+  /** Shared governed final-release check for hard final-output adapters. */
+  governedFinalRelease?: GovernedFinalReleaseDecisionInput;
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();

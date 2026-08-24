@@ -323,6 +323,18 @@ describe("config schema regressions", () => {
     expect(res.ok).toBe(true);
   });
 
+  it("accepts browser SSRF allowedOrigins", () => {
+    const res = validateConfigObject({
+      browser: {
+        ssrfPolicy: {
+          allowedOrigins: ["http://localhost:18789", "http://127.0.0.1:18789"],
+        },
+      },
+    });
+
+    expect(res.ok).toBe(true);
+  });
+
   it("accepts browser local startup timeout settings", () => {
     const res = validateConfigObject({
       browser: {

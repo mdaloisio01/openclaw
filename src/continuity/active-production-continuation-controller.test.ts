@@ -4,6 +4,7 @@ import {
   buildTaskFlowDispatchAction,
   createActiveProductionDispatchReceipt,
   evaluateActiveProductionFinality,
+  evaluateActiveProductionRuntimeProbes,
   hasValidContinuationDispatchReceipt,
   isActiveProductionHardBoundary,
   resolveActiveProductionBoundary,
@@ -137,6 +138,41 @@ describe("active-production-continuation-controller", () => {
       allowed: false,
       result: "continuation_required",
       boundary: "watchdog_recovery",
+    });
+  });
+
+  it("classifies runtime probes as restart recovery continuation evidence", () => {
+    expect(
+      evaluateActiveProductionRuntimeProbes({
+        capturedAt: 1,
+        activeToolAgeMs: 34_000,
+        pendingReplyCount: 1,
+        restartRecoveryFailureCount: 3,
+        eventLoopUtilization: 1,
+        eventLoopDelayP99Ms: 8_002,
+        eventLoopDelayMaxMs: 9_100,
+        activeEmbeddedRunCount: 1,
+      }),
+    ).toEqual({
+      boundary: "runtime_restart_recovery",
+      continuationRequired: true,
+      reasons: [
+        "active_tool_age_ms=34000",
+        "pending_reply_count=1",
+        "restart_recovery_failure_count=3",
+        "event_loop_utilization=1",
+        "event_loop_delay_p99_ms=8002",
+        "event_loop_delay_max_ms=9100",
+        "active_embedded_run_count=1",
+      ],
+    });
+  });
+
+  it("keeps empty runtime probes neutral", () => {
+    expect(evaluateActiveProductionRuntimeProbes({ capturedAt: 1 })).toEqual({
+      boundary: "none",
+      continuationRequired: false,
+      reasons: [],
     });
   });
 });

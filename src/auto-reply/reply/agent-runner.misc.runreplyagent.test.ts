@@ -3004,7 +3004,7 @@ describe("runReplyAgent private message_tool_only final warning (#85714)", () =>
     finalAssistantText?: string;
     payloadText?: string;
     successfulCronAdds?: number;
-  }) {
+  }): Promise<SessionEntry | undefined> {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-stranded-"));
     const storePath = path.join(tmp, "sessions.json");
     const sessionKey = "stranded";
@@ -3087,12 +3087,18 @@ describe("runReplyAgent private message_tool_only final warning (#85714)", () =>
       shouldInjectGroupIntro: false,
       typingMode: "instant",
     });
+    return loadSessionStore(storePath)[sessionKey];
   }
 
   it("warns when a substantive private final reply never used the message tool", async () => {
-    await runPrivateFinalCase({});
+    const stored = await runPrivateFinalCase({});
     expect(warnPrivateFinalSpy).toHaveBeenCalledTimes(1);
     expect(warnPrivateFinalSpy.mock.calls[0]?.[0]).toMatchObject({ sessionKey: "stranded" });
+    expect(stored?.pendingFinalDelivery).toBe(true);
+    expect(stored?.pendingFinalDeliveryText).toContain("Here is the answer");
+    expect(stored?.pendingFinalDeliveryLastError).toBe(
+      "message_tool_only final reply missed required delivery tool",
+    );
   });
 
   it("warns for a short substantive private final reply", async () => {

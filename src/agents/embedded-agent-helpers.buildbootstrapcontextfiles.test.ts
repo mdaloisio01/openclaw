@@ -122,6 +122,84 @@ describe("buildBootstrapContextFiles", () => {
     expect(result?.content).toContain(requiredScopedInstruction);
     expect(result?.content).toContain("[...truncated, read AGENTS.md for full content...]");
   });
+  it("keeps restart-continuation and delivery policy lines from oversized AGENTS.md", () => {
+    const continuationPolicy =
+      "- Required restart continuation: persist a durable checkpoint before governed restart and recover automatically.";
+    const deliveryPolicy =
+      "- Required visible reply delivery: message_tool_only final replies must use the message tool or leave repair state.";
+    const content = [
+      "# Root policy",
+      "A".repeat(900),
+      continuationPolicy,
+      "B".repeat(900),
+      deliveryPolicy,
+      "C".repeat(900),
+      "tail marker",
+    ].join("\n");
+    const [result] = buildBootstrapContextFiles([makeFile({ content })], {
+      maxChars: 700,
+    });
+
+    expect(result?.content.length).toBeLessThanOrEqual(700);
+    expect(result?.content).toContain("[Policy digest from AGENTS.md]");
+    expect(result?.content).toContain(continuationPolicy);
+    expect(result?.content).toContain(deliveryPolicy);
+  });
+  it("keeps USER.md Cleanup Crew delivery and watchdog rules when USER.md is truncated", () => {
+    const deliveryRule =
+      "- Milestone report delivery law: reports must be delivered visibly in chat, not only as artifacts.";
+    const watchdogRule =
+      "- Watchdog NEEDS_REVIEW requires explicit reconciliation before adjacent production work.";
+    const canonicalPolicyRule =
+      "- Cleanup Crew canonical policy: ACTION_BLOCKED / MALFORMED_POLICY_INPUT; MISSION_ABORTED needs exhaustion proof.";
+    const content = [
+      "# User policy",
+      "A".repeat(900),
+      deliveryRule,
+      "B".repeat(900),
+      watchdogRule,
+      "C".repeat(900),
+      canonicalPolicyRule,
+      "D".repeat(900),
+      "tail marker",
+    ].join("\n");
+    const [result] = buildBootstrapContextFiles(
+      [makeFile({ name: "USER.md", path: "/tmp/USER.md", content })],
+      {
+        maxChars: 1200,
+      },
+    );
+
+    expect(result?.content.length).toBeLessThanOrEqual(1200);
+    expect(result?.content).toContain("[Policy digest from USER.md]");
+    expect(result?.content).toContain(deliveryRule);
+    expect(result?.content).toContain(watchdogRule);
+    expect(result?.content).toContain(canonicalPolicyRule);
+    expect(result?.content).toContain("[...truncated, read USER.md for full content...]");
+  });
+  it("keeps canonical watchdog clean-state and worker-coverage rules when policy files are truncated", () => {
+    const watchdogCoverageRule =
+      "- Cleanup watchdog canonical policy version cleanup-watchdog-governance-20260715T1442Z requires P2_ACTIVE_NO_WORKER before pending_report_delivery, worker_coverage for CLEAN, and mission resumption after restart.";
+    const fencingRule =
+      "- Duplicate suppression affects chat delivery only; fencing and active_no_worker repair work still execute.";
+    const content = [
+      "# Root policy",
+      "A".repeat(900),
+      watchdogCoverageRule,
+      "B".repeat(900),
+      fencingRule,
+      "C".repeat(900),
+      "tail marker",
+    ].join("\n");
+    const [result] = buildBootstrapContextFiles([makeFile({ content })], {
+      maxChars: 1200,
+    });
+
+    expect(result?.content.length).toBeLessThanOrEqual(1200);
+    expect(result?.content).toContain("[Policy digest from AGENTS.md]");
+    expect(result?.content).toContain(watchdogCoverageRule);
+    expect(result?.content).toContain(fencingRule);
+  });
   it("keeps bootstrap bytes in tiny per-file budgets when the marker is longer than the limit", () => {
     const maxChars = 64;
     const content = `HEAD-${"a".repeat(1_000)}-TAIL`;

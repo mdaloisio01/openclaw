@@ -59,6 +59,7 @@ const mockConfig = vi.hoisted(() => {
     exists: true,
     config: initial as TestConfig,
     hash: "mock-hash-0" as string | undefined,
+    version: 0,
   };
   const cloneConfig = () => structuredClone(state.config);
   const snapshot = () => {
@@ -85,12 +86,31 @@ const mockConfig = vi.hoisted(() => {
       state.exists = true;
       state.config = {};
       state.hash = "mock-hash-0";
+      state.version = 0;
     },
     missing(pathLocal: string) {
       state.path = pathLocal;
       state.exists = false;
       state.config = {};
       state.hash = undefined;
+      state.version = 0;
+    },
+    setPath(dotPath: string, value: unknown) {
+      const next = cloneConfig();
+      const segments = dotPath.split(".");
+      let current = next;
+      for (const segment of segments.slice(0, -1)) {
+        const child = current[segment];
+        if (!child || typeof child !== "object") {
+          current[segment] = {};
+        }
+        current = current[segment] as TestConfig;
+      }
+      current[segments.at(-1) ?? dotPath] = value;
+      state.exists = true;
+      state.config = next;
+      state.version += 1;
+      state.hash = `mock-hash-${state.version}`;
     },
     currentConfig() {
       return cloneConfig();
@@ -338,14 +358,47 @@ describe("parseCrestodianOperation", () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "crestodian-config-set-"));
     vi.stubEnv("OPENCLAW_STATE_DIR", tempDir);
     const { runtime, lines } = createCrestodianTestRuntime();
-    const runConfigSet = vi.fn(async () => {});
+    const runConfigSet = vi.fn(async (opts: { path?: string; value?: string }) => {
+      mockConfig.setPath(opts.path ?? "", opts.value);
+    });
+    const registry = {
+      integrity_status: vi.fn(async () => ({ valid: true })),
+      create_operation: vi.fn(async () => ({ operation_id: "op-config-set", revision: 1 })),
+      transition_operation: vi.fn(async () => ({ revision: 2 })),
+    };
 
     const result = await executeCrestodianOperation(
       { kind: "config-set", path: "gateway.port", value: "19001" },
       runtime,
       {
         approved: true,
-        deps: { runConfigSet },
+        deps: {
+          runConfigSet,
+          configSetCommonChange: {
+            registry,
+            missionAdmission: {
+              result: "ALLOW_BOUNDED",
+              admittedStageId: "one_configuration_write_entrypoint_adapter_migration",
+            },
+            attribution: {
+              actor: "test-actor",
+              session: "test-session",
+              tool: "src/crestodian/operations.ts:config-set",
+              workOrder: "test-work-order",
+            },
+            authority: {
+              authorityId: "src/cli/config-cli.ts:runConfigSet",
+              writerPath: "src/config/mutate.ts:replaceConfigFile",
+              rollbackBoundary: "config_mutation_base_hash_atomic_write",
+            },
+            expectedConfigIdentity: {
+              beforeHash: "mock-hash-0",
+              path: "/tmp/openclaw.json",
+            },
+            idempotencyKey: "config-set-test",
+            expectedRegistryRevision: 0,
+          },
+        },
         auditDetails: { rescue: true, channel: "whatsapp" },
       },
     );
@@ -356,6 +409,13 @@ describe("parseCrestodianOperation", () => {
       value: "19001",
       cliOptions: {},
     });
+    expect(registry.create_operation).toHaveBeenCalledTimes(1);
+    expect(registry.transition_operation).toHaveBeenCalledTimes(3);
+    expect(registry.transition_operation.mock.calls.map((call) => call[1])).toEqual([
+      "preflight_passed",
+      "applied",
+      "post_action_pending",
+    ]);
     expect(lines.join("\n")).toContain("[crestodian] done: config.set");
     const auditPath = path.join(tempDir, "audit", "crestodian.jsonl");
     const audit = JSON.parse((await fs.readFile(auditPath, "utf8")).trim());
@@ -366,8 +426,31 @@ describe("parseCrestodianOperation", () => {
         rescue: true,
         channel: "whatsapp",
         path: "gateway.port",
+        commonChangeOperationId: "op-config-set",
+        lifecycleBoundary: "post_action_pending",
       },
     );
+  });
+
+  it("blocks the old config set bypass when common-change context is unavailable", async () => {
+    const { runtime } = createCrestodianTestRuntime();
+    const runConfigSet = vi.fn(async () => {
+      mockConfig.setPath("gateway.port", "19001");
+    });
+
+    await expect(
+      executeCrestodianOperation(
+        { kind: "config-set", path: "gateway.port", value: "19001" },
+        runtime,
+        {
+          approved: true,
+          deps: { runConfigSet },
+        },
+      ),
+    ).rejects.toThrow("common_change_config_set_blocked:registry_unavailable");
+
+    expect(runConfigSet).not.toHaveBeenCalled();
+    expect(mockConfig.currentConfig()).toEqual({});
   });
 
   it("applies SecretRef config set through typed deps and writes an audit entry", async () => {

@@ -1,7 +1,16 @@
 import { persistCleanupCrewContinuityGateDecision } from "../../commands/cleanup-plan.js";
-import type { AuthoritySource, ContinuityGateIssue } from "../../continuity/continuity-gate-v2.js";
-import { classifyCleanupCrewBlocker } from "../../continuity/continuity-gate-v2.js";
+import type {
+  AuthoritySource,
+  CleanupCrewTypedDecisionReceipt,
+  ContinuityGateIssue,
+} from "../../continuity/continuity-gate-v2.js";
+import { createCleanupCrewBootstrapB0TypedDecisionReceipt } from "../../continuity/continuity-gate-v2.js";
+import { evaluateFalseCloseoutAdmission } from "../../governance/false-closeout-admission-controller.js";
+import { writeFalseCloseoutAdmissionDecisionReceipt } from "../../governance/false-closeout-runtime-evidence.js";
+import type { CompletionDecision, MissionMode } from "../../governance/mission-manifest.types.js";
+import { getReplyPayloadMetadata, type ReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
+import { buildRuntimeCloseoutAdmissionInput } from "./false-closeout-admission-producer.js";
 import type { ReplyDispatcher } from "./reply-dispatcher.types.js";
 
 export type ActiveRunContinuationEventType =
@@ -11,6 +20,10 @@ export type ActiveRunContinuationEventType =
   | "NEXT_EXECUTABLE_STEP_STARTED"
   | "TERMINAL_CLOSEOUT_ATTEMPTED"
   | "TERMINAL_CLOSEOUT_ALLOWED"
+  | "FALSE_CLOSEOUT_ADMISSION_OFF_BYPASSED"
+  | "FALSE_CLOSEOUT_ADMISSION_SHADOW_REJECTED"
+  | "FALSE_CLOSEOUT_ADMISSION_ENFORCED_REJECTED"
+  | "FALSE_CLOSEOUT_ADMISSION_ALLOWED"
   | "CLEANUP_CREW_TERMINAL_CLOSEOUT_REJECTED"
   | "ACTIVE_RUN_CONTINUITY_VIOLATION";
 
@@ -49,6 +62,7 @@ export type ActiveRunContinuityGatePersistenceOptions = {
 export type CleanupCrewFinalResponseGuardContext = {
   currentTurnText?: string;
   activeCleanupCrewMission?: boolean;
+  falseCloseoutAdmissionMode?: MissionMode;
 };
 
 export type CleanupCrewFinalResponseGateDecision = {
@@ -63,6 +77,7 @@ export type CleanupCrewFinalResponseGateDecision = {
   hardBlockerNamedWithProof: boolean;
   blockerArtifactPresent: boolean;
   laneCDecisionRequired: boolean;
+  typedDecisionReceipt: CleanupCrewTypedDecisionReceipt;
   violationReason?: string;
 };
 
@@ -145,38 +160,6 @@ function isTerminalAttemptText(text: string): boolean {
   return false;
 }
 
-function hasRepairableBlocker(text: string): boolean {
-  return includesAny(text, [
-    "repairable blocker",
-    "repairable prerequisite blocker",
-    "downstream phase blocked",
-    "watchdog needs_review",
-    "watchdog stoppage captured",
-    "routed to cleanup crew recovery",
-    "cleanup crew recovery",
-    "needs_review",
-    "phase 13 watchdog",
-    "phase 13",
-    "stop adjacent production",
-    "stop_adjacent_phase",
-    "stop_phase_transition",
-    "continue cleanup repair",
-    "continue_cleanup_repair",
-    "next repair classification",
-    "lawful repair path",
-    "proof gap",
-    "proof_gap",
-    "stoppage captured",
-    "plan amendment required",
-    "recovery amendment",
-    "lane a",
-    "lane b",
-    "memory append lane",
-    "memory flush dirty-tree defect",
-    "append-only memory",
-  ]);
-}
-
 function hasNextRepairPath(text: string): boolean {
   return includesAny(text, [
     "next repair path",
@@ -202,26 +185,11 @@ function hasNextRepairPath(text: string): boolean {
   ]);
 }
 
-function hasUnsupportedHardBlocker(text: string): boolean {
-  return includesAny(text, [
-    "raw db",
-    "raw-db",
-    "unsafe duplicate worker restart",
-    "authority cannot be verified",
-    "live path truth cannot be verified",
-    "supported owner surface cannot be verified",
-    "no lawful repair path",
-    "no repair path",
-    "continuation is impossible",
-  ]);
-}
-
-function hasNamedHardBlockerProof(text: string): boolean {
+function hasTerminalBlockerProofArtifacts(text: string): boolean {
   return (
     (text.includes("blocker:") || text.includes("packet blocked:")) &&
     (text.includes("proof:") || text.includes("why continuation is not lawful:")) &&
-    hasBlockerArtifact(text) &&
-    hasUnsupportedHardBlocker(text)
+    hasBlockerArtifact(text)
   );
 }
 
@@ -248,6 +216,40 @@ function hasLaneCDecisionRequired(text: string): boolean {
   );
 }
 
+function typedDecisionContinuesRepair(receipt: CleanupCrewTypedDecisionReceipt): boolean {
+  return (
+    receipt.validation.ok &&
+    receipt.outcome === "REPAIR_AND_CONTINUE" &&
+    receipt.reason_code === "TECHNICAL_REPAIR"
+  );
+}
+
+function typedDecisionNamesNextRepair(receipt: CleanupCrewTypedDecisionReceipt): boolean {
+  return (
+    typedDecisionContinuesRepair(receipt) &&
+    receipt.next_action === "continue_cleanup_repair_through_canonical_policy"
+  );
+}
+
+function typedDecisionBlocksTerminalCloseout(receipt: CleanupCrewTypedDecisionReceipt): boolean {
+  return (
+    !receipt.validation.ok ||
+    receipt.outcome === "ACTION_BLOCKED" ||
+    receipt.outcome === "PHASE_BLOCKED" ||
+    receipt.outcome === "EXTERNAL_DEPENDENCY" ||
+    receipt.outcome === "OWNER_DECISION_REQUIRED" ||
+    receipt.outcome === "MISSION_ABORTED"
+  );
+}
+
+function typedDecisionIsHardTerminalBlocker(receipt: CleanupCrewTypedDecisionReceipt): boolean {
+  return (
+    typedDecisionBlocksTerminalCloseout(receipt) &&
+    receipt.impact === "MISSION" &&
+    receipt.next_action === "record_lawful_blocker_artifact_before_terminal_closeout"
+  );
+}
+
 export function resolveCleanupCrewFinalResponseGate(params: {
   currentTurnText?: string;
   responseText?: string;
@@ -262,20 +264,24 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   const explicitStopRequest = isExplicitStopRequest(currentTurnText);
   const milestoneVisibilityReport = isMilestoneVisibilityReport(responseText);
   const terminalAttempt = isTerminalAttemptText(responseText);
-  const blockerClassification = classifyCleanupCrewBlocker({
+  const typedDecisionReceipt = createCleanupCrewBootstrapB0TypedDecisionReceipt({
+    missionId: "cleanup-crew-b0-final-response-gate",
+    phase: "phase5_mechanical_policy_unification_b0_adapter",
+    owner: "Will",
     summary: responseText,
     blocker: responseText,
     nextRepairPathKnown: hasNextRepairPath(responseText) || milestoneVisibilityReport,
+    evidence: ["active-run-continuation-guard:b0-compatibility-input"],
+    rollbackProofRef: "active-run-continuation-guard:previous-local-classifier",
   });
-  const repairableBlocker =
-    hasRepairableBlocker(responseText) || blockerClassification.canContinueCleanupRepair;
-  const nextRepairPathKnown =
-    hasNextRepairPath(responseText) ||
-    milestoneVisibilityReport ||
-    blockerClassification.scopedStops.includes("continue_cleanup_repair");
+  const repairableBlocker = typedDecisionContinuesRepair(typedDecisionReceipt);
+  const nextRepairPathKnown = typedDecisionNamesNextRepair(typedDecisionReceipt);
   const blockerArtifactPresent = hasBlockerArtifact(responseText);
   const laneCDecisionRequired = hasLaneCDecisionRequired(responseText);
-  const hardBlockerNamedWithProof = hasNamedHardBlockerProof(responseText);
+  const hardBlockerNamedWithProof =
+    typedDecisionIsHardTerminalBlocker(typedDecisionReceipt) &&
+    hasTerminalBlockerProofArtifacts(responseText);
+  const typedTerminalBlocker = typedDecisionBlocksTerminalCloseout(typedDecisionReceipt);
 
   if (!activeCleanupCrewMission || !terminalAttempt) {
     return {
@@ -290,6 +296,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       hardBlockerNamedWithProof,
       blockerArtifactPresent,
       laneCDecisionRequired,
+      typedDecisionReceipt,
     };
   }
 
@@ -311,6 +318,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       hardBlockerNamedWithProof,
       blockerArtifactPresent,
       laneCDecisionRequired,
+      typedDecisionReceipt,
     };
   }
 
@@ -327,14 +335,16 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       hardBlockerNamedWithProof,
       blockerArtifactPresent,
       laneCDecisionRequired,
+      typedDecisionReceipt,
       violationReason:
         "Cleanup Crew Lane C terminal stop requires a blocker artifact naming the Mark decision",
     };
   }
 
   if (
-    hasUnsupportedHardBlocker(responseText) ||
-    (blockerClassification.hardStopWholeMission && hardBlockerNamedWithProof === false)
+    typedTerminalBlocker &&
+    typedDecisionIsHardTerminalBlocker(typedDecisionReceipt) &&
+    hardBlockerNamedWithProof === false
   ) {
     return {
       allowed: false,
@@ -348,6 +358,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       hardBlockerNamedWithProof,
       blockerArtifactPresent,
       laneCDecisionRequired,
+      typedDecisionReceipt,
       violationReason:
         "Cleanup Crew hard-blocker terminal close requires the exact hard blocker and proof",
     };
@@ -366,6 +377,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       hardBlockerNamedWithProof,
       blockerArtifactPresent,
       laneCDecisionRequired,
+      typedDecisionReceipt,
       violationReason:
         "Cleanup Crew final response attempted terminal blocked/done/closeout while a lawful repair path is known or derivable",
     };
@@ -383,6 +395,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
     hardBlockerNamedWithProof,
     blockerArtifactPresent,
     laneCDecisionRequired,
+    typedDecisionReceipt,
   };
 }
 
@@ -408,6 +421,24 @@ function buildBlockedCloseoutPayload(reason: string): ReplyPayload {
     isStatusNotice: true,
     isError: true,
   };
+}
+
+function buildFalseCloseoutShadowPayload(decision: CompletionDecision): ReplyPayload {
+  return {
+    text: `FALSE_CLOSEOUT_SHADOW_REJECTED: ${decision.rejectionCodes.join(", ")}`,
+    isStatusNotice: true,
+  };
+}
+
+function persistFalseCloseoutAdmissionDecision(
+  input: NonNullable<ReplyPayloadMetadata["falseCloseoutAdmission"]>,
+  decision: CompletionDecision,
+): string | undefined {
+  try {
+    return writeFalseCloseoutAdmissionDecisionReceipt({ input, decision }).path;
+  } catch {
+    return undefined;
+  }
 }
 
 function emitViolationNotice(dispatcher: ReplyDispatcher, state: GuardState, reason: string): void {
@@ -542,11 +573,13 @@ export function recordNonTerminalBuildUpdateEmitted(
   state.lastUpdateWasNonTerminal = true;
   state.lastNonTerminalDetail = detail;
   state.nextExecutableStepStarted = false;
-  state.blocker = false;
-  state.blockerType = undefined;
   state.continuityGatePersistenceQueued = false;
   recordEvent(state, "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail);
-  recordEvent(state, "BLOCKER_STATE", "false");
+  recordEvent(
+    state,
+    "BLOCKER_STATE",
+    state.blocker ? `true:${state.blockerType ?? "unknown"}` : "false",
+  );
 }
 
 export function recordNextExecutableStepStarted(
@@ -587,6 +620,59 @@ export function allowTerminalCloseout(
       activeCleanupCrewMission: state.cleanupCrewFinalResponse?.activeCleanupCrewMission,
       responseText: payload?.text,
     });
+    const falseCloseoutAdmission =
+      (payload ? getReplyPayloadMetadata(payload)?.falseCloseoutAdmission : undefined) ??
+      buildRuntimeCloseoutAdmissionInput({
+        activeCleanupCrewMission: cleanupCrewDecision.activeCleanupCrewMission,
+        terminalAttempt: cleanupCrewDecision.terminalAttempt,
+        currentTurnText: state.cleanupCrewFinalResponse?.currentTurnText,
+        responseText: payload?.text,
+        mode: state.cleanupCrewFinalResponse?.falseCloseoutAdmissionMode,
+        activeRunStarted: state.activeRunStarted,
+        executionRunningNow: getReplyPayloadMetadata(payload ?? {})?.activeRunContinuation
+          ?.executionRunningNow,
+        nextExecutableStepStarted: state.nextExecutableStepStarted,
+        pendingContinuationRequirement: hasPendingContinuationRequirement(state),
+        blocker: state.blocker,
+      });
+    if (falseCloseoutAdmission) {
+      const decision = evaluateFalseCloseoutAdmission(falseCloseoutAdmission);
+      const receiptPath = persistFalseCloseoutAdmissionDecision(falseCloseoutAdmission, decision);
+      if (decision.mode === "off") {
+        recordEvent(
+          state,
+          "FALSE_CLOSEOUT_ADMISSION_OFF_BYPASSED",
+          `${decision.state}:${decision.rejectionCodes.join(",")}${receiptPath ? `:${receiptPath}` : ""}`,
+        );
+      } else if (decision.allowed) {
+        recordEvent(
+          state,
+          "FALSE_CLOSEOUT_ADMISSION_ALLOWED",
+          `${decision.mode}:${decision.state}${receiptPath ? `:${receiptPath}` : ""}`,
+        );
+      } else if (decision.mode === "enforce") {
+        const violationReason = `False-closeout admission controller rejected terminal closeout: ${decision.rejectionCodes.join(", ")}`;
+        recordEvent(
+          state,
+          "FALSE_CLOSEOUT_ADMISSION_ENFORCED_REJECTED",
+          `${violationReason}${receiptPath ? ` receipt=${receiptPath}` : ""}`,
+        );
+        recordEvent(state, "ACTIVE_RUN_CONTINUITY_VIOLATION", violationReason);
+        persistContinuityGateDecision(state, {
+          reason: violationReason,
+          kind: "terminal_closeout_rejected",
+        });
+        emitViolationNotice(dispatcher, state, violationReason);
+        return { allowed: false, violationReason };
+      } else if (decision.mode === "shadow") {
+        recordEvent(
+          state,
+          "FALSE_CLOSEOUT_ADMISSION_SHADOW_REJECTED",
+          `${decision.rejectionCodes.join(",")}${receiptPath ? `:${receiptPath}` : ""}`,
+        );
+        dispatcher.sendToolResult(buildFalseCloseoutShadowPayload(decision));
+      }
+    }
     if (
       cleanupCrewDecision.activeCleanupCrewMission &&
       cleanupCrewDecision.milestoneVisibilityReport &&

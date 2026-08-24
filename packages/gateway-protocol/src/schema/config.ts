@@ -23,6 +23,8 @@ export const ConfigSetParamsSchema = Type.Object(
   {
     raw: NonEmptyString,
     baseHash: Type.Optional(NonEmptyString),
+    controlPlaneManifest: Type.Optional(Type.Unknown()),
+    controlPlaneApproval: Type.Optional(Type.Unknown()),
   },
   { additionalProperties: false },
 );
@@ -35,6 +37,8 @@ const ConfigApplyLikeParamsSchema = Type.Object(
     deliveryContext: Type.Optional(ConfigDeliveryContextSchema),
     note: Type.Optional(Type.String()),
     restartDelayMs: Type.Optional(Type.Integer({ minimum: 0 })),
+    controlPlaneManifest: Type.Optional(Type.Unknown()),
+    controlPlaneApproval: Type.Optional(Type.Unknown()),
   },
   { additionalProperties: false },
 );

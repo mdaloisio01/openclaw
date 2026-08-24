@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
+import path from "node:path";
 import {
   asDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
@@ -26,6 +28,8 @@ import {
   validateConfigObjectRawWithPlugins,
   validateConfigObjectWithPlugins,
 } from "../../config/config.js";
+import { evaluateControlPlaneActivation } from "../../config/control-plane-protection.js";
+import { stampConfigWriteMetadata } from "../../config/io.meta.js";
 import { createMergePatch, projectSourceOntoRuntimeShape } from "../../config/io.write-prepare.js";
 import { formatConfigIssueLines } from "../../config/issue-format.js";
 import { applyMergePatch } from "../../config/merge-patch.js";
@@ -55,7 +59,9 @@ import {
   commitGatewayConfigWrite,
   didActiveSharedGatewayAuthChange,
   didSharedGatewayAuthChange,
+  type ConfigWriteOptions,
   resolveGatewayConfigPath,
+  resolveGatewayConfigWriteRestartScope,
   resolveGatewayConfigRestartWriteResult,
 } from "./config-write-flow.js";
 import type { GatewayRequestContext, GatewayRequestHandlers, RespondFn } from "./types.js";
@@ -77,6 +83,16 @@ type ConfigRedactionHints = Parameters<typeof redactConfigObject>[1];
 type ConfigWriteCommitResult = Awaited<ReturnType<typeof commitGatewayConfigWrite>>;
 type ConfigRestartWriteKind = Parameters<typeof resolveGatewayConfigRestartWriteResult>[0]["kind"];
 type ConfigRestartWriteMode = Parameters<typeof resolveGatewayConfigRestartWriteResult>[0]["mode"];
+type ControlPlaneWriteParams = {
+  controlPlaneManifest?: unknown;
+  controlPlaneApproval?: unknown;
+};
+type ControlPlaneWriteApproval = {
+  candidateConfig: OpenClawConfig;
+  candidateRaw: string;
+  candidateSha256: string;
+  writeOptions: ConfigWriteOptions;
+};
 
 function requireConfigBaseHash(
   params: unknown,
@@ -268,6 +284,100 @@ function stripBundledProviderRuntimeDefaults(params: {
   };
 }
 
+export function prepareConfigWriteCandidateForControlPlane(params: {
+  raw: string;
+  snapshot: Awaited<ReturnType<typeof readConfigFileSnapshot>>;
+}): { config: OpenClawConfig; writeConfig: OpenClawConfig; schema: ConfigSchemaResponse } {
+  const parsedRes = parseConfigJson5(params.raw);
+  if (!parsedRes.ok) {
+    throw new Error(parsedRes.error);
+  }
+  const schema = loadSchemaWithPlugins();
+  const restored = restoreRedactedValues(parsedRes.parsed, params.snapshot.config, schema.uiHints);
+  if (!restored.ok) {
+    throw new Error(restored.humanReadableMessage ?? "invalid config");
+  }
+  // Validate against runtime shape, but write the source-shaped config the operator submitted.
+  const projectedValidationCandidate = params.snapshot.valid
+    ? applyMergePatch(
+        projectSourceOntoRuntimeShape(params.snapshot.resolved, params.snapshot.config),
+        createMergePatch(params.snapshot.config, restored.result),
+      )
+    : restored.result;
+  const validationCandidate = stripBundledProviderRuntimeDefaults({
+    candidate: projectedValidationCandidate,
+    sourceConfig: params.snapshot.parsed,
+  });
+  const sourceValidated = validateConfigObjectRawWithPlugins(validationCandidate);
+  if (!sourceValidated.ok) {
+    throw Object.assign(new Error(summarizeConfigValidationIssues(sourceValidated.issues)), {
+      issues: sourceValidated.issues,
+    });
+  }
+  const validated = validateConfigObjectWithPlugins(validationCandidate);
+  if (!validated.ok) {
+    throw Object.assign(new Error(summarizeConfigValidationIssues(validated.issues)), {
+      issues: validated.issues,
+    });
+  }
+  return {
+    config: validated.config,
+    writeConfig: validationCandidate as OpenClawConfig,
+    schema,
+  };
+}
+
+export function prepareConfigPatchCandidateForControlPlane(params: {
+  raw: string;
+  snapshot: Awaited<ReturnType<typeof readConfigFileSnapshot>>;
+}): { config: OpenClawConfig; writeConfig: OpenClawConfig; schema: ConfigSchemaResponse } {
+  const parsedRes = parseConfigJson5(params.raw);
+  if (!parsedRes.ok) {
+    throw new Error(parsedRes.error);
+  }
+  if (
+    !parsedRes.parsed ||
+    typeof parsedRes.parsed !== "object" ||
+    Array.isArray(parsedRes.parsed)
+  ) {
+    throw new Error("config.patch raw must be an object");
+  }
+  const merged = applyMergePatch(params.snapshot.config, parsedRes.parsed, {
+    // Arrays with stable ids behave like maps for partial control-plane edits.
+    mergeObjectArraysById: true,
+  });
+  const schema = loadSchemaWithPlugins();
+  const restoredMerge = restoreRedactedValues(merged, params.snapshot.config, schema.uiHints);
+  if (!restoredMerge.ok) {
+    throw new Error(restoredMerge.humanReadableMessage ?? "invalid config");
+  }
+  const projectedValidationCandidate = applyMergePatch(
+    projectSourceOntoRuntimeShape(params.snapshot.resolved, params.snapshot.config),
+    createMergePatch(params.snapshot.config, restoredMerge.result),
+  );
+  const validationCandidate = stripBundledProviderRuntimeDefaults({
+    candidate: projectedValidationCandidate,
+    sourceConfig: params.snapshot.parsed,
+  });
+  const sourceValidated = validateConfigObjectRawWithPlugins(validationCandidate);
+  if (!sourceValidated.ok) {
+    throw Object.assign(new Error(summarizeConfigValidationIssues(sourceValidated.issues)), {
+      issues: sourceValidated.issues,
+    });
+  }
+  const validated = validateConfigObjectWithPlugins(validationCandidate);
+  if (!validated.ok) {
+    throw Object.assign(new Error(summarizeConfigValidationIssues(validated.issues)), {
+      issues: validated.issues,
+    });
+  }
+  return {
+    config: validated.config,
+    writeConfig: validationCandidate as OpenClawConfig,
+    schema,
+  };
+}
+
 function parseValidateConfigFromRawOrRespond(
   params: unknown,
   requestName: string,
@@ -278,63 +388,19 @@ function parseValidateConfigFromRawOrRespond(
   if (!rawValue) {
     return null;
   }
-  const parsedRes = parseConfigJson5(rawValue);
-  if (!parsedRes.ok) {
-    respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, parsedRes.error));
-    return null;
-  }
-  const schema = loadSchemaWithPlugins();
-  const restored = restoreRedactedValues(parsedRes.parsed, snapshot.config, schema.uiHints);
-  if (!restored.ok) {
+  try {
+    return prepareConfigWriteCandidateForControlPlane({ raw: rawValue, snapshot });
+  } catch (error) {
+    const issues = isRecord(error) && Array.isArray(error.issues) ? error.issues : undefined;
     respond(
       false,
       undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, restored.humanReadableMessage ?? "invalid config"),
-    );
-    return null;
-  }
-  // Validate against runtime shape, but write the source-shaped config the operator submitted.
-  const projectedValidationCandidate = snapshot.valid
-    ? applyMergePatch(
-        projectSourceOntoRuntimeShape(snapshot.resolved, snapshot.config),
-        createMergePatch(snapshot.config, restored.result),
-      )
-    : restored.result;
-  const validationCandidate = stripBundledProviderRuntimeDefaults({
-    candidate: projectedValidationCandidate,
-    sourceConfig: snapshot.parsed,
-  });
-  const sourceValidated = validateConfigObjectRawWithPlugins(validationCandidate);
-  if (!sourceValidated.ok) {
-    respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.INVALID_REQUEST,
-        summarizeConfigValidationIssues(sourceValidated.issues),
-        {
-          details: { issues: sourceValidated.issues },
-        },
-      ),
-    );
-    return null;
-  }
-  const validated = validateConfigObjectWithPlugins(validationCandidate);
-  if (!validated.ok) {
-    respond(
-      false,
-      undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, summarizeConfigValidationIssues(validated.issues), {
-        details: { issues: validated.issues },
+      errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(error), {
+        ...(issues ? { details: { issues } } : {}),
       }),
     );
     return null;
   }
-  return {
-    config: validated.config,
-    writeConfig: validationCandidate as OpenClawConfig,
-    schema,
-  };
 }
 
 function summarizeConfigValidationIssues(issues: ReadonlyArray<ConfigValidationIssue>): string {
@@ -492,6 +558,154 @@ function loadSchemaWithPlugins(): ConfigSchemaResponse {
   return response;
 }
 
+function formatCanonicalConfigCandidateRaw(config: OpenClawConfig): string {
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function sha256Text(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf-8").digest("hex");
+}
+
+function createControlPlaneApprovedCandidate(params: {
+  writeOptions: ConfigWriteOptions;
+  candidateConfig: OpenClawConfig;
+  activationTimestamp: string;
+}): ControlPlaneWriteApproval {
+  const candidateConfig = stampConfigWriteMetadata(
+    params.candidateConfig,
+    params.activationTimestamp,
+    params.writeOptions.lastTouchedVersionOverride,
+  );
+  const candidateRaw = formatCanonicalConfigCandidateRaw(candidateConfig);
+  return {
+    candidateConfig,
+    candidateRaw,
+    candidateSha256: sha256Text(candidateRaw),
+    writeOptions: {
+      ...params.writeOptions,
+      lastTouchedAtOverride: params.activationTimestamp,
+    },
+  };
+}
+
+function resolveControlPlaneActivationTimestampOrRespond(params: {
+  requestParams: unknown;
+  respond: RespondFn;
+}): string | null {
+  const requestParams = (params.requestParams ?? {}) as ControlPlaneWriteParams;
+  const manifest = requestParams.controlPlaneManifest;
+  const activationTimestamp = isRecord(manifest) ? manifest.activationTimestamp : undefined;
+  if (typeof activationTimestamp !== "string" || !activationTimestamp.trim()) {
+    params.respond(
+      false,
+      undefined,
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        "control-plane manifest rejected (malformed_manifest): activationTimestamp is required",
+        { details: { code: "malformed_manifest" } },
+      ),
+    );
+    return null;
+  }
+  if (!Number.isFinite(Date.parse(activationTimestamp))) {
+    params.respond(
+      false,
+      undefined,
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        "control-plane manifest rejected (malformed_manifest): activationTimestamp is invalid",
+        { details: { code: "malformed_manifest" } },
+      ),
+    );
+    return null;
+  }
+  return activationTimestamp;
+}
+
+function enforceControlPlaneManifestOrRespond(params: {
+  requestParams: unknown;
+  snapshot: Awaited<ReturnType<typeof readConfigFileSnapshot>>;
+  candidateConfig: OpenClawConfig;
+  candidateRaw: string;
+  changedPaths: string[];
+  actor: ReturnType<typeof resolveControlPlaneActor>;
+  tool: "config.set" | "config.patch" | "config.apply";
+  restartScope: "none" | "gateway";
+  requestedServices: string[];
+  respond: RespondFn;
+}): boolean {
+  if (params.changedPaths.length === 0) {
+    return true;
+  }
+  const requestParams = (params.requestParams ?? {}) as ControlPlaneWriteParams;
+  const decision = evaluateControlPlaneActivation({
+    beforeConfig: params.snapshot.resolved,
+    candidateConfig: params.candidateConfig,
+    candidateRaw: params.candidateRaw,
+    manifest: requestParams.controlPlaneManifest,
+    approval: requestParams.controlPlaneApproval,
+    now: new Date(),
+    candidatePath: params.snapshot.path,
+    stagingRoot: path.dirname(params.snapshot.path),
+    actor: params.actor.actor,
+    tool: params.tool,
+    requestedServices: params.requestedServices,
+    restartScope: params.restartScope,
+    auditSinkAvailable: true,
+    rollbackSinkAvailable: true,
+  });
+  if (decision.ok) {
+    return true;
+  }
+  params.respond(
+    false,
+    undefined,
+    errorShape(
+      ErrorCodes.INVALID_REQUEST,
+      `control-plane manifest rejected (${decision.code}): ${decision.reason}`,
+      {
+        details: {
+          code: decision.code,
+          changedPaths: decision.changedPaths,
+        },
+      },
+    ),
+  );
+  return false;
+}
+
+function verifyControlPlanePostWriteOrRespond(params: {
+  approved: ControlPlaneWriteApproval;
+  writeResult: ConfigWriteCommitResult;
+  respond: RespondFn;
+}): boolean {
+  const persistedRaw = formatCanonicalConfigCandidateRaw(params.writeResult.config);
+  const persistedSha256 = sha256Text(persistedRaw);
+  if (
+    params.writeResult.persistedHash === params.approved.candidateSha256 &&
+    persistedSha256 === params.approved.candidateSha256 &&
+    persistedRaw === params.approved.candidateRaw
+  ) {
+    return true;
+  }
+  params.respond(
+    false,
+    undefined,
+    errorShape(
+      ErrorCodes.INVALID_REQUEST,
+      "control-plane post-write validation failed: persisted config does not match approved candidate",
+      {
+        details: {
+          expectedSha256: params.approved.candidateSha256,
+          persistedHash: params.writeResult.persistedHash,
+          persistedSha256,
+        },
+      },
+    ),
+  );
+  return false;
+}
+
 export const configHandlers: GatewayRequestHandlers = {
   "config.get": async ({ params, respond }) => {
     if (!assertValidParams(params, validateConfigGetParams, "config.get", respond)) {
@@ -540,7 +754,7 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     respond(true, result, undefined);
   },
-  "config.set": async ({ params, respond, context }) => {
+  "config.set": async ({ params, respond, client, context }) => {
     if (!assertValidParams(params, validateConfigSetParams, "config.set", respond)) {
       return;
     }
@@ -556,12 +770,47 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!(await ensureResolvableSecretRefsOrRespond({ config: parsed.config, respond }))) {
       return;
     }
+    const actor = resolveControlPlaneActor(client);
+    const changedPaths = diffConfigPaths(snapshot.config, parsed.config);
+    const activationTimestamp = resolveControlPlaneActivationTimestampOrRespond({
+      requestParams: params,
+      respond,
+    });
+    if (!activationTimestamp) {
+      return;
+    }
+    const approvedCandidate = createControlPlaneApprovedCandidate({
+      writeOptions,
+      candidateConfig: parsed.writeConfig,
+      activationTimestamp,
+    });
+    if (
+      !enforceControlPlaneManifestOrRespond({
+        requestParams: params,
+        snapshot,
+        candidateConfig: approvedCandidate.candidateConfig,
+        candidateRaw: approvedCandidate.candidateRaw,
+        changedPaths,
+        actor,
+        tool: "config.set",
+        restartScope: "none",
+        requestedServices: [],
+        respond,
+      })
+    ) {
+      return;
+    }
     const writeResult = await commitGatewayConfigWrite({
       snapshot,
-      writeOptions,
+      writeOptions: approvedCandidate.writeOptions,
       nextConfig: parsed.writeConfig,
       context,
     });
+    if (
+      !verifyControlPlanePostWriteOrRespond({ approved: approvedCandidate, writeResult, respond })
+    ) {
+      return;
+    }
     clearConfigSchemaResponseCache();
     respond(
       true,
@@ -603,72 +852,41 @@ export const configHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const parsedRes = parseConfigJson5(rawValue);
-    if (!parsedRes.ok) {
-      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, parsedRes.error));
-      return;
-    }
-    if (
-      !parsedRes.parsed ||
-      typeof parsedRes.parsed !== "object" ||
-      Array.isArray(parsedRes.parsed)
-    ) {
+    let patchCandidate: ReturnType<typeof prepareConfigPatchCandidateForControlPlane>;
+    try {
+      patchCandidate = prepareConfigPatchCandidateForControlPlane({ raw: rawValue, snapshot });
+    } catch (error) {
+      const issues = isRecord(error) && Array.isArray(error.issues) ? error.issues : undefined;
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, "config.patch raw must be an object"),
+        errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(error), {
+          ...(issues ? { details: { issues } } : {}),
+        }),
       );
       return;
     }
-    const merged = applyMergePatch(snapshot.config, parsedRes.parsed, {
-      // Arrays with stable ids behave like maps for partial control-plane edits.
-      mergeObjectArraysById: true,
-    });
-    const schemaPatch = loadSchemaWithPlugins();
-    const restoredMerge = restoreRedactedValues(merged, snapshot.config, schemaPatch.uiHints);
-    if (!restoredMerge.ok) {
-      respond(
-        false,
-        undefined,
-        errorShape(
-          ErrorCodes.INVALID_REQUEST,
-          restoredMerge.humanReadableMessage ?? "invalid config",
-        ),
-      );
-      return;
-    }
-    const restoredChangedPaths = diffConfigPaths(snapshot.config, restoredMerge.result);
+    const restoredChangedPaths = diffConfigPaths(snapshot.resolved, patchCandidate.writeConfig);
     const actor = resolveControlPlaneActor(client);
     if (restoredChangedPaths.length === 0) {
       respondConfigPatchNoop({
         snapshot,
         config: snapshot.config,
-        uiHints: schemaPatch.uiHints,
+        uiHints: patchCandidate.schema.uiHints,
         actor,
         context,
         respond,
       });
       return;
     }
-    const validated = validateConfigObjectWithPlugins(restoredMerge.result);
-    if (!validated.ok) {
-      respond(
-        false,
-        undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, summarizeConfigValidationIssues(validated.issues), {
-          details: { issues: validated.issues },
-        }),
-      );
-      return;
-    }
     const preparedSecretsSnapshot = await ensureResolvableSecretRefsOrRespond({
-      config: validated.config,
+      config: patchCandidate.config,
       respond,
     });
     if (!preparedSecretsSnapshot) {
       return;
     }
-    const changedPaths = diffConfigPaths(snapshot.config, validated.config);
+    const changedPaths = diffConfigPaths(snapshot.resolved, patchCandidate.writeConfig);
 
     // No-op: if the validated config is identical to the current config,
     // skip the file write and SIGUSR1 restart entirely. This avoids a full
@@ -677,12 +895,44 @@ export const configHandlers: GatewayRequestHandlers = {
     if (changedPaths.length === 0) {
       respondConfigPatchNoop({
         snapshot,
-        config: validated.config,
-        uiHints: schemaPatch.uiHints,
+        config: patchCandidate.config,
+        uiHints: patchCandidate.schema.uiHints,
         actor,
         context,
         respond,
       });
+      return;
+    }
+    const restartScope = resolveGatewayConfigWriteRestartScope({
+      changedPaths,
+      nextConfig: patchCandidate.config,
+    });
+    const activationTimestamp = resolveControlPlaneActivationTimestampOrRespond({
+      requestParams: params,
+      respond,
+    });
+    if (!activationTimestamp) {
+      return;
+    }
+    const approvedCandidate = createControlPlaneApprovedCandidate({
+      writeOptions,
+      candidateConfig: patchCandidate.writeConfig,
+      activationTimestamp,
+    });
+    if (
+      !enforceControlPlaneManifestOrRespond({
+        requestParams: params,
+        snapshot,
+        candidateConfig: approvedCandidate.candidateConfig,
+        candidateRaw: approvedCandidate.candidateRaw,
+        changedPaths,
+        actor,
+        tool: "config.patch",
+        restartScope: restartScope.restartScope,
+        requestedServices: restartScope.requestedServices,
+        respond,
+      })
+    ) {
       return;
     }
 
@@ -693,16 +943,21 @@ export const configHandlers: GatewayRequestHandlers = {
     // previous shared secret immediately after the config update succeeds.
     const disconnectSharedAuthClients = shouldDisconnectSharedAuthClientsForConfigWrite({
       prevConfig: snapshot.config,
-      nextConfig: validated.config,
+      nextConfig: patchCandidate.config,
       preparedSecretsSnapshot,
     });
     const writeResult = await commitGatewayConfigWrite({
       snapshot,
-      writeOptions,
-      nextConfig: validated.config,
+      writeOptions: approvedCandidate.writeOptions,
+      nextConfig: patchCandidate.writeConfig,
       context,
       disconnectSharedAuthClients,
     });
+    if (
+      !verifyControlPlanePostWriteOrRespond({ approved: approvedCandidate, writeResult, respond })
+    ) {
+      return;
+    }
     await respondWithConfigRestartWrite({
       requestParams: params,
       kind: "config-patch",
@@ -712,7 +967,7 @@ export const configHandlers: GatewayRequestHandlers = {
       actor,
       context,
       respond,
-      uiHints: schemaPatch.uiHints,
+      uiHints: patchCandidate.schema.uiHints,
     });
   },
   "config.apply": async ({ params, respond, client, context }) => {
@@ -737,6 +992,38 @@ export const configHandlers: GatewayRequestHandlers = {
     }
     const changedPaths = diffConfigPaths(snapshot.config, parsed.config);
     const actor = resolveControlPlaneActor(client);
+    const restartScope = resolveGatewayConfigWriteRestartScope({
+      changedPaths,
+      nextConfig: parsed.config,
+    });
+    const activationTimestamp = resolveControlPlaneActivationTimestampOrRespond({
+      requestParams: params,
+      respond,
+    });
+    if (!activationTimestamp) {
+      return;
+    }
+    const approvedCandidate = createControlPlaneApprovedCandidate({
+      writeOptions,
+      candidateConfig: parsed.writeConfig,
+      activationTimestamp,
+    });
+    if (
+      !enforceControlPlaneManifestOrRespond({
+        requestParams: params,
+        snapshot,
+        candidateConfig: approvedCandidate.candidateConfig,
+        candidateRaw: approvedCandidate.candidateRaw,
+        changedPaths,
+        actor,
+        tool: "config.apply",
+        restartScope: restartScope.restartScope,
+        requestedServices: restartScope.requestedServices,
+        respond,
+      })
+    ) {
+      return;
+    }
     context?.logGateway?.info(
       `config.apply write ${formatControlPlaneActor(actor)} changedPaths=${summarizeChangedPaths(changedPaths)} restartReason=config.apply`,
     );
@@ -749,11 +1036,16 @@ export const configHandlers: GatewayRequestHandlers = {
     });
     const writeResult = await commitGatewayConfigWrite({
       snapshot,
-      writeOptions,
+      writeOptions: approvedCandidate.writeOptions,
       nextConfig: parsed.writeConfig,
       context,
       disconnectSharedAuthClients,
     });
+    if (
+      !verifyControlPlanePostWriteOrRespond({ approved: approvedCandidate, writeResult, respond })
+    ) {
+      return;
+    }
     await respondWithConfigRestartWrite({
       requestParams: params,
       kind: "config-apply",

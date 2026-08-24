@@ -96,6 +96,9 @@ function gitStatusForPath(rootDir, relativePath, options = {}) {
     cwd: rootDir,
     encoding: "utf8",
   });
+  if (result.status === 0) {
+    return { ok: true, status: result.stdout ?? "" };
+  }
   if (result.error || result.status !== 0) {
     return {
       ok: false,
@@ -105,7 +108,6 @@ function gitStatusForPath(rootDir, relativePath, options = {}) {
           : result.stderr?.trim() || `git status exited ${result.status}`,
     };
   }
-  return { ok: true, status: result.stdout ?? "" };
 }
 
 function classifyRootShrinkwrap(rootDir, options = {}) {

@@ -106,7 +106,7 @@ describe("handleDirList — happy path", () => {
     }
     expect(page1.entries.map((e) => e.name)).toEqual(["f-0.txt", "f-1.txt", "f-2.txt"]);
     expect(page1.truncated).toBe(true);
-    expect(page1.nextPageToken).toBe("3");
+    expect(page1.nextPageToken).toMatch(/^after:/u);
 
     const page2 = await handleDirList({
       path: tmpRoot,
@@ -118,6 +118,7 @@ describe("handleDirList — happy path", () => {
     }
     expect(page2.entries.map((e) => e.name)).toEqual(["f-3.txt", "f-4.txt", "f-5.txt"]);
     expect(page2.truncated).toBe(true);
+    expect(page2.nextPageToken).toMatch(/^after:/u);
 
     const page3 = await handleDirList({
       path: tmpRoot,
@@ -132,6 +133,55 @@ describe("handleDirList — happy path", () => {
     expect(page3.nextPageToken).toBeUndefined();
   });
 
+  it("filters entries by a case-insensitive filename query before paging", async () => {
+    await fs.writeFile(path.join(tmpRoot, "alpha-report.md"), "x");
+    await fs.writeFile(path.join(tmpRoot, "beta.txt"), "x");
+    await fs.writeFile(path.join(tmpRoot, "REPORT-final.md"), "x");
+    await fs.writeFile(path.join(tmpRoot, "zeta-report.md"), "x");
+
+    const page1 = await handleDirList({ path: tmpRoot, maxEntries: 2, query: "report" });
+    if (!page1.ok) {
+      throw new Error("page1");
+    }
+    expect(page1.query).toBe("report");
+    expect(page1.entries.map((e) => e.name)).toEqual(["alpha-report.md", "REPORT-final.md"]);
+    expect(page1.truncated).toBe(true);
+    expect(page1.nextPageToken).toMatch(/^after:/u);
+
+    const page2 = await handleDirList({
+      path: tmpRoot,
+      maxEntries: 2,
+      pageToken: page1.nextPageToken,
+      query: "report",
+    });
+    if (!page2.ok) {
+      throw new Error("page2");
+    }
+    expect(page2.entries.map((e) => e.name)).toEqual(["zeta-report.md"]);
+    expect(page2.truncated).toBe(false);
+  });
+
+  it("returns a bounded first page for a large directory", async () => {
+    for (let i = 0; i < 100; i++) {
+      await fs.writeFile(path.join(tmpRoot, `bulk-${String(i).padStart(3, "0")}.txt`), "x");
+    }
+
+    const r = await handleDirList({ path: tmpRoot, maxEntries: 5 });
+
+    if (!r.ok) {
+      throw new Error("expected ok");
+    }
+    expect(r.entries.map((e) => e.name)).toEqual([
+      "bulk-000.txt",
+      "bulk-001.txt",
+      "bulk-002.txt",
+      "bulk-003.txt",
+      "bulk-004.txt",
+    ]);
+    expect(r.truncated).toBe(true);
+    expect(r.nextPageToken).toMatch(/^after:/u);
+  });
+
   it("does not coerce partial page tokens", async () => {
     for (let i = 0; i < 3; i++) {
       await fs.writeFile(path.join(tmpRoot, `f-${i}.txt`), "x");
@@ -142,7 +192,7 @@ describe("handleDirList — happy path", () => {
       throw new Error("expected ok");
     }
     expect(r.entries.map((e) => e.name)).toEqual(["f-0.txt"]);
-    expect(r.nextPageToken).toBe("1");
+    expect(r.nextPageToken).toMatch(/^after:/u);
   });
 
   it("accepts plus-signed page tokens", async () => {
@@ -155,7 +205,7 @@ describe("handleDirList — happy path", () => {
       throw new Error("expected ok");
     }
     expect(r.entries.map((e) => e.name)).toEqual(["f-1.txt"]);
-    expect(r.nextPageToken).toBe("2");
+    expect(r.nextPageToken).toMatch(/^after:/u);
   });
 });
 

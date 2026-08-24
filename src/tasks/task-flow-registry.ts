@@ -642,8 +642,15 @@ function updateContinuationAfterNextLaunch(
   if (!state?.activeProductionRun) {
     return state;
   }
+  const { lawfulStopReason: _lawfulStopReason, ...stateWithoutStopReason } = state;
   let next: ProductionContinuationState = {
-    ...state,
+    ...stateWithoutStopReason,
+    currentUnitStatus: "started",
+    blockerPresent: false,
+    ownerDecisionRequired: false,
+    restartOrReloadRequired: false,
+    hardStopPresent: false,
+    safetyStopPresent: false,
     nextExecutableUnitIdentified: true,
     nextExecutableUnitLaunched: true,
     continuationViolation: false,
@@ -934,6 +941,7 @@ export function deriveTaskFlowStatusFromTask(
 function isTerminalTaskFlowStatus(status: TaskFlowStatus): boolean {
   return (
     status === "succeeded" ||
+    status === "terminal_pending_watchdog" ||
     status === "blocked" ||
     status === "failed" ||
     status === "cancelled" ||
@@ -1833,6 +1841,7 @@ function updateContinuationForLawfulStop(params: {
     hardStopPresent: params.reason === "hard_stop",
     safetyStopPresent: params.reason === "safety_stop",
     lawfulWholeRunCompletion: params.reason === "whole_run_complete",
+    parentRunOpen: params.reason === "whole_run_complete" ? false : params.state.parentRunOpen,
     continuationRequiredAfterLocalSuccess: false,
     continuationViolation: false,
     lawfulStopReason: params.reason,
@@ -1929,7 +1938,9 @@ export function recordFlowLawfulStop(params: {
     expectedRevision: params.expectedRevision,
     patch: {
       status:
-        params.reason === "whole_run_complete" ? current.status : (params.status ?? "blocked"),
+        params.reason === "whole_run_complete"
+          ? "terminal_pending_watchdog"
+          : (params.status ?? "blocked"),
       currentStep: params.currentStep,
       stateJson: attachProductionContinuationToStateJson({
         flow: current,

@@ -29,6 +29,7 @@ const HTTP_CLOSE_FORCE_WAIT_MS = 5_000;
 const MCP_RUNTIME_CLOSE_GRACE_MS = 5_000;
 const LSP_RUNTIME_CLOSE_GRACE_MS = 5_000;
 const RESTART_REPLY_DRAIN_POLL_MS = 100;
+const RESTART_REPLY_MIN_DRAIN_TIMEOUT_MS = 10_000;
 const RESTART_REPLY_POST_ABORT_DRAIN_TIMEOUT_MS = 1_000;
 const RESTART_REPLY_POST_ABORT_DRAIN_POLL_MS = 50;
 
@@ -151,9 +152,13 @@ async function waitForRestartReplyDrain(params: {
   elapsedMs: number;
   counts: { pendingReplies: number; activeRuns: number };
 }> {
-  const timeoutMs = Math.max(0, Math.floor(params.timeoutMs));
-  const pollMs = Math.max(25, Math.floor(params.pollMs ?? RESTART_REPLY_DRAIN_POLL_MS));
   let counts = getRestartReplyDrainCounts(params);
+  const requestedTimeoutMs = Math.max(0, Math.floor(params.timeoutMs));
+  const timeoutMs =
+    requestedTimeoutMs <= 0 && (counts.pendingReplies > 0 || counts.activeRuns > 0)
+      ? RESTART_REPLY_MIN_DRAIN_TIMEOUT_MS
+      : requestedTimeoutMs;
+  const pollMs = Math.max(25, Math.floor(params.pollMs ?? RESTART_REPLY_DRAIN_POLL_MS));
   if (counts.pendingReplies <= 0 && counts.activeRuns <= 0) {
     return { drained: true, elapsedMs: 0, counts };
   }

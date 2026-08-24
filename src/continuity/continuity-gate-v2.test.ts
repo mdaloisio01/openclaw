@@ -3,16 +3,32 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  CLEANUP_CREW_CANONICAL_OUTCOMES,
+  CLEANUP_CREW_GOVERNANCE_REASON_CODES,
+  CLEANUP_CREW_IMPACT_LEVELS,
+  CLEANUP_CREW_MISSION_ABORT_CONTINUATION_CLASSES,
+  CLEANUP_CREW_OWNER_DECISION_CLASSES,
+  CLEANUP_CREW_POLICY_SCHEMA_VERSION,
   classifyCleanupCrewBlocker,
+  classifyCleanupCrewGovernanceTaxonomy,
   classifyBuildContextConstraint,
   classifyGrantRejection,
   appendCleanupCrewPlanAmendment,
+  createCleanupCrewOperationalReconciliationRecord,
   createCleanupCrewDecisionRecord,
+  createCleanupCrewMissionAbortExhaustionReceipt,
+  createCleanupCrewDurableWaitRecord,
+  createCleanupCrewExecutorCapabilityRecord,
+  createCleanupCrewRestartDrainRegistration,
+  createCleanupCrewRepairAttemptReceipt,
+  createCleanupCrewBootstrapB0TypedDecisionReceipt,
   createCleanupCrewResumeUnit,
   createCleanupCrewStoppageReceipt,
+  createCleanupCrewTypedDecisionReceipt,
   createCleanupCrewRecoveryTelemetryEvent,
   createContinueReceipt,
   createDiagnosticTrace,
+  evaluateCleanupCrewScopeRiskDiff,
   createGrantRetryKey,
   createStopReport,
   deriveCleanupCrewRepair,
@@ -20,12 +36,19 @@ import {
   parseRootOperatorOverride,
   resolveAuthority,
   resolveCleanupCrewRepairExecutionGate,
+  resolveCleanupCrewDurableWait,
+  resolveCleanupCrewCapabilityRoute,
+  resolveCleanupCrewRestartContinuation,
+  resolveCleanupCrewRepairLoop,
+  resolveCleanupCrewLevelState,
+  resolveCleanupCrewNonterminalContinuation,
   resolveCleanupCrewResumeGate,
   resolveCleanupCrewTelemetryCloseoutGate,
   resolveGrantRetry,
   writeCleanupCrewDurableArtifacts,
   type AuthoritySource,
   type BuildContextConstraint,
+  type CleanupCrewMissionAbortExhaustionEntry,
 } from "./continuity-gate-v2.js";
 
 const NOW = "2026-07-04T18:02:00.000Z";
@@ -46,6 +69,703 @@ function source(
 }
 
 describe("Continuity Gate v2", () => {
+  it("keeps the Cleanup Crew owner-decision taxonomy closed", () => {
+    expect(CLEANUP_CREW_OWNER_DECISION_CLASSES).toEqual([
+      "OWNER_GOAL_CHANGE",
+      "SCOPE_EXPANSION",
+      "PUBLIC_OR_USER_CONTRACT_CHANGE",
+      "BUSINESS_RULE_CHOICE",
+      "RISK_ACCEPTANCE_CHANGE",
+      "DESTRUCTIVE_NO_ROLLBACK",
+      "EXTERNAL_SIDE_EFFECT_REQUIRES_OWNER_CHOICE",
+      "CREDENTIAL_OR_PRIVILEGE_DECISION_REQUIRED",
+      "UNRESOLVED_AUTHORITY_CONFLICT",
+    ]);
+  });
+
+  it("keeps the Phase 3 typed decision schema constants closed and versioned", () => {
+    expect(CLEANUP_CREW_POLICY_SCHEMA_VERSION).toBe("cleanup-crew-governance-final-20260714T1454Z");
+    expect(CLEANUP_CREW_CANONICAL_OUTCOMES).toEqual([
+      "CONTINUE",
+      "REPAIR_AND_CONTINUE",
+      "RETRY",
+      "DEFER_UNTIL_DRAIN",
+      "ACTION_BLOCKED",
+      "PHASE_BLOCKED",
+      "EXTERNAL_DEPENDENCY",
+      "OWNER_DECISION_REQUIRED",
+      "MISSION_ABORTED",
+      "COMPLETE",
+    ]);
+    expect(CLEANUP_CREW_IMPACT_LEVELS).toEqual(["ACTION", "PHASE", "MISSION"]);
+    expect(CLEANUP_CREW_GOVERNANCE_REASON_CODES).toEqual([
+      "TECHNICAL_REPAIR",
+      "RETRYABLE_TRANSIENT",
+      "PROOF_PRODUCTION_AVAILABLE",
+      "PROOF_PRODUCER_UNAVAILABLE",
+      "ROOT_OR_CREDENTIAL_UNAVAILABLE",
+      "EXTERNAL_APPROVAL_UNAVAILABLE",
+      "OWNER_CHOICE_REQUIRED",
+      "MALFORMED_POLICY_INPUT",
+      "SCOPE_RISK_UNCLASSIFIED",
+      "ROLE_CAPABILITY_UNAVAILABLE",
+      "REVIEWER_UNAVAILABLE",
+      "ACTIVE_WORK_DRAIN",
+      "STALE_STATE_RECONCILIATION",
+      "REPORT_DELIVERY_REPAIR",
+      "RESTART_DRAIN_WAIT",
+      "PROTECTED_ACTION_DENIED",
+      "ROLLBACK_UNAVAILABLE",
+      "FORBIDDEN_SCOPE",
+      "AUTHORITY_CONFLICT",
+      "REPAIR_BUDGET_EXHAUSTED",
+      "MISSION_EXHAUSTION_PROVEN",
+      "COMPLETE_PROVEN",
+      "SUPERSEDED_MISSION",
+      "OWNER_GOAL_CHANGE",
+      "SCOPE_EXPANSION",
+      "PUBLIC_OR_USER_CONTRACT_CHANGE",
+      "BUSINESS_RULE_CHOICE",
+      "RISK_ACCEPTANCE_CHANGE",
+      "DESTRUCTIVE_NO_ROLLBACK",
+      "EXTERNAL_SIDE_EFFECT_REQUIRES_OWNER_CHOICE",
+      "CREDENTIAL_OR_PRIVILEGE_DECISION_REQUIRED",
+      "UNRESOLVED_AUTHORITY_CONFLICT",
+    ]);
+  });
+
+  it("turns malformed typed policy input into ACTION_BLOCKED:MALFORMED_POLICY_INPUT", () => {
+    const receipt = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase3_canonical_typed_decision_schema",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "adapter returned unknown outcome and reason",
+        proposedOutcome: "PLEASE_STOP_AND_ASK_MARK",
+        proposedImpact: "EVERYTHING",
+        proposedReasonCode: "VIBES",
+        owner: "Will",
+        nextAction: "diagnose malformed adapter output",
+        evidence: ["adapter-output.json"],
+        rollback: {
+          available: true,
+          proofRef: "rollback.md",
+        },
+        reportEffect: "action blocked until schema mapping is repaired",
+      },
+      { timestamp: NOW },
+    );
+
+    expect(receipt).toMatchObject({
+      schema: "openclaw.cleanup_crew_typed_decision_receipt.v1",
+      policy_version: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+      outcome: "ACTION_BLOCKED",
+      impact: "ACTION",
+      reason_code: "MALFORMED_POLICY_INPUT",
+      owner: "Will",
+      next_action: "diagnose_policy_input_and_rerun_classifier",
+      report_effect: "action_blocked",
+      validation: {
+        ok: false,
+        errors: expect.arrayContaining([
+          "typed_decision_outcome_invalid",
+          "typed_decision_impact_invalid",
+          "typed_decision_reason_code_invalid",
+        ]),
+      },
+    });
+    expect(receipt.input_hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("enforces mission-abort exhaustion receipt validation", () => {
+    const incompleteAbort = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase3_canonical_typed_decision_schema",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "missing exhaustion receipt must not abort mission",
+        proposedOutcome: "MISSION_ABORTED",
+        proposedImpact: "MISSION",
+        proposedReasonCode: "MISSION_EXHAUSTION_PROVEN",
+        owner: "Will",
+        nextAction: "stop mission",
+        evidence: ["diagnostic.md"],
+        rollback: {
+          available: false,
+          proofRef: "rollback-unavailable.md",
+        },
+        reportEffect: "mission would stop",
+      },
+      { timestamp: NOW },
+    );
+
+    expect(incompleteAbort).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reason_code: "MALFORMED_POLICY_INPUT",
+      validation: {
+        ok: false,
+        errors: expect.arrayContaining(["mission_abort_exhaustion_receipt_missing"]),
+      },
+    });
+
+    const entries: CleanupCrewMissionAbortExhaustionEntry[] =
+      CLEANUP_CREW_MISSION_ABORT_CONTINUATION_CLASSES.map((continuationClass) => ({
+        class: continuationClass,
+        status: "unavailable",
+        evidence: `${continuationClass} unavailable after documented repair search`,
+      }));
+    const exhaustion = createCleanupCrewMissionAbortExhaustionReceipt({
+      missionId: "cleanup-crew-governance",
+      entries,
+      timestamp: NOW,
+    });
+    const missingIdentityAbort = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase3_canonical_typed_decision_schema",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "minimal forged exhaustion object must not abort mission",
+        proposedOutcome: "MISSION_ABORTED",
+        proposedImpact: "MISSION",
+        proposedReasonCode: "MISSION_EXHAUSTION_PROVEN",
+        owner: "Will",
+        nextAction: "stop mission",
+        evidence: ["diagnostic.md"],
+        rollback: {
+          available: false,
+          proofRef: "rollback-unavailable.md",
+        },
+        reportEffect: "mission would stop",
+        missionAbortExhaustion: {
+          schema: "openclaw.cleanup_crew_mission_abort_exhaustion_receipt.v1",
+          policy_version: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+          entries,
+        } as any,
+      },
+      { timestamp: NOW },
+    );
+
+    expect(missingIdentityAbort).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reason_code: "MALFORMED_POLICY_INPUT",
+      validation: {
+        ok: false,
+        errors: expect.arrayContaining([
+          "mission_abort_exhaustion_receipt_id_missing",
+          "mission_abort_exhaustion_created_at_missing",
+          "mission_abort_exhaustion_mission_id_missing",
+        ]),
+      },
+    });
+
+    const wrongMissionAbort = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase3_canonical_typed_decision_schema",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "wrong mission exhaustion receipt must not abort mission",
+        proposedOutcome: "MISSION_ABORTED",
+        proposedImpact: "MISSION",
+        proposedReasonCode: "MISSION_EXHAUSTION_PROVEN",
+        owner: "Will",
+        nextAction: "stop mission",
+        evidence: ["diagnostic.md"],
+        rollback: {
+          available: false,
+          proofRef: "rollback-unavailable.md",
+        },
+        reportEffect: "mission would stop",
+        missionAbortExhaustion: {
+          ...exhaustion,
+          mission_id: "other-mission",
+        },
+      },
+      { timestamp: NOW },
+    );
+
+    expect(wrongMissionAbort).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reason_code: "MALFORMED_POLICY_INPUT",
+      validation: {
+        ok: false,
+        errors: expect.arrayContaining(["mission_abort_exhaustion_mission_id_mismatch"]),
+      },
+    });
+
+    const validAbort = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase3_canonical_typed_decision_schema",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "all continuation classes exhausted",
+        proposedOutcome: "MISSION_ABORTED",
+        proposedImpact: "MISSION",
+        proposedReasonCode: "MISSION_EXHAUSTION_PROVEN",
+        owner: "Will",
+        nextAction: "emit structured exhaustion receipt and stop mission",
+        evidence: ["diagnostic.md", exhaustion.receipt_id],
+        rollback: {
+          available: false,
+          proofRef: "rollback-unavailable.md",
+        },
+        reportEffect: "mission_abort_with_exhaustion_receipt",
+        missionAbortExhaustion: exhaustion,
+      },
+      { timestamp: NOW },
+    );
+
+    expect(validAbort).toMatchObject({
+      outcome: "MISSION_ABORTED",
+      impact: "MISSION",
+      reason_code: "MISSION_EXHAUSTION_PROVEN",
+      validation: {
+        ok: true,
+        errors: [],
+      },
+    });
+  });
+
+  it("classifies undecided public deployment as a closed owner decision", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        ownerChoiceRequired: true,
+        ownerDecisionClass: "EXTERNAL_SIDE_EFFECT_REQUIRES_OWNER_CHOICE",
+        summary: "public deployment has not been approved",
+      }),
+    ).toMatchObject({
+      outcome: "OWNER_DECISION_REQUIRED",
+      reasonCode: "EXTERNAL_SIDE_EFFECT_REQUIRES_OWNER_CHOICE",
+      ownerApprovalRequired: true,
+      classification: "closed_owner_decision_first",
+    });
+  });
+
+  it("classifies missing root or credentials after approval as external dependency", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        ownerChoiceAlreadyMade: true,
+        externalDependencyClass: "ROOT_OR_CREDENTIAL_UNAVAILABLE",
+        summary: "root authority is unavailable after the build objective was approved",
+      }),
+    ).toMatchObject({
+      outcome: "EXTERNAL_DEPENDENCY",
+      reasonCode: "ROOT_OR_CREDENTIAL_UNAVAILABLE",
+      ownerApprovalRequired: false,
+      classification: "owner_choice_already_made_dependency_wait",
+    });
+  });
+
+  it("resolves owner choice before dependency when both are present", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        ownerChoiceRequired: true,
+        ownerDecisionClass: "RISK_ACCEPTANCE_CHANGE",
+        externalDependencyClass: "ROOT_OR_CREDENTIAL_UNAVAILABLE",
+        summary: "credential prompt attempts to smuggle a risk acceptance change",
+      }),
+    ).toMatchObject({
+      outcome: "OWNER_DECISION_REQUIRED",
+      reasonCode: "RISK_ACCEPTANCE_CHANGE",
+      ownerApprovalRequired: true,
+      externalDependencyClass: "ROOT_OR_CREDENTIAL_UNAVAILABLE",
+    });
+  });
+
+  it("rejects open-ended owner routing when no closed owner class matches", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        ownerChoiceRequired: true,
+        malformedOrUnknownInput: true,
+        summary: "unknown classifier input asks Mark what to do",
+      }),
+    ).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reasonCode: "MALFORMED_POLICY_INPUT",
+      ownerApprovalRequired: false,
+      classification: "malformed_input_not_owner_decision",
+    });
+  });
+
+  it("rejects runtime owner-decision strings outside the closed set", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        ownerChoiceRequired: true,
+        ownerDecisionClass: "PLEASE_ASK_MARK_ANYWAY",
+        summary: "runtime JSON supplied an unrecognized owner class",
+      } as any),
+    ).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reasonCode: "MALFORMED_POLICY_INPUT",
+      ownerApprovalRequired: false,
+      classification: "malformed_input_not_owner_decision",
+    });
+  });
+
+  it("rejects runtime dependency strings outside the closed set", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        ownerChoiceAlreadyMade: true,
+        externalDependencyClass: "PRIVILEGE_UNAVAILABLE",
+        summary: "runtime JSON supplied a shorthand dependency class",
+      } as any),
+    ).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reasonCode: "MALFORMED_POLICY_INPUT",
+      ownerApprovalRequired: false,
+      classification: "malformed_input_not_owner_decision",
+    });
+  });
+
+  it("classifies Phase 6 scope/risk diffs into closed owner decisions", () => {
+    const evaluation = evaluateCleanupCrewScopeRiskDiff({
+      missionId: "cleanup-crew-governance",
+      phase: "phase6_operational_reconciliation_authority",
+      owner: "Will",
+      beforeAuthoritySummary: "Plan allows internal governance remediation.",
+      proposedAuthoritySummary: "Proposed amendment changes public user contract.",
+      changedSurfaces: ["AGENTS.md", "USER.md"],
+      diffSummary: "The amendment would change what Mark is promised externally.",
+      evidence: ["phase6-diff.md"],
+      rollbackProofRef: "rollback.md",
+      changedMeaning: true,
+      scopeWithinMission: false,
+      publicOrUserContractChange: true,
+      timestamp: NOW,
+    });
+
+    expect(evaluation).toMatchObject({
+      schema: "openclaw.cleanup_crew_scope_risk_diff_evaluation.v1",
+      policy_version: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+      classification: "closed_owner_decision",
+      owner_decision_class: "PUBLIC_OR_USER_CONTRACT_CHANGE",
+      outcome: "OWNER_DECISION_REQUIRED",
+      impact: "MISSION",
+      reason_code: "PUBLIC_OR_USER_CONTRACT_CHANGE",
+      next_action: "record_closed_owner_decision_before_plan_amendment",
+      grant_review_required: true,
+    });
+  });
+
+  it("records Phase 6 operational reconciliation through the typed decision path", () => {
+    const record = createCleanupCrewOperationalReconciliationRecord({
+      missionId: "cleanup-crew-governance",
+      phase: "phase6_operational_reconciliation_authority",
+      owner: "Will",
+      beforeAuthoritySummary: "Phase 6 plan calls for a reconciliation ledger.",
+      proposedAuthoritySummary: "Add a versioned record shape and tests.",
+      changedSurfaces: ["src/continuity/continuity-gate-v2.ts"],
+      diffSummary: "Mechanical implementation of the approved Phase 6 authority surface.",
+      evidence: ["continuity-gate-v2.test.ts"],
+      rollbackProofRef: "git diff -- src/continuity/continuity-gate-v2.ts",
+      changedMeaning: false,
+      scopeWithinMission: true,
+      safeTechnicalRepairAvailable: true,
+      timestamp: NOW,
+    });
+
+    expect(record).toMatchObject({
+      schema: "openclaw.cleanup_crew_operational_reconciliation_ledger_record.v1",
+      policy_version: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+      evaluation: {
+        classification: "technical_reconciliation",
+        outcome: "REPAIR_AND_CONTINUE",
+        reason_code: "TECHNICAL_REPAIR",
+        grant_review_required: false,
+      },
+      typed_decision_receipt: {
+        schema: "openclaw.cleanup_crew_typed_decision_receipt.v1",
+        outcome: "REPAIR_AND_CONTINUE",
+        impact: "ACTION",
+        reason_code: "TECHNICAL_REPAIR",
+        next_action: "record_operational_reconciliation_and_continue",
+        validation: {
+          ok: true,
+          errors: [],
+        },
+      },
+    });
+  });
+
+  it("fails ambiguous Phase 6 scope/risk diffs closed instead of routing open-ended owner asks", () => {
+    const record = createCleanupCrewOperationalReconciliationRecord({
+      missionId: "cleanup-crew-governance",
+      phase: "phase6_operational_reconciliation_authority",
+      owner: "Will",
+      beforeAuthoritySummary: "Prior plan allows internal remediation.",
+      proposedAuthoritySummary: "Proposed amendment has unclear scope.",
+      changedSurfaces: ["AGENTS.md"],
+      diffSummary: "The diff cannot prove whether behavior semantics changed.",
+      evidence: ["ambiguous-diff.md"],
+      rollbackProofRef: "rollback.md",
+      changedMeaning: true,
+      scopeWithinMission: false,
+      timestamp: NOW,
+    });
+
+    expect(record.evaluation).toMatchObject({
+      classification: "scope_risk_unclassified",
+      outcome: "ACTION_BLOCKED",
+      impact: "ACTION",
+      reason_code: "SCOPE_RISK_UNCLASSIFIED",
+      next_action: "classify_scope_risk_diff_with_evidence_and_grant_review",
+      grant_review_required: true,
+    });
+    expect(record.typed_decision_receipt).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reason_code: "SCOPE_RISK_UNCLASSIFIED",
+      validation: {
+        ok: true,
+        errors: [],
+      },
+    });
+  });
+
+  it("fails Phase 6 diffs closed when scope and meaning facts are omitted", () => {
+    const record = createCleanupCrewOperationalReconciliationRecord({
+      missionId: "cleanup-crew-governance",
+      phase: "phase6_operational_reconciliation_authority",
+      owner: "Will",
+      beforeAuthoritySummary: "Prior authority exists.",
+      proposedAuthoritySummary: "Proposed authority is underspecified.",
+      changedSurfaces: ["AGENTS.md"],
+      diffSummary: "No structured proof states whether meaning or scope changed.",
+      evidence: ["incomplete-diff.md"],
+      rollbackProofRef: "rollback.md",
+      timestamp: NOW,
+    });
+
+    expect(record.evaluation).toMatchObject({
+      changed_meaning: null,
+      scope_within_mission: null,
+      classification: "scope_risk_unclassified",
+      outcome: "ACTION_BLOCKED",
+      reason_code: "SCOPE_RISK_UNCLASSIFIED",
+      grant_review_required: true,
+    });
+    expect(record.typed_decision_receipt).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      reason_code: "SCOPE_RISK_UNCLASSIFIED",
+      validation: {
+        ok: true,
+        errors: [],
+      },
+    });
+  });
+
+  it("resolves Phase 7 action blockers without stopping the phase or mission", () => {
+    const receipt = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase7_action_phase_mission_separation",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "single action needs repair before continuation",
+        proposedOutcome: "ACTION_BLOCKED",
+        proposedImpact: "ACTION",
+        proposedReasonCode: "TECHNICAL_REPAIR",
+        owner: "Will",
+        nextAction: "repair_action_then_resume_phase",
+        evidence: ["action-blocker.md"],
+        rollback: {
+          available: true,
+          proofRef: "rollback.md",
+        },
+        reportEffect: "action_blocked_phase_continues",
+      },
+      { timestamp: NOW },
+    );
+
+    expect(resolveCleanupCrewLevelState(receipt)).toMatchObject({
+      schema: "openclaw.cleanup_crew_level_state_resolution.v1",
+      action_state: "blocked",
+      phase_state: "open",
+      mission_state: "open",
+      stop_levels: ["ACTION"],
+      resume_behavior: "repair_action_then_resume_phase",
+      safe_parallel_work_continues: true,
+    });
+  });
+
+  it("resolves Phase 7 phase blockers without aborting the mission", () => {
+    const receipt = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase7_action_phase_mission_separation",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "reviewer unavailable for risky activation",
+        proposedOutcome: "PHASE_BLOCKED",
+        proposedImpact: "PHASE",
+        proposedReasonCode: "REVIEWER_UNAVAILABLE",
+        owner: "Will",
+        nextAction: "wait_for_grant_or_alternate_reviewer",
+        evidence: ["review-required.md"],
+        rollback: {
+          available: true,
+          proofRef: "rollback.md",
+        },
+        reportEffect: "phase_blocked_safe_unrelated_work_continues",
+      },
+      { timestamp: NOW },
+    );
+
+    expect(resolveCleanupCrewLevelState(receipt)).toMatchObject({
+      action_state: "blocked",
+      phase_state: "blocked",
+      mission_state: "open",
+      stop_levels: ["ACTION", "PHASE"],
+      resume_behavior: "wait_for_grant_or_alternate_reviewer",
+      safe_parallel_work_continues: true,
+    });
+  });
+
+  it("resolves Phase 7 mission abort only from a valid mission-abort receipt", () => {
+    const entries: CleanupCrewMissionAbortExhaustionEntry[] =
+      CLEANUP_CREW_MISSION_ABORT_CONTINUATION_CLASSES.map((continuationClass) => ({
+        class: continuationClass,
+        status: "unavailable",
+        evidence: `${continuationClass} unavailable`,
+      }));
+    const exhaustion = createCleanupCrewMissionAbortExhaustionReceipt({
+      missionId: "cleanup-crew-governance",
+      entries,
+      timestamp: NOW,
+    });
+    const receipt = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase7_action_phase_mission_separation",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "all continuation classes exhausted",
+        proposedOutcome: "MISSION_ABORTED",
+        proposedImpact: "MISSION",
+        proposedReasonCode: "MISSION_EXHAUSTION_PROVEN",
+        owner: "Will",
+        nextAction: "emit_exhaustion_receipt_and_stop_mission",
+        evidence: ["exhaustion.md", exhaustion.receipt_id],
+        rollback: {
+          available: false,
+          proofRef: "rollback-unavailable.md",
+        },
+        reportEffect: "mission_aborted_with_exhaustion",
+        missionAbortExhaustion: exhaustion,
+      },
+      { timestamp: NOW },
+    );
+
+    expect(resolveCleanupCrewLevelState(receipt)).toMatchObject({
+      action_state: "aborted",
+      phase_state: "aborted",
+      mission_state: "aborted",
+      stop_levels: ["ACTION", "PHASE", "MISSION"],
+      safe_parallel_work_continues: false,
+    });
+  });
+
+  it("resolves malformed Phase 7 typed decisions as action-level repair only", () => {
+    const receipt = createCleanupCrewTypedDecisionReceipt(
+      {
+        schema: "openclaw.cleanup_crew_typed_decision_input.v1",
+        policyVersion: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+        phase: "phase7_action_phase_mission_separation",
+        missionId: "cleanup-crew-governance",
+        inputSummary: "adapter emitted bad impact",
+        proposedOutcome: "ACTION_BLOCKED",
+        proposedImpact: "EVERYTHING",
+        proposedReasonCode: "TECHNICAL_REPAIR",
+        owner: "Will",
+        nextAction: "bad",
+        evidence: ["bad-adapter.json"],
+        rollback: {
+          available: true,
+          proofRef: "rollback.md",
+        },
+        reportEffect: "bad",
+      },
+      { timestamp: NOW },
+    );
+
+    expect(resolveCleanupCrewLevelState(receipt)).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      impact: "ACTION",
+      reason_code: "MALFORMED_POLICY_INPUT",
+      action_state: "blocked",
+      phase_state: "open",
+      mission_state: "open",
+      stop_levels: ["ACTION"],
+      resume_behavior: "diagnose_policy_input_and_rerun_classifier",
+      safe_parallel_work_continues: true,
+    });
+  });
+
+  it("keeps technical persistence and identity defects out of owner-decision routing", () => {
+    expect(
+      classifyCleanupCrewGovernanceTaxonomy({
+        technicalPersistenceOrIdentityDefect: true,
+        summary: "guard-local blocker state is persisted under the wrong identity",
+      }),
+    ).toMatchObject({
+      outcome: "REPAIR_AND_CONTINUE",
+      reasonCode: "TECHNICAL_REPAIR",
+      ownerApprovalRequired: false,
+      classification: "technical_repair_not_owner_decision",
+    });
+  });
+
+  it("adapts Bootstrap B0 repairable blockers into canonical typed decisions", () => {
+    const receipt = createCleanupCrewBootstrapB0TypedDecisionReceipt({
+      missionId: "cleanup-crew-governance",
+      phase: "phase5_mechanical_policy_unification",
+      owner: "Will",
+      summary: "STATUS: blocked",
+      blocker: "watchdog NEEDS_REVIEW but next action is rerun watchdog",
+      nextRepairPathKnown: true,
+      evidence: ["watchdog-receipt.json"],
+      rollbackProofRef: "b0-local-classifier-backup",
+      timestamp: NOW,
+    });
+
+    expect(receipt).toMatchObject({
+      policy_version: CLEANUP_CREW_POLICY_SCHEMA_VERSION,
+      phase: "phase5_mechanical_policy_unification",
+      mission_id: "cleanup-crew-governance",
+      outcome: "REPAIR_AND_CONTINUE",
+      impact: "ACTION",
+      reason_code: "TECHNICAL_REPAIR",
+      next_action: "continue_cleanup_repair_through_canonical_policy",
+      report_effect: "b0_compatibility_repair_continues",
+      validation: { ok: true, errors: [] },
+    });
+  });
+
+  it("adapts Bootstrap B0 hard blockers into fail-closed canonical typed decisions", () => {
+    const receipt = createCleanupCrewBootstrapB0TypedDecisionReceipt({
+      missionId: "cleanup-crew-governance",
+      phase: "phase5_mechanical_policy_unification",
+      owner: "Will",
+      summary: "STATUS: blocked",
+      blocker: "raw DB repair required without emergency SOP",
+      evidence: ["blocked-artifact.md"],
+      rollbackProofRef: "b0-local-classifier-backup",
+      timestamp: NOW,
+    });
+
+    expect(receipt).toMatchObject({
+      outcome: "ACTION_BLOCKED",
+      impact: "MISSION",
+      reason_code: "PROTECTED_ACTION_DENIED",
+      next_action: "record_lawful_blocker_artifact_before_terminal_closeout",
+      report_effect: "b0_compatibility_terminal_stop_requires_blocker_proof",
+      validation: { ok: true, errors: [] },
+    });
+  });
+
   it("creates stoppage receipts with required proof-gap metadata and bounded output tails", () => {
     const receipt = createCleanupCrewStoppageReceipt({
       timestamp: NOW,
@@ -764,6 +1484,507 @@ describe("Continuity Gate v2", () => {
     expect(classifyCleanupCrewBlocker({ authorityOrScopeMissing: true })).toMatchObject({
       category: "authority_scope_blocker",
       hardStopWholeMission: true,
+    });
+  });
+
+  it("keeps first and second no-progress repairs active within the Phase 8 budget", () => {
+    const attempts = [1, 2].map((attemptNumber) =>
+      createCleanupCrewRepairAttemptReceipt({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "watchdog_needs_review",
+        attemptIdentity: "watchdog-flow-763440db-repair",
+        attemptNumber,
+        inputRef: "watchdog_receipt_20260715_042023",
+        action: "reattach_foreground_cleanup_crew_executor",
+        evidence: [`attempt-${attemptNumber}`],
+        result: "no_progress",
+        deltaSummary: "watchdog still reports the same stale flow/task pair",
+        timestamp: NOW,
+      }),
+    );
+
+    expect(
+      resolveCleanupCrewRepairLoop({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "watchdog_needs_review",
+        attempts: [attempts[0]!],
+      }),
+    ).toMatchObject({
+      outcome: "continue_repair",
+      identical_no_progress_count: 1,
+      retry_budget: 3,
+      mission_remains_active: true,
+      safe_parallel_work_continues: true,
+    });
+
+    expect(
+      resolveCleanupCrewRepairLoop({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "watchdog_needs_review",
+        attempts,
+      }),
+    ).toMatchObject({
+      outcome: "continue_repair",
+      identical_no_progress_count: 2,
+      retry_budget: 3,
+      mission_remains_active: true,
+      safe_parallel_work_continues: true,
+    });
+  });
+
+  it("quarantines and investigates alternate path after three identical no-progress repairs", () => {
+    const attempts = [1, 2, 3].map((attemptNumber) =>
+      createCleanupCrewRepairAttemptReceipt({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "watchdog_needs_review",
+        attemptIdentity: "watchdog-flow-763440db-repair",
+        attemptNumber,
+        inputRef: "watchdog_receipt_20260715_042023",
+        action: "reattach_foreground_cleanup_crew_executor",
+        evidence: [`attempt-${attemptNumber}`],
+        result: "no_progress",
+        deltaSummary: "watchdog still reports the same stale flow/task pair",
+        timestamp: NOW,
+      }),
+    );
+
+    expect(
+      resolveCleanupCrewRepairLoop({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "watchdog_needs_review",
+        attempts,
+      }),
+    ).toMatchObject({
+      outcome: "quarantine_and_investigate_alternate",
+      identical_no_progress_count: 3,
+      retry_budget: 3,
+      quarantine_required: true,
+      alternate_path_required: true,
+      mission_remains_active: true,
+      safe_parallel_work_continues: true,
+      next_action: "quarantine_affected_change_and_investigate_alternate_path",
+    });
+  });
+
+  it("does not let retry budget bypass a required rollback", () => {
+    const attempt = createCleanupCrewRepairAttemptReceipt({
+      missionId: "cleanup-crew-governance",
+      reasonCode: "technical_repair",
+      attemptNumber: 1,
+      inputRef: "failed_patch",
+      action: "retry_patch_without_rollback",
+      evidence: ["diff touched protected surface"],
+      result: "rollback_required",
+      deltaSummary: "rollback is required before another mutation",
+      rollbackRequired: true,
+      rollbackAvailable: false,
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewRepairLoop({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "technical_repair",
+        attempts: [attempt],
+      }),
+    ).toMatchObject({
+      outcome: "action_blocked_rollback_required",
+      quarantine_required: false,
+      alternate_path_required: false,
+      mission_remains_active: true,
+      next_action: "perform_or_restore_rollback_before_retry_budget_can_continue",
+    });
+  });
+
+  it("blocks malformed proof producer output without closing the mission", () => {
+    const attempt = createCleanupCrewRepairAttemptReceipt({
+      missionId: "cleanup-crew-governance",
+      reasonCode: "proof_production_available",
+      attemptNumber: 1,
+      inputRef: "watchdog_clean_proof",
+      action: "parse_watchdog_receipt",
+      evidence: ["receipt missing summary.items_suspicious"],
+      result: "malformed_evidence",
+      deltaSummary: "proof producer returned malformed evidence",
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewRepairLoop({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "proof_production_available",
+        attempts: [attempt],
+      }),
+    ).toMatchObject({
+      outcome: "action_blocked_malformed_evidence",
+      mission_remains_active: true,
+      alternate_path_required: true,
+      next_action: "repair_or_replace_malformed_proof_producer_before_retrying",
+    });
+  });
+
+  it("keeps Phase 8 repair attempt receipts durable across JSON persistence", async () => {
+    const outputDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-phase8-repair-"));
+    try {
+      const attempt = createCleanupCrewRepairAttemptReceipt({
+        missionId: "cleanup-crew-governance",
+        reasonCode: "watchdog_needs_review",
+        attemptIdentity: "watchdog-flow-763440db-repair",
+        attemptNumber: 1,
+        inputRef: "watchdog_receipt_20260715_042023",
+        action: "reattach_foreground_cleanup_crew_executor",
+        evidence: ["flow 763440db", "task d92e4133"],
+        result: "progress",
+        deltaSummary: "foreground executor reattached to Phase 8",
+        timestamp: NOW,
+      });
+      const savedPath = path.join(outputDir, "repair-attempt.json");
+      await writeFile(savedPath, JSON.stringify(attempt, null, 2), "utf8");
+      const restored = JSON.parse(await readFile(savedPath, "utf8"));
+
+      expect(restored).toEqual(attempt);
+      expect(
+        resolveCleanupCrewRepairLoop({
+          missionId: "cleanup-crew-governance",
+          reasonCode: "watchdog_needs_review",
+          attempts: [restored],
+        }),
+      ).toMatchObject({
+        outcome: "continue_repair",
+        mission_remains_active: true,
+      });
+    } finally {
+      await rm(outputDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records Phase 9 source-turn drain waits as durable continuation records", () => {
+    const wait = createCleanupCrewDurableWaitRecord({
+      missionId: "cleanup-crew-governance",
+      waitKind: "drain",
+      owner: "Will",
+      evidence: ["foreground source turn is actively executing Phase 9"],
+      timeoutAt: "2026-07-04T18:12:00.000Z",
+      nextProbeAt: "2026-07-04T18:07:00.000Z",
+      resumeProbeTarget: "agent:orchestrator:main",
+      resumeCondition: "source turn finished or yielded with next executable step",
+      timestamp: NOW,
+    });
+
+    expect(wait).toMatchObject({
+      schema: "openclaw.cleanup_crew_durable_wait_record.v1",
+      wait_kind: "drain",
+      reason_code: "ACTIVE_WORK_DRAIN",
+      owner: "Will",
+      continuation_receipt_required: true,
+      mission_remains_open: true,
+      resume_probe: {
+        kind: "source_turn_drain",
+        target: "agent:orchestrator:main",
+      },
+    });
+
+    expect(
+      resolveCleanupCrewDurableWait({
+        record: wait,
+        now: "2026-07-04T18:03:00.000Z",
+      }),
+    ).toMatchObject({
+      outcome: "wait_valid",
+      canonical_outcome: "DEFER_UNTIL_DRAIN",
+      mission_remains_open: true,
+      pending_report_delivery_can_close_mission: false,
+      next_action: "keep_durable_wait_until_resume_probe_or_timeout",
+      validation_errors: [],
+    });
+  });
+
+  it("makes pending report delivery a durable wait that cannot close the parent mission", () => {
+    const wait = createCleanupCrewDurableWaitRecord({
+      missionId: "cleanup-crew-governance",
+      waitKind: "report_delivery",
+      owner: "Will",
+      evidence: ["milestone report body pending visible chat delivery"],
+      timeoutAt: "2026-07-04T18:12:00.000Z",
+      nextProbeAt: "2026-07-04T18:04:00.000Z",
+      resumeProbeTarget: "report-delivery-guard:phase9",
+      resumeCondition: "report body delivered or repair receipt written",
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewDurableWait({
+        record: wait,
+        now: "2026-07-04T18:05:00.000Z",
+      }),
+    ).toMatchObject({
+      outcome: "resume_probe_due",
+      canonical_outcome: "DEFER_UNTIL_DRAIN",
+      mission_remains_open: true,
+      pending_report_delivery_can_close_mission: false,
+      next_action: "run_resume_probe:report_delivery:report-delivery-guard:phase9",
+    });
+  });
+
+  it("rejects nonterminal parent responses that omit continuation receipt or durable wait", () => {
+    expect(
+      resolveCleanupCrewNonterminalContinuation({
+        missionId: "cleanup-crew-governance",
+        parentMissionOpen: true,
+        localStageComplete: true,
+        attemptedParentCloseout: true,
+      }),
+    ).toMatchObject({
+      allowed_to_emit_nonterminal_response: false,
+      allowed_to_close_parent_mission: false,
+      validation_errors: expect.arrayContaining([
+        "continuation_receipt_missing",
+        "parent_mission_closeout_forbidden_while_open",
+      ]),
+      next_action: "write_continuation_receipt_or_durable_wait_before_response",
+    });
+  });
+
+  it("turns expired durable waits into resume probes instead of idle silence", () => {
+    const wait = createCleanupCrewDurableWaitRecord({
+      missionId: "cleanup-crew-governance",
+      waitKind: "lost_session",
+      owner: "Will",
+      evidence: ["child session disappeared during Phase 9 wait"],
+      timeoutAt: "2026-07-04T18:04:00.000Z",
+      resumeProbeTarget: "child-session:agent:worker:phase9",
+      resumeCondition: "child session active or supersession receipt exists",
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewDurableWait({
+        record: wait,
+        now: "2026-07-04T18:05:00.000Z",
+      }),
+    ).toMatchObject({
+      outcome: "wait_expired_probe_required",
+      canonical_outcome: "DEFER_UNTIL_DRAIN",
+      mission_remains_open: true,
+      next_action: "run_resume_probe:child_session:child-session:agent:worker:phase9",
+    });
+  });
+
+  it("routes Phase 10 prohibited background writes to the available foreground executor", () => {
+    const background = createCleanupCrewExecutorCapabilityRecord({
+      executorId: "coding-agent-background",
+      role: "Coding Agent",
+      sessionKey: "agent:codex:background",
+      permitted: ["repo_read"],
+      prohibited: ["repo_write"],
+    });
+    const foreground = createCleanupCrewExecutorCapabilityRecord({
+      executorId: "will-foreground",
+      role: "Will",
+      sessionKey: "agent:orchestrator:main",
+      taskId: "d92e4133-066f-4ad5-9656-fe07e365983a",
+      leaseRevision: 38,
+      permitted: ["repo_read", "repo_write", "taskflow_reconciliation", "watchdog_repair"],
+      prohibited: [],
+      receiptRequirements: ["taskflow_revision", "watchdog_receipt"],
+    });
+
+    expect(
+      resolveCleanupCrewCapabilityRoute({
+        missionId: "cleanup-crew-governance",
+        requiredCapability: "repo_write",
+        preferredExecutorId: "coding-agent-background",
+        executors: [background, foreground],
+        evidence: ["background writes prohibited; foreground executor active"],
+      }),
+    ).toMatchObject({
+      outcome: "route_to_available_executor",
+      selected_executor_id: "will-foreground",
+      canonical_outcome: "CONTINUE",
+      reason_code: "TECHNICAL_REPAIR",
+      duplicate_spawn_allowed: false,
+      next_action: "route_work_to_executor:will-foreground",
+    });
+  });
+
+  it("turns Grant unavailable into a phase wait instead of bypassing required review", () => {
+    expect(
+      resolveCleanupCrewCapabilityRoute({
+        missionId: "cleanup-crew-governance",
+        requiredCapability: "grant_review",
+        requiresGrantReview: true,
+        executors: [
+          createCleanupCrewExecutorCapabilityRecord({
+            executorId: "grant",
+            role: "Grant",
+            sessionKey: "agent:grant:unavailable",
+            available: false,
+            permitted: ["grant_review"],
+          }),
+        ],
+        evidence: ["risky repeated repairs require Grant"],
+      }),
+    ).toMatchObject({
+      outcome: "reviewer_unavailable_wait",
+      canonical_outcome: "PHASE_BLOCKED",
+      reason_code: "REVIEWER_UNAVAILABLE",
+      duplicate_spawn_allowed: false,
+      next_action: "write_reviewer_unavailable_wait_and_resume_probe",
+    });
+  });
+
+  it("blocks stale executor identity before duplicate spawn or mutation", () => {
+    expect(
+      resolveCleanupCrewCapabilityRoute({
+        missionId: "cleanup-crew-governance",
+        requiredCapability: "taskflow_reconciliation",
+        executors: [
+          createCleanupCrewExecutorCapabilityRecord({
+            executorId: "stale-worker",
+            role: "Coding Agent",
+            taskId: "lost-task",
+            runId: "ended-run",
+            available: true,
+            stale: true,
+            permitted: ["taskflow_reconciliation"],
+          }),
+        ],
+        evidence: ["watchdog reported stale worker"],
+      }),
+    ).toMatchObject({
+      outcome: "stale_identity_reconciliation_required",
+      canonical_outcome: "ACTION_BLOCKED",
+      reason_code: "STALE_STATE_RECONCILIATION",
+      duplicate_spawn_allowed: false,
+      next_action: "reconcile_stale_executor_identity_before_spawn_or_mutation",
+    });
+  });
+
+  it("blocks identity-poor capability records before routing", () => {
+    expect(
+      resolveCleanupCrewCapabilityRoute({
+        missionId: "cleanup-crew-governance",
+        requiredCapability: "watchdog_repair",
+        executors: [
+          createCleanupCrewExecutorCapabilityRecord({
+            executorId: "anonymous-counter",
+            role: "TaskFlow",
+            permitted: ["watchdog_repair"],
+          }),
+        ],
+        evidence: ["counter says active but no task/session/run identity exists"],
+      }),
+    ).toMatchObject({
+      outcome: "identity_missing_blocked",
+      canonical_outcome: "ACTION_BLOCKED",
+      reason_code: "ROLE_CAPABILITY_UNAVAILABLE",
+      duplicate_spawn_allowed: false,
+      next_action: "attach_executor_identity_and_receipt_requirements_before_routing",
+    });
+  });
+
+  it("requires restart drain registration before active-work restart deferral", () => {
+    expect(
+      resolveCleanupCrewRestartContinuation({
+        missionId: "cleanup-crew-governance",
+        restartRequested: true,
+        activeWorkPresent: true,
+      }),
+    ).toMatchObject({
+      outcome: "restart_missing_registration_blocked",
+      canonical_outcome: "ACTION_BLOCKED",
+      reason_code: "RESTART_DRAIN_WAIT",
+      mission_remains_open: true,
+      allowed_to_close: false,
+      next_action: "write_restart_registration_before_drain_or_restart",
+    });
+  });
+
+  it("defers restart through a registered active-work drain", () => {
+    const registration = createCleanupCrewRestartDrainRegistration({
+      missionId: "cleanup-crew-governance",
+      owner: "Will",
+      restartTarget: "gateway-runtime",
+      drainReason: "Phase 11 validates source turn as legitimate active work",
+      activeWorkRef: "taskflow:763440db:revision39",
+      timeoutAt: "2026-07-04T18:15:00.000Z",
+      postRestartProofRequired: ["runtime_descriptor_loaded", "watchdog_clean"],
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewRestartContinuation({
+        missionId: "cleanup-crew-governance",
+        restartRequested: true,
+        activeWorkPresent: true,
+        registration,
+      }),
+    ).toMatchObject({
+      outcome: "restart_registered_defer_until_drain",
+      canonical_outcome: "DEFER_UNTIL_DRAIN",
+      reason_code: "RESTART_DRAIN_WAIT",
+      mission_remains_open: true,
+      allowed_to_close: false,
+      next_action: "defer_restart_until_registered_active_work_drains_then_probe",
+    });
+  });
+
+  it("blocks closeout when post-restart target proof is missing", () => {
+    const registration = createCleanupCrewRestartDrainRegistration({
+      missionId: "cleanup-crew-governance",
+      owner: "Will",
+      restartTarget: "gateway-runtime",
+      drainReason: "restart required after build",
+      activeWorkRef: "taskflow:phase11",
+      timeoutAt: "2026-07-04T18:15:00.000Z",
+      postRestartProofRequired: ["runtime_descriptor_loaded", "watchdog_clean"],
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewRestartContinuation({
+        missionId: "cleanup-crew-governance",
+        restartRequested: true,
+        activeWorkPresent: false,
+        registration,
+        postRestartProof: ["runtime_descriptor_loaded"],
+        attemptedCloseout: true,
+      }),
+    ).toMatchObject({
+      outcome: "post_restart_proof_missing_blocked",
+      canonical_outcome: "ACTION_BLOCKED",
+      allowed_to_close: false,
+      mission_remains_open: true,
+      next_action: "prove_post_restart_target_surface_loaded_before_closeout",
+    });
+  });
+
+  it("continues after all post-restart target proof is present", () => {
+    const registration = createCleanupCrewRestartDrainRegistration({
+      missionId: "cleanup-crew-governance",
+      owner: "Will",
+      restartTarget: "gateway-runtime",
+      drainReason: "restart required after build",
+      activeWorkRef: "taskflow:phase11",
+      timeoutAt: "2026-07-04T18:15:00.000Z",
+      postRestartProofRequired: ["runtime_descriptor_loaded", "watchdog_clean"],
+      timestamp: NOW,
+    });
+
+    expect(
+      resolveCleanupCrewRestartContinuation({
+        missionId: "cleanup-crew-governance",
+        restartRequested: true,
+        activeWorkPresent: false,
+        registration,
+        postRestartProof: ["runtime_descriptor_loaded", "watchdog_clean"],
+      }),
+    ).toMatchObject({
+      outcome: "post_restart_proof_passed_continue",
+      canonical_outcome: "CONTINUE",
+      allowed_to_close: false,
+      mission_remains_open: true,
+      next_action: "continue_after_post_restart_target_surface_proof",
     });
   });
 

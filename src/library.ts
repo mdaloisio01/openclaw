@@ -89,3 +89,102 @@ export {
   saveSessionStore,
   waitForever,
 };
+
+export {
+  CLEANUP_WATCHDOG_ACCEPTED_READ_VERSIONS,
+  CLEANUP_WATCHDOG_ACTIVATION_GATES,
+  CLEANUP_WATCHDOG_CLEAN_DIMENSIONS,
+  CLEANUP_WATCHDOG_COVERAGE_KINDS,
+  CLEANUP_WATCHDOG_POLICY_VERSION,
+  CLEANUP_WATCHDOG_PRIORITY_ORDER,
+  compareCleanupWatchdogPriority,
+  evaluateCleanupWatchdogCoverage,
+  getCleanupWatchdogPriority,
+  isCleanupWatchdogPolicyVersionCompatible,
+  type CleanupWatchdogActivationGate,
+  type CleanupWatchdogCleanDimension,
+  type CleanupWatchdogCoverageDecision,
+  type CleanupWatchdogCoverageInput,
+  type CleanupWatchdogCoverageKind,
+  type CleanupWatchdogFindingCategory,
+  type CleanupWatchdogPolicyVersion,
+  type CleanupWatchdogPriorityCode,
+} from "./governance/cleanup-watchdog-policy.js";
+export {
+  createCleanupWatchdogShadowInputFromReceipt,
+  evaluateCleanupWatchdogActivationGate,
+  reconcileCleanupWatchdogMission,
+  type CleanupWatchdogActivationGateDecision,
+  type CleanupWatchdogActivationGateInput,
+  type CleanupWatchdogActivationMode,
+  type CleanupWatchdogControllerDecision,
+  type CleanupWatchdogControllerFinding,
+  type CleanupWatchdogControllerInput,
+  type CleanupWatchdogControllerMode,
+  type CleanupWatchdogReceiptItemSnapshot,
+  type CleanupWatchdogReceiptSnapshot,
+} from "./governance/cleanup-watchdog-controller.js";
+export {
+  CLEANUP_WATCHDOG_LIVE_CONTROLLER_SCHEMA,
+  activateCleanupWatchdogLiveController,
+  consumeReceiptWithLiveController,
+  evaluateReceiptWithLiveController,
+  getCleanupWatchdogLiveControllerState,
+  resolveCleanupWatchdogLiveControllerPaths,
+  rollbackCleanupWatchdogLiveController,
+  runCleanupWatchdogLiveRecoveryExercise,
+  runCleanupWatchdogControlledCanaries,
+  type CleanupWatchdogActivationParams,
+  type CleanupWatchdogCanaryResult,
+  type CleanupWatchdogCanarySuiteResult,
+  type CleanupWatchdogLiveRecoveryExerciseResult,
+  type CleanupWatchdogReceiptConsumptionResult,
+  type CleanupWatchdogLiveControllerPaths,
+  type CleanupWatchdogLiveControllerState,
+} from "./governance/cleanup-watchdog-live-controller.js";
+export {
+  evaluateFalseCloseoutAdmission,
+  resolveFalseCloseoutAdmissionMode,
+} from "./governance/false-closeout-admission-controller.js";
+export {
+  compileMissionPlan,
+  type CompiledMissionPlan,
+} from "./governance/mission-plan-compiler.js";
+export { writeEvidenceReceipt, sha256Text } from "./governance/mission-evidence-store.js";
+export { latestPassingReceiptForGate } from "./governance/mission-gate-registry.js";
+export {
+  reconcileTestManifest,
+  type TestManifestReconciliation,
+} from "./governance/test-manifest.js";
+export {
+  rollbackReceiptValid,
+  restorationReceiptValid,
+} from "./governance/rollback-restoration-state.js";
+export { exportManifestComplete } from "./governance/mission-export-packager.js";
+export { grantApprovalFresh } from "./agents/grant-evidence-review.js";
+export type {
+  AcceptanceGate,
+  CloseoutAdmissionInput,
+  CompletionDecision,
+  CompletionDecisionState,
+  CompletionRejection,
+  CompletionRejectionCode,
+  CompletionRequest,
+  EvidenceReceipt,
+  ExportManifest,
+  GateKind,
+  GrantApprovalReceipt,
+  MissionIdentity,
+  MissionManifest,
+  MissionMode,
+  RawTestResult,
+  RepairWorkState,
+  RequirementManifest,
+  RequirementManifestItem,
+  RequirementStatus,
+  RestorationReceipt,
+  RollbackReceipt,
+  RuntimeCloseoutState,
+  TestManifest,
+  WatchdogState,
+} from "./governance/mission-manifest.types.js";

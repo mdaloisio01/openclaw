@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   flowsStartProductionCommand: vi.fn(),
   flowsResumeProductionCommand: vi.fn(),
   flowsLawfulStopCommand: vi.fn(),
+  flowsSupersedeForegroundCleanupCrewExecutorCommand: vi.fn(),
   setVerbose: vi.fn(),
   runtime: {
     log: vi.fn(),
@@ -53,6 +54,8 @@ const flowsCancelCommand = mocks.flowsCancelCommand;
 const flowsStartProductionCommand = mocks.flowsStartProductionCommand;
 const flowsResumeProductionCommand = mocks.flowsResumeProductionCommand;
 const flowsLawfulStopCommand = mocks.flowsLawfulStopCommand;
+const flowsSupersedeForegroundCleanupCrewExecutorCommand =
+  mocks.flowsSupersedeForegroundCleanupCrewExecutorCommand;
 const setVerbose = mocks.setVerbose;
 const runtime = mocks.runtime;
 
@@ -128,6 +131,8 @@ vi.mock("../../commands/flows.js", () => ({
   flowsStartProductionCommand: mocks.flowsStartProductionCommand,
   flowsResumeProductionCommand: mocks.flowsResumeProductionCommand,
   flowsLawfulStopCommand: mocks.flowsLawfulStopCommand,
+  flowsSupersedeForegroundCleanupCrewExecutorCommand:
+    mocks.flowsSupersedeForegroundCleanupCrewExecutorCommand,
 }));
 
 vi.mock("../../globals.js", () => ({
@@ -587,6 +592,34 @@ describe("registerStatusHealthSessionsCommands", () => {
       reason: "blocker",
       detail: "authority decision remains blocked",
       currentStep: "blocked",
+    });
+
+    await runCli([
+      "tasks",
+      "flow",
+      "supersede-foreground-cleanup-crew-executor",
+      "flow-123",
+      "--lost-task-id",
+      "task-lost",
+      "--replacement-task-id",
+      "task-replacement",
+      "--owner-key",
+      "agent:orchestrator:main",
+      "--session-key",
+      "agent:orchestrator:main",
+      "--current-step",
+      "governance_remediation_current_truth_reconciliation",
+      "--detail",
+      "active_no_worker executor recovery",
+    ]);
+    expectCommandOptions(flowsSupersedeForegroundCleanupCrewExecutorCommand, {
+      lookup: "flow-123",
+      lostTaskId: "task-lost",
+      replacementTaskId: "task-replacement",
+      ownerKey: "agent:orchestrator:main",
+      sessionKey: "agent:orchestrator:main",
+      currentStep: "governance_remediation_current_truth_reconciliation",
+      detail: "active_no_worker executor recovery",
     });
   });
 
