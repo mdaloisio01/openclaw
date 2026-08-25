@@ -15,6 +15,7 @@ import {
 } from "./task-flow-registry.js";
 import { configureTaskFlowRegistryRuntime } from "./task-flow-registry.store.js";
 import {
+  closeTaskFlowRegistryDatabase,
   loadTaskFlowRegistryStateFromSqlite,
   saveTaskFlowRegistryStateToSqlite,
 } from "./task-flow-registry.store.sqlite.js";
@@ -279,6 +280,35 @@ describe("task-flow-registry store runtime", () => {
       expect(restored?.flowId).toBe(created.flowId);
       expect(restored?.stateJson).toBeNull();
       expect(restored?.waitJson).toBeNull();
+    });
+  });
+
+  it("does not reuse a read-only restore handle for later flow writes", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const existing = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/readonly-flow-existing",
+        goal: "Existing flow",
+        status: "blocked",
+        blockedSummary: "Waiting.",
+      });
+      resetTaskFlowRegistryForTests({ persist: false });
+      closeTaskFlowRegistryDatabase();
+
+      const restored = loadTaskFlowRegistryStateFromSqlite();
+      expect(restored.flows.has(existing.flowId)).toBe(true);
+
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/readonly-flow-new",
+        goal: "New flow after read-only restore",
+        status: "running",
+      });
+      const afterWrite = loadTaskFlowRegistryStateFromSqlite();
+      expect(afterWrite.flows.has(created.flowId)).toBe(true);
     });
   });
 

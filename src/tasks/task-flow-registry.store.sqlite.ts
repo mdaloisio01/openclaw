@@ -30,9 +30,10 @@ type FlowRegistryRow = Selectable<FlowRunsTable> & {
 type FlowRegistryDatabase = {
   db: DatabaseSync;
   path: string;
+  readOnly: boolean;
 };
 
-let cachedDatabase: FlowRegistryDatabase | null = null;
+const cachedDatabases = new Map<string, FlowRegistryDatabase>();
 
 function normalizeNumber(value: number | bigint | null): number | undefined {
   if (typeof value === "bigint") {
@@ -197,20 +198,27 @@ function upsertFlowRow(db: DatabaseSync, row: Insertable<FlowRunsTable>): void {
   );
 }
 
-function openFlowRegistryDatabase(): FlowRegistryDatabase {
-  const database = openOpenClawStateDatabase();
+function openFlowRegistryDatabase(options: { readOnly?: boolean } = {}): FlowRegistryDatabase {
+  const database = options.readOnly
+    ? openOpenClawStateDatabase({ readOnly: true })
+    : openOpenClawStateDatabase();
   const pathname = database.path;
-  if (cachedDatabase && cachedDatabase.path === pathname && cachedDatabase.db.isOpen) {
+  const readOnly = options.readOnly === true;
+  const cacheKey = `${pathname}\0${readOnly ? "readonly" : "readwrite"}`;
+  const cachedDatabase = cachedDatabases.get(cacheKey);
+  if (cachedDatabase?.db.isOpen) {
     return cachedDatabase;
   }
-  if (cachedDatabase && !cachedDatabase.db.isOpen) {
-    cachedDatabase = null;
+  if (cachedDatabase) {
+    cachedDatabases.delete(cacheKey);
   }
-  cachedDatabase = {
+  const flowDatabase = {
     db: database.db,
     path: pathname,
+    readOnly,
   };
-  return cachedDatabase;
+  cachedDatabases.set(cacheKey, flowDatabase);
+  return flowDatabase;
 }
 
 function withWriteTransaction(write: (database: FlowRegistryDatabase) => void) {
@@ -221,7 +229,7 @@ function withWriteTransaction(write: (database: FlowRegistryDatabase) => void) {
 }
 
 export function loadTaskFlowRegistryStateFromSqlite(): TaskFlowRegistryStoreSnapshot {
-  const { db } = openFlowRegistryDatabase();
+  const { db } = openFlowRegistryDatabase({ readOnly: true });
   const rows = selectFlowRows(db);
   return {
     flows: new Map(rows.map((row) => [row.flow_id, rowToFlowRecord(row)])),
@@ -259,6 +267,6 @@ export function deleteTaskFlowRegistryRecordFromSqlite(flowId: string) {
 }
 
 export function closeTaskFlowRegistryDatabase() {
-  cachedDatabase = null;
+  cachedDatabases.clear();
   closeOpenClawStateDatabase();
 }

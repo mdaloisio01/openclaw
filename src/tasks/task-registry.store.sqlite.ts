@@ -43,6 +43,7 @@ type TaskDeliveryStateRow = Selectable<TaskDeliveryStateTable>;
 type TaskRegistryDatabase = {
   db: DatabaseSync;
   path: string;
+  readOnly: boolean;
 };
 
 const TASK_RUN_SELECT_COLUMNS = [
@@ -78,7 +79,7 @@ const TASK_RUN_SELECT_COLUMNS = [
   "terminal_outcome",
 ] as const;
 
-let cachedDatabase: TaskRegistryDatabase | null = null;
+const cachedDatabases = new Map<string, TaskRegistryDatabase>();
 
 function normalizeNumber(value: number | bigint | null): number | undefined {
   if (typeof value === "bigint") {
@@ -302,20 +303,27 @@ function deleteTaskRowsWithDeliveryState(db: DatabaseSync, taskId: string): void
   executeSqliteQuerySync(db, kysely.deleteFrom("task_runs").where("task_id", "=", taskId));
 }
 
-function openTaskRegistryDatabase(): TaskRegistryDatabase {
-  const database = openOpenClawStateDatabase();
+function openTaskRegistryDatabase(options: { readOnly?: boolean } = {}): TaskRegistryDatabase {
+  const database = options.readOnly
+    ? openOpenClawStateDatabase({ readOnly: true })
+    : openOpenClawStateDatabase();
   const pathname = database.path;
-  if (cachedDatabase && cachedDatabase.path === pathname && cachedDatabase.db.isOpen) {
+  const readOnly = options.readOnly === true;
+  const cacheKey = `${pathname}\0${readOnly ? "readonly" : "readwrite"}`;
+  const cachedDatabase = cachedDatabases.get(cacheKey);
+  if (cachedDatabase?.db.isOpen) {
     return cachedDatabase;
   }
-  if (cachedDatabase && !cachedDatabase.db.isOpen) {
-    cachedDatabase = null;
+  if (cachedDatabase) {
+    cachedDatabases.delete(cacheKey);
   }
-  cachedDatabase = {
+  const taskDatabase = {
     db: database.db,
     path: pathname,
+    readOnly,
   };
-  return cachedDatabase;
+  cachedDatabases.set(cacheKey, taskDatabase);
+  return taskDatabase;
 }
 
 function withWriteTransaction(write: (database: TaskRegistryDatabase) => void) {
@@ -326,7 +334,7 @@ function withWriteTransaction(write: (database: TaskRegistryDatabase) => void) {
 }
 
 export function loadTaskRegistryStateFromSqlite(): TaskRegistryStoreSnapshot {
-  const { db } = openTaskRegistryDatabase();
+  const { db } = openTaskRegistryDatabase({ readOnly: true });
   const taskRows = selectTaskRows(db);
   const deliveryRows = selectTaskDeliveryStateRows(db);
   return {
@@ -441,6 +449,6 @@ export function deleteTaskDeliveryStateFromSqlite(taskId: string) {
 }
 
 export function closeTaskRegistryDatabase() {
-  cachedDatabase = null;
+  cachedDatabases.clear();
   closeOpenClawStateDatabase();
 }

@@ -31,6 +31,7 @@ import {
   type TaskRegistryObserverEvent,
 } from "./task-registry.store.js";
 import {
+  closeTaskRegistryDatabase,
   loadTaskRegistryStateFromSqlite,
   saveTaskRegistryStateToSqlite,
 } from "./task-registry.store.sqlite.js";
@@ -286,6 +287,43 @@ describe("task-registry store runtime", () => {
           missionState: "active",
           missionUpdatedAt: 1234,
         });
+      },
+    );
+  });
+
+  it("does not reuse a read-only restore handle for later task writes", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-task-store-readonly-cache-" },
+      async () => {
+        resetTaskRegistryForTests();
+        const existing = createTaskRecord({
+          runtime: "acp",
+          ownerKey: "agent:main:main",
+          scopeKind: "session",
+          childSessionKey: "agent:main:acp:existing",
+          runId: "run-readonly-existing",
+          task: "Existing task",
+          status: "running",
+          deliveryStatus: "pending",
+        });
+        resetTaskRegistryForTests({ persist: false });
+        closeTaskRegistryDatabase();
+
+        const restored = loadTaskRegistryStateFromSqlite();
+        expect(restored.tasks.has(existing.taskId)).toBe(true);
+
+        const created = createTaskRecord({
+          runtime: "acp",
+          ownerKey: "agent:main:main",
+          scopeKind: "session",
+          childSessionKey: "agent:main:acp:new",
+          runId: "run-readonly-new",
+          task: "New task after read-only restore",
+          status: "running",
+          deliveryStatus: "pending",
+        });
+        const afterWrite = loadTaskRegistryStateFromSqlite();
+        expect(afterWrite.tasks.has(created.taskId)).toBe(true);
       },
     );
   });
