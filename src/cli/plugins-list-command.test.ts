@@ -37,12 +37,15 @@ describe("runPluginsListCommand", () => {
       throw new Error("plugins list JSON must use the snapshot status module");
     });
     vi.doMock("../plugins/status-snapshot.js", () => ({
-      buildPluginRegistrySnapshotReport: () => ({
-        workspaceDir: "/workspace",
-        registrySource: "config",
-        registryDiagnostics: [],
-        plugins: [{ id: "demo", enabled: true }],
-        diagnostics: [],
+      buildPluginRegistrySnapshotReport: vi.fn((params?: { preferPersisted?: boolean }) => {
+        expect(params?.preferPersisted).toBe(false);
+        return {
+          workspaceDir: "/workspace",
+          registrySource: "config",
+          registryDiagnostics: [],
+          plugins: [{ id: "demo", enabled: true }],
+          diagnostics: [],
+        };
       }),
     }));
     vi.doMock("../plugins/source-display.js", () => {

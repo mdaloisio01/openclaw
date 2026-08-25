@@ -43,6 +43,7 @@ export async function runPluginsListCommand(
   const cfg = getRuntimeConfig();
   const report = buildPluginRegistrySnapshotReport({
     config: cfg,
+    ...(opts.json ? { preferPersisted: false } : {}),
     ...(opts.json ? { logger: quietPluginJsonLogger } : {}),
   });
   const list = opts.enabled ? report.plugins.filter((p) => p.enabled) : report.plugins;

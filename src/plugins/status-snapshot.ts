@@ -19,6 +19,7 @@ export type PluginRegistryStatusReport = PluginRegistry & {
 type PluginRegistrySnapshotReportParams = {
   config?: OpenClawConfig;
   workspaceDir?: string;
+  preferPersisted?: boolean;
   /** Use an explicit env when plugin roots should resolve independently from process.env. */
   env?: NodeJS.ProcessEnv;
   logger?: PluginLogger;
@@ -135,6 +136,9 @@ export function buildPluginRegistrySnapshotReport(
         config,
         env: params?.env,
         workspaceDir: params?.workspaceDir,
+        ...(params?.preferPersisted !== undefined
+          ? { preferPersisted: params.preferPersisted }
+          : {}),
       }),
     { surface: "status" },
   );
