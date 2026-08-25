@@ -42,6 +42,7 @@ type CountRow = {
 type PluginStateDatabase = {
   db: DatabaseSync;
   path: string;
+  readOnly: boolean;
 };
 
 type PluginStateSeedEntryForTests = {
@@ -53,7 +54,7 @@ type PluginStateSeedEntryForTests = {
   expiresAt?: number | null;
 };
 
-let cachedDatabase: PluginStateDatabase | null = null;
+const cachedDatabases = new Map<string, PluginStateDatabase>();
 
 function normalizeNumber(value: number | bigint | null): number | undefined {
   if (typeof value === "bigint") {
@@ -330,20 +331,25 @@ function openPluginStateDatabase(
 ): PluginStateDatabase {
   const env = options.env ?? process.env;
   const pathname = resolveOpenClawStateSqlitePath(env);
-  if (cachedDatabase && cachedDatabase.path === pathname && cachedDatabase.db.isOpen) {
+  const readOnly = options.readOnly === true;
+  const cacheKey = `${pathname}\0${readOnly ? "readonly" : "readwrite"}`;
+  const cachedDatabase = cachedDatabases.get(cacheKey);
+  if (cachedDatabase?.db.isOpen) {
     return cachedDatabase;
   }
-  if (cachedDatabase && !cachedDatabase.db.isOpen) {
-    cachedDatabase = null;
+  if (cachedDatabase) {
+    cachedDatabases.delete(cacheKey);
   }
 
   try {
     const database = openOpenClawStateDatabase(options);
-    cachedDatabase = {
+    const pluginDatabase = {
       db: database.db,
       path: database.path,
+      readOnly,
     };
-    return cachedDatabase;
+    cachedDatabases.set(cacheKey, pluginDatabase);
+    return pluginDatabase;
   } catch (error) {
     throw wrapPluginStateError(
       error,
@@ -362,6 +368,10 @@ function countRow(row: CountRow | undefined): number {
 
 function envOptions(env?: NodeJS.ProcessEnv): OpenClawStateDatabaseOptions {
   return env ? { env } : {};
+}
+
+function readOnlyEnvOptions(env?: NodeJS.ProcessEnv): OpenClawStateDatabaseOptions {
+  return { ...envOptions(env), readOnly: true };
 }
 
 function runWriteTransaction<T>(
@@ -628,7 +638,7 @@ export function pluginStateLookup(params: {
   env?: NodeJS.ProcessEnv;
 }): unknown {
   try {
-    const { db } = openPluginStateDatabase("lookup", envOptions(params.env));
+    const { db } = openPluginStateDatabase("lookup", readOnlyEnvOptions(params.env));
     const row = selectPluginStateEntry(db, {
       pluginId: params.pluginId,
       namespace: params.namespace,
@@ -710,7 +720,7 @@ export function pluginStateEntries(params: {
   env?: NodeJS.ProcessEnv;
 }): PluginStateEntry<unknown>[] {
   try {
-    const { db } = openPluginStateDatabase("entries", envOptions(params.env));
+    const { db } = openPluginStateDatabase("entries", readOnlyEnvOptions(params.env));
     const rows = selectPluginStateEntries(db, {
       pluginId: params.pluginId,
       namespace: params.namespace,
@@ -772,7 +782,7 @@ export function sweepExpiredPluginStateEntries(): number {
 }
 
 export function isPluginStateDatabaseOpen(): boolean {
-  return cachedDatabase?.db.isOpen === true;
+  return Array.from(cachedDatabases.values()).some((database) => database.db.isOpen);
 }
 
 export function clearPluginStateDatabaseForTests(): void {
@@ -830,7 +840,7 @@ export function seedPluginStateDatabaseEntriesForTests(
 export function probePluginStateStore(): PluginStateStoreProbeResult {
   const databasePath = resolveOpenClawStateSqlitePath(process.env);
   const steps: PluginStateStoreProbeStep[] = [];
-  const wasOpen = cachedDatabase !== null;
+  const wasOpen = isPluginStateDatabaseOpen();
   const stateWasOpen = isOpenClawStateDatabaseOpen();
 
   const pushOk = (name: string) => steps.push({ name, ok: true });
@@ -915,7 +925,7 @@ export function probePluginStateStore(): PluginStateStoreProbeResult {
 }
 
 export function closePluginStateDatabase(): void {
-  cachedDatabase = null;
+  cachedDatabases.clear();
   closeOpenClawStateDatabase();
 }
 

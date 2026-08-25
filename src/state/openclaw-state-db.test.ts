@@ -225,6 +225,33 @@ describe("openclaw state database", () => {
     expect(readSqliteNumberPragma(first.db, "user_version")).toBe(1);
   });
 
+  it("keeps read-only and write handles separate", () => {
+    const stateDir = createTempStateDir();
+    const options = { env: { OPENCLAW_STATE_DIR: stateDir } };
+    openOpenClawStateDatabase(options);
+    closeOpenClawStateDatabaseForTest();
+
+    const readOnly = openOpenClawStateDatabase({ ...options, readOnly: true });
+    expect(readSqliteNumberPragma(readOnly.db, "user_version")).toBe(1);
+    expect(() =>
+      readOnly.db
+        .prepare(
+          "INSERT INTO diagnostic_events (scope, event_key, payload_json, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .run("readonly", "blocked", "{}", 1),
+    ).toThrow();
+
+    const write = openOpenClawStateDatabase(options);
+    expect(write).not.toBe(readOnly);
+    expect(() =>
+      write.db
+        .prepare(
+          "INSERT INTO diagnostic_events (scope, event_key, payload_json, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .run("readonly", "allowed", "{}", 2),
+    ).not.toThrow();
+  });
+
   it("uses savepoints for nested write transaction rollback", () => {
     const stateDir = createTempStateDir();
     const options = { env: { OPENCLAW_STATE_DIR: stateDir } };

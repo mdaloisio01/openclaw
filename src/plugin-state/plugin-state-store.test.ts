@@ -712,6 +712,21 @@ describe("plugin state keyed store", () => {
     });
   });
 
+  it("does not reuse a read-only lookup handle for later writes", async () => {
+    await withPluginStateTestState(async () => {
+      const store = createPluginStateKeyedStore<{ ok: boolean }>("discord", {
+        namespace: "readonly-cache-switch",
+        maxEntries: 10,
+      });
+      openOpenClawStateDatabase();
+      closePluginStateDatabase();
+
+      await expect(store.lookup("missing")).resolves.toBeUndefined();
+      await expect(store.register("k", { ok: true })).resolves.toBeUndefined();
+      await expect(store.lookup("k")).resolves.toEqual({ ok: true });
+    });
+  });
+
   it.runIf(process.platform !== "win32")("hardens DB directory and file permissions", async () => {
     await withPluginStateTestState(async () => {
       const store = createPluginStateKeyedStore("discord", { namespace: "perms", maxEntries: 10 });

@@ -32,6 +32,7 @@ export type OpenClawStateDatabase = {
 export type OpenClawStateDatabaseOptions = {
   env?: NodeJS.ProcessEnv;
   path?: string;
+  readOnly?: boolean;
 };
 
 export type OpenClawMigrationRunStatus = "completed" | "warning" | "failed";
@@ -295,41 +296,59 @@ function resolveDatabasePath(options: OpenClawStateDatabaseOptions = {}): string
   return options.path ?? resolveOpenClawStateSqlitePath(options.env ?? process.env);
 }
 
+function createNoopWalMaintenance(): SqliteWalMaintenance {
+  return {
+    checkpoint: () => true,
+    close: () => true,
+  };
+}
+
 export function openOpenClawStateDatabase(
   options: OpenClawStateDatabaseOptions = {},
 ): OpenClawStateDatabase {
   const env = options.env ?? process.env;
   const pathname = resolveDatabasePath(options);
-  const cached = cachedDatabases.get(pathname);
+  const cacheKey = `${pathname}\0${options.readOnly ? "readonly" : "readwrite"}`;
+  const cached = cachedDatabases.get(cacheKey);
   if (cached?.db.isOpen) {
     return cached;
   }
   if (cached) {
     cached.walMaintenance.close();
     clearNodeSqliteKyselyCacheForDatabase(cached.db);
-    cachedDatabases.delete(pathname);
+    cachedDatabases.delete(cacheKey);
   }
 
-  ensureOpenClawStatePermissions(pathname, env);
   const sqlite = requireNodeSqlite();
-  const db = new sqlite.DatabaseSync(pathname);
-  const walMaintenance = configureSqliteWalMaintenance(db, {
-    databaseLabel: "openclaw-state",
-    databasePath: pathname,
-  });
+  if (!options.readOnly) {
+    ensureOpenClawStatePermissions(pathname, env);
+  }
+  const db = options.readOnly
+    ? new sqlite.DatabaseSync(pathname, { readOnly: true })
+    : new sqlite.DatabaseSync(pathname);
+  const walMaintenance = options.readOnly
+    ? createNoopWalMaintenance()
+    : configureSqliteWalMaintenance(db, {
+        databaseLabel: "openclaw-state",
+        databasePath: pathname,
+      });
   db.exec("PRAGMA synchronous = NORMAL;");
   db.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
   db.exec("PRAGMA foreign_keys = ON;");
-  try {
-    ensureSchema(db, pathname);
-  } catch (err) {
-    walMaintenance.close();
-    db.close();
-    throw err;
+  if (!options.readOnly) {
+    try {
+      ensureSchema(db, pathname);
+    } catch (err) {
+      walMaintenance.close();
+      db.close();
+      throw err;
+    }
+    ensureOpenClawStatePermissions(pathname, env);
+  } else {
+    assertSupportedSchemaVersion(db, pathname);
   }
-  ensureOpenClawStatePermissions(pathname, env);
   const database = { db, path: pathname, walMaintenance };
-  cachedDatabases.set(pathname, database);
+  cachedDatabases.set(cacheKey, database);
   return database;
 }
 
