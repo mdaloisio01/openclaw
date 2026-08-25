@@ -9,6 +9,27 @@ import {
 
 export const SOURCE_TURN_DELIVERY_ROW_KIND = "openclaw.source-delivery-obligation";
 
+export const SOURCE_TURN_DELIVERY_OBLIGATION_STAGES = [
+  "owed",
+  "prepared",
+  "delivery_attempted",
+  "delivered",
+  "failed",
+  "needs_review",
+  "settled_by_verified_later_delivery",
+] as const;
+
+export type SourceTurnDeliveryObligationStage =
+  (typeof SOURCE_TURN_DELIVERY_OBLIGATION_STAGES)[number];
+
+export type SourceTurnDeliveryObligationIdentity = {
+  missionId?: string;
+  runId?: string;
+  reportId?: string;
+  deliveryId?: string;
+  generation?: string | number;
+};
+
 export type SourceTurnDeliveryWatchdogReconciliation = {
   status?: string;
   action?: string;
@@ -25,6 +46,9 @@ export type SourceTurnDeliveryRow = {
   acceptedAt: string;
   updatedAt: string;
   deliveryStatus: string;
+  obligationStage: SourceTurnDeliveryObligationStage;
+  obligationIdentity: SourceTurnDeliveryObligationIdentity;
+  idempotencyKey: string;
   sourceTurnState: SourceTurnDeliveryState;
   finalDeliveryDelivered: boolean;
   visibleDeliveryCount: number;
@@ -47,6 +71,14 @@ export type PersistSourceTurnDeliveryParams = {
   now?: string;
   currentStage?: string;
   reportArtifactPaths?: string[];
+  missionId?: string;
+  runId?: string;
+  reportId?: string;
+  deliveryId?: string;
+  generation?: string | number;
+  reportPrepared?: boolean;
+  deliveryAttempted?: boolean;
+  needsReview?: boolean;
   watchdogReconciliation?: SourceTurnDeliveryWatchdogReconciliation;
 };
 
@@ -118,6 +150,115 @@ function visibleDeliveryCountForDecision(decision: SourceTurnDeliveryDecision): 
   return 0;
 }
 
+function normalizeIdentityPart(value: string | number | undefined): string | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function normalizeObligationIdentity(
+  params: PersistSourceTurnDeliveryParams,
+  existing?: SourceTurnDeliveryRow,
+): SourceTurnDeliveryObligationIdentity {
+  const missionId =
+    normalizeIdentityPart(params.missionId) ??
+    normalizeIdentityPart(existing?.obligationIdentity?.missionId);
+  const runId =
+    normalizeIdentityPart(params.runId) ??
+    normalizeIdentityPart(existing?.obligationIdentity?.runId);
+  const reportId =
+    normalizeIdentityPart(params.reportId) ??
+    normalizeIdentityPart(existing?.obligationIdentity?.reportId);
+  const deliveryId =
+    normalizeIdentityPart(params.deliveryId) ??
+    normalizeIdentityPart(existing?.obligationIdentity?.deliveryId);
+  const generation =
+    normalizeIdentityPart(params.generation) ??
+    normalizeIdentityPart(existing?.obligationIdentity?.generation);
+  return {
+    ...(missionId ? { missionId } : {}),
+    ...(runId ? { runId } : {}),
+    ...(reportId ? { reportId } : {}),
+    ...(deliveryId ? { deliveryId } : {}),
+    ...(generation ? { generation } : {}),
+  };
+}
+
+function hasExplicitObligationIdentity(params: PersistSourceTurnDeliveryParams): boolean {
+  return Boolean(
+    normalizeIdentityPart(params.missionId) ||
+    normalizeIdentityPart(params.runId) ||
+    normalizeIdentityPart(params.reportId) ||
+    normalizeIdentityPart(params.deliveryId) ||
+    normalizeIdentityPart(params.generation),
+  );
+}
+
+export function buildSourceTurnDeliveryObligationKey(params: {
+  sourceTurnId: string;
+  missionId?: string;
+  runId?: string;
+  reportId?: string;
+  deliveryId?: string;
+  generation?: string | number;
+}): string {
+  const identity = [
+    ["source", params.sourceTurnId],
+    ["mission", params.missionId],
+    ["run", params.runId],
+    ["report", params.reportId],
+    ["delivery", params.deliveryId],
+    ["generation", params.generation],
+  ]
+    .map(([label, value]) => {
+      const normalized = normalizeIdentityPart(value);
+      return normalized ? `${label}:${normalized}` : undefined;
+    })
+    .filter((value): value is string => Boolean(value));
+  return identity.join("|");
+}
+
+function deriveObligationStage(params: {
+  decision: SourceTurnDeliveryDecision;
+  facts: SourceTurnDeliveryFacts;
+  reportArtifactPaths?: string[];
+  reportPrepared?: boolean;
+  deliveryAttempted?: boolean;
+  needsReview?: boolean;
+}): SourceTurnDeliveryObligationStage {
+  if (params.decision.state === "settled_resolved_later") {
+    return "settled_by_verified_later_delivery";
+  }
+  if (params.decision.state === "final_delivered") {
+    return "delivered";
+  }
+  if (params.decision.state === "final_delivery_failed") {
+    return "failed";
+  }
+  if (params.decision.state === "progress_delivered") {
+    return "delivery_attempted";
+  }
+  if (params.needsReview === true || params.decision.state === "blocked_refused") {
+    return "needs_review";
+  }
+  if (params.deliveryAttempted === true || params.facts.deliveryToolFailed === true) {
+    return "delivery_attempted";
+  }
+  if (
+    params.reportPrepared === true ||
+    Boolean(params.facts.reportArtifactPath?.trim()) ||
+    (params.reportArtifactPaths ?? []).length > 0
+  ) {
+    return "prepared";
+  }
+  return "owed";
+}
+
 export async function loadSourceTurnDeliveryRegistry(
   registryPath: string,
 ): Promise<SourceTurnDeliveryRegistry> {
@@ -128,16 +269,36 @@ export async function persistSourceTurnDeliveryState(
   params: PersistSourceTurnDeliveryParams,
 ): Promise<SourceTurnDeliveryRow> {
   const registry = await readRegistry(params.registryPath);
-  const existing = registry.rows.find((row) => row.id === params.id);
+  const legacyExisting = registry.rows.find((row) => row.id === params.id);
   const decision = resolveSourceTurnDeliveryState(params.facts);
   const now = params.now ?? new Date().toISOString();
+  const sourceTurnId = params.sourceTurnId ?? legacyExisting?.sourceTurnId ?? params.id;
+  const obligationIdentity = normalizeObligationIdentity(params, legacyExisting);
+  const idempotencyKey = buildSourceTurnDeliveryObligationKey({
+    sourceTurnId,
+    ...obligationIdentity,
+  });
+  const existing =
+    registry.rows.find((row) => row.idempotencyKey === idempotencyKey) ??
+    (hasExplicitObligationIdentity(params) ? undefined : legacyExisting);
+  const obligationStage = deriveObligationStage({
+    decision,
+    facts: params.facts,
+    reportArtifactPaths: params.reportArtifactPaths,
+    reportPrepared: params.reportPrepared,
+    deliveryAttempted: params.deliveryAttempted,
+    needsReview: params.needsReview,
+  });
   const row: SourceTurnDeliveryRow = {
     id: params.id,
     kind: SOURCE_TURN_DELIVERY_ROW_KIND,
-    sourceTurnId: params.sourceTurnId ?? existing?.sourceTurnId ?? params.id,
+    sourceTurnId,
     acceptedAt: existing?.acceptedAt ?? now,
     updatedAt: now,
     deliveryStatus: statusForDecision(decision),
+    obligationStage,
+    obligationIdentity,
+    idempotencyKey,
     sourceTurnState: decision.state,
     finalDeliveryDelivered: decision.finalDeliveryDelivered,
     visibleDeliveryCount: visibleDeliveryCountForDecision(decision),
@@ -164,7 +325,7 @@ export async function persistSourceTurnDeliveryState(
     deliveryDecision: decision,
   };
   const nextRows = existing
-    ? registry.rows.map((candidate) => (candidate.id === row.id ? row : candidate))
+    ? registry.rows.map((candidate) => (candidate === existing ? row : candidate))
     : [...registry.rows, row];
   await writeRegistry(params.registryPath, { rows: nextRows });
   return row;

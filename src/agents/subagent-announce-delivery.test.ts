@@ -36,6 +36,9 @@ type SourceTurnDeliveryRegistryForTest = {
     deliveryStatus?: string;
     finalDeliveryDelivered?: boolean;
     failureReason?: string;
+    idempotencyKey?: string;
+    obligationIdentity?: Record<string, unknown>;
+    obligationStage?: string;
     sourceTurnState?: string;
     visibleDeliveryCount?: number;
   }>;
@@ -1914,11 +1917,19 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(rows[0]).toMatchObject({
       currentStage: "subagent_completion_final_delivery_failed",
       deliveryStatus: "delivery_failed",
+      obligationIdentity: {
+        missionId: "agent:main:slack:channel:C123:thread:171.222",
+        runId: "agent:main:slack:channel:C123:thread:171.222",
+        reportId: "subagent_completion",
+        deliveryId: "announce-thread-delivery-status-failed",
+      },
+      obligationStage: "failed",
       failureReason: "delivery_tool_failed",
       finalDeliveryDelivered: false,
       sourceTurnState: "final_delivery_failed",
       visibleDeliveryCount: 0,
     });
+    expect(rows[0]?.idempotencyKey).toContain("|delivery:announce-thread-delivery-status-failed");
   });
 
   it("records delivered subagent completion source-turn proof", async () => {
@@ -1961,10 +1972,18 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(rows[0]).toMatchObject({
       currentStage: "subagent_completion_direct_final_delivered",
       deliveryStatus: "final_delivered",
+      obligationIdentity: {
+        missionId: "agent:main:slack:channel:C123:thread:171.222",
+        runId: "agent:main:slack:channel:C123:thread:171.222",
+        reportId: "subagent_completion",
+        deliveryId: "announce-thread-delivered-source-turn",
+      },
+      obligationStage: "delivered",
       finalDeliveryDelivered: true,
       sourceTurnState: "final_delivered",
       visibleDeliveryCount: 1,
     });
+    expect(rows[0]?.idempotencyKey).toContain("|delivery:announce-thread-delivered-source-turn");
   });
 
   it("does not redeliver subagent completion after durable final delivery proof exists", async () => {
@@ -2016,6 +2035,11 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(rows[0]).toMatchObject({
       currentStage: "subagent_completion_direct_final_delivered",
       deliveryStatus: "final_delivered",
+      obligationIdentity: {
+        deliveryId: "announce-thread-delivered-source-turn-replay",
+        reportId: "subagent_completion",
+      },
+      obligationStage: "delivered",
       finalDeliveryDelivered: true,
       sourceTurnState: "final_delivered",
       visibleDeliveryCount: 1,

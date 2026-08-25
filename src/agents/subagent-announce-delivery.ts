@@ -50,8 +50,10 @@ import type { AgentInternalEvent } from "./internal-events.js";
 import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
 import type { SourceTurnDeliveryFacts } from "./source-turn-delivery-state.js";
 import {
+  buildSourceTurnDeliveryObligationKey,
   loadSourceTurnDeliveryRegistry,
   persistSourceTurnDeliveryState,
+  type SourceTurnDeliveryObligationIdentity,
   type SourceTurnDeliveryRow,
 } from "./source-turn-delivery-store.js";
 import { buildExplicitStopExplanation } from "./stop-contract.js";
@@ -141,6 +143,7 @@ function buildSubagentSourceTurnDeliveryRecordId(params: {
 async function persistSubagentSourceTurnDeliveryState(params: {
   registryPath?: string;
   recordId: string;
+  obligationIdentity: SourceTurnDeliveryObligationIdentity;
   facts: SourceTurnDeliveryFacts;
   currentStage: string;
 }): Promise<SourceTurnDeliveryRow | undefined> {
@@ -152,6 +155,7 @@ async function persistSubagentSourceTurnDeliveryState(params: {
       registryPath: params.registryPath,
       id: params.recordId,
       sourceTurnId: params.recordId,
+      ...params.obligationIdentity,
       facts: params.facts,
       currentStage: params.currentStage,
     });
@@ -166,13 +170,18 @@ async function persistSubagentSourceTurnDeliveryState(params: {
 async function sourceTurnDeliveryAlreadyFinalDelivered(params: {
   registryPath?: string;
   recordId: string;
+  idempotencyKey: string;
 }): Promise<boolean> {
   if (!params.registryPath) {
     return false;
   }
   try {
     const registry = await loadSourceTurnDeliveryRegistry(params.registryPath);
-    const row = registry.rows.find((candidate) => candidate.id === params.recordId);
+    const row =
+      registry.rows.find((candidate) => candidate.idempotencyKey === params.idempotencyKey) ??
+      registry.rows.find(
+        (candidate) => !candidate.idempotencyKey && candidate.id === params.recordId,
+      );
     return Boolean(
       row?.finalDeliveryDelivered ||
       row?.sourceTurnState === "final_delivered" ||
@@ -1773,10 +1782,22 @@ export async function deliverSubagentAnnouncement(params: {
     announceId: params.announceId,
     directIdempotencyKey: params.directIdempotencyKey,
   });
+  const sourceTurnDeliveryObligationIdentity: SourceTurnDeliveryObligationIdentity = {
+    missionId: params.targetRequesterSessionKey,
+    runId: params.requesterSessionKey,
+    reportId: params.expectsCompletionMessage ? "subagent_completion" : "subagent_announcement",
+    deliveryId: params.directIdempotencyKey,
+    ...(params.announceId ? { generation: params.announceId } : {}),
+  };
+  const sourceTurnDeliveryIdempotencyKey = buildSourceTurnDeliveryObligationKey({
+    sourceTurnId: sourceTurnDeliveryRecordId,
+    ...sourceTurnDeliveryObligationIdentity,
+  });
   const recordSourceTurnDeliveryState = (facts: SourceTurnDeliveryFacts, currentStage: string) =>
     persistSubagentSourceTurnDeliveryState({
       registryPath: sourceTurnDeliveryRegistryPath,
       recordId: sourceTurnDeliveryRecordId,
+      obligationIdentity: sourceTurnDeliveryObligationIdentity,
       facts,
       currentStage,
     });
@@ -1784,6 +1805,7 @@ export async function deliverSubagentAnnouncement(params: {
     await sourceTurnDeliveryAlreadyFinalDelivered({
       registryPath: sourceTurnDeliveryRegistryPath,
       recordId: sourceTurnDeliveryRecordId,
+      idempotencyKey: sourceTurnDeliveryIdempotencyKey,
     })
   ) {
     return {
