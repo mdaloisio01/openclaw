@@ -200,6 +200,23 @@ export type SessionGoal = {
   budgetLimitedAt?: number;
 };
 
+export type TrbRecoveryState = {
+  schemaVersion: 1;
+  trb_recovery_required: true;
+  recovery_mode: "trb";
+  trigger_message_id?: string;
+  trigger_session_key?: string;
+  trigger_session_id?: string;
+  trigger_timestamp: number;
+  active_mission_session_ref?: string;
+  requires_session_tool_log_proof: boolean;
+  final_response_gate?: {
+    status: "pending" | "passed" | "blocked";
+    checkedAt: number;
+    reasonCodes?: string[];
+  };
+};
+
 export type SessionEntry = {
   /**
    * Last delivered heartbeat payload (used to suppress duplicate heartbeat notifications).
@@ -255,6 +272,8 @@ export type SessionEntry = {
   quotaSuspension?: QuotaSuspension;
   /** Core-owned durable goal state for this thread/session. */
   goal?: SessionGoal;
+  /** Runtime TRB recovery gate state for the active source turn/run. */
+  trbRecovery?: TrbRecoveryState;
   /** Timestamp (ms) when the current sessionId first became active. */
   sessionStartedAt?: number;
   /** Stable usage lineage key for transcript-backed rollups across sessionId rotations. */

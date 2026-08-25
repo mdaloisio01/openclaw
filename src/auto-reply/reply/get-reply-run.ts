@@ -28,6 +28,7 @@ import type { SessionEntry } from "../../config/sessions/types.js";
 import { resolveSilentReplySettings } from "../../config/silent-reply.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
+import { buildTrbRecoverySystemPrompt } from "../../governance/trb-recovery-contract.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { clearCommandLane, getQueueSize } from "../../process/command-queue.js";
 import {
@@ -598,6 +599,7 @@ export async function runPreparedReply(
   );
   const extraSystemPromptParts = [
     inboundMetaPrompt,
+    buildTrbRecoverySystemPrompt(preparedSessionState.sessionEntry?.trbRecovery),
     directChatContext,
     groupChatContext,
     groupIntro,

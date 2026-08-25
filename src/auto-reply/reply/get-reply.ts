@@ -16,6 +16,13 @@ import { DEFAULT_AGENT_WORKSPACE_DIR, ensureAgentWorkspace } from "../../agents/
 import { resolveChannelModelOverride } from "../../channels/model-overrides.js";
 import { type OpenClawConfig, getRuntimeConfig } from "../../config/config.js";
 import { logVerbose } from "../../globals.js";
+import {
+  buildTrbRecoveryBlockedPayload,
+  createTrbRecoveryState,
+  inboundTrbRecoveryRequired,
+  markTrbGateResultOnSessionEntry,
+  validateTrbFinalReplyPayloads,
+} from "../../governance/trb-recovery-contract.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
@@ -268,6 +275,7 @@ export async function getReplyFromConfig(
   const finalized = resolverTiming.measureSync("reply.finalize_context", () =>
     finalizeInboundContext(ctx),
   );
+  const trbInboundRequired = inboundTrbRecoveryRequired(finalized);
   const { agentSessionKey, agentId } = resolverTiming.measureSync(
     "reply.resolve_agent_scope",
     () => {
@@ -386,23 +394,25 @@ export async function getReplyFromConfig(
   const nativeSlashCommandFastReply = await traceGetReplyPhase(
     "reply.native_slash_command_fast_path",
     () =>
-      maybeResolveNativeSlashCommandFastReply({
-        ctx: finalized,
-        cfg,
-        agentId,
-        agentDir,
-        agentCfg,
-        commandAuthorized: finalized.CommandAuthorized,
-        defaultProvider,
-        defaultModel,
-        aliasIndex,
-        provider,
-        model,
-        workspaceDir: workspaceDirForNativeCommand,
-        typing,
-        opts: resolvedOpts,
-        skillFilter: mergedSkillFilter,
-      }),
+      trbInboundRequired
+        ? { handled: false as const }
+        : maybeResolveNativeSlashCommandFastReply({
+            ctx: finalized,
+            cfg,
+            agentId,
+            agentDir,
+            agentCfg,
+            commandAuthorized: finalized.CommandAuthorized,
+            defaultProvider,
+            defaultModel,
+            aliasIndex,
+            provider,
+            model,
+            workspaceDir: workspaceDirForNativeCommand,
+            typing,
+            opts: resolvedOpts,
+            skillFilter: mergedSkillFilter,
+          }),
   );
   if (nativeSlashCommandFastReply.handled) {
     logResolverTiming("completed", "native_slash_command_fast_path");
@@ -495,6 +505,52 @@ export async function getReplyFromConfig(
   } = sessionState;
   let { abortedLastRun } = sessionState;
   resolverTimingSessionKey = sessionKey ?? resolverTimingSessionKey;
+
+  const persistTrbRecoveryState = async () => {
+    if (!sessionKey || !storePath || !sessionEntry?.trbRecovery) {
+      return;
+    }
+    const { applySessionStoreEntryPatch } = await import("../../config/sessions.js");
+    await applySessionStoreEntryPatch({
+      storePath,
+      sessionKey,
+      skipMaintenance: true,
+      takeCacheOwnership: true,
+      patch: {
+        trbRecovery: sessionEntry.trbRecovery,
+      },
+    });
+  };
+
+  if (trbInboundRequired && sessionEntry) {
+    sessionEntry.trbRecovery = createTrbRecoveryState({
+      ctx: finalized,
+      sessionKey,
+      sessionId,
+    });
+    if (sessionKey && sessionStore) {
+      sessionStore[sessionKey] = sessionEntry;
+    }
+    await traceGetReplyPhase("reply.persist_trb_recovery_state", persistTrbRecoveryState);
+  }
+
+  const finalizeTrbReply = async (
+    reply: ReplyPayload | ReplyPayload[] | undefined,
+  ): Promise<ReplyPayload | ReplyPayload[] | undefined> => {
+    if (!sessionEntry?.trbRecovery?.trb_recovery_required) {
+      return reply;
+    }
+    const result = validateTrbFinalReplyPayloads({
+      payloads: reply,
+      state: sessionEntry.trbRecovery,
+    });
+    markTrbGateResultOnSessionEntry({ sessionEntry, result });
+    if (sessionKey && sessionStore) {
+      sessionStore[sessionKey] = sessionEntry;
+    }
+    await traceGetReplyPhase("reply.persist_trb_final_gate", persistTrbRecoveryState);
+    return result.ok ? reply : buildTrbRecoveryBlockedPayload(result);
+  };
 
   if (sessionEntry?.pendingFinalDelivery && sessionEntry.pendingFinalDeliveryText) {
     const text = sanitizePendingFinalDeliveryText(sessionEntry.pendingFinalDeliveryText);
@@ -722,7 +778,7 @@ export async function getReplyFromConfig(
       }),
     );
     logResolverTiming("completed", "fast_directive_prepared_reply");
-    return fastReplyResult;
+    return finalizeTrbReply(fastReplyResult);
   }
 
   const directiveResult = await traceGetReplyPhase("reply.resolve_directives", () =>
@@ -759,7 +815,7 @@ export async function getReplyFromConfig(
   );
   if (directiveResult.kind === "reply") {
     logResolverTiming("completed", "directive_reply");
-    return directiveResult.reply;
+    return finalizeTrbReply(directiveResult.reply);
   }
   const {
     commandSource,
@@ -857,7 +913,7 @@ export async function getReplyFromConfig(
   if (inlineActionResult.kind === "reply") {
     await maybeEmitMissingResetHooks();
     logResolverTiming("completed", "inline_action_reply");
-    return inlineActionResult.reply;
+    return finalizeTrbReply(inlineActionResult.reply);
   }
   await maybeEmitMissingResetHooks();
   directives = inlineActionResult.directives;
@@ -949,7 +1005,7 @@ export async function getReplyFromConfig(
       );
       if (hookResult?.handled) {
         logResolverTiming("completed", "before_agent_reply_hook");
-        return hookResult.reply ?? { text: SILENT_REPLY_TOKEN };
+        return finalizeTrbReply(hookResult.reply ?? { text: SILENT_REPLY_TOKEN });
       }
     }
   }
@@ -1020,5 +1076,5 @@ export async function getReplyFromConfig(
     }),
   );
   logResolverTiming("completed", "prepared_reply");
-  return replyResult;
+  return finalizeTrbReply(replyResult);
 }
