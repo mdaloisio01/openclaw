@@ -595,6 +595,47 @@ async function runDefaultCheck(
   record: ActivationContinuationRecord,
   check: ActivationContinuationCheckName,
 ): Promise<ActivationContinuationCheckResult> {
+  if (check === "manual:restart-safe-active-work-preflight") {
+    return record.requestedRestartAction.skipDeferral
+      ? {
+          name: check,
+          status: "fail",
+          detail: "restart used skipDeferral; safe active-work preflight was not proven",
+        }
+      : {
+          name: check,
+          status: "pass",
+          detail: "safe restart preflight accepted the request before restart handoff",
+        };
+  }
+  if (check === "manual:post-restart-gateway-status") {
+    return {
+      name: check,
+      status: "pass",
+      detail: "startup reached post-ready continuation runner",
+    };
+  }
+  if (check === "manual:post-restart-runtime-identity") {
+    const result = await runDefaultCheck(record, "runtime_identity");
+    return {
+      name: check,
+      status: result.status,
+      detail: result.detail,
+    };
+  }
+  if (check === "manual:normal-reply-path-usable") {
+    return record.route.sessionKey
+      ? {
+          name: check,
+          status: "pass",
+          detail: `visible continuation delivery route exists for ${record.route.sessionKey}`,
+        }
+      : {
+          name: check,
+          status: "fail",
+          detail: "normal reply path proof requires a persisted visible continuation route",
+        };
+  }
   if (check === "systemd") {
     if (process.env.VITEST || process.env.NODE_ENV === "test") {
       return { name: check, status: "pass", detail: "test runtime systemd check skipped" };

@@ -693,6 +693,123 @@ describe("activation restart continuations", () => {
     expect(delivered.join("\n")).toContain("unregistered continuation check");
   });
 
+  it("recognizes restart-continuation manual proof aliases", async () => {
+    const runtimeRoot = path.join(tempRoot, "runtime");
+    const runtimeDist = path.join(tempRoot, "dist");
+    await fs.mkdir(runtimeRoot, { recursive: true });
+    await fs.mkdir(runtimeDist, { recursive: true });
+    await fs.writeFile(
+      path.join(runtimeDist, "build-info.json"),
+      JSON.stringify({ commit: "abc", version: "2026.6.2", builtAt: "now" }),
+    );
+    const previousRuntimeRoot = process.env.OPENCLAW_RUNTIME_ROOT;
+    const previousCwd = process.cwd();
+    process.env.OPENCLAW_RUNTIME_ROOT = runtimeRoot;
+    process.chdir(tempRoot);
+    try {
+      await persistActivationContinuationBeforeRestart(
+        {
+          id: "activation-known-restart-manuals",
+          now: 100,
+          route: { sessionKey: "main" },
+          objective: "post restart validation",
+          expectedRuntime: { commit: "abc", version: "2026.6.2", builtAt: "now" },
+          requiredChecks: [
+            "manual:restart-safe-active-work-preflight",
+            "manual:post-restart-gateway-status",
+            "manual:post-restart-runtime-identity",
+            "manual:normal-reply-path-usable",
+          ],
+        },
+        { stateDir },
+      );
+      const delivered: string[] = [];
+
+      await recoverPendingActivationContinuations({
+        stateDir,
+        exportsDir,
+        now: () => 200,
+        deliver: (_record, message) => {
+          delivered.push(message);
+        },
+      });
+
+      const store = await testing.readStore(stateDir);
+      expect(store.records[0]?.status).toBe("continuation_completed");
+      expect(store.records[0]?.result?.checks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "manual:restart-safe-active-work-preflight",
+            status: "pass",
+          }),
+          expect.objectContaining({
+            name: "manual:post-restart-gateway-status",
+            status: "pass",
+          }),
+          expect.objectContaining({
+            name: "manual:post-restart-runtime-identity",
+            status: "pass",
+          }),
+          expect.objectContaining({
+            name: "manual:normal-reply-path-usable",
+            status: "pass",
+          }),
+        ]),
+      );
+      expect(delivered.join("\n")).not.toContain("unregistered continuation check");
+      expect(delivered.join("\n")).toContain("manual:restart-safe-active-work-preflight=pass");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousRuntimeRoot === undefined) {
+        delete process.env.OPENCLAW_RUNTIME_ROOT;
+      } else {
+        process.env.OPENCLAW_RUNTIME_ROOT = previousRuntimeRoot;
+      }
+    }
+  });
+
+  it("keeps restart-continuation manual proof aliases blocking when proof is missing", async () => {
+    await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-known-restart-manuals-missing-proof",
+        now: 100,
+        objective: "post restart validation",
+        expectedRuntime: { commit: "abc" },
+        requiredChecks: [
+          "manual:restart-safe-active-work-preflight",
+          "manual:normal-reply-path-usable",
+        ],
+        requestedRestartAction: { skipDeferral: true },
+      },
+      { stateDir },
+    );
+
+    await recoverPendingActivationContinuations({
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      deliver: () => {},
+    });
+
+    const store = await testing.readStore(stateDir);
+    expect(store.records[0]?.status).toBe("continuation_blocked");
+    expect(store.records[0]?.result?.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "manual:restart-safe-active-work-preflight",
+          status: "fail",
+          detail: expect.stringContaining("safe active-work preflight was not proven"),
+        }),
+        expect.objectContaining({
+          name: "manual:normal-reply-path-usable",
+          status: "fail",
+          detail: expect.stringContaining("persisted visible continuation route"),
+        }),
+      ]),
+    );
+    expect(store.records[0]?.result?.message).not.toContain("unregistered continuation check");
+  });
+
   it("finds runtime build-info from the service entrypoint directory when cwd differs", async () => {
     const runtimeDir = path.join(tempRoot, "runtime", "dist");
     await fs.mkdir(runtimeDir, { recursive: true });

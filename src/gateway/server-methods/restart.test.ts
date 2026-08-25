@@ -273,6 +273,54 @@ describe("gateway.restart.request handler", () => {
     );
   });
 
+  it("accepts known restart-continuation manual proof aliases without manual prefixes", async () => {
+    persistActivationContinuationBeforeRestart.mockResolvedValueOnce({
+      id: "activation-restart-proof-aliases",
+    });
+    requestSafeGatewayRestart.mockImplementationOnce(() => ({
+      ok: true,
+      status: "scheduled",
+      preflight: { safe: true, counts: {}, blockers: [], summary: "safe" },
+      restart: {
+        ok: true,
+        pid: 0,
+        signal: "SIGUSR1",
+        delayMs: 0,
+        mode: "emit",
+        coalesced: false,
+        cooldownMsApplied: 0,
+      },
+    }));
+
+    await invokeRestartRequest({
+      reason: "operator",
+      activationContinuation: {
+        id: "activation-restart-proof-aliases",
+        sessionKey: "agent:main:main",
+        objective: "prove restart continuation",
+        expectedRuntime: { commit: "abc", version: "2026.6.2" },
+        requiredChecks: [
+          "restart-safe-active-work-preflight",
+          "post-restart-gateway-status",
+          "post-restart-runtime-identity",
+          "normal-reply-path-usable",
+        ],
+      },
+    });
+
+    expect(persistActivationContinuationBeforeRestart).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requiredChecks: [
+          "manual:restart-safe-active-work-preflight",
+          "manual:post-restart-gateway-status",
+          "manual:post-restart-runtime-identity",
+          "manual:normal-reply-path-usable",
+        ],
+      }),
+    );
+    expect(requestSafeGatewayRestart).toHaveBeenCalled();
+  });
+
   it("rejects unregistered required checks before scheduling a restart", async () => {
     const respond = await invokeRestartRequest({
       reason: "operator",

@@ -11,6 +11,13 @@ import {
 } from "../../infra/restart-coordinator.js";
 import type { GatewayRequestHandlers } from "./types.js";
 
+const RESTART_CONTINUATION_MANUAL_CHECK_ALIASES = new Set([
+  "restart-safe-active-work-preflight",
+  "post-restart-gateway-status",
+  "post-restart-runtime-identity",
+  "normal-reply-path-usable",
+]);
+
 function normalizeReason(value: unknown): string | undefined {
   // Restart reasons are operator-visible log context, not payload storage.
   // Trim and cap them before passing through to the coordinator.
@@ -145,6 +152,9 @@ function normalizeCheckName(value: string): ActivationContinuationCheckName | nu
   }
   if (lower === "delivery_route" || lower.includes("visible") || lower.includes("delivery")) {
     return "delivery_route";
+  }
+  if (RESTART_CONTINUATION_MANUAL_CHECK_ALIASES.has(lower)) {
+    return `manual:${lower}` as ActivationContinuationCheckName;
   }
   if (raw.startsWith("manual:")) {
     return raw.slice(0, 160) as ActivationContinuationCheckName;
