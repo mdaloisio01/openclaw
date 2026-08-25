@@ -540,6 +540,9 @@ export async function getReplyFromConfig(
     if (!sessionEntry?.trbRecovery?.trb_recovery_required) {
       return reply;
     }
+    if (sessionEntry.trbRecovery.final_response_gate?.status === "passed") {
+      return reply;
+    }
     const result = validateTrbFinalReplyPayloads({
       payloads: reply,
       state: sessionEntry.trbRecovery,

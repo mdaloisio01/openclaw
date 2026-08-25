@@ -257,6 +257,16 @@ function trbRecoveryState(): TrbRecoveryState {
   };
 }
 
+function completedTrbRecoveryState(): TrbRecoveryState {
+  return {
+    ...trbRecoveryState(),
+    final_response_gate: {
+      status: "passed",
+      checkedAt: 1_787_686_100_000,
+    },
+  };
+}
+
 type MockCallSource = {
   mock: {
     calls: ReadonlyArray<ReadonlyArray<unknown>>;
@@ -627,6 +637,12 @@ describe("runPreparedReply media-only handling", () => {
       isNewSession: false,
       trbRecovery: trbRecoveryState(),
       expectTrbPrompt: true,
+    },
+    {
+      label: "existing session after TRB final gate passed",
+      isNewSession: false,
+      trbRecovery: completedTrbRecoveryState(),
+      expectTrbPrompt: false,
     },
   ])(
     "builds early TRB recovery prompt without prepared session TDZ crash for $label",

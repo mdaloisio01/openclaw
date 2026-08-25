@@ -426,6 +426,9 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
   if (!state?.trb_recovery_required) {
     return undefined;
   }
+  if (state.final_response_gate?.status === "passed") {
+    return undefined;
+  }
   return [
     "## Runtime TRB Recovery Gate",
     "This turn has mechanically entered TRB recovery mode.",
