@@ -12,9 +12,11 @@ import {
 import type { GatewayRequestHandlers } from "./types.js";
 
 const RESTART_CONTINUATION_MANUAL_CHECK_ALIASES = new Set([
+  "gateway-status",
   "restart-safe-active-work-preflight",
   "post-restart-gateway-status",
   "post-restart-runtime-identity",
+  "post-restart-asset-guard",
   "normal-reply-path-usable",
 ]);
 

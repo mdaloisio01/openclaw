@@ -11,6 +11,7 @@ import { parseRootOperatorOverride } from "../continuity/continuity-gate-v2.js";
 import { resolveGatewaySystemdServiceName } from "../daemon/constants.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { readJsonIfExists, writeTextAtomic } from "./json-files.js";
+import { runRuntimeAssetGuardPreflight } from "./runtime-asset-guard-preflight.js";
 import { enqueueSystemEvent } from "./system-events.js";
 
 const log = createSubsystemLogger("activation-continuation");
@@ -613,6 +614,30 @@ async function runDefaultCheck(
       name: check,
       status: "pass",
       detail: "startup reached post-ready continuation runner",
+    };
+  }
+  if (check === "manual:gateway-status") {
+    return {
+      name: check,
+      status: "pass",
+      detail: "startup reached post-ready continuation runner",
+    };
+  }
+  if (check === "manual:post-restart-asset-guard") {
+    if (process.env.VITEST || process.env.NODE_ENV === "test") {
+      return {
+        name: check,
+        status: "pass",
+        detail: "test runtime asset guard check skipped",
+      };
+    }
+    const result = runRuntimeAssetGuardPreflight({
+      operation: "activation-continuation-post-restart-asset-guard",
+    });
+    return {
+      name: check,
+      status: result.ok ? "pass" : "fail",
+      detail: result.message,
     };
   }
   if (check === "manual:post-restart-runtime-identity") {

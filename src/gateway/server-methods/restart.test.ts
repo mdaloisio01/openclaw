@@ -301,8 +301,10 @@ describe("gateway.restart.request handler", () => {
         expectedRuntime: { commit: "abc", version: "2026.6.2" },
         requiredChecks: [
           "restart-safe-active-work-preflight",
+          "gateway-status",
           "post-restart-gateway-status",
           "post-restart-runtime-identity",
+          "post-restart-asset-guard",
           "normal-reply-path-usable",
         ],
       },
@@ -312,8 +314,10 @@ describe("gateway.restart.request handler", () => {
       expect.objectContaining({
         requiredChecks: [
           "manual:restart-safe-active-work-preflight",
+          "manual:gateway-status",
           "manual:post-restart-gateway-status",
           "manual:post-restart-runtime-identity",
+          "manual:post-restart-asset-guard",
           "manual:normal-reply-path-usable",
         ],
       }),

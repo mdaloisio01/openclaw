@@ -717,7 +717,9 @@ describe("activation restart continuations", () => {
           requiredChecks: [
             "manual:restart-safe-active-work-preflight",
             "manual:post-restart-gateway-status",
+            "manual:gateway-status",
             "manual:post-restart-runtime-identity",
+            "manual:post-restart-asset-guard",
             "manual:normal-reply-path-usable",
           ],
         },
@@ -747,7 +749,15 @@ describe("activation restart continuations", () => {
             status: "pass",
           }),
           expect.objectContaining({
+            name: "manual:gateway-status",
+            status: "pass",
+          }),
+          expect.objectContaining({
             name: "manual:post-restart-runtime-identity",
+            status: "pass",
+          }),
+          expect.objectContaining({
+            name: "manual:post-restart-asset-guard",
             status: "pass",
           }),
           expect.objectContaining({
