@@ -7,7 +7,7 @@ import {
   clearActiveEmbeddedRun,
   setActiveEmbeddedRun,
 } from "../../agents/embedded-agent-runner/runs.js";
-import type { SessionEntry } from "../../config/sessions.js";
+import type { SessionEntry, TrbRecoveryState } from "../../config/sessions.js";
 import { createReplyOperation } from "./reply-run-registry.js";
 
 vi.mock("../../agents/auth-profiles/session-override.js", () => ({
@@ -237,6 +237,24 @@ function ownerParams(): Parameters<typeof runPreparedReply>[0] {
     senderIsOwner: true,
   } as never;
   return params;
+}
+
+function trbRecoveryState(): TrbRecoveryState {
+  return {
+    schemaVersion: 1,
+    trb_recovery_required: true,
+    recovery_mode: "trb",
+    trigger_message_id: "trb-message-1",
+    trigger_session_key: "session-key",
+    trigger_session_id: "session-trb",
+    trigger_timestamp: 1_787_686_000_000,
+    active_mission_session_ref: "session-key",
+    requires_session_tool_log_proof: true,
+    final_response_gate: {
+      status: "pending",
+      checkedAt: 1_787_686_000_000,
+    },
+  };
 }
 
 type MockCallSource = {
@@ -584,6 +602,66 @@ describe("runPreparedReply media-only handling", () => {
     expect(call.followupRun.prompt).toContain("Earlier message in this thread");
     expect(call.followupRun.prompt).toContain("[User sent media without caption]");
   });
+
+  it.each([
+    {
+      label: "new session without TRB state",
+      isNewSession: true,
+      trbRecovery: undefined,
+      expectTrbPrompt: false,
+    },
+    {
+      label: "existing session without TRB state",
+      isNewSession: false,
+      trbRecovery: undefined,
+      expectTrbPrompt: false,
+    },
+    {
+      label: "new recovery-mode session with TRB state",
+      isNewSession: true,
+      trbRecovery: trbRecoveryState(),
+      expectTrbPrompt: true,
+    },
+    {
+      label: "existing recovery-mode session with TRB state",
+      isNewSession: false,
+      trbRecovery: trbRecoveryState(),
+      expectTrbPrompt: true,
+    },
+  ])(
+    "builds early TRB recovery prompt without prepared session TDZ crash for $label",
+    async ({ isNewSession, trbRecovery, expectTrbPrompt }) => {
+      const sessionEntry: SessionEntry = {
+        sessionId: "session-trb",
+        sessionFile: "/tmp/session-trb.jsonl",
+        updatedAt: 1,
+        ...(trbRecovery ? { trbRecovery } : {}),
+      };
+      const sessionStore: Record<string, SessionEntry> = {
+        "session-key": sessionEntry,
+      };
+
+      await expect(
+        runPreparedReply(
+          baseParams({
+            isNewSession,
+            sessionEntry,
+            sessionStore,
+            storePath: "/tmp/openclaw-sessions.json",
+          }),
+        ),
+      ).resolves.toEqual({ text: "ok" });
+
+      const call = requireRunReplyAgentCall();
+      const extraSystemPrompt = call.followupRun.run.extraSystemPrompt ?? "";
+      if (expectTrbPrompt) {
+        expect(extraSystemPrompt).toContain("## Runtime TRB Recovery Gate");
+        expect(extraSystemPrompt).toContain("session_tool_log_proof: checked, with evidence.");
+      } else {
+        expect(extraSystemPrompt).not.toContain("## Runtime TRB Recovery Gate");
+      }
+    },
+  );
 
   it.each([
     "discord",

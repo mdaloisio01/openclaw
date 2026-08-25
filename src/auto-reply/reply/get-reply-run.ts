@@ -599,7 +599,7 @@ export async function runPreparedReply(
   );
   const extraSystemPromptParts = [
     inboundMetaPrompt,
-    buildTrbRecoverySystemPrompt(preparedSessionState.sessionEntry?.trbRecovery),
+    buildTrbRecoverySystemPrompt(sessionEntry?.trbRecovery),
     directChatContext,
     groupChatContext,
     groupIntro,
