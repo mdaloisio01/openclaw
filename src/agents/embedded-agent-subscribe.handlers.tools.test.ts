@@ -1,9 +1,13 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { AgentEvent } from "openclaw/plugin-sdk/agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   onAgentEvent as registerAgentEventListener,
   resetAgentEventsForTest,
 } from "../infra/agent-events.js";
+import { listActiveWorkCheckpoints } from "./active-work-checkpoint.js";
 import type { MessagingToolSend } from "./embedded-agent-messaging.types.js";
 import {
   handleToolExecutionEnd,
@@ -711,6 +715,29 @@ describe("handleToolExecutionEnd mutating failure recovery", () => {
 });
 
 describe("handleToolExecutionEnd timeout metadata", () => {
+  let tmpStateDir: string | undefined;
+  let previousStateDir: string | undefined;
+
+  async function useTempStateDir() {
+    tmpStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-tool-error-checkpoint-"));
+    previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = tmpStateDir;
+    return tmpStateDir;
+  }
+
+  afterEach(async () => {
+    if (previousStateDir === undefined) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
+    previousStateDir = undefined;
+    if (tmpStateDir) {
+      await fs.rm(tmpStateDir, { recursive: true, force: true });
+      tmpStateDir = undefined;
+    }
+  });
+
   it("records timeout metadata for failed exec results", async () => {
     const { ctx } = createTestContext();
 
@@ -743,6 +770,80 @@ describe("handleToolExecutionEnd timeout metadata", () => {
       toolName: "exec",
       timedOut: true,
     });
+  });
+
+  it("writes active-work checkpoints for recoverable exec failures", async () => {
+    const stateDir = await useTempStateDir();
+    const { ctx } = createTestContext();
+    ctx.state.toolMetaById.set("tool-exec-erofs", {
+      toolName: "exec",
+      meta: "build",
+    });
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "exec",
+        toolCallId: "tool-exec-erofs",
+        isError: true,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: "EROFS: read-only file system, rename '/home/will/openclaw-source/dist'",
+            },
+          ],
+          details: {
+            status: "failed",
+            exitCode: 1,
+          },
+        },
+      } as never,
+    );
+
+    const checkpoints = await listActiveWorkCheckpoints({ stateDir });
+    expect(checkpoints).toHaveLength(1);
+    expect(checkpoints[0]).toMatchObject({
+      source: "recoverable_tool_error",
+      sessionKey: "agent:unit-session",
+      sessionId: "session-test-id",
+      runId: "run-test",
+      requestingAgentToolPath: "exec build",
+      currentPhase: "post recoverable tool-error boundary",
+      continuationStatus: "pending",
+      safeToAutoResume: true,
+      requiresOperatorReview: false,
+    });
+    expect(checkpoints[0]?.nextValidationStep).toContain("Resume from the failed command boundary");
+  });
+
+  it("does not checkpoint harmless search misses", async () => {
+    const stateDir = await useTempStateDir();
+    const { ctx } = createTestContext();
+    ctx.state.toolMetaById.set("tool-exec-search", {
+      toolName: "exec",
+      meta: "search source",
+    });
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "exec",
+        toolCallId: "tool-exec-search",
+        isError: true,
+        result: {
+          content: [{ type: "text", text: "Command exited with code 1: no matches found" }],
+          details: {
+            status: "failed",
+            exitCode: 1,
+          },
+        },
+      } as never,
+    );
+
+    expect(await listActiveWorkCheckpoints({ stateDir })).toHaveLength(0);
   });
 
   it("records structured error codes for failed tool results", async () => {

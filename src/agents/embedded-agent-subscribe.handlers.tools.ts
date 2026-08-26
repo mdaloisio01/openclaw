@@ -29,6 +29,7 @@ import type { PluginHookAfterToolCallEvent } from "../plugins/types.js";
 import { createLazyImportLoader } from "../shared/lazy-promise.js";
 import { truncateUtf16Safe } from "../utils.js";
 import { normalizeAcceptedSessionSpawnResult } from "./accepted-session-spawn.js";
+import { writeActiveWorkCheckpoint } from "./active-work-checkpoint.js";
 import { REQUIRED_PARAM_GROUPS, type RequiredParamGroup } from "./agent-tools.params.js";
 import type { ApplyPatchSummary } from "./apply-patch.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
@@ -57,6 +58,7 @@ import {
 import { inferToolMetaFromArgs } from "./embedded-agent-utils.js";
 import { parseExecApprovalResultText } from "./exec-approval-result.js";
 import type { AgentEvent } from "./runtime/index.js";
+import { isExecLikeToolName, type ToolErrorSummary } from "./tool-error-summary.js";
 import { buildToolMutationState, isSameToolMutationAction } from "./tool-mutation.js";
 import { normalizeToolName } from "./tool-policy.js";
 
@@ -725,6 +727,100 @@ function readExecApprovalUnavailableDetails(result: unknown): {
   };
 }
 
+function isHarmlessSearchNoMatchToolErrorSummary(
+  lastToolError: ToolErrorSummary,
+  resultText?: string,
+): boolean {
+  if (lastToolError.timedOut === true || lastToolError.middlewareError === true) {
+    return false;
+  }
+  const meta = normalizeOptionalLowercaseString(lastToolError.meta) ?? "";
+  const error = [
+    normalizeOptionalLowercaseString(lastToolError.error),
+    normalizeOptionalLowercaseString(resultText),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const looksLikeSearch =
+    meta.startsWith("search ") ||
+    meta.includes(" -> search ") ||
+    meta.startsWith("find ") ||
+    meta.includes(" -> find ");
+  const noMatchError =
+    error.includes("exited with code 1") ||
+    error.includes("exit code 1") ||
+    error.includes("no matches found");
+  return looksLikeSearch && noMatchError;
+}
+
+function shouldCheckpointRecoverableToolError(
+  lastToolError: ToolErrorSummary,
+  resultText?: string,
+): boolean {
+  return (
+    isExecLikeToolName(lastToolError.toolName) &&
+    !isHarmlessSearchNoMatchToolErrorSummary(lastToolError, resultText)
+  );
+}
+
+function buildRecoverableToolErrorCheckpointInput(params: {
+  ctx: ToolHandlerContext;
+  lastToolError: ToolErrorSummary;
+}) {
+  const toolLabel = params.lastToolError.meta
+    ? `${params.lastToolError.toolName} ${params.lastToolError.meta}`
+    : params.lastToolError.toolName;
+  const errorLabel =
+    params.lastToolError.errorCode ??
+    (params.lastToolError.timedOut ? "timeout" : undefined) ??
+    "tool_error";
+  return {
+    source: "recoverable_tool_error" as const,
+    sessionKey: params.ctx.params.sessionKey,
+    sessionId: params.ctx.params.sessionId,
+    runId: params.ctx.params.runId,
+    requestingAgentToolPath: toolLabel,
+    activeObjective:
+      "Recoverable command/tool failure occurred during an active OpenClaw turn; continuation must preserve the failed boundary and produce a visible current-truth report or next action.",
+    currentPhase: "post recoverable tool-error boundary",
+    lastCompletedProof: `Tool failure was recorded as structured runtime state: ${errorLabel}.`,
+    nextValidationStep:
+      "Resume from the failed command boundary, decide whether to retry, escalate for approval, write a blocker, or continue with the next lawful proof-preserving action before reporting closed.",
+    stopConditions: [
+      "The failed command/tool boundary cannot be reconstructed from session state.",
+      "Retry would require destructive operations or an unapproved protected action.",
+      "A visible current-truth status, blocker, or closeout report cannot be produced.",
+      "The next lawful action is unclear after bounded recovery inspection.",
+    ],
+    pendingApprovalState: params.lastToolError.errorCode ?? "none",
+    safeToAutoResume: true,
+    requiresOperatorReview: false,
+  };
+}
+
+async function checkpointRecoverableToolError(params: {
+  ctx: ToolHandlerContext;
+  lastToolError: ToolErrorSummary;
+  resultText?: string;
+}) {
+  if (!shouldCheckpointRecoverableToolError(params.lastToolError, params.resultText)) {
+    return;
+  }
+  try {
+    const checkpoint = await writeActiveWorkCheckpoint({
+      input: buildRecoverableToolErrorCheckpointInput(params),
+    });
+    params.ctx.log.warn(
+      `recoverable tool-error checkpoint written checkpointId=${checkpoint.checkpointId} tool=${params.lastToolError.toolName}`,
+    );
+  } catch (error) {
+    params.ctx.log.warn("failed to write recoverable tool-error checkpoint", {
+      error: error instanceof Error ? error.message : String(error),
+      toolName: params.lastToolError.toolName,
+    });
+  }
+}
+
 async function emitToolResultOutput(params: {
   ctx: ToolHandlerContext;
   toolName: string;
@@ -1187,7 +1283,7 @@ export async function handleToolExecutionEnd(
   if (isToolError) {
     const errorMessage = extractToolErrorMessage(sanitizedResult);
     const errorCode = extractToolErrorCode(sanitizedResult);
-    ctx.state.lastToolError = {
+    const lastToolError: ToolErrorSummary = {
       toolName,
       meta,
       ...(errorCode ? { errorCode } : {}),
@@ -1198,6 +1294,12 @@ export async function handleToolExecutionEnd(
       actionFingerprint: callSummary?.actionFingerprint,
       fileTarget: callSummary?.fileTarget,
     };
+    ctx.state.lastToolError = lastToolError;
+    await checkpointRecoverableToolError({
+      ctx,
+      lastToolError,
+      resultText: extractToolResultText(sanitizedResult),
+    });
   } else if (ctx.state.lastToolError) {
     // Keep unresolved mutating failures until the same action succeeds.
     if (ctx.state.lastToolError.mutatingAction) {

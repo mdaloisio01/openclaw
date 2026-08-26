@@ -15,6 +15,7 @@ export type ActiveWorkCheckpointSource =
   | "memory_flush"
   | "preflight_compaction"
   | "gateway_restart"
+  | "recoverable_tool_error"
   | "runtime_maintenance";
 export type ActiveWorkCheckpointMaintenanceStatus = "pending" | "completed" | "failed" | "skipped";
 export type ActiveWorkCheckpointContinuationStatus =
@@ -133,6 +134,7 @@ function normalizeCheckpointSource(value: unknown): ActiveWorkCheckpointSource {
   return value === "memory_flush" ||
     value === "preflight_compaction" ||
     value === "gateway_restart" ||
+    value === "recoverable_tool_error" ||
     value === "runtime_maintenance"
     ? value
     : "runtime_maintenance";
