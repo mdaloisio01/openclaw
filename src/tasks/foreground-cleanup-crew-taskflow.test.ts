@@ -375,6 +375,63 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     expect(listTasksForFlowId(first.flow.flowId)).toHaveLength(1);
   });
 
+  it("records report-boundary and tool-batch checkpoints with the next executable action", () => {
+    const first = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "scope_lock_complete",
+      now: 1000,
+    });
+    if (first.status !== "registered") {
+      throw new Error("expected registered result");
+    }
+
+    const checkpoint = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "issue_040_tool_batch_checkpoint",
+      checkpointKind: "tool_batch_completed",
+      checkpointSummary: "scope and source reads completed without a SOP blocker",
+      nextExecutableAction: "write design lock and patch the selected source owner",
+      now: 2000,
+    });
+
+    expect(checkpoint.status).toBe("attached");
+    if (checkpoint.status !== "attached") {
+      throw new Error("expected attached result");
+    }
+    expect(checkpoint.flow.currentStep).toBe("issue_040_tool_batch_checkpoint");
+    expect(checkpoint.flow.stateJson).toMatchObject({
+      currentStageId: "issue_040_tool_batch_checkpoint",
+      currentCheckpointKind: "tool_batch_completed",
+      currentCheckpointSummary: "scope and source reads completed without a SOP blocker",
+      nextExecutableAction: "write design lock and patch the selected source owner",
+    });
+    expect(listTasksForFlowId(first.flow.flowId)[0]?.progressSummary).toContain(
+      "checkpoint=tool_batch_completed",
+    );
+    expect(listTasksForFlowId(first.flow.flowId)[0]?.progressSummary).toContain(
+      "next=write design lock and patch the selected source owner",
+    );
+  });
+
+  it("blocks checkpoint registration when the next executable action is missing", () => {
+    expect(
+      ensureForegroundCleanupCrewTaskFlow({
+        sessionKey: "webchat:direct:mark",
+        currentTurnText: "Cleanup Crew production repair build.",
+        stageId: "report_boundary_without_next_action",
+        checkpointKind: "report_boundary",
+        checkpointSummary: "final report artifact was prepared",
+        now: 1000,
+      }),
+    ).toEqual({
+      status: "blocked",
+      reason: "checkpoint_next_executable_action_missing",
+    });
+    expect(listTaskFlowRecords()).toHaveLength(0);
+  });
+
   it("does not resume a lawfully blocked foreground Cleanup Crew flow", () => {
     const first = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: "webchat:direct:mark",

@@ -755,6 +755,9 @@ export async function flowsAttachForegroundCleanupCrewExecutionCommand(
     sessionKey?: string;
     currentTurnText?: string;
     currentStep?: string;
+    checkpointKind?: string;
+    checkpointSummary?: string;
+    nextExecutableAction?: string;
     authorityPath?: string;
     authorityBasis?: string;
     ownerLane?: string;
@@ -785,6 +788,9 @@ export async function flowsAttachForegroundCleanupCrewExecutionCommand(
     stageId:
       normalizeOptionalString(opts.currentStep) ??
       "foreground_cleanup_crew_current_session_execution",
+    checkpointKind: normalizeOptionalString(opts.checkpointKind),
+    checkpointSummary: normalizeOptionalString(opts.checkpointSummary),
+    nextExecutableAction: normalizeOptionalString(opts.nextExecutableAction),
   });
   if (result.status === "blocked" || result.status === "skipped") {
     failCommand(runtime, `Foreground Cleanup Crew execution attachment blocked: ${result.reason}.`);

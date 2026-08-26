@@ -729,6 +729,12 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .requiredOption("--session-key <key>", "Foreground executor session key")
     .option("--current-turn-text <text>", "Cleanup Crew production turn text")
     .option("--current-step <step>", "Current executable step")
+    .option(
+      "--checkpoint-kind <kind>",
+      "Cleanup Crew checkpoint kind: tool_batch_completed, tool_error_recovery, report_boundary, validation_failure, startup_proof_batch, or milestone_delivered",
+    )
+    .option("--checkpoint-summary <text>", "Short checkpoint proof summary")
+    .option("--next-executable-action <text>", "Next executable action after this checkpoint")
     .option("--authority-path <path>", "Authority or build-plan path")
     .option("--authority-basis <text>", "Authority basis")
     .option("--owner-lane <lane>", "Owner lane")
@@ -742,6 +748,9 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             sessionKey: opts.sessionKey as string | undefined,
             currentTurnText: opts.currentTurnText as string | undefined,
             currentStep: opts.currentStep as string | undefined,
+            checkpointKind: opts.checkpointKind as string | undefined,
+            checkpointSummary: opts.checkpointSummary as string | undefined,
+            nextExecutableAction: opts.nextExecutableAction as string | undefined,
             authorityPath: opts.authorityPath as string | undefined,
             authorityBasis: opts.authorityBasis as string | undefined,
             ownerLane: opts.ownerLane as string | undefined,

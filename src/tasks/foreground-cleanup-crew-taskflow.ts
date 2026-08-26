@@ -30,10 +30,25 @@ const FOREGROUND_CLEANUP_CREW_TASK_KIND = "foreground_cleanup_crew_execution";
 const FOREGROUND_CLEANUP_CREW_SOURCE_ID = "cleanup-crew:foreground";
 const FOREGROUND_CLEANUP_CREW_SUPERSESSION_SOURCE_ID = "cleanup-crew:foreground:supersession";
 
+export const FOREGROUND_CLEANUP_CREW_CHECKPOINT_KINDS = [
+  "tool_batch_completed",
+  "tool_error_recovery",
+  "report_boundary",
+  "validation_failure",
+  "startup_proof_batch",
+  "milestone_delivered",
+] as const;
+
+export type ForegroundCleanupCrewCheckpointKind =
+  (typeof FOREGROUND_CLEANUP_CREW_CHECKPOINT_KINDS)[number];
+
 type ForegroundCleanupCrewTracking = {
   packetId?: string;
   stageId?: string;
   activeValidationCommand?: string;
+  checkpointKind?: ForegroundCleanupCrewCheckpointKind;
+  checkpointSummary?: string;
+  nextExecutableAction?: string;
 };
 
 export type ForegroundCleanupCrewTaskFlowRegistrationResult =
@@ -128,7 +143,11 @@ function normalizeTracking(params: {
   packetId?: string | null;
   stageId?: string | null;
   activeValidationCommand?: string | null;
+  checkpointKind?: string | null;
+  checkpointSummary?: string | null;
+  nextExecutableAction?: string | null;
 }): ForegroundCleanupCrewTracking {
+  const checkpointKind = normalizeOptionalString(params.checkpointKind);
   return {
     ...(normalizeOptionalString(params.packetId)
       ? { packetId: normalizeOptionalString(params.packetId)! }
@@ -139,7 +158,23 @@ function normalizeTracking(params: {
     ...(normalizeOptionalString(params.activeValidationCommand)
       ? { activeValidationCommand: normalizeOptionalString(params.activeValidationCommand)! }
       : {}),
+    ...(checkpointKind &&
+    FOREGROUND_CLEANUP_CREW_CHECKPOINT_KINDS.includes(
+      checkpointKind as ForegroundCleanupCrewCheckpointKind,
+    )
+      ? { checkpointKind: checkpointKind as ForegroundCleanupCrewCheckpointKind }
+      : {}),
+    ...(normalizeOptionalString(params.checkpointSummary)
+      ? { checkpointSummary: normalizeOptionalString(params.checkpointSummary)! }
+      : {}),
+    ...(normalizeOptionalString(params.nextExecutableAction)
+      ? { nextExecutableAction: normalizeOptionalString(params.nextExecutableAction)! }
+      : {}),
   };
+}
+
+function checkpointRequiresNextAction(tracking: ForegroundCleanupCrewTracking): boolean {
+  return Boolean(tracking.checkpointKind);
 }
 
 function buildProgressSummary(tracking: ForegroundCleanupCrewTracking): string {
@@ -152,6 +187,15 @@ function buildProgressSummary(tracking: ForegroundCleanupCrewTracking): string {
   }
   if (tracking.activeValidationCommand) {
     parts.push(`validation=${tracking.activeValidationCommand}`);
+  }
+  if (tracking.checkpointKind) {
+    parts.push(`checkpoint=${tracking.checkpointKind}`);
+  }
+  if (tracking.checkpointSummary) {
+    parts.push(`summary=${tracking.checkpointSummary}`);
+  }
+  if (tracking.nextExecutableAction) {
+    parts.push(`next=${tracking.nextExecutableAction}`);
   }
   return parts.join(" ");
 }
@@ -168,6 +212,11 @@ function applyTrackingToStateJson(
     ...(tracking.stageId ? { currentStageId: tracking.stageId } : {}),
     ...(tracking.activeValidationCommand
       ? { activeValidationCommand: tracking.activeValidationCommand }
+      : {}),
+    ...(tracking.checkpointKind ? { currentCheckpointKind: tracking.checkpointKind } : {}),
+    ...(tracking.checkpointSummary ? { currentCheckpointSummary: tracking.checkpointSummary } : {}),
+    ...(tracking.nextExecutableAction
+      ? { nextExecutableAction: tracking.nextExecutableAction }
       : {}),
   };
 }
@@ -470,6 +519,9 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   packetId?: string | null;
   stageId?: string | null;
   activeValidationCommand?: string | null;
+  checkpointKind?: string | null;
+  checkpointSummary?: string | null;
+  nextExecutableAction?: string | null;
   intakeStateDir?: string;
   now?: number;
 }): ForegroundCleanupCrewTaskFlowRegistrationResult {
@@ -483,6 +535,10 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   }
   const ownerKey = sessionKey;
   const now = params.now ?? Date.now();
+  const tracking = normalizeTracking(params);
+  if (checkpointRequiresNextAction(tracking) && !tracking.nextExecutableAction) {
+    return { status: "blocked", reason: "checkpoint_next_executable_action_missing" };
+  }
   const intakeRecord = createOwnerRequestIntakeRecord({
     message: currentTurnText,
     sourceSessionKey: sessionKey,
@@ -502,7 +558,6 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
     stateDir: params.intakeStateDir,
     nowMs: now,
   });
-  const tracking = normalizeTracking(params);
   const existing = findForegroundCleanupCrewFlow(ownerKey);
   if (existing) {
     if (isLawfullyBlockedWithoutLaunch(existing)) {
@@ -569,6 +624,13 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       ...(tracking.stageId ? { currentStageId: tracking.stageId } : {}),
       ...(tracking.activeValidationCommand
         ? { activeValidationCommand: tracking.activeValidationCommand }
+        : {}),
+      ...(tracking.checkpointKind ? { currentCheckpointKind: tracking.checkpointKind } : {}),
+      ...(tracking.checkpointSummary
+        ? { currentCheckpointSummary: tracking.checkpointSummary }
+        : {}),
+      ...(tracking.nextExecutableAction
+        ? { nextExecutableAction: tracking.nextExecutableAction }
         : {}),
     },
     createdAt: now,
