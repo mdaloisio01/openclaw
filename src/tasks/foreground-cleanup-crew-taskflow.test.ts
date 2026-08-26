@@ -427,6 +427,64 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     ).toBe("write design lock and patch the selected source owner");
   });
 
+  it("preserves dispatched checkpoint state when a later foreground attach has no tracking", () => {
+    const first = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      now: 1000,
+    });
+
+    expect(first.status).toBe("registered");
+    if (first.status !== "registered") {
+      throw new Error("expected registered result");
+    }
+
+    const checkpoint = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "issue_040_checkpoint_dispatch_activation_closeout_delivered",
+      checkpointKind: "milestone_delivered",
+      checkpointSummary: "checkpoint-dispatch activation proof passed",
+      nextExecutableAction: "re-triage the remaining ISSUE-040 family",
+      now: 1500,
+    });
+
+    expect(checkpoint.status).toBe("attached");
+    if (checkpoint.status !== "attached") {
+      throw new Error("expected attached result");
+    }
+    const activeContinuation = getTaskFlowActiveProductionContinuation(checkpoint.flow);
+    expect(activeContinuation).toMatchObject({
+      status: "dispatched",
+      lastDispatchReceiptId: expect.stringContaining(":next-executable:dispatch:"),
+    });
+    expect(activeContinuation?.dispatchReceipts[0]?.proofRef).toBe(
+      "re-triage the remaining ISSUE-040 family",
+    );
+
+    const laterAttach = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      now: 2000,
+    });
+
+    expect(laterAttach.status).toBe("attached");
+    if (laterAttach.status !== "attached") {
+      throw new Error("expected attached result");
+    }
+    expect(laterAttach.flow.revision).toBe(checkpoint.flow.revision);
+    expect(getTaskFlowProductionContinuation(laterAttach.flow)).toMatchObject({
+      nextExecutableUnitLaunched: true,
+    });
+    expect(getTaskFlowActiveProductionContinuation(laterAttach.flow)).toMatchObject({
+      status: "dispatched",
+      lastDispatchReceiptId: activeContinuation?.lastDispatchReceiptId,
+    });
+    expect(
+      getTaskFlowActiveProductionContinuation(laterAttach.flow)?.dispatchReceipts[0]?.proofRef,
+    ).toBe("re-triage the remaining ISSUE-040 family");
+  });
+
   it("settles an obsolete restart boundary when a later checkpoint advances the foreground run", () => {
     const first = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: "webchat:direct:mark",

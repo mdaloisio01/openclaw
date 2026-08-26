@@ -178,6 +178,17 @@ function checkpointRequiresNextAction(tracking: ForegroundCleanupCrewTracking): 
   return Boolean(tracking.checkpointKind);
 }
 
+function hasForegroundCleanupCrewTracking(tracking: ForegroundCleanupCrewTracking): boolean {
+  return Boolean(
+    tracking.packetId ||
+    tracking.stageId ||
+    tracking.activeValidationCommand ||
+    tracking.checkpointKind ||
+    tracking.checkpointSummary ||
+    tracking.nextExecutableAction,
+  );
+}
+
 function buildProgressSummary(tracking: ForegroundCleanupCrewTracking): string {
   const parts = ["Foreground Cleanup Crew mission is active in this source conversation."];
   if (tracking.packetId) {
@@ -708,6 +719,31 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       return {
         status: "blocked",
         reason: "foreground_cleanup_crew_flow_lawfully_blocked",
+      };
+    }
+    if (!hasForegroundCleanupCrewTracking(tracking)) {
+      return {
+        status: "attached",
+        flow: existing,
+        taskId: (() => {
+          const taskId = ensureForegroundExecutionTask({
+            flow: existing,
+            ownerKey,
+            sessionKey,
+            now,
+            tracking,
+          });
+          markOwnerRequestMissionRegistered({
+            requestId: intakeRecord.requestId,
+            taskFlowId: existing.flowId,
+            taskId,
+            lastExecutableAction: "attached to existing foreground Cleanup Crew TaskFlow",
+            nextExecutableAction: "continue active production run",
+            stateDir: params.intakeStateDir,
+            nowMs: now,
+          });
+          return taskId;
+        })(),
       };
     }
     const trackedStateJson = applyTrackingToStateJson(existing.stateJson, tracking);
