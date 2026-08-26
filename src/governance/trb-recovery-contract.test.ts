@@ -184,6 +184,126 @@ describe("TRB recovery runtime contract", () => {
     expect(validateTrbRecoveryContract(completeContract).ok).toBe(true);
   });
 
+  it("parses a Mark-facing report with a machine-readable contract block and prose", () => {
+    const result = validateTrbFinalReplyPayloads({
+      state: createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-report" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-report",
+        now: 321,
+      }),
+      payloads: {
+        text: [
+          "classification: current_blocker",
+          "what_was_happening_before_misfire: final report was blocked by the runtime gate",
+          "proof_checked:",
+          "- session transcript",
+          "- TRB gate source",
+          "actual_issue_identified: report format did not satisfy the runtime contract",
+          "root_cause: final text used a human report shape instead of parseable fields",
+          "active_mission_impact: repair report must include the contract block",
+          "issue_list_action: update ISSUE-040 with the recurrence",
+          "recovery_artifact_path: /tmp/trb-format-repair.md",
+          "exact_next_action: patch parser and prompt",
+          "",
+          "TRB Format Repair",
+          "",
+          "Status: Open - source repair is being validated",
+          "",
+          "Update:",
+          "- The required contract block is present before the human report.",
+        ].join("\n"),
+      },
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
+  it("normalizes exact backticked classification values", () => {
+    const parsed = parseTrbRecoveryContractFromText(
+      [
+        "classification: `deferred_issue`",
+        "what_was_happening_before_misfire: activation closeout was already delivered",
+        "proof_checked: issue register; closeout artifact",
+        "actual_issue_identified: no current blocker remained",
+        "root_cause: follow-up formatting defect was recorded for later repair",
+        "active_mission_impact: active repair slice can continue",
+        "issue_list_action: ISSUE-040 update already records the recurrence",
+        "recovery_artifact_path: /tmp/trb.md",
+        "exact_next_action: continue issue-list triage",
+      ].join("\n"),
+    );
+
+    expect(parsed.classification).toBe("deferred_issue");
+    expect(validateTrbRecoveryContract(parsed).ok).toBe(true);
+  });
+
+  it("parses proof_checked bullet lists under an empty label", () => {
+    const parsed = parseTrbRecoveryContractFromText(
+      [
+        "classification: current_blocker",
+        "what_was_happening_before_misfire: report stopped before a final answer",
+        "proof_checked:",
+        "- session transcript",
+        "- tool output summary",
+        "actual_issue_identified: final report was absent",
+        "root_cause: run ended before closeout delivery",
+        "active_mission_impact: recovery must deliver the final report",
+        "lawful_no_update_reason: current blocker handled immediately",
+        "recovery_artifact_path: /tmp/trb.md",
+        "exact_next_action: deliver recovery report",
+      ].join("\n"),
+    );
+
+    expect(parsed.proof_checked).toEqual(["session transcript", "tool output summary"]);
+    expect(validateTrbRecoveryContract(parsed).ok).toBe(true);
+  });
+
+  it("rejects backticked classification values with extra prose", () => {
+    const parsed = parseTrbRecoveryContractFromText(
+      [
+        "classification: `deferred_issue` for the aborted tool wait",
+        "what_was_happening_before_misfire: activation closeout was already delivered",
+        "proof_checked: issue register; closeout artifact",
+        "actual_issue_identified: no current blocker remained",
+        "root_cause: follow-up formatting defect was recorded for later repair",
+        "active_mission_impact: active repair slice can continue",
+        "issue_list_action: ISSUE-040 update already records the recurrence",
+        "recovery_artifact_path: /tmp/trb.md",
+        "exact_next_action: continue issue-list triage",
+      ].join("\n"),
+    );
+
+    expect(parsed.classification).toBe("`deferred_issue` for the aborted tool wait");
+    expect(validateTrbRecoveryContract(parsed).ok).toBe(false);
+  });
+
+  it("still fails closed for prose-only incomplete TRB responses", () => {
+    const result = validateTrbFinalReplyPayloads({
+      state: createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-prose" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-prose",
+        now: 654,
+      }),
+      payloads: {
+        text: [
+          "TRB finding: The compact visible recovery slice is closed.",
+          "",
+          "Status: Closed - everything important passed.",
+          "",
+          "Files/Reports:",
+          "cleanupcrew_issue_040_compact_visible_recovery_activation_closeout.md",
+        ].join("\n"),
+      },
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reasonCodes).toContain("TRB_FINAL_MISSING_REQUIRED_FIELDS");
+    expect(result.reasonCodes).toContain("TRB_ARTIFACT_MISSING");
+    expect(result.reasonCodes).toContain("TRB_ISSUE_ACTION_MISSING");
+  });
+
   it("drains stale TRB recovery state on the next non-TRB inbound turn", () => {
     const state = createTrbRecoveryState({
       ctx: { Body: "TRB", MessageSid: "msg-stale" },

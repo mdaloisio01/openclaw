@@ -251,9 +251,57 @@ export function validateTrbRecoveryContract(
 function parseLineValue(text: string, labels: string[]): string | undefined {
   for (const label of labels) {
     const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = text.match(new RegExp(`^\\s*(?:[-*]\\s*)?${escaped}\\s*:\\s*(.+)$`, "im"));
+    const match = text.match(
+      new RegExp(`^[ \\t]*(?:[-*][ \\t]*)?${escaped}[ \\t]*:[ \\t]*(.+)$`, "im"),
+    );
     if (match?.[1]?.trim()) {
       return match[1].trim();
+    }
+  }
+  return undefined;
+}
+
+function unwrapExactBacktickValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const match = trimmed.match(/^`([^`]+)`$/);
+  return match?.[1]?.trim() || trimmed;
+}
+
+function parseBulletListUnderEmptyLabel(text: string, labels: string[]): string[] | undefined {
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    const matchedLabel = labels.some((label) => {
+      const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`^\\s*(?:[-*]\\s*)?${escaped}\\s*:\\s*$`, "i").test(line);
+    });
+    if (!matchedLabel) {
+      continue;
+    }
+
+    const entries: string[] = [];
+    for (let nextIndex = index + 1; nextIndex < lines.length; nextIndex += 1) {
+      const nextLine = lines[nextIndex] ?? "";
+      if (!nextLine.trim()) {
+        if (entries.length === 0) {
+          continue;
+        }
+        break;
+      }
+      const bullet = nextLine.match(/^\s*[-*]\s+(.+)$/);
+      if (!bullet) {
+        break;
+      }
+      if (bullet[1]?.trim()) {
+        entries.push(bullet[1].trim());
+      }
+    }
+
+    if (entries.length > 0) {
+      return entries;
     }
   }
   return undefined;
@@ -262,12 +310,20 @@ function parseLineValue(text: string, labels: string[]): string | undefined {
 function parseProofList(text: string): string[] | undefined {
   const value = parseLineValue(text, ["proof_checked", "proof checked", "PROOF"]);
   if (!value) {
-    return undefined;
+    return parseBulletListUnderEmptyLabel(text, ["proof_checked", "proof checked", "PROOF"]);
   }
   return value
     .split(/[,;|]/)
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function parseRequiredScalarValue(text: string, labels: string[]): string | undefined {
+  const value = parseLineValue(text, labels);
+  if (!value) {
+    return undefined;
+  }
+  return unwrapExactBacktickValue(value);
 }
 
 export function parseTrbRecoveryContractFromText(text: string): TrbRecoveryContract {
@@ -324,7 +380,7 @@ export function parseTrbRecoveryContractFromText(text: string): TrbRecoveryContr
             parseLineValue(text, ["exact_next_action", "exact next action"]),
         }
       : undefined,
-    classification: parseLineValue(text, ["classification", "TRB classification"]),
+    classification: parseRequiredScalarValue(text, ["classification", "TRB classification"]),
     active_mission_impact: parseLineValue(text, ["active_mission_impact", "active mission impact"]),
     active_mission_blocked:
       /active_mission_blocked\s*:\s*true|active mission blocked\s*:\s*true/i.test(text),
@@ -462,6 +518,9 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
     state.requires_session_tool_log_proof
       ? "session_tool_log_proof: checked, with evidence. This TRB cannot close without session/tool-log proof."
       : undefined,
+    "Put the required contract block before any prose. Each scalar field must be one same-line `field: value` entry with no extra explanation on that line.",
+    "Use `proof_checked: item one; item two` on one line, or `proof_checked:` followed immediately by short `- item` bullet lines.",
+    "The `classification:` value must be exactly `current_blocker` or `deferred_issue`.",
     "If any root cause is unknown, likely, probably, not proven, unclear, or cannot be determined, include what_was_checked, proof_missing, where_proof_should_exist, missing_proof_is_blocker, and exact_next_recovery_step.",
     "If the active mission cannot continue, required proof is missing, closeout/report delivery is missing, source repair did not land, or validation did not run, classification must be current_blocker.",
   ]
