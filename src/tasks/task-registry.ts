@@ -1747,12 +1747,68 @@ export function formatActiveMissionContextBlock(params: {
 }
 
 export function buildActiveMissionContextBlockForOwnerKey(ownerKey: string): string | null {
-  ensureTaskRegistryReady();
-  const normalizedOwnerKey = normalizeOptionalString(ownerKey);
-  if (!normalizedOwnerKey) {
+  const activeMission = findSingleActiveMissionForLookup({ ownerKeys: [ownerKey] });
+  const missionId = normalizeOptionalString(activeMission?.missionId);
+  if (!activeMission || !missionId) {
     return null;
   }
-  const activeMission = findLatestActiveMissionForOwnerKey(normalizedOwnerKey);
+  return formatActiveMissionContextBlock({
+    missionId,
+    missionSummary: activeMission.missionSummary,
+  });
+}
+
+function collectMissionTasksForLookup(params: {
+  ownerKeys?: readonly (string | undefined | null)[];
+  agentId?: string | null;
+}): TaskRecord[] {
+  ensureTaskRegistryReady();
+  const byTaskId = new Map<string, TaskRecord>();
+  for (const ownerKey of uniqueStrings(
+    (params.ownerKeys ?? [])
+      .map((key) => normalizeOptionalString(key))
+      .filter((key): key is string => Boolean(key)),
+  )) {
+    for (const task of [
+      ...listTasksForOwnerKey(ownerKey),
+      ...listTasksForRelatedSessionKey(ownerKey),
+    ]) {
+      if (task.missionId?.trim()) {
+        byTaskId.set(task.taskId, task);
+      }
+    }
+  }
+  const agentId = normalizeOptionalString(params.agentId);
+  if (agentId) {
+    for (const task of listTasksForAgentId(agentId)) {
+      if (task.missionId?.trim()) {
+        byTaskId.set(task.taskId, task);
+      }
+    }
+  }
+  return [...byTaskId.values()].toSorted(compareTasksNewestFirst);
+}
+
+function findSingleActiveMissionForLookup(params: {
+  ownerKeys?: readonly (string | undefined | null)[];
+  agentId?: string | null;
+}): TaskRecord | undefined {
+  const activeMissionTasks = collectMissionTasksForLookup(params).filter(
+    (task) => task.missionState === "active",
+  );
+  const activeMissionIds = uniqueStrings(
+    activeMissionTasks
+      .map((task) => normalizeOptionalString(task.missionId))
+      .filter((missionId): missionId is string => Boolean(missionId)),
+  );
+  return activeMissionIds.length === 1 ? activeMissionTasks[0] : undefined;
+}
+
+export function buildActiveMissionContextBlockForLookup(params: {
+  ownerKeys?: readonly (string | undefined | null)[];
+  agentId?: string | null;
+}): string | null {
+  const activeMission = findSingleActiveMissionForLookup(params);
   const missionId = normalizeOptionalString(activeMission?.missionId);
   if (!activeMission || !missionId) {
     return null;
@@ -1837,15 +1893,32 @@ export function resolveMissionBoundFollowupForOwner(params: {
   ownerKey: string;
   text: string;
 }): MissionBoundFollowupResolution {
+  return resolveMissionBoundFollowupForLookup({
+    ownerKeys: [params.ownerKey],
+    text: params.text,
+  });
+}
+
+export function resolveMissionBoundFollowupForLookup(params: {
+  ownerKeys?: readonly (string | undefined | null)[];
+  agentId?: string | null;
+  text: string;
+}): MissionBoundFollowupResolution {
   ensureTaskRegistryReady();
-  const ownerKey = normalizeOptionalString(params.ownerKey);
+  const ownerKeys = uniqueStrings(
+    (params.ownerKeys ?? [])
+      .map((key) => normalizeOptionalString(key))
+      .filter((key): key is string => Boolean(key)),
+  );
+  const ownerKey = ownerKeys[0] ?? normalizeOptionalString(params.agentId) ?? "";
   const directive = normalizeMissionFollowupText(params.text);
   if (!ownerKey || !directive) {
     return { status: "not_applicable" };
   }
-  const ownerTasks = listTasksForOwnerKey(ownerKey).filter((task) =>
-    Boolean(task.missionId?.trim()),
-  );
+  const ownerTasks = collectMissionTasksForLookup({
+    ownerKeys,
+    agentId: params.agentId,
+  });
   if (ownerTasks.length === 0) {
     return { status: "not_applicable" };
   }

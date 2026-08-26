@@ -4927,6 +4927,48 @@ describe("dispatchReplyFromConfig", () => {
       expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "status" });
     });
 
+    it("injects active mission context after reset when the session key changed", async () => {
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:discord:C791",
+        requesterSessionKey: "agent:main:discord:C791",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:reset-context",
+        agentId: "main",
+        runId: "run-reset-context",
+        task: "Reconnect the reset recovery path",
+        missionId: "mission-reset-reconnect",
+        missionSummary: "Reconnect the reset recovery path",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const dispatcher = createDispatcher();
+      const ctx = buildTestCtx({
+        Provider: "discord",
+        Surface: "discord",
+        OriginatingChannel: "discord",
+        OriginatingTo: "discord:C791",
+        To: "discord:C791",
+        AccountId: "default",
+        AgentId: "main",
+        SessionKey: "agent:main:discord:new-session",
+        BodyForAgent: "hello",
+      });
+      const replyResolver = vi.fn(async (resolverCtx: MsgContext) => {
+        expect(resolverCtx.BodyForAgent).toBe(
+          "<active_mission>\n<mission_id>mission-reset-reconnect</mission_id>\n<mission_summary>Reconnect the reset recovery path</mission_summary>\n<authority>task-registry</authority>\n<legacy_label>Active mission (mission-reset-reconnect): Reconnect the reset recovery path</legacy_label>\n</active_mission>\n\nCurrent user turn:\nhello",
+        );
+        return { text: "reconnected" } satisfies ReplyPayload;
+      });
+
+      await dispatchReplyFromConfig({ ctx, cfg: emptyConfig, dispatcher, replyResolver });
+
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "reconnected" });
+    });
+
     it("fails closed when continue arrives after mission history but no active mission remains", async () => {
       createTaskRecord({
         runtime: "subagent",

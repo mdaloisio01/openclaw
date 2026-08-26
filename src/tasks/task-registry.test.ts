@@ -49,6 +49,7 @@ import {
   resetTaskRegistryControlRuntimeForTests,
   resetTaskRegistryDeliveryRuntimeForTests,
   resetTaskRegistryForTests,
+  resolveMissionBoundFollowupForLookup,
   resolveMissionBoundFollowupForOwner,
   resolveTaskForLookupToken,
   setTaskMissionById,
@@ -2505,6 +2506,83 @@ describe("task-registry", () => {
         activeTaskId: expect.any(String),
         reboundText:
           "Continue the active mission (mission-hang-fix): Fix the Grant blind-test hang path",
+      });
+    });
+  });
+
+  it("rebinds reset-session followups to the single active mission for the agent", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      createTaskRecord({
+        runtime: "subagent",
+        ownerKey: "agent:main:webchat:old-session",
+        requesterSessionKey: "agent:main:webchat:old-session",
+        scopeKind: "session",
+        childSessionKey: "agent:main:subagent:active-followup",
+        agentId: "main",
+        runId: "run-active-followup",
+        task: "Reconnect after reset",
+        missionId: "mission-reset-reconnect",
+        missionSummary: "Reconnect after reset",
+        missionState: "active",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      expect(
+        resolveMissionBoundFollowupForLookup({
+          ownerKeys: ["agent:main:webchat:new-session"],
+          agentId: "main",
+          text: "continue",
+        }),
+      ).toEqual({
+        status: "bound",
+        ownerKey: "agent:main:webchat:new-session",
+        missionId: "mission-reset-reconnect",
+        missionSummary: "Reconnect after reset",
+        activeTaskId: expect.any(String),
+        reboundText: "Continue the active mission (mission-reset-reconnect): Reconnect after reset",
+      });
+    });
+  });
+
+  it("fails closed instead of guessing when reset-session fallback sees multiple active missions", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskRegistryMemoryForTest({ persist: false });
+
+      for (const missionId of ["mission-one", "mission-two"]) {
+        createTaskRecord({
+          runtime: "subagent",
+          ownerKey: `agent:main:webchat:${missionId}`,
+          requesterSessionKey: `agent:main:webchat:${missionId}`,
+          scopeKind: "session",
+          childSessionKey: `agent:main:subagent:${missionId}`,
+          agentId: "main",
+          runId: `run-${missionId}`,
+          task: `Reconnect ${missionId}`,
+          missionId,
+          missionSummary: `Reconnect ${missionId}`,
+          missionState: "active",
+          status: "running",
+          deliveryStatus: "pending",
+        });
+      }
+
+      expect(
+        resolveMissionBoundFollowupForLookup({
+          ownerKeys: ["agent:main:webchat:new-session"],
+          agentId: "main",
+          text: "continue",
+        }),
+      ).toEqual({
+        status: "blocked",
+        ownerKey: "agent:main:webchat:new-session",
+        reason: "multiple_active_missions",
+        message:
+          "I have more than one active mission for this owner, so I will not guess what `continue` or `yes` means. Re-state the exact task.",
       });
     });
   });

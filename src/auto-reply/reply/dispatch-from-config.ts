@@ -91,8 +91,8 @@ import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveSilentReplyPolicyFromPolicies } from "../../shared/silent-reply-policy.js";
 import { ensureForegroundCleanupCrewTaskFlow } from "../../tasks/foreground-cleanup-crew-taskflow.js";
 import {
-  buildActiveMissionContextBlockForOwnerKey,
-  resolveMissionBoundFollowupForOwner,
+  buildActiveMissionContextBlockForLookup,
+  resolveMissionBoundFollowupForLookup,
 } from "../../tasks/task-registry.js";
 import { createTtsDirectiveTextStreamCleaner } from "../../tts/directives.js";
 import {
@@ -205,15 +205,16 @@ function isDispatchReplyOperationAbortedError(
 }
 
 function formatActiveMissionContextPrefix(params: {
-  ownerKey?: string;
+  ownerKeys?: readonly (string | undefined | null)[];
   bodyText?: string;
 }): string | undefined {
-  const ownerKey = normalizeOptionalString(params.ownerKey);
   const bodyText = normalizeOptionalString(params.bodyText);
-  if (!ownerKey || !bodyText) {
+  if (!bodyText) {
     return undefined;
   }
-  const missionBlock = buildActiveMissionContextBlockForOwnerKey(ownerKey);
+  const missionBlock = buildActiveMissionContextBlockForLookup({
+    ownerKeys: params.ownerKeys,
+  });
   if (!missionBlock) {
     return undefined;
   }
@@ -221,6 +222,31 @@ function formatActiveMissionContextPrefix(params: {
     return bodyText;
   }
   return `${missionBlock}\n\nCurrent user turn:\n${bodyText}`;
+}
+
+function resolveConversationMissionOwnerKeyCandidate(params: {
+  agentId?: string | null;
+  provider?: string | null;
+  surface?: string | null;
+  originatingChannel?: string | null;
+  originatingTo?: string | null;
+  to?: string | null;
+}): string | undefined {
+  const agentId = normalizeOptionalString(params.agentId);
+  const provider = normalizeOptionalLowercaseString(
+    params.originatingChannel ?? params.surface ?? params.provider,
+  );
+  const rawConversation = normalizeOptionalString(params.originatingTo ?? params.to);
+  if (!agentId || !provider || !rawConversation) {
+    return undefined;
+  }
+  const conversation = rawConversation.toLowerCase().startsWith(`${provider}:`)
+    ? rawConversation.slice(provider.length + 1)
+    : rawConversation;
+  const normalizedConversation = normalizeOptionalString(conversation);
+  return normalizedConversation
+    ? `agent:${agentId}:${provider}:${normalizedConversation}`
+    : undefined;
 }
 
 function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
@@ -2110,10 +2136,27 @@ export async function dispatchReplyFromConfig(
     normalizeOptionalString(ctx.Body) ??
     normalizeOptionalString(ctx.RawBody) ??
     "";
-  const missionBoundFollowupResolution = resolveMissionBoundFollowupForOwner({
-    ownerKey: acpDispatchSessionKey ?? sessionKey ?? "",
-    text: rawAgentText,
-  });
+  const activeMissionLookupKeys = [
+    acpDispatchSessionKey,
+    sessionKey,
+    sessionStoreEntry.sessionKey,
+    ctx.SessionKey,
+    ctx.CommandTargetSessionKey,
+    resolveConversationMissionOwnerKeyCandidate({
+      agentId: sessionAgentId,
+      provider: ctx.Provider,
+      surface: ctx.Surface,
+      originatingChannel: ctx.OriginatingChannel,
+      originatingTo: ctx.OriginatingTo,
+      to: ctx.To,
+    }),
+  ];
+  const missionBoundFollowupResolution = pluginOwnedBinding
+    ? ({ status: "not_applicable" } as const)
+    : resolveMissionBoundFollowupForLookup({
+        ownerKeys: activeMissionLookupKeys,
+        text: rawAgentText,
+      });
   if (missionBoundFollowupResolution.status === "blocked") {
     runtimeDispatcher.sendFinalReply({ text: missionBoundFollowupResolution.message });
     recordProcessed("completed", { reason: "mission-followup-blocked" });
@@ -2132,7 +2175,7 @@ export async function dispatchReplyFromConfig(
       };
     }
     const missionContextBody = formatActiveMissionContextPrefix({
-      ownerKey: acpDispatchSessionKey ?? sessionKey ?? "",
+      ownerKeys: activeMissionLookupKeys,
       bodyText: rawAgentText || undefined,
     });
     if (!missionContextBody) {
