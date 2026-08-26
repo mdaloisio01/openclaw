@@ -194,7 +194,7 @@ describe("truncateToolResultMessage", () => {
 describe("calculateMaxToolResultChars", () => {
   it("scales with context window size", () => {
     const small = calculateMaxToolResultChars(8_000);
-    const large = calculateMaxToolResultChars(200_000);
+    const large = calculateMaxToolResultChars(1_000_000);
     expect(large).toBeGreaterThan(small);
   });
 
@@ -202,19 +202,26 @@ describe("calculateMaxToolResultChars", () => {
     expect(DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS).toBe(16_000);
   });
 
-  it("auto-scales above the low-context cap for very large windows", () => {
+  it("auto-scales above the low-context cap only for very large windows", () => {
     const result = calculateMaxToolResultChars(2_000_000); // 2M token window
     expect(result).toBeGreaterThan(DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS);
   });
 
-  it("uses a larger auto cap for 128K contexts", () => {
+  it("keeps 128K contexts on the conservative live cap", () => {
     const result = calculateMaxToolResultChars(128_000);
-    expect(result).toBe(32_000);
+    expect(result).toBe(DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS);
   });
 
-  it("uses the largest auto cap for 200K contexts", () => {
-    expect(resolveAutoLiveToolResultMaxChars(200_000)).toBe(64_000);
-    expect(calculateMaxToolResultChars(200_000)).toBe(64_000);
+  it("keeps 200K contexts on the conservative live cap", () => {
+    expect(resolveAutoLiveToolResultMaxChars(200_000)).toBe(DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS);
+    expect(calculateMaxToolResultChars(200_000)).toBe(DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS);
+  });
+
+  it("uses larger automatic caps only for million-token contexts", () => {
+    expect(resolveAutoLiveToolResultMaxChars(500_000)).toBe(24_000);
+    expect(calculateMaxToolResultChars(500_000)).toBe(24_000);
+    expect(resolveAutoLiveToolResultMaxChars(1_000_000)).toBe(32_000);
+    expect(calculateMaxToolResultChars(1_000_000)).toBe(32_000);
   });
 
   it("supports a higher configured hard cap", () => {
