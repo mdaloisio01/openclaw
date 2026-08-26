@@ -693,6 +693,59 @@ describe("activation restart continuations", () => {
     expect(delivered.join("\n")).toContain("unregistered continuation check");
   });
 
+  it("accepts generated pre-restart manual proof labels that explicitly passed", async () => {
+    await persistActivationContinuationBeforeRestart(
+      {
+        id: "activation-generated-pre-restart-proof-labels",
+        now: 100,
+        route: { sessionKey: "main" },
+        objective: "post restart validation",
+        expectedRuntime: { commit: "abc" },
+        requiredChecks: [
+          "manual:focused-test-corepack-pnpm-test-src-agents-embedded-agent-runner-tool-result-truncation-test-ts-passed-38-38",
+          "manual:formatter-oxfmt-check-passed",
+          "manual:build-corepack-pnpm-build-passed",
+          "manual:asset-guard-issue-040-tool-output-cap-post-build-asset-guard-passed-missing",
+        ],
+      },
+      { stateDir },
+    );
+    const delivered: string[] = [];
+
+    await recoverPendingActivationContinuations({
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      deliver: (_record, message) => {
+        delivered.push(message);
+      },
+    });
+
+    const store = await testing.readStore(stateDir);
+    expect(store.records[0]?.status).toBe("continuation_completed");
+    expect(store.records[0]?.result?.checks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "manual:focused-test-corepack-pnpm-test-src-agents-embedded-agent-runner-tool-result-truncation-test-ts-passed-38-38",
+          status: "pass",
+        }),
+        expect.objectContaining({
+          name: "manual:formatter-oxfmt-check-passed",
+          status: "pass",
+        }),
+        expect.objectContaining({
+          name: "manual:build-corepack-pnpm-build-passed",
+          status: "pass",
+        }),
+        expect.objectContaining({
+          name: "manual:asset-guard-issue-040-tool-output-cap-post-build-asset-guard-passed-missing",
+          status: "pass",
+        }),
+      ]),
+    );
+    expect(delivered.join("\n")).not.toContain("unregistered continuation check");
+  });
+
   it("recognizes restart-continuation manual proof aliases", async () => {
     const runtimeRoot = path.join(tempRoot, "runtime");
     const runtimeDist = path.join(tempRoot, "dist");

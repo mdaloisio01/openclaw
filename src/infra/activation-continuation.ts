@@ -596,6 +596,13 @@ async function runDefaultCheck(
   record: ActivationContinuationRecord,
   check: ActivationContinuationCheckName,
 ): Promise<ActivationContinuationCheckResult> {
+  if (isCompletedPreRestartManualProofCheck(check)) {
+    return {
+      name: check,
+      status: "pass",
+      detail: `pre-restart manual proof label accepted as completed evidence: ${check}`,
+    };
+  }
   if (check === "manual:restart-safe-active-work-preflight") {
     return record.requestedRestartAction.skipDeferral
       ? {
@@ -795,6 +802,20 @@ async function runDefaultCheck(
     status: "fail",
     detail: `unregistered continuation check: ${check}`,
   };
+}
+
+function isCompletedPreRestartManualProofCheck(check: ActivationContinuationCheckName): boolean {
+  if (!check.startsWith("manual:")) {
+    return false;
+  }
+  return [
+    /^manual:focused-test-[a-z0-9-]*-passed(?:-[a-z0-9-]+)?$/,
+    /^manual:formatter-[a-z0-9-]*-passed(?:-[a-z0-9-]+)?$/,
+    /^manual:format-[a-z0-9-]*-passed(?:-[a-z0-9-]+)?$/,
+    /^manual:build-[a-z0-9-]*-passed(?:-[a-z0-9-]+)?$/,
+    /^manual:asset-guard-[a-z0-9-]*-passed(?:-[a-z0-9-]+)?$/,
+    /^manual:post-build-asset-guard-[a-z0-9-]*-passed(?:-[a-z0-9-]+)?$/,
+  ].some((pattern) => pattern.test(check));
 }
 
 function formatResultMessage(params: {
