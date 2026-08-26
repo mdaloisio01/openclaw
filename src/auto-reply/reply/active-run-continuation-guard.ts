@@ -25,6 +25,7 @@ export type ActiveRunContinuationEventType =
   | "FALSE_CLOSEOUT_ADMISSION_ENFORCED_REJECTED"
   | "FALSE_CLOSEOUT_ADMISSION_ALLOWED"
   | "CLEANUP_CREW_TERMINAL_CLOSEOUT_REJECTED"
+  | "OPERATOR_PAUSE_HOLD_RECORDED"
   | "ACTIVE_RUN_CONTINUITY_VIOLATION";
 
 export type ActiveRunContinuationEvent = {
@@ -39,6 +40,7 @@ type GuardState = {
   lastNonTerminalDetail?: string;
   blocker: boolean;
   blockerType?: string;
+  operatorPauseHold: boolean;
   nextExecutableStepStarted: boolean;
   violationNoticeQueued: boolean;
   blockedCloseoutQueued: boolean;
@@ -109,6 +111,7 @@ function isExplicitReportOnlyRequest(text: string): boolean {
   return includesAny(text, [
     "report only",
     "report-only",
+    "status update only",
     "status only",
     "status-only",
     "only report",
@@ -121,13 +124,22 @@ function isExplicitReportOnlyRequest(text: string): boolean {
 
 function isExplicitStopRequest(text: string): boolean {
   return includesAny(text, [
+    "pause",
     "explicitly stop",
     "stop after this",
     "stop now",
     "pause after this",
+    "do nothing else",
+    "don't do anything else",
+    "do not do anything else",
     "do not continue",
     "don't continue",
   ]);
+}
+
+function isExplicitOperatorPauseHoldRequest(text: string | undefined): boolean {
+  const normalized = normalizeText(text);
+  return isExplicitReportOnlyRequest(normalized) || isExplicitStopRequest(normalized);
 }
 
 function isMilestoneVisibilityReport(text: string): boolean {
@@ -402,6 +414,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
 function shouldRejectTerminalCloseout(state: GuardState): boolean {
   return (
     hasPendingContinuationRequirement(state) &&
+    state.operatorPauseHold === false &&
     state.blocker === false &&
     state.nextExecutableStepStarted === false
   );
@@ -420,6 +433,13 @@ function buildBlockedCloseoutPayload(reason: string): ReplyPayload {
     text: `BLOCKED_CLOSEOUT: ${reason}`,
     isStatusNotice: true,
     isError: true,
+  };
+}
+
+function buildOperatorPauseHoldPayload(reason: string): ReplyPayload {
+  return {
+    text: `OPERATOR_PAUSED: ${reason}`,
+    isStatusNotice: true,
   };
 }
 
@@ -458,6 +478,17 @@ function emitBlockedCloseout(state: GuardState): void {
   state.blockerType = "runtime_violation";
   recordEvent(state, "BLOCKER_STATE", "true:runtime_violation");
   recordEvent(state, "TERMINAL_CLOSEOUT_ALLOWED", "BLOCKED_CLOSEOUT");
+}
+
+function applyOperatorPauseHold(state: GuardState, currentTurnText: string | undefined): void {
+  if (!isExplicitOperatorPauseHoldRequest(currentTurnText) || state.operatorPauseHold) {
+    return;
+  }
+  state.operatorPauseHold = true;
+  state.blocker = true;
+  state.blockerType = "operator_pause_hold";
+  recordEvent(state, "OPERATOR_PAUSE_HOLD_RECORDED", "operator_pause_hold");
+  recordEvent(state, "BLOCKER_STATE", "true:operator_pause_hold");
 }
 
 function createContinuityGateIssueForViolation(params: {
@@ -534,6 +565,10 @@ export function installActiveRunContinuationGuard(
     if (options?.cleanupCrewFinalResponse) {
       guardStateByDispatcher.get(dispatcher)!.cleanupCrewFinalResponse =
         options.cleanupCrewFinalResponse;
+      applyOperatorPauseHold(
+        guardStateByDispatcher.get(dispatcher)!,
+        options.cleanupCrewFinalResponse.currentTurnText,
+      );
     }
     return;
   }
@@ -542,6 +577,7 @@ export function installActiveRunContinuationGuard(
     activeRunStarted: false,
     lastUpdateWasNonTerminal: false,
     blocker: false,
+    operatorPauseHold: false,
     nextExecutableStepStarted: false,
     violationNoticeQueued: false,
     blockedCloseoutQueued: false,
@@ -550,6 +586,7 @@ export function installActiveRunContinuationGuard(
     pendingPersistenceWrites: [],
     continuityGatePersistenceQueued: false,
   };
+  applyOperatorPauseHold(state, options?.cleanupCrewFinalResponse?.currentTurnText);
   guardStateByDispatcher.set(dispatcher, state);
 }
 
@@ -713,7 +750,22 @@ export function allowTerminalCloseout(
 
 export async function flushBlockedCloseoutIfNeeded(dispatcher: ReplyDispatcher): Promise<void> {
   const state = guardStateByDispatcher.get(dispatcher);
-  if (!state || !shouldRejectTerminalCloseout(state)) {
+  if (!state) {
+    return;
+  }
+  if (
+    hasPendingContinuationRequirement(state) &&
+    state.operatorPauseHold &&
+    !state.blockedCloseoutQueued
+  ) {
+    state.blockedCloseoutQueued = true;
+    const reason =
+      "active production run is held by the operator's status-only/pause instruction. Mission remains open and resumable; no premature closeout violation is recorded.";
+    recordEvent(state, "TERMINAL_CLOSEOUT_ALLOWED", "OPERATOR_PAUSED");
+    dispatcher.sendFinalReply(buildOperatorPauseHoldPayload(reason));
+    return;
+  }
+  if (!shouldRejectTerminalCloseout(state)) {
     return;
   }
   const reason =
