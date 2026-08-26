@@ -84,6 +84,46 @@ describe("report delivery guard", () => {
     });
   });
 
+  it("blocks generated reports until required Mark-facing export proof exists", () => {
+    expect(
+      resolveReportDeliveryGuard({
+        reportGenerated: true,
+        reportArtifactPath:
+          "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/report.md",
+        reportBodyDeliveredInChat: true,
+        markFacingExportRequired: true,
+        markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        markFacingExportVerified: false,
+      }),
+    ).toEqual({
+      state: "pending_mark_facing_export_delivery",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      canonicalPriority: getCleanupWatchdogPriority("pending_report_delivery"),
+      allowed: false,
+      reportDeliveryComplete: false,
+      milestoneReportComplete: false,
+      reason: "missing_mark_facing_export_proof",
+    });
+  });
+
+  it("passes generated reports with chat body and Mark-facing export proof", () => {
+    expect(
+      resolveReportDeliveryGuard({
+        reportGenerated: true,
+        reportArtifactPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        reportBodyDeliveredInChat: true,
+        markFacingExportRequired: true,
+        markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        markFacingExportVerified: true,
+      }),
+    ).toMatchObject({
+      state: "report_delivery_satisfied",
+      allowed: true,
+      reportDeliveryComplete: true,
+      reason: "report_body_delivered",
+    });
+  });
+
   it("allows explicit artifact-only report delivery", () => {
     expect(
       resolveReportDeliveryGuard({
@@ -314,6 +354,28 @@ describe("report delivery guard", () => {
       repairWorkRequired: true,
       acknowledgementAllowed: false,
     });
+  });
+
+  it("requires Mark-facing export proof before acknowledging report-delivery repair", () => {
+    const decision = resolveCleanupCrewReportDeliveryRepair({
+      missionId: "cleanup-crew-governance",
+      reportId: "grant-pass-delivery",
+      reportGenerated: true,
+      reportArtifactPath:
+        "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/grant-pass.md",
+      markFacingExportRequired: true,
+      markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/grant-pass.md",
+      markFacingExportVerified: false,
+      reportBodyDeliveredInChat: true,
+      registryRowPresent: true,
+      parentMissionOpen: true,
+    });
+
+    expect(decision.state).toBe("invalid_report_delivery_state");
+    expect(decision.allowedToAdvance).toBe(false);
+    expect(decision.allowedToCloseMission).toBe(false);
+    expect(decision.acknowledgementAllowed).toBe(false);
+    expect(decision.validationErrors).toContain("mark_facing_export_proof_missing");
   });
 
   it("keeps idempotent report repair pending until visible delivery or settlement proof exists", () => {

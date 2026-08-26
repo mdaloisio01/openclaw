@@ -166,6 +166,90 @@ describe("source turn delivery storage adapter", () => {
     ]);
   });
 
+  it("keeps Mark-facing export obligations blocked until visible export proof exists", async () => {
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:mark-export-missing",
+      sourceTurnId: "source-turn-mark-export",
+      missionId: "mission",
+      runId: "run",
+      reportId: "report",
+      deliveryId: "webchat",
+      generation: 1,
+      facts: {
+        finalDeliveryRequired: true,
+        finalDeliveryDelivered: true,
+        evidenceKinds: ["source_chat_final", "report_artifact"],
+        reportRequired: true,
+        reportArtifactPath:
+          "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/report.md",
+        markFacingExportRequired: true,
+        markFacingExportRoot: "/home/will/.openclaw/workspace/file_hub/exports",
+        markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+      },
+      reportPrepared: true,
+      reportArtifactPaths: [
+        "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/report.md",
+      ],
+    });
+
+    expect(row).toMatchObject({
+      deliveryStatus: "blocked",
+      obligationStage: "needs_review",
+      sourceTurnState: "blocked_refused",
+      finalDeliveryDelivered: false,
+      visibleDeliveryCount: 0,
+      failureReason: "missing_mark_facing_export_proof",
+      markFacingExport: {
+        required: true,
+        root: "/home/will/.openclaw/workspace/file_hub/exports",
+        path: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        verified: false,
+      },
+    });
+    expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("blocking_refused");
+  });
+
+  it("acknowledges Mark-facing export delivery with chat and visible export proof", async () => {
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:mark-export-visible",
+      sourceTurnId: "source-turn-mark-export-visible",
+      missionId: "mission",
+      runId: "run",
+      reportId: "report",
+      deliveryId: "webchat",
+      generation: 1,
+      facts: {
+        finalDeliveryRequired: true,
+        finalDeliveryDelivered: true,
+        evidenceKinds: ["source_chat_final", "mark_facing_export_visible"],
+        reportRequired: true,
+        reportArtifactPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        markFacingExportRequired: true,
+        markFacingExportRoot: "/home/will/.openclaw/workspace/file_hub/exports",
+        markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+      },
+      reportPrepared: true,
+      reportArtifactPaths: ["/home/will/.openclaw/workspace/file_hub/exports/report.md"],
+    });
+
+    expect(row).toMatchObject({
+      deliveryStatus: "final_delivered",
+      obligationStage: "delivered",
+      sourceTurnState: "final_delivered",
+      finalDeliveryDelivered: true,
+      visibleDeliveryCount: 1,
+      markFacingExport: {
+        required: true,
+        root: "/home/will/.openclaw/workspace/file_hub/exports",
+        path: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        verified: true,
+      },
+    });
+    expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("non_blocking_delivered");
+  });
+
   it("keeps report-prepared obligations non-delivered until visible final proof arrives", async () => {
     const prepared = await persistSourceTurnDeliveryState({
       registryPath,

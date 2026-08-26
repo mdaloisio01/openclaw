@@ -39,6 +39,13 @@ export type SourceTurnDeliveryWatchdogReconciliation = {
   originalVisibleDeliveryCount?: number;
 };
 
+export type SourceTurnMarkFacingExportDelivery = {
+  required: boolean;
+  root?: string;
+  path?: string;
+  verified: boolean;
+};
+
 export type SourceTurnDeliveryRow = {
   id: string;
   kind: typeof SOURCE_TURN_DELIVERY_ROW_KIND;
@@ -55,6 +62,7 @@ export type SourceTurnDeliveryRow = {
   currentStage?: string;
   failureReason?: string;
   reportArtifactPaths?: string[];
+  markFacingExport?: SourceTurnMarkFacingExportDelivery;
   watchdogReconciliation?: SourceTurnDeliveryWatchdogReconciliation;
   deliveryDecision: SourceTurnDeliveryDecision;
 };
@@ -259,6 +267,31 @@ function deriveObligationStage(params: {
   return "owed";
 }
 
+function normalizeMarkFacingExportDelivery(
+  facts: SourceTurnDeliveryFacts,
+): SourceTurnMarkFacingExportDelivery | undefined {
+  if (
+    facts.markFacingExportRequired !== true &&
+    !normalizeIdentityPart(facts.markFacingExportRoot) &&
+    !normalizeIdentityPart(facts.markFacingExportPath) &&
+    facts.markFacingExportVerified !== true
+  ) {
+    return undefined;
+  }
+  return {
+    required: facts.markFacingExportRequired === true,
+    ...(normalizeIdentityPart(facts.markFacingExportRoot)
+      ? { root: normalizeIdentityPart(facts.markFacingExportRoot) }
+      : {}),
+    ...(normalizeIdentityPart(facts.markFacingExportPath)
+      ? { path: normalizeIdentityPart(facts.markFacingExportPath) }
+      : {}),
+    verified:
+      facts.markFacingExportVerified === true ||
+      (facts.evidenceKinds ?? []).includes("mark_facing_export_visible"),
+  };
+}
+
 export async function loadSourceTurnDeliveryRegistry(
   registryPath: string,
 ): Promise<SourceTurnDeliveryRegistry> {
@@ -289,6 +322,7 @@ export async function persistSourceTurnDeliveryState(
     deliveryAttempted: params.deliveryAttempted,
     needsReview: params.needsReview,
   });
+  const markFacingExport = normalizeMarkFacingExportDelivery(params.facts);
   const row: SourceTurnDeliveryRow = {
     id: params.id,
     kind: SOURCE_TURN_DELIVERY_ROW_KIND,
@@ -309,6 +343,7 @@ export async function persistSourceTurnDeliveryState(
     ...(params.reportArtifactPaths && params.reportArtifactPaths.length > 0
       ? { reportArtifactPaths: [...params.reportArtifactPaths] }
       : {}),
+    ...(markFacingExport ? { markFacingExport } : {}),
     ...(params.watchdogReconciliation
       ? { watchdogReconciliation: params.watchdogReconciliation }
       : decision.state === "settled_resolved_later"

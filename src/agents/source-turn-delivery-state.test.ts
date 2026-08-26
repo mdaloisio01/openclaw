@@ -76,6 +76,47 @@ describe("source turn delivery state contract", () => {
     });
   });
 
+  it("blocks final delivery when Mark-facing export proof is required but missing", () => {
+    expect(
+      resolveSourceTurnDeliveryState({
+        finalDeliveryRequired: true,
+        finalDeliveryDelivered: true,
+        evidenceKinds: ["source_chat_final", "report_artifact"],
+        reportRequired: true,
+        reportArtifactPath:
+          "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/report.md",
+        markFacingExportRequired: true,
+        markFacingExportRoot: "/home/will/.openclaw/workspace/file_hub/exports",
+        markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+      }),
+    ).toEqual({
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "missing_mark_facing_export_proof",
+    });
+  });
+
+  it("acknowledges final delivery when chat proof and Mark-facing export proof are both present", () => {
+    expect(
+      resolveSourceTurnDeliveryState({
+        finalDeliveryRequired: true,
+        finalDeliveryDelivered: true,
+        evidenceKinds: ["source_chat_final", "mark_facing_export_visible"],
+        reportRequired: true,
+        reportArtifactPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+        markFacingExportRequired: true,
+        markFacingExportRoot: "/home/will/.openclaw/workspace/file_hub/exports",
+        markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/report.md",
+      }),
+    ).toEqual({
+      state: "final_delivered",
+      finalDeliveryDelivered: true,
+      refused: false,
+      reason: "final_visible_delivery_proven",
+    });
+  });
+
   it("blocks report-governed delivery when the report path is missing", () => {
     expect(
       resolveSourceTurnDeliveryState({
@@ -175,6 +216,7 @@ describe("source turn delivery state contract", () => {
     expect(isSourceTurnVisibleFinalProofKind("source_chat_final")).toBe(true);
     expect(isSourceTurnVisibleFinalProofKind("verified_message_tool_final")).toBe(true);
     expect(isSourceTurnVisibleFinalProofKind("direct_source_final")).toBe(true);
+    expect(isSourceTurnVisibleFinalProofKind("mark_facing_export_visible")).toBe(false);
     expect(isSourceTurnVisibleFinalProofKind("ledger_write")).toBe(false);
     expect(isSourceTurnVisibleFinalProofKind("report_artifact")).toBe(false);
   });

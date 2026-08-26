@@ -23,6 +23,7 @@ export type SourceTurnDeliveryEvidenceKind =
   | SourceTurnVisibleFinalProofKind
   | "source_chat_progress"
   | "source_chat_failure"
+  | "mark_facing_export_visible"
   | "ledger_write"
   | "report_artifact"
   | "registry_entry"
@@ -41,6 +42,7 @@ export type SourceTurnDeliveryGuardReason =
   | "historical_debt_settled_not_delivered"
   | "private_final_without_visible_delivery"
   | "missing_visible_final_delivery_proof"
+  | "missing_mark_facing_export_proof"
   | "missing_report_path"
   | "false_final_delivery_delivered_refused";
 
@@ -52,6 +54,10 @@ export type SourceTurnDeliveryFacts = {
   evidenceKinds?: SourceTurnDeliveryEvidenceKind[];
   reportRequired?: boolean;
   reportArtifactPath?: string;
+  markFacingExportRequired?: boolean;
+  markFacingExportRoot?: string;
+  markFacingExportPath?: string;
+  markFacingExportVerified?: boolean;
   privateOnlyFinalResponse?: boolean;
   deliveryToolFailed?: boolean;
   failureNoticeVisible?: boolean;
@@ -94,6 +100,13 @@ function hasProgressProof(facts: SourceTurnDeliveryFacts): boolean {
   return (facts.evidenceKinds ?? []).includes("source_chat_progress");
 }
 
+function hasMarkFacingExportProof(facts: SourceTurnDeliveryFacts): boolean {
+  return (
+    facts.markFacingExportVerified === true ||
+    (facts.evidenceKinds ?? []).includes("mark_facing_export_visible")
+  );
+}
+
 function hasOnlyNonVisibleFinalEvidence(facts: SourceTurnDeliveryFacts): boolean {
   const evidenceKinds = facts.evidenceKinds ?? [];
   return (
@@ -125,6 +138,8 @@ export function resolveSourceTurnDeliveryState(
   }
 
   const visibleFinalDeliveryProof = hasVisibleFinalDeliveryProof(facts);
+  const markFacingExportProof = hasMarkFacingExportProof(facts);
+  const markFacingExportMissing = facts.markFacingExportRequired === true && !markFacingExportProof;
   const claimsFinalDelivered = facts.finalDeliveryDelivered === true;
 
   if (claimsFinalDelivered && !visibleFinalDeliveryProof) {
@@ -133,6 +148,15 @@ export function resolveSourceTurnDeliveryState(
       finalDeliveryDelivered: false,
       refused: true,
       reason: "false_final_delivery_delivered_refused",
+    };
+  }
+
+  if (claimsFinalDelivered && markFacingExportMissing) {
+    return {
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "missing_mark_facing_export_proof",
     };
   }
 
@@ -160,7 +184,7 @@ export function resolveSourceTurnDeliveryState(
     };
   }
 
-  if (visibleFinalDeliveryProof) {
+  if (visibleFinalDeliveryProof && !markFacingExportMissing) {
     return {
       state: "final_delivered",
       finalDeliveryDelivered: true,
@@ -187,6 +211,15 @@ export function resolveSourceTurnDeliveryState(
       finalDeliveryDelivered: false,
       refused: true,
       reason: "missing_report_path",
+    };
+  }
+
+  if (markFacingExportMissing) {
+    return {
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "missing_mark_facing_export_proof",
     };
   }
 

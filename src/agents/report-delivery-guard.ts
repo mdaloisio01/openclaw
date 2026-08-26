@@ -19,6 +19,7 @@ export const REPORT_DELIVERY_GUARD_STATES = [
   "report_delivery_satisfied",
   "pending_report_delivery",
   "pending_milestone_report",
+  "pending_mark_facing_export_delivery",
   "blocked_missing_report_path",
   "blocked_private_only_report",
 ] as const;
@@ -32,11 +33,17 @@ export type ReportDeliveryGuardReason =
   | "artifact_only_without_chat_body"
   | "private_only_report_without_chat_body"
   | "missing_report_path"
+  | "missing_mark_facing_export_path"
+  | "missing_mark_facing_export_proof"
   | "milestone_stage_report_missing";
 
 export type ReportDeliveryGuardFacts = {
   reportGenerated?: boolean;
   reportArtifactPath?: string;
+  markFacingExportRequired?: boolean;
+  markFacingExportRoot?: string;
+  markFacingExportPath?: string;
+  markFacingExportVerified?: boolean;
   reportBodyDeliveredInChat?: boolean;
   explicitArtifactOnlyAllowed?: boolean;
   privateOnlyFinalResponse?: boolean;
@@ -145,6 +152,9 @@ export type CleanupCrewReportDeliveryRepairFacts = {
   reportId?: string;
   reportGenerated?: boolean;
   reportArtifactPath?: string;
+  markFacingExportRequired?: boolean;
+  markFacingExportPath?: string;
+  markFacingExportVerified?: boolean;
   reportBodyDeliveredInChat?: boolean;
   deliveryFailed?: boolean;
   registryRowPresent?: boolean;
@@ -210,6 +220,31 @@ export function resolveReportDeliveryGuard(
       milestoneReportComplete: false,
       reason: "missing_report_path",
     };
+  }
+
+  if (reportRequired && facts.markFacingExportRequired === true) {
+    if (!hasPath(facts.markFacingExportPath)) {
+      return {
+        state: "blocked_missing_report_path",
+        policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+        canonicalPriority: deliveryPriority("pending_report_delivery"),
+        allowed: false,
+        reportDeliveryComplete: false,
+        milestoneReportComplete: false,
+        reason: "missing_mark_facing_export_path",
+      };
+    }
+    if (facts.markFacingExportVerified !== true) {
+      return {
+        state: "pending_mark_facing_export_delivery",
+        policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+        canonicalPriority: deliveryPriority("pending_report_delivery"),
+        allowed: false,
+        reportDeliveryComplete: false,
+        milestoneReportComplete: false,
+        reason: "missing_mark_facing_export_proof",
+      };
+    }
   }
 
   if (
@@ -441,6 +476,14 @@ export function resolveCleanupCrewReportDeliveryRepair(
   }
   if (facts.reportGenerated === true && !hasPath(facts.reportArtifactPath)) {
     validationErrors.push("report_artifact_path_missing");
+  }
+  if (facts.reportGenerated === true && facts.markFacingExportRequired === true) {
+    if (!hasPath(facts.markFacingExportPath)) {
+      validationErrors.push("mark_facing_export_path_missing");
+    }
+    if (facts.markFacingExportVerified !== true) {
+      validationErrors.push("mark_facing_export_proof_missing");
+    }
   }
   if (facts.parentMissionOpen !== true) {
     validationErrors.push("parent_mission_open_proof_missing");
