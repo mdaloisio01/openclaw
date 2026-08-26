@@ -453,6 +453,13 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
     .join("\n");
 }
 
+export function shouldDrainStaleTrbRecoveryState(params: {
+  state?: TrbRecoveryState;
+  trbInboundRequired: boolean;
+}): boolean {
+  return Boolean(params.state?.trb_recovery_required && !params.trbInboundRequired);
+}
+
 export function markTrbGateResultOnSessionEntry(params: {
   sessionEntry?: SessionEntry;
   result: TrbRecoveryValidationResult;

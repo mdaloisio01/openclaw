@@ -3,6 +3,7 @@ import {
   createTrbRecoveryState,
   evaluateTrbPostTurnWatchdog,
   inboundTrbRecoveryRequired,
+  shouldDrainStaleTrbRecoveryState,
   validateTrbFinalReplyPayloads,
   validateTrbRecoveryContract,
   type TrbRecoveryContract,
@@ -148,6 +149,34 @@ describe("TRB recovery runtime contract", () => {
 
   it("passes a complete TRB contract", () => {
     expect(validateTrbRecoveryContract(completeContract).ok).toBe(true);
+  });
+
+  it("drains stale TRB recovery state on the next non-TRB inbound turn", () => {
+    const state = createTrbRecoveryState({
+      ctx: { Body: "TRB", MessageSid: "msg-stale" },
+      sessionKey: "agent:orchestrator:main",
+      sessionId: "session-stale",
+      now: 1_234,
+    });
+
+    expect(
+      shouldDrainStaleTrbRecoveryState({
+        state,
+        trbInboundRequired: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldDrainStaleTrbRecoveryState({
+        state,
+        trbInboundRequired: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldDrainStaleTrbRecoveryState({
+        state: undefined,
+        trbInboundRequired: false,
+      }),
+    ).toBe(false);
   });
 
   it("requires oversized inspection output to be summarized before the turn can close", () => {

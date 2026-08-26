@@ -21,6 +21,7 @@ import {
   createTrbRecoveryState,
   inboundTrbRecoveryRequired,
   markTrbGateResultOnSessionEntry,
+  shouldDrainStaleTrbRecoveryState,
   validateTrbFinalReplyPayloads,
 } from "../../governance/trb-recovery-contract.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
@@ -522,6 +523,26 @@ export async function getReplyFromConfig(
     });
   };
 
+  const clearTrbRecoveryState = async () => {
+    if (!sessionKey || !storePath || !sessionEntry) {
+      return;
+    }
+    sessionEntry.trbRecovery = undefined;
+    if (sessionStore) {
+      sessionStore[sessionKey] = sessionEntry;
+    }
+    const { applySessionStoreEntryPatch } = await import("../../config/sessions.js");
+    await applySessionStoreEntryPatch({
+      storePath,
+      sessionKey,
+      skipMaintenance: true,
+      takeCacheOwnership: true,
+      patch: {
+        trbRecovery: undefined,
+      },
+    });
+  };
+
   if (trbInboundRequired && sessionEntry) {
     sessionEntry.trbRecovery = createTrbRecoveryState({
       ctx: finalized,
@@ -532,11 +553,21 @@ export async function getReplyFromConfig(
       sessionStore[sessionKey] = sessionEntry;
     }
     await traceGetReplyPhase("reply.persist_trb_recovery_state", persistTrbRecoveryState);
+  } else if (
+    shouldDrainStaleTrbRecoveryState({
+      state: sessionEntry?.trbRecovery,
+      trbInboundRequired,
+    })
+  ) {
+    await traceGetReplyPhase("reply.clear_stale_trb_recovery_state", clearTrbRecoveryState);
   }
 
   const finalizeTrbReply = async (
     reply: ReplyPayload | ReplyPayload[] | undefined,
   ): Promise<ReplyPayload | ReplyPayload[] | undefined> => {
+    if (!trbInboundRequired) {
+      return reply;
+    }
     if (!sessionEntry?.trbRecovery?.trb_recovery_required) {
       return reply;
     }
