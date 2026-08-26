@@ -272,6 +272,26 @@ function parseProofList(text: string): string[] | undefined {
 
 export function parseTrbRecoveryContractFromText(text: string): TrbRecoveryContract {
   const missingProofText = parseLineValue(text, ["missing_proof", "missing proof"]);
+  const whatWasChecked = parseLineValue(text, ["what_was_checked", "what was checked"]);
+  const proofMissing = parseLineValue(text, ["proof_missing", "proof missing"]);
+  const whereProofShouldExist = parseLineValue(text, [
+    "where_proof_should_exist",
+    "where proof should exist",
+  ]);
+  const missingProofIsBlocker =
+    /missing_proof_is_blocker\s*:\s*true|missing proof is blocker\s*:\s*true/i.test(text);
+  const exactNextRecoveryStep = parseLineValue(text, [
+    "exact_next_recovery_step",
+    "exact next recovery step",
+  ]);
+  const hasMissingProofFields = Boolean(
+    missingProofText ||
+    whatWasChecked ||
+    proofMissing ||
+    whereProofShouldExist ||
+    exactNextRecoveryStep ||
+    /missing_proof_is_blocker\s*:|missing proof is blocker\s*:/i.test(text),
+  );
   const sessionLogProofText = parseLineValue(text, [
     "session_tool_log_proof",
     "session/tool-log proof",
@@ -293,19 +313,14 @@ export function parseTrbRecoveryContractFromText(text: string): TrbRecoveryContr
       "issue identified",
     ]),
     root_cause: parseLineValue(text, ["root_cause", "root cause"]),
-    missing_proof: missingProofText
+    missing_proof: hasMissingProofFields
       ? {
-          what_was_checked:
-            parseLineValue(text, ["what_was_checked", "what was checked"]) ?? missingProofText,
-          proof_missing:
-            parseLineValue(text, ["proof_missing", "proof missing"]) ?? missingProofText,
-          where_proof_should_exist:
-            parseLineValue(text, ["where_proof_should_exist", "where proof should exist"]) ??
-            missingProofText,
-          missing_proof_is_blocker:
-            /missing_proof_is_blocker\s*:\s*true|missing proof is blocker\s*:\s*true/i.test(text),
+          what_was_checked: whatWasChecked ?? missingProofText,
+          proof_missing: proofMissing ?? missingProofText,
+          where_proof_should_exist: whereProofShouldExist ?? missingProofText,
+          missing_proof_is_blocker: missingProofIsBlocker,
           exact_next_recovery_step:
-            parseLineValue(text, ["exact_next_recovery_step", "exact next recovery step"]) ??
+            exactNextRecoveryStep ??
             parseLineValue(text, ["exact_next_action", "exact next action"]),
         }
       : undefined,
@@ -439,6 +454,7 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
     "proof_checked:",
     "actual_issue_identified:",
     "root_cause: or missing_proof:",
+    "missing_proof: required when root_cause is unknown, likely, probably, not proven, unclear, or cannot be determined.",
     "active_mission_impact:",
     "issue_list_action: or lawful_no_update_reason:",
     "recovery_artifact_path:",

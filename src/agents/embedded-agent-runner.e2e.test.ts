@@ -812,6 +812,57 @@ describe("runEmbeddedAgent", () => {
     expect(disposeSessionMcpRuntimeMock).toHaveBeenCalledWith("session:test");
   });
 
+  it("surfaces remote compaction 404 as a visible blocked payload", async () => {
+    const sessionFile = nextSessionFile();
+    const cfg = createEmbeddedAgentRunnerOpenAiConfig(["mock-1"]);
+    const sessionKey = nextSessionKey();
+    const setTerminalLifecycleMeta = vi.fn();
+    runEmbeddedAttemptMock.mockResolvedValueOnce(
+      makeEmbeddedRunnerAttempt({
+        promptError: new Error(
+          "Error running remote compact task: 404 Not Found POST /backend-api/codex/responses/compact",
+        ),
+        promptErrorSource: "prompt",
+        codexAppServerFailure: {
+          kind: "client_closed_before_turn_completed",
+          transport: "websocket",
+          replaySafe: false,
+        },
+        setTerminalLifecycleMeta,
+      }),
+    );
+
+    const result = await runEmbeddedAgent({
+      sessionId: "session:test",
+      sessionKey,
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "hello",
+      provider: "openai",
+      model: "mock-1",
+      timeoutMs: 5_000,
+      agentDir,
+      runId: nextRunId("remote-compact-404-visible-block"),
+      enqueue: immediateEnqueue,
+    });
+
+    expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(1);
+    expect(result.payloads?.[0]?.text).toContain("Auto-compaction failed");
+    expect(result.payloads?.[0]?.text).toContain("visible recovery proof");
+    expect(result.payloads?.[0]?.isError).toBe(true);
+    expect(result.meta.finalAssistantVisibleText).toContain("Auto-compaction failed");
+    expect(result.meta.livenessState).toBe("blocked");
+    expect(result.meta.error).toMatchObject({
+      kind: "compaction_failure",
+      message:
+        "Error running remote compact task: 404 Not Found POST /backend-api/codex/responses/compact",
+    });
+    expect(setTerminalLifecycleMeta).toHaveBeenCalledWith(
+      expect.objectContaining({ livenessState: "blocked" }),
+    );
+  });
+
   it("retries a planning-only GPT turn once with an act-now steer", async () => {
     const sessionFile = nextSessionFile();
     const cfg = createEmbeddedAgentRunnerOpenAiConfig(["gpt-5.4"]);

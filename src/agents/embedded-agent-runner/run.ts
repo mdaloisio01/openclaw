@@ -211,6 +211,23 @@ const COMPACTION_CONTINUATION_RETRY_INSTRUCTION =
 const NO_REAL_CONVERSATION_MESSAGES_REASON = "no real conversation messages";
 type EmbeddedRunAttemptForRunner = Awaited<ReturnType<typeof runEmbeddedAttemptWithBackend>>;
 
+function isRemoteCompactPromptError(value: unknown): boolean {
+  const text = formatErrorMessage(value);
+  return (
+    /Error running remote compact task:/i.test(text) ||
+    /\/backend-api\/codex\/responses\/compact/i.test(text)
+  );
+}
+
+function buildRemoteCompactFailureText(errorText: string): string {
+  const detail = errorText.replace(/\s+/g, " ").trim();
+  return (
+    "Auto-compaction failed before a final reply could be produced. " +
+    "The run is blocked with visible recovery proof instead of silently ending." +
+    (detail ? ` Detail: ${detail}` : "")
+  );
+}
+
 function isNoRealConversationCompactionNoop(params: {
   ok?: boolean;
   compacted?: boolean;
@@ -2400,6 +2417,38 @@ export async function runEmbeddedAgent(
           );
           let shouldSurfaceCodexCompletionTimeout = false;
           if (promptError && promptErrorSource !== "compaction" && attempt.codexAppServerFailure) {
+            if (isRemoteCompactPromptError(promptError)) {
+              const errorText = formatErrorMessage(promptError);
+              const compactFailureText = buildRemoteCompactFailureText(errorText);
+              attempt.setTerminalLifecycleMeta?.({
+                replayInvalid: resolveReplayInvalidForAttempt(),
+                livenessState: "blocked",
+              });
+              return {
+                payloads: [{ text: compactFailureText, isError: true }],
+                meta: {
+                  durationMs: Date.now() - started,
+                  agentMeta: buildErrorAgentMeta({
+                    sessionId: sessionIdUsed,
+                    sessionFile: activeSessionFile,
+                    provider,
+                    model: model.id,
+                    contextTokens: ctxInfo.tokens,
+                    usageAccumulator,
+                    lastRunPromptUsage,
+                    lastAssistant: sessionLastAssistant,
+                    lastTurnTotal,
+                  }),
+                  systemPromptReport: attempt.systemPromptReport,
+                  finalAssistantVisibleText: compactFailureText,
+                  finalAssistantRawText: compactFailureText,
+                  finalPromptText: attempt.finalPromptText,
+                  replayInvalid: resolveReplayInvalidForAttempt(),
+                  livenessState: "blocked",
+                  error: { kind: "compaction_failure", message: errorText },
+                },
+              };
+            }
             // Retry replay-safe Codex app-server failures.
             const codexAppServerRecoveryRetry = resolveCodexAppServerRecoveryRetry({
               attempt,

@@ -3,6 +3,7 @@ import {
   createTrbRecoveryState,
   evaluateTrbPostTurnWatchdog,
   inboundTrbRecoveryRequired,
+  parseTrbRecoveryContractFromText,
   shouldDrainStaleTrbRecoveryState,
   validateTrbFinalReplyPayloads,
   validateTrbRecoveryContract,
@@ -111,6 +112,38 @@ describe("TRB recovery runtime contract", () => {
       },
     });
 
+    expect(result.ok).toBe(true);
+  });
+
+  it("parses child missing-proof fields without requiring a parent missing_proof line", () => {
+    const parsed = parseTrbRecoveryContractFromText(
+      [
+        "classification: current_blocker",
+        "what_was_happening_before_misfire: remote compaction failed after tool work",
+        "proof_checked: session transcript, trajectory log",
+        "actual_issue_identified: final reply was withheld",
+        "root_cause: not proven",
+        "what_was_checked: session history and compact error",
+        "proof_missing: provider compact endpoint root cause",
+        "where_proof_should_exist: provider telemetry",
+        "missing_proof_is_blocker: true",
+        "exact_next_recovery_step: patch visible compaction fallback",
+        "active_mission_impact: build remains blocked until visible recovery lands",
+        "lawful_no_update_reason: current blocker handled in active ISSUE-040 repair",
+        "recovery_artifact_path: /tmp/trb.md",
+        "exact_next_action: run focused tests",
+      ].join("\n"),
+    );
+
+    const result = validateTrbRecoveryContract(parsed);
+
+    expect(parsed.missing_proof).toMatchObject({
+      what_was_checked: "session history and compact error",
+      proof_missing: "provider compact endpoint root cause",
+      where_proof_should_exist: "provider telemetry",
+      missing_proof_is_blocker: true,
+      exact_next_recovery_step: "patch visible compaction fallback",
+    });
     expect(result.ok).toBe(true);
   });
 
