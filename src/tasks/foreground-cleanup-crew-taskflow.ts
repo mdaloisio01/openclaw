@@ -306,7 +306,8 @@ function refreshCheckpointNextActionProjectionStateJson(params: {
   const activeProductionContinuation = getTaskFlowActiveProductionContinuation(flowForProjection);
   if (
     !continuation ||
-    activeProductionContinuation?.status !== "dispatch_required" ||
+    (activeProductionContinuation?.status !== "dispatch_required" &&
+      activeProductionContinuation?.status !== "dispatched") ||
     !activeProductionContinuation.nextAction
   ) {
     return params.stateJson;
@@ -388,6 +389,29 @@ function ensureForegroundExecutionTask(params: {
     progressSummary,
   });
   return task?.taskId;
+}
+
+function recordForegroundCheckpointDispatch(params: {
+  flow: TaskFlowRecord;
+  tracking: ForegroundCleanupCrewTracking;
+  currentStep: string;
+  now: number;
+}): TaskFlowRecord {
+  if (!params.tracking.checkpointKind || !params.tracking.nextExecutableAction) {
+    return params.flow;
+  }
+  const activeProductionContinuation = getTaskFlowActiveProductionContinuation(params.flow);
+  if (activeProductionContinuation?.status !== "dispatch_required") {
+    return params.flow;
+  }
+  const launched = recordFlowNextExecutableLaunch({
+    flowId: params.flow.flowId,
+    expectedRevision: params.flow.revision,
+    detail: params.tracking.nextExecutableAction,
+    currentStep: params.currentStep,
+    updatedAt: params.now,
+  });
+  return launched.applied ? launched.flow : params.flow;
 }
 
 function findExistingForegroundSupersessionTask(params: {
@@ -711,9 +735,15 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       stateJson: nextActionStateJson,
       updatedAt: now,
     });
-    const flow = resumed.applied
+    const resumedFlow = resumed.applied
       ? (findForegroundCleanupCrewFlow(ownerKey) ?? resumed.flow)
       : existing;
+    const flow = recordForegroundCheckpointDispatch({
+      flow: resumedFlow,
+      tracking,
+      currentStep,
+      now,
+    });
     return {
       status: "attached",
       flow,

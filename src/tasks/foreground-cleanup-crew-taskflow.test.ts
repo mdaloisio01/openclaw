@@ -413,6 +413,18 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     expect(listTasksForFlowId(first.flow.flowId)[0]?.progressSummary).toContain(
       "next=write design lock and patch the selected source owner",
     );
+    expect(getTaskFlowProductionContinuation(checkpoint.flow)).toMatchObject({
+      nextExecutableUnitIdentified: true,
+      nextExecutableUnitLaunched: true,
+    });
+    expect(getTaskFlowActiveProductionContinuation(checkpoint.flow)).toMatchObject({
+      status: "dispatched",
+      boundary: "plan_next_step",
+      lastDispatchReceiptId: expect.stringContaining(":next-executable:dispatch:"),
+    });
+    expect(
+      getTaskFlowActiveProductionContinuation(checkpoint.flow)?.dispatchReceipts[0]?.proofRef,
+    ).toBe("write design lock and patch the selected source owner");
   });
 
   it("settles an obsolete restart boundary when a later checkpoint advances the foreground run", () => {
@@ -466,16 +478,19 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
       restartOrReloadRequired: false,
       lawfulWholeRunCompletion: false,
       nextExecutableUnitIdentified: true,
-      nextExecutableUnitLaunched: false,
+      nextExecutableUnitLaunched: true,
       continuationViolation: false,
     });
     expect(continuation?.lawfulStopReason).toBeUndefined();
     expect(activeContinuation).toMatchObject({
       broaderBuildOpen: true,
-      status: "dispatch_required",
+      status: "dispatched",
       boundary: "plan_next_step",
     });
     expect(activeContinuation?.nextAction?.summary).toContain(
+      "write the active-production continuation settlement package",
+    );
+    expect(activeContinuation?.dispatchReceipts[0]?.proofRef).toBe(
       "write the active-production continuation settlement package",
     );
 
@@ -495,6 +510,10 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     }
     expect(
       getTaskFlowActiveProductionContinuation(closeoutCheckpoint.flow)?.nextAction?.summary,
+    ).toBe("re-triage the remaining ISSUE-040 family");
+    expect(
+      getTaskFlowActiveProductionContinuation(closeoutCheckpoint.flow)?.dispatchReceipts[0]
+        ?.proofRef,
     ).toBe("re-triage the remaining ISSUE-040 family");
   });
 
