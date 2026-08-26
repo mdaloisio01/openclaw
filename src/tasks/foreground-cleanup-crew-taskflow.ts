@@ -14,6 +14,7 @@ import {
 } from "./runtime-internal.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import {
+  getTaskFlowActiveProductionContinuation,
   createManagedTaskFlow,
   getTaskFlowById,
   getTaskFlowProductionContinuation,
@@ -218,6 +219,125 @@ function applyTrackingToStateJson(
     ...(tracking.nextExecutableAction
       ? { nextExecutableAction: tracking.nextExecutableAction }
       : {}),
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function settleObsoleteRestartBoundaryStateJson(params: {
+  flow: TaskFlowRecord;
+  stateJson: TaskFlowRecord["stateJson"];
+  tracking: ForegroundCleanupCrewTracking;
+  currentStep: string;
+  now: number;
+}): TaskFlowRecord["stateJson"] {
+  if (!params.tracking.checkpointKind || !params.tracking.nextExecutableAction) {
+    return params.stateJson;
+  }
+  const continuation = getTaskFlowProductionContinuation(params.flow);
+  if (
+    !continuation?.activeProductionRun ||
+    continuation.lawfulStopReason !== "restart_or_reload" ||
+    continuation.restartOrReloadRequired !== true
+  ) {
+    return params.stateJson;
+  }
+  const { lawfulStopReason: _obsoleteStopReason, ...continuationWithoutStopReason } = continuation;
+  const detail = `Obsolete restart/reload boundary settled by ${params.tracking.checkpointKind}: ${params.tracking.nextExecutableAction}`;
+  const settledContinuation = {
+    ...continuationWithoutStopReason,
+    currentUnitStatus: "started" as const,
+    blockerPresent: false,
+    ownerDecisionRequired: false,
+    restartOrReloadRequired: false,
+    hardStopPresent: false,
+    safetyStopPresent: false,
+    lawfulWholeRunCompletion: false,
+    continuationRequiredAfterLocalSuccess: false,
+    nextExecutableUnitIdentified: true,
+    nextExecutableUnitLaunched: false,
+    continuationViolation: false,
+    events: [
+      ...continuation.events,
+      {
+        type: "NEXT_EXECUTABLE_UNIT_IDENTIFIED" as const,
+        at: params.now,
+        detail,
+      },
+    ],
+  };
+  const baseState = isPlainRecord(params.stateJson) ? { ...params.stateJson } : {};
+  const flowForProjection: TaskFlowRecord = {
+    ...params.flow,
+    currentStep: params.currentStep,
+    stateJson: {
+      ...baseState,
+      productionContinuation: settledContinuation,
+    },
+  };
+  const activeProductionContinuation =
+    getTaskFlowActiveProductionContinuation(flowForProjection) ?? undefined;
+  return {
+    ...baseState,
+    productionContinuation: settledContinuation,
+    ...(activeProductionContinuation ? { activeProductionContinuation } : {}),
+  };
+}
+
+function refreshCheckpointNextActionProjectionStateJson(params: {
+  flow: TaskFlowRecord;
+  stateJson: TaskFlowRecord["stateJson"];
+  tracking: ForegroundCleanupCrewTracking;
+  currentStep: string;
+  now: number;
+}): TaskFlowRecord["stateJson"] {
+  if (!params.tracking.checkpointKind || !params.tracking.nextExecutableAction) {
+    return params.stateJson;
+  }
+  const baseState = isPlainRecord(params.stateJson) ? { ...params.stateJson } : {};
+  const flowForProjection: TaskFlowRecord = {
+    ...params.flow,
+    currentStep: params.currentStep,
+    stateJson: baseState,
+  };
+  const continuation = getTaskFlowProductionContinuation(flowForProjection);
+  const activeProductionContinuation = getTaskFlowActiveProductionContinuation(flowForProjection);
+  if (
+    !continuation ||
+    activeProductionContinuation?.status !== "dispatch_required" ||
+    !activeProductionContinuation.nextAction
+  ) {
+    return params.stateJson;
+  }
+  const refreshedContinuation = {
+    ...continuation,
+    nextExecutableUnitIdentified: true,
+    nextExecutableUnitLaunched: false,
+    events: [
+      ...continuation.events,
+      {
+        type: "NEXT_EXECUTABLE_UNIT_IDENTIFIED" as const,
+        at: params.now,
+        detail: params.tracking.nextExecutableAction,
+      },
+    ],
+  };
+  const refreshedFlowForProjection: TaskFlowRecord = {
+    ...flowForProjection,
+    stateJson: {
+      ...baseState,
+      productionContinuation: refreshedContinuation,
+    },
+  };
+  const refreshedActiveProductionContinuation =
+    getTaskFlowActiveProductionContinuation(refreshedFlowForProjection) ??
+    activeProductionContinuation;
+  return {
+    ...baseState,
+    productionContinuation: refreshedContinuation,
+    activeProductionContinuation: refreshedActiveProductionContinuation,
   };
 }
 
@@ -567,12 +687,28 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       };
     }
     const trackedStateJson = applyTrackingToStateJson(existing.stateJson, tracking);
+    const currentStep =
+      tracking.stageId ?? existing.currentStep ?? "foreground_cleanup_crew_resumed";
+    const settledStateJson = settleObsoleteRestartBoundaryStateJson({
+      flow: existing,
+      stateJson: trackedStateJson,
+      tracking,
+      currentStep,
+      now,
+    });
+    const nextActionStateJson = refreshCheckpointNextActionProjectionStateJson({
+      flow: existing,
+      stateJson: settledStateJson,
+      tracking,
+      currentStep,
+      now,
+    });
     const resumed = resumeFlow({
       flowId: existing.flowId,
       expectedRevision: existing.revision,
       status: "running",
-      currentStep: tracking.stageId ?? existing.currentStep ?? "foreground_cleanup_crew_resumed",
-      stateJson: trackedStateJson,
+      currentStep,
+      stateJson: nextActionStateJson,
       updatedAt: now,
     });
     const flow = resumed.applied

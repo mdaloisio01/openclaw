@@ -415,6 +415,132 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     );
   });
 
+  it("settles an obsolete restart boundary when a later checkpoint advances the foreground run", () => {
+    const first = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "issue_040_gateway_restart_proof",
+      now: 1000,
+    });
+    if (first.status !== "registered") {
+      throw new Error("expected registered result");
+    }
+    const stopped = recordFlowLawfulStop({
+      flowId: first.flow.flowId,
+      expectedRevision: first.flow.revision,
+      reason: "restart_or_reload",
+      detail: "runtime restart required for loaded-proof stage",
+      currentStep: "issue_040_gateway_restart_proof",
+      updatedAt: 1500,
+    });
+    expect(stopped.applied).toBe(true);
+    if (!stopped.applied) {
+      throw new Error("expected stopped flow");
+    }
+    expect(getTaskFlowProductionContinuation(stopped.flow)).toMatchObject({
+      restartOrReloadRequired: true,
+      lawfulStopReason: "restart_or_reload",
+    });
+
+    const checkpoint = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "issue_040_remaining_family_retriage",
+      checkpointKind: "report_boundary",
+      checkpointSummary: "runtime proof already passed; re-triage selected next family target",
+      nextExecutableAction: "write the active-production continuation settlement package",
+      now: 2000,
+    });
+
+    expect(checkpoint.status).toBe("attached");
+    if (checkpoint.status !== "attached") {
+      throw new Error("expected attached result");
+    }
+    const continuation = getTaskFlowProductionContinuation(checkpoint.flow);
+    const activeContinuation = getTaskFlowActiveProductionContinuation(checkpoint.flow);
+    expect(checkpoint.flow.currentStep).toBe("issue_040_remaining_family_retriage");
+    expect(continuation).toMatchObject({
+      activeProductionRun: true,
+      parentRunOpen: true,
+      currentUnitStatus: "started",
+      restartOrReloadRequired: false,
+      lawfulWholeRunCompletion: false,
+      nextExecutableUnitIdentified: true,
+      nextExecutableUnitLaunched: false,
+      continuationViolation: false,
+    });
+    expect(continuation?.lawfulStopReason).toBeUndefined();
+    expect(activeContinuation).toMatchObject({
+      broaderBuildOpen: true,
+      status: "dispatch_required",
+      boundary: "plan_next_step",
+    });
+    expect(activeContinuation?.nextAction?.summary).toContain(
+      "write the active-production continuation settlement package",
+    );
+
+    const closeoutCheckpoint = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "issue_040_active_production_continuation_settlement_closeout_delivered",
+      checkpointKind: "milestone_delivered",
+      checkpointSummary: "settlement closeout and register update were delivered",
+      nextExecutableAction: "re-triage the remaining ISSUE-040 family",
+      now: 3000,
+    });
+
+    expect(closeoutCheckpoint.status).toBe("attached");
+    if (closeoutCheckpoint.status !== "attached") {
+      throw new Error("expected attached result");
+    }
+    expect(
+      getTaskFlowActiveProductionContinuation(closeoutCheckpoint.flow)?.nextAction?.summary,
+    ).toBe("re-triage the remaining ISSUE-040 family");
+  });
+
+  it("preserves restart boundaries when foreground progress lacks an explicit checkpoint", () => {
+    const first = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      now: 1000,
+    });
+    if (first.status !== "registered") {
+      throw new Error("expected registered result");
+    }
+    const stopped = recordFlowLawfulStop({
+      flowId: first.flow.flowId,
+      expectedRevision: first.flow.revision,
+      reason: "restart_or_reload",
+      detail: "runtime restart required for loaded-proof stage",
+      currentStep: "issue_040_gateway_restart_proof",
+      updatedAt: 1500,
+    });
+    expect(stopped.applied).toBe(true);
+    if (!stopped.applied) {
+      throw new Error("expected stopped flow");
+    }
+
+    const resumed = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      stageId: "issue_040_runtime_status_check",
+      now: 2000,
+    });
+
+    expect(resumed.status).toBe("attached");
+    if (resumed.status !== "attached") {
+      throw new Error("expected attached result");
+    }
+    expect(getTaskFlowProductionContinuation(resumed.flow)).toMatchObject({
+      restartOrReloadRequired: true,
+      lawfulStopReason: "restart_or_reload",
+    });
+    expect(getTaskFlowActiveProductionContinuation(resumed.flow)).toMatchObject({
+      status: "hard_boundary",
+      boundary: "runtime_restart_recovery",
+    });
+  });
+
   it("blocks checkpoint registration when the next executable action is missing", () => {
     expect(
       ensureForegroundCleanupCrewTaskFlow({
