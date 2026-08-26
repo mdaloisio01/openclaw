@@ -166,7 +166,11 @@ function isTerminalAttemptText(text: string): boolean {
   if (text.includes("terminal") && (text.includes("blocked") || text.includes("done"))) {
     return true;
   }
-  if (text.includes("status: done") || text.includes("status: complete")) {
+  if (
+    text.includes("status: done") ||
+    text.includes("status: complete") ||
+    text.includes("status: closed")
+  ) {
     return true;
   }
   return false;
@@ -177,6 +181,7 @@ function hasNextRepairPath(text: string): boolean {
     "next repair path",
     "safe next action:",
     "next action:",
+    "next steps:",
     "next packet:",
     "continue cleanup repair",
     "continue_cleanup_repair",

@@ -324,6 +324,54 @@ describe("createReplyDispatcher", () => {
     );
   });
 
+  it("rejects Cleanup Crew Status: Closed reports when they still name next steps", () => {
+    const dispatcher = {
+      sendToolResult: vi.fn(() => true),
+      sendBlockReply: vi.fn(() => true),
+      sendFinalReply: vi.fn(() => true),
+      waitForIdle: vi.fn(async () => {}),
+      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      markComplete: vi.fn(),
+    };
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        currentTurnText: "resume under cleanup crew sop",
+        activeCleanupCrewMission: true,
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+
+    const result = allowTerminalCloseout(dispatcher, "sendFinalReply", {
+      text: [
+        "Cleanup Crew ISSUE-040 Resume",
+        "",
+        "Status: Closed - scoped activation proved.",
+        "",
+        "Remaining Work:",
+        "- Broader ISSUE-040 family remains open.",
+        "",
+        "Next Steps:",
+        "Continue remaining-family re-triage.",
+      ].join("\n"),
+    });
+
+    expect(result.allowed).toBe(false);
+    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        expect.objectContaining({ type: "CLEANUP_CREW_TERMINAL_CLOSEOUT_REJECTED" }),
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
   it("persists Continuity Gate v2 technical continuation evidence for blocked terminal closeout", async () => {
     const outputDir = await mkdtemp(path.join(os.tmpdir(), "openclaw-active-run-gate-"));
     try {
