@@ -453,6 +453,35 @@ function emitSubagentRequesterSystemEvent(
     });
 }
 
+function emitParentYieldNoPendingChildrenEvent(params: {
+  controllerSessionKey: string;
+  parentRunId?: string;
+  reason?: string;
+  now: number;
+}): void {
+  const sessionKey = normalizeOptionalString(params.controllerSessionKey);
+  if (!sessionKey) {
+    return;
+  }
+  const trimmedReason = normalizeOptionalString(params.reason);
+  const message = [
+    "Subagent wait ready to resume:",
+    trimmedReason || "parent called sessions_yield, but no pending child runs were found.",
+    "No pending child completion can wake this wait.",
+    "Resume the parent task now and produce the required user-facing closeout; do not reply NO_REPLY.",
+  ].join(" ");
+  enqueueSystemEvent(message, {
+    sessionKey,
+    contextKey: `subagent:yield-wait-empty:${params.parentRunId ?? "run"}:${params.now}`,
+  });
+  requestHeartbeat({
+    source: "subagent-progress",
+    intent: "event",
+    reason: "subagent:yield-wait-empty",
+    sessionKey,
+  });
+}
+
 function isRunTerminalForParentYieldWait(entry: SubagentRunRecord): boolean {
   return (
     typeof entry.endedAt === "number" &&
@@ -584,6 +613,12 @@ export function markParentYieldWaitForController(params: {
   });
 
   if (candidates.length === 0) {
+    emitParentYieldNoPendingChildrenEvent({
+      controllerSessionKey,
+      parentRunId: params.parentRunId,
+      reason: params.reason,
+      now,
+    });
     return { marked: 0, expectedChildRunIds: [], terminalChildRunIds: [] };
   }
 

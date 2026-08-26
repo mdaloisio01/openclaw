@@ -2336,6 +2336,36 @@ describe("subagent registry seam flow", () => {
     );
   });
 
+  it("schedules a parent continuation when sessions_yield has no pending children", () => {
+    const marked = mod.markParentYieldWaitForController({
+      controllerSessionKey: "agent:main:main",
+      parentRunId: "parent-run-empty",
+      reason: "waiting for completion events",
+      now: 1_500,
+      staleAfterMs: 60_000,
+    });
+
+    expect(marked).toEqual({
+      marked: 0,
+      expectedChildRunIds: [],
+      terminalChildRunIds: [],
+    });
+    expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+      expect.stringContaining("No pending child completion can wake this wait."),
+      expect.objectContaining({
+        sessionKey: "agent:main:main",
+        contextKey: "subagent:yield-wait-empty:parent-run-empty:1500",
+      }),
+    );
+    expect(mocks.requestHeartbeat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "subagent-progress",
+        reason: "subagent:yield-wait-empty",
+        sessionKey: "agent:main:main",
+      }),
+    );
+  });
+
   it("announces blocked agent.wait snapshots as errors instead of success", async () => {
     mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
       if (request.method === "agent.wait") {
