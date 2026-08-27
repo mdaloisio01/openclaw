@@ -1,4 +1,6 @@
 import crypto from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { isParentOwnedBackgroundAcpSession } from "@openclaw/acp-core/session-interaction-mode";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -413,9 +415,25 @@ const replyMediaPathsRuntimeLoader = createLazyImportLoader(
 );
 
 const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+const WORKSPACE_ORCHESTRATOR_DIR_ENV = "OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR";
 
-function resolveSourceTurnDeliveryRegistryPath(): string | undefined {
-  return normalizeOptionalString(process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV]);
+function resolveDefaultSourceTurnDeliveryRegistryPath(): string {
+  const workspaceDir =
+    normalizeOptionalString(process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV]) ??
+    join(homedir(), ".openclaw", "workspace-orchestrator");
+  return join(
+    workspaceDir,
+    "var",
+    "source_delivery_obligations",
+    "source_delivery_obligations.json",
+  );
+}
+
+function resolveSourceTurnDeliveryRegistryPath(): string {
+  return (
+    normalizeOptionalString(process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV]) ??
+    resolveDefaultSourceTurnDeliveryRegistryPath()
+  );
 }
 
 function buildSourceTurnDeliveryRecordId(params: {

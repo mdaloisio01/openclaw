@@ -27,8 +27,10 @@ let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatch
 let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
 let sourceTurnDeliveryTempDir: string | undefined;
 let previousSourceTurnDeliveryRegistryPath: string | undefined;
+let previousWorkspaceOrchestratorDir: string | undefined;
 
 const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
+const WORKSPACE_ORCHESTRATOR_DIR_ENV = "OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR";
 
 type SourceTurnDeliveryRegistryForTest = {
   rows?: Array<{
@@ -99,7 +101,9 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
 
   beforeEach(() => {
     previousSourceTurnDeliveryRegistryPath = process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
+    previousWorkspaceOrchestratorDir = process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
     delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
+    delete process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
     sourceTurnDeliveryTempDir = undefined;
     clearAgentHarnesses();
     setDiscordTestRegistry();
@@ -169,6 +173,11 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
     } else {
       process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV] = previousSourceTurnDeliveryRegistryPath;
+    }
+    if (previousWorkspaceOrchestratorDir === undefined) {
+      delete process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
+    } else {
+      process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV] = previousWorkspaceOrchestratorDir;
     }
     if (sourceTurnDeliveryTempDir) {
       await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
@@ -308,6 +317,36 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
 
     expect(result.queuedFinal).toBe(true);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_delivered",
+      deliveryStatus: "final_delivered",
+      finalDeliveryDelivered: true,
+      sourceTurnState: "final_delivered",
+      visibleDeliveryCount: 1,
+    });
+  });
+
+  it("uses the workspace source-turn delivery registry when env override is unset", async () => {
+    sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-default-"));
+    process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV] = sourceTurnDeliveryTempDir;
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx(),
+      cfg: emptyConfig,
+      dispatcher: createDispatcher(),
+      replyResolver: async () => ({ text: "visible final from default registry" }),
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    const registryPath = join(
+      sourceTurnDeliveryTempDir,
+      "var",
+      "source_delivery_obligations",
+      "source_delivery_obligations.json",
+    );
     const rows = await readSourceTurnDeliveryRows(registryPath);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
