@@ -1005,6 +1005,7 @@ function persistFlowRegistry(): boolean {
     getTaskFlowRegistryStore().saveSnapshot({
       flows: createFlowSnapshotWith(),
     });
+    restoreFailureMessage = null;
     return true;
   } catch (error) {
     log.warn("Failed to persist task-flow registry snapshot", { error });
@@ -1136,6 +1137,7 @@ function writeFlowRecord(next: TaskFlowRecord, previous?: TaskFlowRecord): TaskF
   if (!tryPersistFlowUpsert(next, previous ? "update" : "create")) {
     return null;
   }
+  restoreFailureMessage = null;
   flows.set(next.flowId, next);
   emitFlowRegistryObserverEvent(() => ({
     kind: "upserted",
@@ -2115,6 +2117,7 @@ export function deleteTaskFlowRecordById(flowId: string): boolean {
   if (!tryPersistFlowDelete(flowId)) {
     return false;
   }
+  restoreFailureMessage = null;
   flows.delete(flowId);
   emitFlowRegistryObserverEvent(() => ({
     kind: "deleted",
