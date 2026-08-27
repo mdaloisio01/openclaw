@@ -3348,6 +3348,9 @@ export async function dispatchReplyFromConfig(
     const beforeAgentRunBlocked = replies.some(
       (reply) => getReplyPayloadMetadata(reply)?.beforeAgentRunBlocked === true,
     );
+    const finalDeliveryPrepared = replies.some(
+      (reply) => reply.isReasoning !== true && hasOutboundReplyContent(reply, { trimText: true }),
+    );
 
     let queuedFinal = false;
     let routedFinalCount = 0;
@@ -3365,6 +3368,15 @@ export async function dispatchReplyFromConfig(
       !sendPolicyDenied &&
       getReplyPayloadMetadata(reply)?.deliverDespiteSourceReplySuppression === true &&
       (ctx.InboundEventKind !== "room_event" || explicitCommandTurnCtx);
+    if (finalDeliveryPrepared) {
+      await recordSourceTurnDeliveryState(
+        {
+          finalDeliveryRequired: true,
+          evidenceKinds: ["internal_evidence_record"],
+        },
+        "final_dispatch_prepared_pending_delivery",
+      );
+    }
     for (const reply of replies) {
       throwIfDispatchOperationAborted();
       // Suppress reasoning payloads from channel delivery — channels using this

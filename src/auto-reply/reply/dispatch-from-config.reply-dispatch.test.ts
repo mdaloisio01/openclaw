@@ -344,6 +344,35 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
   });
 
+  it("records pending final delivery before dispatch can abort", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    const dispatcher = createDispatcher();
+    vi.mocked(dispatcher.sendFinalReply).mockImplementation(() => {
+      throw new Error("dispatch bubble closed");
+    });
+
+    await expect(
+      dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx(),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver: async () => ({ text: "visible final" }),
+      }),
+    ).rejects.toThrow("dispatch bubble closed");
+
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_prepared_pending_delivery",
+      deliveryStatus: "blocked",
+      failureReason: "missing_visible_final_delivery_proof",
+      finalDeliveryDelivered: false,
+      sourceTurnState: "blocked_refused",
+      visibleDeliveryCount: 0,
+    });
+  });
+
   it("records message-tool-only private final as refused, not delivered", async () => {
     const registryPath = await useTempSourceTurnDeliveryRegistry();
     hookMocks.runner.hasHooks.mockReturnValue(false);
