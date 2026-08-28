@@ -4,7 +4,15 @@ import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearAgentHarnesses } from "../../agents/harness/registry.js";
 import type { PluginHookReplyDispatchResult } from "../../plugins/hooks.js";
+import { listTasksForFlowId, resetTaskRegistryForTests } from "../../tasks/runtime-internal.js";
+import {
+  getTaskFlowActiveProductionContinuation,
+  getTaskFlowProductionContinuation,
+  listTaskFlowRecords,
+  resetTaskFlowRegistryForTests,
+} from "../../tasks/task-flow-runtime-internal.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
   acpManagerRuntimeMocks,
   acpMocks,
@@ -28,6 +36,8 @@ let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
 let sourceTurnDeliveryTempDir: string | undefined;
 let previousSourceTurnDeliveryRegistryPath: string | undefined;
 let previousWorkspaceOrchestratorDir: string | undefined;
+let previousFalseCloseoutAdmission: string | undefined;
+let previousFalseCloseoutAdmissionMode: string | undefined;
 
 const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
 const WORKSPACE_ORCHESTRATOR_DIR_ENV = "OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR";
@@ -43,6 +53,27 @@ type SourceTurnDeliveryRegistryForTest = {
   }>;
 };
 
+const CLEANUP_CREW_OPEN_MILESTONE_REPORT = [
+  "STATUS: in progress",
+  "MODE: Cleanup Crew execution",
+  "STAGE COMPLETE: ISSUE-039 scoped closeout delivered",
+  "RESULT: PASS",
+  "PROOF: focused validation and Grant review passed",
+  "NEXT STAGE: dispatch ISSUE-040 post-milestone continuation repair",
+  "SAFETY CHECK: no SOP blocker",
+  "BLOCKERS: none",
+  "Open/closed truth: broader Cleanup Crew issue-list repair remains open.",
+].join("\n");
+
+const CLEANUP_CREW_FULL_BUILD_COMPLETE_REPORT = [
+  "Cleanup Crew final closeout",
+  "Status: closed",
+  "What is materially real now: Cleanup Crew issue-list repair is truthfully complete.",
+  "What is still not real yet: nothing.",
+  "Open/closed truth: Cleanup Crew issue-list repair is truthfully closed.",
+  "Exact next action: none; whole run complete.",
+].join("\n");
+
 async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
   sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-delivery-"));
   const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
@@ -55,6 +86,22 @@ async function readSourceTurnDeliveryRows(registryPath: string) {
     await readFile(registryPath, "utf8"),
   ) as SourceTurnDeliveryRegistryForTest;
   return registry.rows ?? [];
+}
+
+async function withCleanupCrewDispatchState(run: () => Promise<void>): Promise<void> {
+  await withOpenClawTestState(
+    { layout: "state-only", prefix: "openclaw-cleanup-post-report-" },
+    async () => {
+      resetTaskRegistryForTests({ persist: false });
+      resetTaskFlowRegistryForTests({ persist: false });
+      try {
+        await run();
+      } finally {
+        resetTaskRegistryForTests({ persist: false });
+        resetTaskFlowRegistryForTests({ persist: false });
+      }
+    },
+  );
 }
 
 function createSourceTurnCtx(overrides: Partial<ReturnType<typeof createHookCtx>> = {}) {
@@ -102,8 +149,12 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
   beforeEach(() => {
     previousSourceTurnDeliveryRegistryPath = process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
     previousWorkspaceOrchestratorDir = process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
+    previousFalseCloseoutAdmission = process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
+    previousFalseCloseoutAdmissionMode = process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE;
     delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
     delete process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
+    delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
+    delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE;
     sourceTurnDeliveryTempDir = undefined;
     clearAgentHarnesses();
     setDiscordTestRegistry();
@@ -178,6 +229,16 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       delete process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
     } else {
       process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV] = previousWorkspaceOrchestratorDir;
+    }
+    if (previousFalseCloseoutAdmission === undefined) {
+      delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
+    } else {
+      process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = previousFalseCloseoutAdmission;
+    }
+    if (previousFalseCloseoutAdmissionMode === undefined) {
+      delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE;
+    } else {
+      process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE = previousFalseCloseoutAdmissionMode;
     }
     if (sourceTurnDeliveryTempDir) {
       await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
@@ -302,6 +363,154 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       finalDeliveryDelivered: true,
       sourceTurnState: "final_delivered",
       visibleDeliveryCount: 1,
+    });
+  });
+
+  it("dispatches the next Cleanup Crew action after a delivered open-build milestone report", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+
+    await withCleanupCrewDispatchState(async () => {
+      const result = await dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx({
+          SessionKey: "webchat:direct:mark",
+          Body: "Cleanup Crew production repair build.",
+          BodyForAgent: "Cleanup Crew production repair build.",
+          BodyForCommands: "Cleanup Crew production repair build.",
+        }),
+        cfg: emptyConfig,
+        dispatcher: createDispatcher(),
+        replyResolver: async () => ({ text: CLEANUP_CREW_OPEN_MILESTONE_REPORT }),
+      });
+
+      expect(result.queuedFinal).toBe(true);
+      const rows = await readSourceTurnDeliveryRows(registryPath);
+      expect(rows[0]).toMatchObject({
+        currentStage: "final_dispatch_delivered",
+        deliveryStatus: "final_delivered",
+      });
+      const [flow] = listTaskFlowRecords();
+      expect(flow).toBeDefined();
+      expect(flow?.currentStep).toBe("cleanup_crew_post_report_continuation");
+      expect(flow?.stateJson).toMatchObject({
+        currentCheckpointKind: "milestone_delivered",
+        nextExecutableAction: "dispatch ISSUE-040 post-milestone continuation repair",
+      });
+      expect(getTaskFlowProductionContinuation(flow!)).toMatchObject({
+        activeProductionRun: true,
+        parentRunOpen: true,
+        nextExecutableUnitIdentified: true,
+        nextExecutableUnitLaunched: true,
+        continuationRequiredAfterLocalSuccess: true,
+      });
+      expect(getTaskFlowActiveProductionContinuation(flow!)).toMatchObject({
+        broaderBuildOpen: true,
+        status: "dispatched",
+        boundary: "plan_next_step",
+        nextAction: {
+          summary: "dispatch ISSUE-040 post-milestone continuation repair",
+          dispatchProofRef: "dispatch ISSUE-040 post-milestone continuation repair",
+        },
+      });
+      expect(listTasksForFlowId(flow!.flowId)).toHaveLength(1);
+    });
+  });
+
+  it("keeps duplicate post-milestone continuation delivery idempotent", async () => {
+    await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+
+    await withCleanupCrewDispatchState(async () => {
+      const ctx = createSourceTurnCtx({
+        SessionKey: "webchat:direct:mark",
+        Body: "Cleanup Crew production repair build.",
+        BodyForAgent: "Cleanup Crew production repair build.",
+        BodyForCommands: "Cleanup Crew production repair build.",
+      });
+      await dispatchReplyFromConfig({
+        ctx,
+        cfg: emptyConfig,
+        dispatcher: createDispatcher(),
+        replyResolver: async () => ({ text: CLEANUP_CREW_OPEN_MILESTONE_REPORT }),
+      });
+      const [firstFlow] = listTaskFlowRecords();
+      expect(firstFlow).toBeDefined();
+      const firstTaskId = listTasksForFlowId(firstFlow!.flowId)[0]?.taskId;
+      const firstReceipt = getTaskFlowActiveProductionContinuation(
+        firstFlow!,
+      )?.lastDispatchReceiptId;
+
+      await dispatchReplyFromConfig({
+        ctx,
+        cfg: emptyConfig,
+        dispatcher: createDispatcher(),
+        replyResolver: async () => ({ text: CLEANUP_CREW_OPEN_MILESTONE_REPORT }),
+      });
+
+      const flows = listTaskFlowRecords();
+      expect(flows).toHaveLength(1);
+      const [secondFlow] = flows;
+      expect(listTasksForFlowId(secondFlow!.flowId).map((task) => task.taskId)).toEqual([
+        firstTaskId,
+      ]);
+      expect(getTaskFlowActiveProductionContinuation(secondFlow!)).toMatchObject({
+        status: "dispatched",
+        nextAction: {
+          summary: "dispatch ISSUE-040 post-milestone continuation repair",
+        },
+      });
+      expect(getTaskFlowActiveProductionContinuation(secondFlow!)?.dispatchReceipts).toHaveLength(
+        1,
+      );
+      expect(
+        getTaskFlowActiveProductionContinuation(secondFlow!)?.lastDispatchReceiptId,
+      ).not.toBeUndefined();
+      expect(firstReceipt).not.toBeUndefined();
+    });
+  });
+
+  it("allows a delivered full-build complete Cleanup Crew report to stop without active-run violation", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+
+    await withCleanupCrewDispatchState(async () => {
+      const dispatcher = createDispatcher();
+      const result = await dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx({
+          SessionKey: "webchat:direct:mark",
+          Body: "Cleanup Crew production repair build.",
+          BodyForAgent: "Cleanup Crew production repair build.",
+          BodyForCommands: "Cleanup Crew production repair build.",
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver: async () => ({ text: CLEANUP_CREW_FULL_BUILD_COMPLETE_REPORT }),
+      });
+
+      expect(result.queuedFinal).toBe(true);
+      expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+        }),
+      );
+      const rows = await readSourceTurnDeliveryRows(registryPath);
+      expect(rows[0]).toMatchObject({
+        currentStage: "final_dispatch_delivered",
+        deliveryStatus: "final_delivered",
+      });
+      const [flow] = listTaskFlowRecords();
+      expect(flow).toBeDefined();
+      expect(flow?.status).toBe("terminal_pending_watchdog");
+      expect(flow?.currentStep).toBe("cleanup_crew_full_build_complete_report_delivered");
+      expect(getTaskFlowProductionContinuation(flow!)).toMatchObject({
+        activeProductionRun: true,
+        parentRunOpen: false,
+        lawfulWholeRunCompletion: true,
+        lawfulStopReason: "whole_run_complete",
+      });
     });
   });
 

@@ -147,10 +147,41 @@ function isMilestoneVisibilityReport(text: string): boolean {
     text.includes("status:") &&
     text.includes("mode:") &&
     (text.includes("packet complete:") || text.includes("stage complete:")) &&
-    text.includes("next packet:") &&
+    (text.includes("next packet:") || text.includes("next stage:")) &&
     text.includes("safety check:") &&
     text.includes("blockers:")
   );
+}
+
+function reportNamesBroaderBuildOpen(text: string): boolean {
+  return includesAny(text, [
+    "broader build remains open",
+    "broader mission remains open",
+    "broader cleanup crew remains open",
+    "cleanup crew issue-list repair remains open",
+    "build still open",
+    "mission still open",
+    "repair remains open",
+    "remaining work:",
+  ]);
+}
+
+function reportNamesFullBuildComplete(text: string): boolean {
+  if (reportNamesBroaderBuildOpen(text)) {
+    return false;
+  }
+  return includesAny(text, [
+    "broader build is complete",
+    "broader mission is complete",
+    "cleanup crew issue-list repair is truthfully closed",
+    "cleanup crew issue-list repair is complete",
+    "whole build is complete",
+    "whole mission is complete",
+    "mission closed with proof",
+    "nothing remains open",
+    "what is still not real yet: nothing",
+    "whole run complete",
+  ]);
 }
 
 function isTerminalAttemptText(text: string): boolean {
@@ -281,6 +312,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   const explicitStopRequest = isExplicitStopRequest(currentTurnText);
   const milestoneVisibilityReport = isMilestoneVisibilityReport(responseText);
   const terminalAttempt = isTerminalAttemptText(responseText);
+  const fullBuildCompleteReport = reportNamesFullBuildComplete(responseText);
   const typedDecisionReceipt = createCleanupCrewBootstrapB0TypedDecisionReceipt({
     missionId: "cleanup-crew-b0-final-response-gate",
     phase: "phase5_mechanical_policy_unification_b0_adapter",
@@ -320,6 +352,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   if (
     explicitReportOnlyRequest ||
     explicitStopRequest ||
+    fullBuildCompleteReport ||
     hardBlockerNamedWithProof ||
     (laneCDecisionRequired && blockerArtifactPresent)
   ) {
@@ -720,7 +753,15 @@ export function allowTerminalCloseout(
       cleanupCrewDecision.milestoneVisibilityReport &&
       cleanupCrewDecision.terminalAttempt === false
     ) {
-      recordNonTerminalBuildUpdateEmitted(dispatcher, "cleanup_crew_milestone_visibility_report");
+      if (state.nextExecutableStepStarted) {
+        recordEvent(
+          state,
+          "NON_TERMINAL_BUILD_UPDATE_EMITTED",
+          "cleanup_crew_milestone_visibility_report",
+        );
+      } else {
+        recordNonTerminalBuildUpdateEmitted(dispatcher, "cleanup_crew_milestone_visibility_report");
+      }
     }
     if (!cleanupCrewDecision.allowed) {
       const violationReason =

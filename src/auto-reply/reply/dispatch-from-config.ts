@@ -31,6 +31,7 @@ import {
   resolveModelRefFromString,
   type ModelAliasIndex,
 } from "../../agents/model-selection.js";
+import { resolveCleanupCrewPostReportContinuation } from "../../agents/report-delivery-guard.js";
 import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
 import {
   persistSourceTurnDeliveryState,
@@ -92,6 +93,7 @@ import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveSilentReplyPolicyFromPolicies } from "../../shared/silent-reply-policy.js";
 import { ensureForegroundCleanupCrewTaskFlow } from "../../tasks/foreground-cleanup-crew-taskflow.js";
+import { recordFlowLawfulStop } from "../../tasks/task-flow-registry.js";
 import {
   buildActiveMissionContextBlockForLookup,
   resolveMissionBoundFollowupForLookup,
@@ -267,6 +269,22 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
     return undefined;
   }
   const normalized = text.toLowerCase();
+  if (
+    (normalized.includes("cleanup crew issue-list repair is truthfully closed") ||
+      normalized.includes("cleanup crew issue-list repair is complete") ||
+      normalized.includes("whole run complete") ||
+      normalized.includes("whole build is complete") ||
+      normalized.includes("whole mission is complete")) &&
+    !normalized.includes("build still open") &&
+    !normalized.includes("mission still open") &&
+    !normalized.includes("repair remains open")
+  ) {
+    return {
+      stopAllowed: true,
+      stopReason: "whole_run_complete",
+      openTruth: "whole run complete.",
+    };
+  }
   if (normalized.includes("routed to lawful owner, build still open")) {
     return {
       stopAllowed: true,
@@ -1167,6 +1185,7 @@ function createAbortAwareDispatcher(params: {
     if (
       continuation.stopAllowed === true &&
       (continuation.stopReason === "blocker" ||
+        continuation.stopReason === "whole_run_complete" ||
         continuation.stopReason === "approval_blocked" ||
         continuation.stopReason === "restart_or_reload" ||
         continuation.stopReason === "hard_stop" ||
@@ -1538,6 +1557,130 @@ export async function dispatchReplyFromConfig(
       `cleanup_crew_taskflow_${cleanupCrewTaskFlowRegistration.status}:${cleanupCrewTaskFlowRegistration.flow.flowId}`,
     );
   }
+  let cleanupCrewPostReportContinuationRecorded = false;
+  const recordCleanupCrewPostReportContinuation = (
+    payload: ReplyPayload,
+    options: { finalDeliveryDelivered: boolean },
+  ): void => {
+    if (cleanupCrewPostReportContinuationRecorded) {
+      return;
+    }
+    const reportText = normalizeOptionalString(payload.text);
+    if (!reportText) {
+      return;
+    }
+    const decision = resolveCleanupCrewPostReportContinuation({
+      currentTurnText: currentTurnTextForCleanupCrewGuard,
+      reportText,
+      finalDeliveryDelivered: options.finalDeliveryDelivered,
+    });
+    if (decision.state === "terminal_stop_allowed_lawful_blocker") {
+      recordLawfulBlocker(dispatcher, "blocker");
+      cleanupCrewPostReportContinuationRecorded = true;
+      return;
+    }
+    if (decision.state === "terminal_stop_allowed_full_build_complete") {
+      recordLawfulBlocker(dispatcher, "whole_run_complete");
+      cleanupCrewPostReportContinuationRecorded = true;
+      if (
+        cleanupCrewTaskFlowRegistration.status === "registered" ||
+        cleanupCrewTaskFlowRegistration.status === "attached"
+      ) {
+        recordFlowLawfulStop({
+          flowId: cleanupCrewTaskFlowRegistration.flow.flowId,
+          expectedRevision: cleanupCrewTaskFlowRegistration.flow.revision,
+          reason: "whole_run_complete",
+          currentStep: "cleanup_crew_full_build_complete_report_delivered",
+          detail: "Delivered Cleanup Crew report records full build completion.",
+        });
+      }
+      return;
+    }
+    if (
+      decision.state !== "continuation_dispatch_required" &&
+      decision.state !== "pending_continuation_action"
+    ) {
+      return;
+    }
+    const nextExecutableAction =
+      decision.nextExecutableAction ??
+      "identify and persist the next executable Cleanup Crew action before terminal stop";
+    const checkpointKind = decision.checkpointKind ?? "report_boundary";
+    const sessionKeyForContinuation = acpDispatchSessionKey ?? sessionKey;
+    if (!sessionKeyForContinuation) {
+      return;
+    }
+    const postReportRegistration = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: sessionKeyForContinuation,
+      currentTurnText: [currentTurnTextForCleanupCrewGuard, reportText]
+        .map((part) => normalizeOptionalString(part))
+        .filter(Boolean)
+        .join("\n"),
+      authorityPath: "foreground_cleanup_crew_post_report_continuation",
+      authorityBasis:
+        "Delivered Cleanup Crew report names an open broader build and requires continuation.",
+      ownerLane: "Will",
+      stageId: "cleanup_crew_post_report_continuation",
+      checkpointKind,
+      checkpointSummary:
+        decision.state === "pending_continuation_action"
+          ? "delivered Cleanup Crew report left the broader build open without a next executable action"
+          : "delivered Cleanup Crew report left the broader build open with a next executable action",
+      nextExecutableAction,
+    });
+    if (
+      postReportRegistration.status === "registered" ||
+      postReportRegistration.status === "attached"
+    ) {
+      cleanupCrewPostReportContinuationRecorded = true;
+      recordNextExecutableStepStarted(
+        dispatcher,
+        `cleanup_crew_post_report_continuation:${nextExecutableAction}`,
+      );
+    } else if (postReportRegistration.status === "blocked") {
+      recordNonTerminalBuildUpdateEmitted(
+        dispatcher,
+        `cleanup_crew_post_report_continuation_blocked:${postReportRegistration.reason}`,
+      );
+    }
+  };
+  const recordCleanupCrewTerminalStopBeforeFinalDelivery = (payload: ReplyPayload): void => {
+    if (cleanupCrewPostReportContinuationRecorded) {
+      return;
+    }
+    const reportText = normalizeOptionalString(payload.text);
+    if (!reportText) {
+      return;
+    }
+    const decision = resolveCleanupCrewPostReportContinuation({
+      currentTurnText: currentTurnTextForCleanupCrewGuard,
+      reportText,
+      finalDeliveryDelivered: true,
+    });
+    if (decision.state === "terminal_stop_allowed_lawful_blocker") {
+      recordLawfulBlocker(dispatcher, "blocker");
+      cleanupCrewPostReportContinuationRecorded = true;
+      return;
+    }
+    if (decision.state !== "terminal_stop_allowed_full_build_complete") {
+      return;
+    }
+    recordLawfulBlocker(dispatcher, "whole_run_complete");
+    cleanupCrewPostReportContinuationRecorded = true;
+    if (
+      cleanupCrewTaskFlowRegistration.status !== "registered" &&
+      cleanupCrewTaskFlowRegistration.status !== "attached"
+    ) {
+      return;
+    }
+    recordFlowLawfulStop({
+      flowId: cleanupCrewTaskFlowRegistration.flow.flowId,
+      expectedRevision: cleanupCrewTaskFlowRegistration.flow.revision,
+      reason: "whole_run_complete",
+      currentStep: "cleanup_crew_full_build_complete_report_delivered",
+      detail: "Cleanup Crew final report records full build completion.",
+    });
+  };
   let dispatchReplyOperation: ReplyOperation | undefined;
   let dispatchAbortOperation: ReplyOperation | undefined;
   let preDispatchAbortOperation: ReplyOperation | undefined;
@@ -2484,6 +2627,7 @@ export async function dispatchReplyFromConfig(
       throwIfFinalDeliveryAborted();
       const normalizedPayload = await normalizeReplyMediaPayload(ttsPayload);
       throwIfFinalDeliveryAborted();
+      recordCleanupCrewTerminalStopBeforeFinalDelivery(normalizedPayload);
       const result = await routeReplyToOriginating(normalizedPayload, {
         abortSignal,
         kind: "final",
@@ -2495,6 +2639,9 @@ export async function dispatchReplyFromConfig(
           );
         }
         if (isRoutedReplyDelivered(result)) {
+          recordCleanupCrewPostReportContinuation(normalizedPayload, {
+            finalDeliveryDelivered: true,
+          });
           await mirrorInternalSourceReplyToTranscript({
             metadata: sourceReplyTranscriptMirror,
             cfg,
@@ -2512,6 +2659,10 @@ export async function dispatchReplyFromConfig(
         dispatcher,
         metadata: sourceReplyTranscriptMirror,
       });
+      recordCleanupCrewTerminalStopBeforeFinalDelivery(normalizedPayload);
+      recordCleanupCrewPostReportContinuation(normalizedPayload, {
+        finalDeliveryDelivered: true,
+      });
       const queuedFinal = runtimeDispatcher.sendFinalReply(normalizedPayload);
       if (queuedFinal) {
         await mirrorInternalSourceReplyAfterDispatcherDelivery({
@@ -2526,7 +2677,6 @@ export async function dispatchReplyFromConfig(
         routedFinalCount: 0,
       };
     };
-
     // Run before_dispatch hook — let plugins inspect or handle before model dispatch.
     if (hookRunner?.hasHooks("before_dispatch")) {
       const beforeDispatchResult = await traceReplyPhase("reply.before_dispatch_hooks", () =>

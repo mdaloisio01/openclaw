@@ -64,6 +64,17 @@ const PACKET_A_MILESTONE_REPORT = [
   "BLOCKERS: none",
 ].join("\n");
 
+const STAGE_MILESTONE_REPORT = [
+  "STATUS: in progress",
+  "MODE: Cleanup Crew resume",
+  "STAGE COMPLETE: ISSUE-039 verification-only closeout",
+  "RESULT: scoped issue closed; broader Cleanup Crew remains open",
+  "PROOF: focused validation and Grant review passed",
+  "NEXT STAGE: ISSUE-040 post-milestone continuation repair",
+  "SAFETY CHECK: milestone only; Cleanup Crew continues",
+  "BLOCKERS: none",
+].join("\n");
+
 const FALSE_CLOSEOUT_IDENTITY: MissionIdentity = {
   missionId: "mission-false-closeout",
   planRevisionId: "plan-r1",
@@ -856,6 +867,32 @@ describe("createReplyDispatcher", () => {
     expect(
       allowTerminalCloseout(dispatcher, "sendFinalReply", {
         text: PACKET_A_MILESTONE_REPORT,
+      }).allowed,
+    ).toBe(false);
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        {
+          type: "NON_TERMINAL_BUILD_UPDATE_EMITTED",
+          detail: "cleanup_crew_milestone_visibility_report",
+        },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
+  it("treats stage-based milestone reporting as visibility, not Cleanup Crew mission stop", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        activeCleanupCrewMission: true,
+        currentTurnText: "Execute Cleanup Crew stages in order.",
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+
+    expect(
+      allowTerminalCloseout(dispatcher, "sendFinalReply", {
+        text: STAGE_MILESTONE_REPORT,
       }).allowed,
     ).toBe(false);
     expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(

@@ -188,6 +188,28 @@ export type CleanupCrewReportDeliveryRepairDecision = {
   validationErrors: string[];
 };
 
+export type CleanupCrewPostReportContinuationState =
+  | "not_cleanup_crew_report"
+  | "delivery_not_verified"
+  | "terminal_stop_allowed_operator_stop"
+  | "terminal_stop_allowed_full_build_complete"
+  | "terminal_stop_allowed_lawful_blocker"
+  | "continuation_dispatch_required"
+  | "pending_continuation_action";
+
+export type CleanupCrewPostReportContinuationDecision = {
+  schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1";
+  state: CleanupCrewPostReportContinuationState;
+  activeCleanupCrewMission: boolean;
+  broaderBuildOpen: boolean;
+  finalDeliveryDelivered: boolean;
+  stopAllowed: boolean;
+  checkpointKind?: "milestone_delivered" | "report_boundary";
+  nextExecutableAction?: string;
+  pendingContinuationVisible: boolean;
+  reason: string;
+};
+
 function hasPath(value: string | undefined): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -433,6 +455,273 @@ export function resolveCleanupCrewStageTransition(
     requiredReportDelivered,
     milestoneReportFormat,
     nextAction: "continue to the next lawful Cleanup Crew stage",
+  };
+}
+
+function normalizeReportText(value: string | undefined): string {
+  return (value ?? "").toLowerCase();
+}
+
+function reportTextIncludesAny(text: string, values: string[]): boolean {
+  return values.some((value) => text.includes(value));
+}
+
+function isCleanupCrewReportText(text: string): boolean {
+  return reportTextIncludesAny(text, ["cleanup crew", "cleanup-crew"]);
+}
+
+function isOperatorStopText(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "report only",
+    "report-only",
+    "status only",
+    "status-only",
+    "only report",
+    "just report",
+    "stop after this",
+    "stop now",
+    "do not continue",
+    "don't continue",
+  ]);
+}
+
+function reportNamesBroaderBuildOpen(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "broader build remains open",
+    "broader mission remains open",
+    "broader cleanup crew remains open",
+    "broader cleanup crew issue-list repair remains open",
+    "cleanup crew issue-list repair remains open",
+    "cleanup crew mission remains open",
+    "parent mission remains open",
+    "parent run remains open",
+    "build still open",
+    "mission still open",
+    "repair remains open",
+    "remains open and routes",
+    "remaining work:",
+  ]);
+}
+
+function reportNamesFullBuildComplete(text: string): boolean {
+  if (reportNamesBroaderBuildOpen(text)) {
+    return false;
+  }
+  return reportTextIncludesAny(text, [
+    "broader build is complete",
+    "broader mission is complete",
+    "cleanup crew issue-list repair is truthfully closed",
+    "cleanup crew issue-list repair is complete",
+    "whole build is complete",
+    "whole mission is complete",
+    "mission closed with proof",
+    "nothing remains open",
+    "what is still not real yet: nothing",
+  ]);
+}
+
+function reportNamesLawfulStopBlocker(text: string): boolean {
+  return (
+    (reportTextIncludesAny(text, [
+      "lawful blocker",
+      "sop blocker",
+      "why continuation is not lawful",
+      "continuation is not lawful",
+      "hard blocker",
+      "blocked by sop",
+    ]) ||
+      (text.includes("status: blocked") && text.includes("blocker:"))) &&
+    text.includes("proof:") &&
+    reportTextIncludesAny(text, [
+      "blocker_artifact:",
+      "blocker artifact:",
+      "blocker artifact path",
+      "verified-blocker artifact",
+    ])
+  );
+}
+
+function isMilestoneReportText(text: string): boolean {
+  return (
+    text.includes("status:") &&
+    text.includes("mode:") &&
+    (text.includes("packet complete:") || text.includes("stage complete:")) &&
+    (text.includes("next packet:") || text.includes("next stage:")) &&
+    text.includes("safety check:") &&
+    text.includes("blockers:")
+  );
+}
+
+function stripNextActionText(value: string): string | undefined {
+  const stripped = value
+    .trim()
+    .replace(/^[-*]\s*/u, "")
+    .replace(/^["']|["']$/gu, "")
+    .trim();
+  return stripped.length > 0 ? stripped : undefined;
+}
+
+function extractNextExecutableAction(reportText: string | undefined): string | undefined {
+  const lines = (reportText ?? "").split(/\r?\n/u);
+  const labels = [
+    "exact next action",
+    "next executable action",
+    "next action",
+    "next stage",
+    "next packet",
+    "next steps",
+  ];
+  for (const wantedLabel of labels) {
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index] ?? "";
+      const match = line.match(/^\s*([A-Za-z ]+):\s*(.*)$/u);
+      if (!match) {
+        continue;
+      }
+      const label = match[1]?.trim().toLowerCase();
+      if (label !== wantedLabel) {
+        continue;
+      }
+      const inlineAction = stripNextActionText(match[2] ?? "");
+      if (inlineAction) {
+        return inlineAction;
+      }
+      for (let nextIndex = index + 1; nextIndex < lines.length; nextIndex += 1) {
+        const nextAction = stripNextActionText(lines[nextIndex] ?? "");
+        if (nextAction) {
+          return nextAction;
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Determines whether a delivered Cleanup Crew milestone/final report may end
+ * the source turn, or must be followed by a durable continuation checkpoint.
+ */
+export function resolveCleanupCrewPostReportContinuation(input: {
+  currentTurnText?: string;
+  reportText?: string;
+  finalDeliveryDelivered?: boolean;
+  activeCleanupCrewMission?: boolean;
+}): CleanupCrewPostReportContinuationDecision {
+  const currentTurnText = normalizeReportText(input.currentTurnText);
+  const reportText = normalizeReportText(input.reportText);
+  const combinedText = `${currentTurnText}\n${reportText}`;
+  const activeCleanupCrewMission =
+    input.activeCleanupCrewMission === true || isCleanupCrewReportText(combinedText);
+  const finalDeliveryDelivered = input.finalDeliveryDelivered === true;
+  const broaderBuildOpen = reportNamesBroaderBuildOpen(reportText);
+
+  if (!activeCleanupCrewMission) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "not_cleanup_crew_report",
+      activeCleanupCrewMission: false,
+      broaderBuildOpen: false,
+      finalDeliveryDelivered,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+      reason: "not_cleanup_crew_report",
+    };
+  }
+
+  if (!finalDeliveryDelivered) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "delivery_not_verified",
+      activeCleanupCrewMission,
+      broaderBuildOpen,
+      finalDeliveryDelivered: false,
+      stopAllowed: false,
+      pendingContinuationVisible: false,
+      reason: "final_delivery_not_verified",
+    };
+  }
+
+  if (isOperatorStopText(currentTurnText)) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "terminal_stop_allowed_operator_stop",
+      activeCleanupCrewMission,
+      broaderBuildOpen,
+      finalDeliveryDelivered,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+      reason: "operator_requested_report_only_or_stop",
+    };
+  }
+
+  if (reportNamesLawfulStopBlocker(reportText)) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "terminal_stop_allowed_lawful_blocker",
+      activeCleanupCrewMission,
+      broaderBuildOpen,
+      finalDeliveryDelivered,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+      reason: "lawful_blocker_recorded_with_proof",
+    };
+  }
+
+  if (reportNamesFullBuildComplete(reportText)) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "terminal_stop_allowed_full_build_complete",
+      activeCleanupCrewMission,
+      broaderBuildOpen: false,
+      finalDeliveryDelivered,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+      reason: "full_build_completion_recorded",
+    };
+  }
+
+  if (!broaderBuildOpen) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "not_cleanup_crew_report",
+      activeCleanupCrewMission,
+      broaderBuildOpen: false,
+      finalDeliveryDelivered,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+      reason: "no_open_broader_build_claim",
+    };
+  }
+
+  const nextExecutableAction = extractNextExecutableAction(input.reportText);
+  const checkpointKind = isMilestoneReportText(reportText)
+    ? "milestone_delivered"
+    : "report_boundary";
+  if (nextExecutableAction) {
+    return {
+      schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+      state: "continuation_dispatch_required",
+      activeCleanupCrewMission,
+      broaderBuildOpen,
+      finalDeliveryDelivered,
+      stopAllowed: false,
+      checkpointKind,
+      nextExecutableAction,
+      pendingContinuationVisible: false,
+      reason: "broader_build_open_next_action_named",
+    };
+  }
+
+  return {
+    schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
+    state: "pending_continuation_action",
+    activeCleanupCrewMission,
+    broaderBuildOpen,
+    finalDeliveryDelivered,
+    stopAllowed: false,
+    checkpointKind,
+    pendingContinuationVisible: true,
+    reason: "broader_build_open_next_action_missing",
   };
 }
 

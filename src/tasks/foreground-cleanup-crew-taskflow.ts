@@ -841,10 +841,26 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   if (!flow) {
     return { status: "blocked", reason: "taskflow_persistence_failed" };
   }
-  const taskId = ensureForegroundExecutionTask({ flow, ownerKey, sessionKey, now, tracking });
+  const currentStep =
+    tracking.checkpointKind && tracking.nextExecutableAction
+      ? (tracking.stageId ?? flow.currentStep ?? "foreground_cleanup_crew_checkpoint")
+      : flow.currentStep;
+  const dispatchedFlow = recordForegroundCheckpointDispatch({
+    flow,
+    tracking,
+    currentStep,
+    now,
+  });
+  const taskId = ensureForegroundExecutionTask({
+    flow: dispatchedFlow,
+    ownerKey,
+    sessionKey,
+    now,
+    tracking,
+  });
   markOwnerRequestMissionRegistered({
     requestId: intakeRecord.requestId,
-    taskFlowId: flow.flowId,
+    taskFlowId: dispatchedFlow.flowId,
     taskId,
     lastExecutableAction: "registered foreground Cleanup Crew TaskFlow",
     nextExecutableAction: "execute Cleanup Crew production mission",
@@ -853,7 +869,7 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   });
   return {
     status: "registered",
-    flow,
+    flow: dispatchedFlow,
     taskId,
   };
 }

@@ -6,6 +6,7 @@ import {
 } from "../governance/cleanup-watchdog-policy.js";
 import {
   CLEANUP_CREW_CANONICAL_POLICY_PROMPT,
+  resolveCleanupCrewPostReportContinuation,
   resolveCleanupCrewReportDeliveryRepair,
   resolveCleanupCrewStageTransition,
   resolveReportDeliveryGuard,
@@ -246,6 +247,92 @@ describe("report delivery guard", () => {
       shouldContinue: true,
       allowedToAdvance: true,
       requiredReportDelivered: true,
+    });
+  });
+
+  it("requires continuation dispatch when a delivered milestone leaves the broader build open", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Cleanup Crew production repair build.",
+        reportText: [
+          VALID_MILESTONE_REPORT,
+          "Open/closed truth: local slice closed; broader Cleanup Crew issue-list repair remains open.",
+          "Exact next action: dispatch ISSUE-041 scope/source/authority lock.",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "continuation_dispatch_required",
+      activeCleanupCrewMission: true,
+      broaderBuildOpen: true,
+      finalDeliveryDelivered: true,
+      stopAllowed: false,
+      checkpointKind: "milestone_delivered",
+      nextExecutableAction: "dispatch ISSUE-041 scope/source/authority lock.",
+      pendingContinuationVisible: false,
+    });
+  });
+
+  it("allows post-report stop when the full Cleanup Crew build is complete", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Cleanup Crew production repair build.",
+        reportText: [
+          "Cleanup Crew final closeout",
+          "Status: closed",
+          "Open/closed truth: Cleanup Crew issue-list repair is truthfully closed.",
+          "What is still not real yet: nothing.",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "terminal_stop_allowed_full_build_complete",
+      broaderBuildOpen: false,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+    });
+  });
+
+  it("allows post-report stop when a lawful blocker is recorded with proof", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Cleanup Crew production repair build.",
+        reportText: [
+          "STATUS: blocked",
+          "MODE: Cleanup Crew execution",
+          "BLOCKER: lawful blocker requires Mark decision before continuation.",
+          "WHY CONTINUATION IS NOT LAWFUL: owner decision is required.",
+          "PROOF: live authority check has no lawful owner route.",
+          "BLOCKER_ARTIFACT: /tmp/cleanup-crew-blocker.json",
+          "Open/closed truth: broader Cleanup Crew issue-list repair remains open.",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "terminal_stop_allowed_lawful_blocker",
+      broaderBuildOpen: true,
+      stopAllowed: true,
+      pendingContinuationVisible: false,
+    });
+  });
+
+  it("leaves visible pending continuation when an open delivered report omits the next action", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Cleanup Crew production repair build.",
+        reportText: [
+          "Cleanup Crew scoped closeout",
+          "Status: closed for the local slice",
+          "Open/closed truth: broader Cleanup Crew issue-list repair remains open.",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "pending_continuation_action",
+      broaderBuildOpen: true,
+      stopAllowed: false,
+      pendingContinuationVisible: true,
+      checkpointKind: "report_boundary",
     });
   });
 
