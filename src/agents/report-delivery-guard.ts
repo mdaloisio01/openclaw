@@ -193,7 +193,7 @@ export type CleanupCrewPostReportContinuationState =
   | "delivery_not_verified"
   | "terminal_stop_allowed_operator_stop"
   | "terminal_stop_allowed_full_build_complete"
-  | "terminal_stop_allowed_lawful_blocker"
+  | "terminal_stop_allowed_verified_hard_stop"
   | "continuation_dispatch_required"
   | "pending_continuation_action";
 
@@ -209,6 +209,54 @@ export type CleanupCrewPostReportContinuationDecision = {
   pendingContinuationVisible: boolean;
   reason: string;
 };
+
+function reportNamesVerifiedHardStopOrExhaustion(text: string): boolean {
+  return (
+    reportTextIncludesAny(text, [
+      "true hard stop",
+      "hard stop",
+      "hard_stop",
+      "safety stop",
+      "safety_stop",
+      "destructive risk",
+      "forbidden action",
+      "operator-only decision",
+      "human/operator-only decision",
+      "owner decision required",
+      "approval unavailable",
+      "approval_unavailable",
+      "external dependency",
+      "external_dependency",
+      "no lawful executable path remains",
+      "no lawful path remains",
+      "all lawful recovery paths exhausted",
+      "all lawful repair paths exhausted",
+      "lawful alternatives exhausted",
+      "exhausted lawful alternatives",
+      "alternate execution surfaces are exhausted",
+      "alternate execution surfaces exhausted",
+    ]) &&
+    reportTextIncludesAny(text, [
+      "exhausted",
+      "operator-only",
+      "owner decision required",
+      "approval unavailable",
+      "external dependency",
+      "hard stop",
+      "safety stop",
+      "forbidden action",
+      "destructive risk",
+    ]) &&
+    reportTextIncludesAny(text, [
+      "proof",
+      "evidence",
+      "blocker_artifact",
+      "blocker artifact",
+      "hey, i'm stuck",
+      "hey, im stuck",
+    ])
+  );
+}
 
 function hasPath(value: string | undefined): boolean {
   return typeof value === "string" && value.trim().length > 0;
@@ -654,16 +702,19 @@ export function resolveCleanupCrewPostReportContinuation(input: {
     };
   }
 
-  if (reportNamesLawfulStopBlocker(reportText)) {
+  if (
+    reportNamesLawfulStopBlocker(reportText) &&
+    reportNamesVerifiedHardStopOrExhaustion(reportText)
+  ) {
     return {
       schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
-      state: "terminal_stop_allowed_lawful_blocker",
+      state: "terminal_stop_allowed_verified_hard_stop",
       activeCleanupCrewMission,
       broaderBuildOpen,
       finalDeliveryDelivered,
       stopAllowed: true,
       pendingContinuationVisible: false,
-      reason: "lawful_blocker_recorded_with_proof",
+      reason: "verified_hard_stop_or_exhaustion_recorded_with_proof",
     };
   }
 

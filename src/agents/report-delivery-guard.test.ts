@@ -293,23 +293,47 @@ describe("report delivery guard", () => {
     });
   });
 
-  it("allows post-report stop when a lawful blocker is recorded with proof", () => {
+  it("requires continuation when a blocker report lacks hard-stop or exhaustion proof", () => {
     expect(
       resolveCleanupCrewPostReportContinuation({
         currentTurnText: "Cleanup Crew production repair build.",
         reportText: [
           "STATUS: blocked",
           "MODE: Cleanup Crew execution",
-          "BLOCKER: lawful blocker requires Mark decision before continuation.",
-          "WHY CONTINUATION IS NOT LAWFUL: owner decision is required.",
-          "PROOF: live authority check has no lawful owner route.",
+          "BLOCKER: lawful blocker observed during cleanup.",
+          "PROOF: live status shows a restart boundary.",
+          "BLOCKER_ARTIFACT: /tmp/cleanup-crew-blocker.json",
+          "Exact next action: run the next lawful recovery command.",
+          "Open/closed truth: broader Cleanup Crew issue-list repair remains open.",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "continuation_dispatch_required",
+      broaderBuildOpen: true,
+      stopAllowed: false,
+      pendingContinuationVisible: false,
+      nextExecutableAction: "run the next lawful recovery command.",
+    });
+  });
+
+  it("allows post-report stop only for verified hard stop or exhausted recovery", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Cleanup Crew production repair build.",
+        reportText: [
+          "STATUS: blocked",
+          "MODE: Cleanup Crew execution",
+          "BLOCKER: true hard stop requires Mark decision before continuation.",
+          "WHY CONTINUATION IS NOT LAWFUL: owner decision required after all lawful recovery paths exhausted.",
+          "PROOF: live authority check has no lawful owner route and alternate execution surfaces exhausted.",
           "BLOCKER_ARTIFACT: /tmp/cleanup-crew-blocker.json",
           "Open/closed truth: broader Cleanup Crew issue-list repair remains open.",
         ].join("\n"),
         finalDeliveryDelivered: true,
       }),
     ).toMatchObject({
-      state: "terminal_stop_allowed_lawful_blocker",
+      state: "terminal_stop_allowed_verified_hard_stop",
       broaderBuildOpen: true,
       stopAllowed: true,
       pendingContinuationVisible: false,
