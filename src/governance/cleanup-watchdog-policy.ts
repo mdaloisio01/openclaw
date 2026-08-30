@@ -386,10 +386,18 @@ export function evaluateCleanupWatchdogCoverage(
     return { ok: false, reason: "duplicate_executor_coverage_for_unfinished_mission" };
   }
   const durableCoverage: CleanupWatchdogCoverageKind[] = [];
-  if (input.durableDeferRecord) durableCoverage.push("durable_defer");
-  if (input.externalWaitRecord) durableCoverage.push("external_wait");
-  if (input.ownerWaitRecord) durableCoverage.push("owner_wait");
-  if (input.verifiedBlockerRecord) durableCoverage.push("verified_blocker");
+  if (input.durableDeferRecord) {
+    durableCoverage.push("durable_defer");
+  }
+  if (input.externalWaitRecord) {
+    durableCoverage.push("external_wait");
+  }
+  if (input.ownerWaitRecord) {
+    durableCoverage.push("owner_wait");
+  }
+  if (input.verifiedBlockerRecord) {
+    durableCoverage.push("verified_blocker");
+  }
   if (durableCoverage.length === 1) {
     return {
       ok: true,
@@ -410,7 +418,7 @@ export function canCleanupWatchdogCloseClean(params: {
   return (
     params.suspiciousCount === 0 &&
     (Object.keys(params.dimensions) as CleanupWatchdogCleanDimension[]).every(
-      (dimension) => params.dimensions[dimension] === true,
+      (dimension) => params.dimensions[dimension],
     )
   );
 }

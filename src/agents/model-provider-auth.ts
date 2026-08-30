@@ -333,9 +333,7 @@ export async function hasAuthForModelProvider(params: {
       ? ensureAuthProfileStoreWithoutExternalProfiles(slowPathAgentDir, {
           allowKeychainPrompt: false,
         })
-      : ensureAuthProfileStore(slowPathAgentDir, {
-          ...(externalCli ? { externalCli } : {}),
-        }));
+      : ensureAuthProfileStore(slowPathAgentDir, externalCli ? { externalCli } : {}));
   recordTiming("auth_store", authStoreStarted, params.store ? "provided_store" : "loaded_store");
   const profileListStarted = performance.now();
   const profiles = listProfilesForProvider(store, provider);

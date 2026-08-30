@@ -458,7 +458,6 @@ async function emitPreparedGatewayRestart(
   while (nextHooks) {
     if (preparedHooks) {
       await preparedHooks.afterEmitRejected?.().catch(() => undefined);
-      preparedHooks = undefined;
     }
     try {
       await nextHooks.beforeEmit?.();

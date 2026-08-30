@@ -219,28 +219,54 @@ function canonicalCategoryForItem(
   classification: WatchdogReconciliationClass,
 ): CleanupWatchdogFindingCategory | undefined {
   const category = normalize(item.category);
-  if (category === "active_no_worker") return "active_no_worker";
-  if (category === "pending_report_delivery") return "pending_report_delivery";
-  if (category === "pending_milestone_report") return "pending_milestone_report";
+  if (category === "active_no_worker") {
+    return "active_no_worker";
+  }
+  if (category === "pending_report_delivery") {
+    return "pending_report_delivery";
+  }
+  if (category === "pending_milestone_report") {
+    return "pending_milestone_report";
+  }
   if (category === "source_delivery_stale" || category === "source_delivery_failed") {
     return "pending_report_delivery";
   }
-  if (category === "lost") return "lost_ownership";
-  if (category === "stale") return "corrupted_state";
-  if (category === "queued_no_dispatch") return "corrupted_continuation";
+  if (category === "lost") {
+    return "lost_ownership";
+  }
+  if (category === "stale") {
+    return "corrupted_state";
+  }
+  if (category === "queued_no_dispatch") {
+    return "corrupted_continuation";
+  }
   if (category === "already_completed_not_closed_cleanly" || category === "needs_final_delivery") {
     return "missing_correctness_proof";
   }
-  if (category === "monitor_disabled") return "runtime_recovery_failure";
+  if (category === "monitor_disabled") {
+    return "runtime_recovery_failure";
+  }
   if (category === "blocked_lawful" || category === "waiting_on_owner") {
     return "review_required_for_safe_work";
   }
-  if (classification === "cron/watchdog state mismatch") return "runtime_recovery_failure";
-  if (classification === "corrupted taskflow pointer") return "corrupted_pointer";
-  if (classification === "orphaned task") return "lost_ownership";
-  if (classification === "missing closeout") return "missing_correctness_proof";
-  if (classification === "real production blocker") return "review_required_for_safe_work";
-  if (classification === "stale running state") return "corrupted_state";
+  if (classification === "cron/watchdog state mismatch") {
+    return "runtime_recovery_failure";
+  }
+  if (classification === "corrupted taskflow pointer") {
+    return "corrupted_pointer";
+  }
+  if (classification === "orphaned task") {
+    return "lost_ownership";
+  }
+  if (classification === "missing closeout") {
+    return "missing_correctness_proof";
+  }
+  if (classification === "real production blocker") {
+    return "review_required_for_safe_work";
+  }
+  if (classification === "stale running state") {
+    return "corrupted_state";
+  }
   return undefined;
 }
 
@@ -503,23 +529,29 @@ export function resolveWatchdogNeedsReviewReconciliation(
             reason,
           })
         : undefined;
-    return {
-      entityType: stringValue(item.entity_type, "unknown"),
-      entityId: stringValue(item.entity_id, "unknown"),
-      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
-      ...(canonicalPriority ? { canonicalPriority } : {}),
-      classification,
-      repairRoute: routeForClassification(classification),
-      validationRequired: "rerun_watchdog" as const,
-      stoppageClass: "watchdog_needs_review" as const,
-      pauseForAnalysis: true,
-      ...recoveryFlags,
-      nextAnalysisOwner: "cleanup_crew_planning_dev_sop" as const,
-      planAmendmentRequired: classification !== "true active worker",
-      nextExecutableCommand: "rerun_system_wide_active_work_watchdog" as const,
-      ...(cleanupCrewRecoveryBridge ? { cleanupCrewRecoveryBridge } : {}),
-      reason,
-    };
+    return Object.assign(
+      {
+        entityType: stringValue(item.entity_type, "unknown"),
+        entityId: stringValue(item.entity_id, "unknown"),
+        policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      },
+      canonicalPriority ? { canonicalPriority } : {},
+      {
+        classification,
+        repairRoute: routeForClassification(classification),
+        validationRequired: "rerun_watchdog" as const,
+        stoppageClass: "watchdog_needs_review" as const,
+        pauseForAnalysis: true,
+      },
+      recoveryFlags,
+      {
+        nextAnalysisOwner: "cleanup_crew_planning_dev_sop" as const,
+        planAmendmentRequired: classification !== "true active worker",
+        nextExecutableCommand: "rerun_system_wide_active_work_watchdog" as const,
+      },
+      cleanupCrewRecoveryBridge ? { cleanupCrewRecoveryBridge } : {},
+      { reason },
+    );
   });
 
   return {

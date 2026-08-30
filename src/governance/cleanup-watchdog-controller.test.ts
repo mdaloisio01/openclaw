@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildCleanupWatchdogNeedsReviewReconciliationArtifact,
+  classifyCleanupWatchdogNeedsReviewItem,
   createCleanupWatchdogShadowInputFromReceipt,
   evaluateCleanupWatchdogActivationGate,
   reconcileCleanupWatchdogMission,
@@ -335,6 +337,93 @@ describe("cleanup-watchdog-controller", () => {
     expect(decision.requiredRepairTasks.map((finding) => finding.category)).toContain(
       "active_no_worker",
     );
+  });
+
+  it("classifies watchdog NEEDS_REVIEW items into required repair-route families", () => {
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "task_run",
+        entity_id: "worker-1",
+        category: "active_with_worker",
+      }),
+    ).toBe("true_active_worker");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "flow_run",
+        entity_id: "flow-stale",
+        category: "stale",
+        reason: "blocked flow stale",
+      }),
+    ).toBe("stale_blocked_flow");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "runtime",
+        entity_id: "gateway",
+        category: "runtime_recovery_failure",
+        reason: "stale runtime identity",
+      }),
+    ).toBe("stale_running_state");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "task_run",
+        entity_id: "task-orphan",
+        category: "active_no_worker",
+      }),
+    ).toBe("orphaned_task");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "report",
+        entity_id: "report-1",
+        category: "pending_report_delivery",
+      }),
+    ).toBe("missing_closeout");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "flow_run",
+        entity_id: "flow-corrupt",
+        category: "corrupted_pointer",
+      }),
+    ).toBe("corrupted_taskflow_pointer");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "cron",
+        entity_id: "cron-watchdog",
+        category: "missing_correctness_proof",
+        reason: "cron/watchdog state mismatch",
+      }),
+    ).toBe("cron_watchdog_state_mismatch");
+    expect(
+      classifyCleanupWatchdogNeedsReviewItem({
+        entity_type: "flow_run",
+        entity_id: "flow-blocker",
+        category: "review_required_for_safe_work",
+        reason: "real production blocker",
+      }),
+    ).toBe("real_production_blocker");
+  });
+
+  it("builds a required reconciliation artifact for watchdog NEEDS_REVIEW routing", () => {
+    expect(
+      buildCleanupWatchdogNeedsReviewReconciliationArtifact({
+        missionId: "flow-corrupt",
+        item: {
+          entity_type: "flow_run",
+          entity_id: "flow-corrupt",
+          category: "corrupted_pointer",
+          reason: "taskflow pointer does not resolve",
+        },
+      }),
+    ).toMatchObject({
+      schema: "openclaw.cleanup_watchdog.needs_review_reconciliation.v1",
+      trigger: "watchdog_needs_review",
+      classification: "corrupted_taskflow_pointer",
+      repairRoute: "taskflow_pointer_repair",
+      validationResult: "repair_required",
+      suspiciousEntity: {
+        type: "flow_run",
+        id: "flow-corrupt",
+      },
+    });
   });
 
   it("allows enforcement only after activation, rollback, shadow, watchdog, and safety gates pass", () => {

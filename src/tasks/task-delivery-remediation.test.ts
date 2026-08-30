@@ -192,7 +192,7 @@ function seedCandidateState(
   closeOpenClawStateDatabaseForTest();
 }
 
-function readRow<T>(dbPath: string, sql: string, ...args: (string | number | bigint | null)[]): T {
+function readRow(dbPath: string, sql: string, ...args: (string | number | bigint | null)[]) {
   const database = openOpenClawStateDatabase({ path: dbPath });
   const row = database.db.prepare(sql).get(...args) as T;
   closeOpenClawStateDatabaseForTest();
@@ -273,16 +273,16 @@ describe("task-delivery-remediation", () => {
       succeededBlockedTasks: 1,
     });
 
-    const repairedTask = readRow<{
-      terminal_outcome: string | null;
-      delivery_status: string;
-      terminal_summary: string | null;
-    }>(
+    const repairedTask = readRow(
       paths.dbPath,
       `SELECT terminal_outcome, delivery_status, terminal_summary
          FROM task_runs
         WHERE task_id = 'task-candidate'`,
-    );
+    ) as {
+      terminal_outcome: string | null;
+      delivery_status: string;
+      terminal_summary: string | null;
+    };
     expect(repairedTask).toEqual({
       terminal_outcome: "succeeded",
       delivery_status: "failed",
@@ -290,28 +290,23 @@ describe("task-delivery-remediation", () => {
         "Required completion delivery failed before reaching the requester: Error: CLI transcript compaction failed for openai/gpt-5.4: Summarization failed: Connection error.",
     });
 
-    const repairedFlow = readRow<{
-      status: string;
-      blocked_task_id: string | null;
-      blocked_summary: string | null;
-    }>(
+    const repairedFlow = readRow(
       paths.dbPath,
       `SELECT status, blocked_task_id, blocked_summary
          FROM flow_runs
         WHERE flow_id = 'flow-candidate'`,
-    );
+    ) as {
+      status: string;
+      blocked_task_id: string | null;
+      blocked_summary: string | null;
+    };
     expect(repairedFlow).toEqual({
       status: "succeeded",
       blocked_task_id: null,
       blocked_summary: null,
     });
 
-    const repairedSubagent = readRow<{
-      pending_final_delivery: number;
-      payload_delivery_status: string | null;
-      payload_suspended_reason: string | null;
-      payload_last_error: string | null;
-    }>(
+    const repairedSubagent = readRow(
       paths.dbPath,
       `SELECT
          pending_final_delivery,
@@ -320,7 +315,12 @@ describe("task-delivery-remediation", () => {
          json_extract(payload_json, '$.delivery.lastError') AS payload_last_error
        FROM subagent_runs
        WHERE run_id = 'run-candidate'`,
-    );
+    ) as {
+      pending_final_delivery: number;
+      payload_delivery_status: string | null;
+      payload_suspended_reason: string | null;
+      payload_last_error: string | null;
+    };
     expect(repairedSubagent).toEqual({
       pending_final_delivery: 0,
       payload_delivery_status: "suspended",
@@ -329,10 +329,9 @@ describe("task-delivery-remediation", () => {
         "Error: CLI transcript compaction failed for openai/gpt-5.4: Summarization failed: Connection error.",
     });
 
-    const backupCount = readRow<{ count: number }>(
-      paths.dbPath,
-      `SELECT COUNT(*) AS count FROM backup_runs`,
-    );
+    const backupCount = readRow(paths.dbPath, `SELECT COUNT(*) AS count FROM backup_runs`) as {
+      count: number;
+    };
     expect(backupCount.count).toBe(1);
 
     const second = runHistoricalDeliveryFailureRemediation({

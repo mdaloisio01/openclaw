@@ -95,9 +95,11 @@ export function admitGovernedMission(
 
   const contractCheck = requireCompleteContract(input.contract);
   if (!contractCheck.ok) {
-    return deny(input, "MALFORMED_CONTRACT_STATE", [
-      ...contractCheck.missingFields.map((field) => `missing:${field}`),
-    ]);
+    return deny(
+      input,
+      "MALFORMED_CONTRACT_STATE",
+      contractCheck.missingFields.map((field) => `missing:${field}`),
+    );
   }
   const contract = contractCheck.contract;
 

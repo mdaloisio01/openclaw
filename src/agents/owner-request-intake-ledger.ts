@@ -66,6 +66,7 @@ export type OwnerRequestIntakeRecord = {
   taskId?: string;
   recoveryDispatchId?: string;
   ownerNotificationId?: string;
+  ownerNotificationProofPath?: string;
   lastExecutableAction?: string;
   nextExecutableAction?: string;
   reason?: string;
@@ -392,6 +393,80 @@ export function markOwnerRequestChatOnlyExempted(params: {
   );
 }
 
+export function markOwnerRequestRecoveryDispatched(params: {
+  requestId: string;
+  recoveryDispatchId: string;
+  reason: string;
+  nextExecutableAction?: string | null;
+  stateDir?: string;
+  nowMs?: number;
+}): OwnerRequestIntakeRecord | undefined {
+  const nowMs = params.nowMs ?? Date.now();
+  return updateRecord(
+    params.requestId,
+    (record) => ({
+      ...record,
+      status: "recovery_dispatched",
+      reason: normalizeRequiredString(
+        params.reason,
+        "owner request intake recovery dispatched",
+        500,
+      ),
+      recoveryDispatchId: normalizeRequiredString(
+        params.recoveryDispatchId,
+        "recovery-dispatch",
+        240,
+      ),
+      updatedAt: nowIso(nowMs),
+      updatedAtMs: nowMs,
+      ...(normalizeOptionalString(params.nextExecutableAction, 500)
+        ? { nextExecutableAction: normalizeOptionalString(params.nextExecutableAction, 500) }
+        : {}),
+    }),
+    params.stateDir,
+  );
+}
+
+export function markOwnerRequestOwnerNotified(params: {
+  requestId: string;
+  ownerNotificationId: string;
+  ownerNotificationProofPath: string;
+  reason: string;
+  stateDir?: string;
+  nowMs?: number;
+}): OwnerRequestIntakeRecord | undefined {
+  const nowMs = params.nowMs ?? Date.now();
+  const ownerNotificationProofPath = normalizeRequiredString(
+    params.ownerNotificationProofPath,
+    "owner-notification-proof",
+    1_000,
+  );
+  if (!fs.existsSync(ownerNotificationProofPath)) {
+    throw new Error(`owner notification proof path does not exist: ${ownerNotificationProofPath}`);
+  }
+  return updateRecord(
+    params.requestId,
+    (record) => ({
+      ...record,
+      status: "owner_notified",
+      reason: normalizeRequiredString(
+        params.reason,
+        "owner notified about unrecoverable intake gap",
+        500,
+      ),
+      ownerNotificationId: normalizeRequiredString(
+        params.ownerNotificationId,
+        "owner-notification",
+        240,
+      ),
+      ownerNotificationProofPath,
+      updatedAt: nowIso(nowMs),
+      updatedAtMs: nowMs,
+    }),
+    params.stateDir,
+  );
+}
+
 export function listOwnerRequestIntakeRecords(
   params: { stateDir?: string } = {},
 ): OwnerRequestIntakeRecord[] {
@@ -415,7 +490,15 @@ export function classifyOwnerRequestIntakeGaps(
     ) {
       return [];
     }
-    if (record.status === "chat_only_exempted" || record.status === "recovery_dispatched") {
+    if (
+      record.status === "chat_only_exempted" ||
+      record.status === "recovery_dispatched" ||
+      (record.status === "owner_notified" &&
+        record.ownerNotificationId &&
+        record.reason &&
+        record.ownerNotificationProofPath &&
+        fs.existsSync(record.ownerNotificationProofPath))
+    ) {
       return [];
     }
     const ageMs = Math.max(0, nowMs - record.updatedAtMs);

@@ -79,7 +79,6 @@ const missionState = createGovernedMissionState({
 });
 
 const hostAllows = { trustedHost: true, openclawAllows: true, osAllows: true, hostAllows: true };
-const hostDenied = { trustedHost: true, openclawAllows: true, osAllows: false, hostAllows: true };
 
 const healthyCapabilities: EnforcementHealthCapabilityRecord[] =
   ENFORCEMENT_HEALTH_CAPABILITIES.map((capability) => ({
@@ -371,9 +370,9 @@ describe("SOP-ENF-20 end-to-end adversarial validation", () => {
         actual: (
           await webChatWithheld(
             () =>
-              new Promise((resolve) =>
-                setTimeout(() => resolve(releaseDecision(releaseState)), 25),
-              ),
+              new Promise((resolve) => {
+                setTimeout(() => resolve(releaseDecision(releaseState)), 25);
+              }),
             1,
           )
         ).text,
@@ -521,7 +520,7 @@ function protectedTool(
     childDelegation: overrides.childDelegation,
     targetPath: "src/governance/file.ts",
   };
-  const authorityProvided = Object.prototype.hasOwnProperty.call(overrides, "authority");
+  const authorityProvided = Object.hasOwn(overrides, "authority");
   return evaluateMissionSpecificToolEnforcement({
     actionId: "protected-action",
     actor: { actorId: "will", runId: "run-1" },
@@ -643,9 +642,12 @@ function health(
 ): ReturnType<typeof evaluateEnforcementHealth> {
   return evaluateEnforcementHealth({
     operation,
-    capabilities: healthyCapabilities.map((record) =>
-      record.capability === failedCapability ? { ...record, state, reason: "adversarial" } : record,
-    ),
+    capabilities: healthyCapabilities.map((record) => {
+      if (record.capability !== failedCapability) {
+        return record;
+      }
+      return Object.assign({}, record, { state, reason: "adversarial" });
+    }),
     now,
   });
 }

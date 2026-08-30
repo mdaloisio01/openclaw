@@ -328,6 +328,16 @@ function resolveAgentIds(cfg: OpenClawConfig, agent?: string): string[] {
   return [resolveDefaultAgentId(cfg)];
 }
 
+function formatReceiptField(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return "missing";
+  }
+  return JSON.stringify(value) ?? "missing";
+}
+
 export async function runMemoryFlushProofCommand(
   opts: MemoryFlushProofCommandOptions,
 ): Promise<void> {
@@ -350,9 +360,9 @@ export async function runMemoryFlushProofCommand(
   defaultRuntime.log(`Target: ${result.target.path}`);
   defaultRuntime.log(`Before size: ${result.target.before.size}`);
   defaultRuntime.log(`After size: ${result.target.after.size}`);
-  defaultRuntime.log(`Receipt schema: ${String(receipt?.schema ?? "missing")}`);
-  defaultRuntime.log(`Receipt operation: ${String(receipt?.operation ?? "missing")}`);
-  defaultRuntime.log(`Receipt path: ${String(receipt?.path ?? "missing")}`);
+  defaultRuntime.log(`Receipt schema: ${formatReceiptField(receipt?.schema)}`);
+  defaultRuntime.log(`Receipt operation: ${formatReceiptField(receipt?.operation)}`);
+  defaultRuntime.log(`Receipt path: ${formatReceiptField(receipt?.path)}`);
 }
 
 function formatExtraPaths(workspaceDir: string, extraPaths: string[]): string[] {

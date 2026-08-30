@@ -321,8 +321,8 @@ function hasValidGovernedAuthority(
 ): boolean {
   return (
     authority?.governedMissionAdmitted === true &&
-    authority.contractValid === true &&
-    authority.sourceLockValid === true &&
+    authority.contractValid &&
+    authority.sourceLockValid &&
     authority.policyDecision?.decision === "ALLOW"
   );
 }

@@ -160,11 +160,10 @@ export async function runMemoryFlushProof(
   const protectedAfter = await Promise.all(
     protectedBefore.map(async (entry) => {
       const after = await readFileSnapshot(path.resolve(workspaceDir, entry.path));
-      return {
-        ...entry,
+      return Object.assign({}, entry, {
         after,
         unchanged: entry.before.sha256 === after.sha256 && entry.before.exists === after.exists,
-      };
+      });
     }),
   );
 

@@ -437,9 +437,7 @@ describeLive("openai plugin live", () => {
     const agentDir = await createTempAgentDir();
 
     try {
-      let description:
-        | Awaited<ReturnType<NonNullable<typeof mediaProvider.describeImage>>>
-        | undefined;
+      let description: { text?: string } | undefined;
       try {
         description = await mediaProvider.describeImage?.({
           buffer: createReferencePng(),

@@ -48,7 +48,7 @@ function taskFlowRecord(
 ): Pick<TaskFlowRecord, "flowId" | "revision" | "stateJson"> {
   const missionState = createGovernedMissionState({
     contract,
-    authorityRef: contract.authorityRefs[0]!,
+    authorityRef: contract.authorityRefs[0],
     currentStep: "before_agent_finalize",
     ownerCorrelation: {
       owner: "Will",

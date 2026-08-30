@@ -153,10 +153,9 @@ export function evaluateMissionSpecificToolEnforcement(
       ]);
     }
   }
-  if (
-    actionClass === "child_execution_delegation" &&
-    authority.childInheritance?.decision !== "ALLOW"
-  ) {
+  const childInheritance =
+    actionClass === "child_execution_delegation" ? authority.childInheritance : undefined;
+  if (actionClass === "child_execution_delegation" && childInheritance?.decision !== "ALLOW") {
     return blocked(input, "MISSING_CHILD_INHERITANCE", [
       "deny_child_delegation",
       "require_child_inheritance_receipt",
@@ -184,11 +183,11 @@ export function evaluateMissionSpecificToolEnforcement(
       requiredEvidencePresent: authority.requiredEvidencePresent,
     },
     enforcementHealth: authority.enforcementHealth,
-    ...(actionClass === "child_execution_delegation"
+    ...(childInheritance?.decision === "ALLOW"
       ? {
           childContext: {
             delegationAllowed: true,
-            childMissionId: authority.childInheritance.receipt.parentMissionId,
+            childMissionId: childInheritance.receipt.parentMissionId,
           },
         }
       : {}),

@@ -98,7 +98,7 @@ async function readOnlyJsonArtifact<T>(dir: string, subdir: string): Promise<T> 
   const artifactDir = path.join(dir, subdir);
   const files = await fs.readdir(artifactDir);
   expect(files).toHaveLength(1);
-  return JSON.parse(await fs.readFile(path.join(artifactDir, files[0]!), "utf8")) as T;
+  return JSON.parse(await fs.readFile(path.join(artifactDir, files[0]), "utf8")) as T;
 }
 
 describe("active production watchdog lifecycle", () => {

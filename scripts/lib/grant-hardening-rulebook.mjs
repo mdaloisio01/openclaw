@@ -36,7 +36,9 @@ async function readRequiredText(absPath, label) {
     return text;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${label} missing or unreadable at ${absPath}: ${message}`);
+    throw new Error(`${label} missing or unreadable at ${absPath}: ${message}`, {
+      cause: error,
+    });
   }
 }
 
@@ -46,7 +48,9 @@ async function readRequiredJson(absPath, label) {
     return JSON.parse(raw);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`${label} missing or unreadable at ${absPath}: ${message}`);
+    throw new Error(`${label} missing or unreadable at ${absPath}: ${message}`, {
+      cause: error,
+    });
   }
 }
 

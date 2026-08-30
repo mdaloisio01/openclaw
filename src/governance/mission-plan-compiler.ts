@@ -22,7 +22,7 @@ export function compileMissionPlan(params: {
     const gateIds = gateKinds.map((kind) => `${requirement.id}:${kind}`);
     for (const [index, kind] of gateKinds.entries()) {
       gates.push({
-        id: gateIds[index]!,
+        id: gateIds[index],
         requirementId: requirement.id,
         kind,
         required: requirement.required,

@@ -65,6 +65,10 @@ const MATRIX_QA_SYNC_STATE_AFTER_KEY = "org.matrix.msc4222.state_after";
 const MATRIX_QA_SYNC_STATE_AFTER_PARAM = "org.matrix.msc4222.use_state_after";
 
 type MatrixQaE2eeBootstrapResult = Awaited<ReturnType<typeof runMatrixQaE2eeBootstrap>>;
+type MatrixQaRoomKeyRestoreSummary = {
+  imported: number;
+  total: number;
+};
 type MatrixQaCliVerificationStatus = {
   backup?: {
     decryptionKeyCached?: boolean | null;
@@ -264,7 +268,7 @@ async function waitForMatrixQaNonEmptyRoomKeyRestore(params: {
   timeoutMs: number;
 }) {
   const startedAt = Date.now();
-  let last: Awaited<ReturnType<MatrixQaE2eeScenarioClient["restoreRoomKeyBackup"]>> | null = null;
+  let last: MatrixQaRoomKeyRestoreSummary | null = null;
   while (Date.now() - startedAt < params.timeoutMs) {
     const restored = await params.client.restoreRoomKeyBackup({
       recoveryKey: params.recoveryKey,

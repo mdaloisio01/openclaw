@@ -35,7 +35,7 @@ async function readOnlyJsonArtifact<T>(dir: string, subdir: string): Promise<T> 
   const artifactDir = path.join(dir, subdir);
   const files = await readdir(artifactDir);
   expect(files).toHaveLength(1);
-  return JSON.parse(await readFile(path.join(artifactDir, files[0]!), "utf8")) as T;
+  return JSON.parse(await readFile(path.join(artifactDir, files[0]), "utf8")) as T;
 }
 
 function createGuardedDispatcher() {
@@ -676,6 +676,36 @@ describe("createReplyDispatcher", () => {
         next_action: "continue_cleanup_repair_through_canonical_policy",
       },
     });
+  });
+
+  it("rejects Cleanup Crew final closeout missing exact truth fields in the final path", () => {
+    const dispatcher = createGuardedDispatcher();
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        activeCleanupCrewMission: true,
+        currentTurnText: "Run Cleanup Crew until the current slice is truthfully closed.",
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+
+    const decision = allowTerminalCloseout(dispatcher, "sendFinalReply", {
+      text: [
+        "Cleanup Crew Runtime Enforcement Integration Slice 3 final closeout",
+        "Status: closed",
+        "Artifact path(s): /home/will/.openclaw/workspace/file_hub/exports/slice_3_closeout.md",
+      ].join("\n"),
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      violationReason: expect.stringContaining("report/closeout acceptance rejected"),
+    });
+    expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "CLEANUP_CREW_TERMINAL_CLOSEOUT_REJECTED" }),
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
   });
 
   it("allows explicit Mark report-only request to end after the report", () => {

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
-import type { SessionAcpMeta } from "../../config/sessions/types.js";
 import {
   AcpRuntimeError,
   AcpSessionManager,
@@ -64,14 +63,11 @@ describe("AcpSessionManager backend failover", () => {
     }));
     hoisted.upsertAcpSessionMetaMock.mockImplementation(async (paramsUnknown: unknown) => {
       const upsertParams = paramsUnknown as {
-        mutate: (
-          current: SessionAcpMeta | undefined,
-          entry: { acp?: SessionAcpMeta } | undefined,
-        ) => SessionAcpMeta | null | undefined;
+        mutate: (current: unknown, entry: { acp?: unknown } | undefined) => unknown;
       };
       const next = upsertParams.mutate(currentMeta, { acp: currentMeta });
       if (next) {
-        currentMeta = next;
+        currentMeta = next as typeof currentMeta;
       }
       return {
         sessionId: "session-1",

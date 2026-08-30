@@ -169,7 +169,7 @@ async function dispatchHarnessReplies(
       await params.dispatcherOptions.deliver?.(finalPayload, { kind: "final" });
       finalCount += 1;
     } catch (err) {
-      void params.dispatcherOptions.onError?.(err, { kind: "final" });
+      params.dispatcherOptions.onError?.(err, { kind: "final" });
     }
   }
   return {

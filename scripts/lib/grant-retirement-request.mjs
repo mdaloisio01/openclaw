@@ -68,6 +68,7 @@ export async function createGrantRetirementRequest(params) {
       `retirement request template missing or unreadable at ${templatePath}: ${
         error instanceof Error ? error.message : String(error)
       }`,
+      { cause: error },
     );
   }
 

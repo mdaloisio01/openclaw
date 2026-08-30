@@ -641,7 +641,7 @@ async function readOnlyJsonArtifact<T>(dir: string, subdir: string): Promise<T> 
   const artifactDir = path.join(dir, subdir);
   const files = await readdir(artifactDir);
   expect(files).toHaveLength(1);
-  return JSON.parse(await readFile(path.join(artifactDir, files[0]!), "utf8")) as T;
+  return JSON.parse(await readFile(path.join(artifactDir, files[0]), "utf8")) as T;
 }
 
 function shouldUseAcpReplyDispatchHook(eventUnknown: unknown): boolean {
@@ -668,7 +668,7 @@ function setNoAbort() {
   mocks.tryFastAbortFromMessage.mockResolvedValue(noAbortResult);
 }
 
-type MockAcpRuntime = AcpRuntime & {
+type MockAcpRuntime = {
   ensureSession: Mock<(input: AcpRuntimeEnsureInput) => Promise<AcpRuntimeHandle>>;
   runTurn: Mock<(input: AcpRuntimeTurnInput) => AsyncIterable<AcpRuntimeEvent>>;
   cancel: Mock<(input: { handle: AcpRuntimeHandle; reason?: string }) => Promise<void>>;

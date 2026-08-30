@@ -3,7 +3,8 @@ import {
   type GovernedPinnedReleaseState,
 } from "./governed-closeout-validator.js";
 
-export const GOVERNED_FINAL_RELEASE_DECISION_VERSION = "governed-final-release-decision-v1";
+export const GOVERNED_FINAL_RELEASE_DECISION_VERSION =
+  "governed-final-release-decision-v1" as const;
 export const GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE =
   "Governed result withheld because compliance state could not be verified.";
 

@@ -142,12 +142,12 @@ function hasProofList(value: unknown): boolean {
 }
 
 function missingProofComplete(value: TrbRecoveryContract["missing_proof"]): boolean {
-  return Boolean(
+  return (
     hasText(value?.what_was_checked) &&
     hasText(value?.proof_missing) &&
     hasText(value?.where_proof_should_exist) &&
     typeof value?.missing_proof_is_blocker === "boolean" &&
-    hasText(value?.exact_next_recovery_step),
+    hasText(value?.exact_next_recovery_step)
   );
 }
 

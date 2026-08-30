@@ -10,7 +10,7 @@ export function latestPassingReceiptForGate(params: {
   const candidates = params.receipts
     .filter((receipt) => receipt.gateId === params.gate.id && receipt.status === "passed")
     .filter((receipt) => identityMatches(receipt, params.identity))
-    .sort((a, b) => Date.parse(b.producedAt) - Date.parse(a.producedAt));
+    .toSorted((a, b) => Date.parse(b.producedAt) - Date.parse(a.producedAt));
   const latest = candidates[0];
   if (!latest) {
     return undefined;

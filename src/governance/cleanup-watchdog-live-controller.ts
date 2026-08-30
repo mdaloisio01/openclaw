@@ -10,6 +10,7 @@ import {
 import {
   createTaskRecord,
   deleteTaskRecordById,
+  getTaskById,
   listTasksForFlowId,
   markTaskLostById,
   recordTaskProgressByRunId,
@@ -22,12 +23,14 @@ import {
   listTaskFlowRecords,
 } from "../tasks/task-flow-runtime-internal.js";
 import {
+  buildCleanupWatchdogNeedsReviewReconciliationArtifact,
   createCleanupWatchdogShadowInputFromReceipt,
   evaluateCleanupWatchdogActivationGate,
   reconcileCleanupWatchdogMission,
   type CleanupWatchdogActivationGateInput,
   type CleanupWatchdogControllerDecision,
   type CleanupWatchdogControllerMode,
+  type CleanupWatchdogNeedsReviewReconciliationArtifact,
   type CleanupWatchdogReceiptItemSnapshot,
   type CleanupWatchdogReceiptSnapshot,
 } from "./cleanup-watchdog-controller.js";
@@ -89,11 +92,12 @@ export type CleanupWatchdogActivationParams = {
 
 export type CleanupWatchdogCanaryResult = {
   name:
-    | "A_active_no_executor"
-    | "B_blocked_false_clean"
-    | "C_priority_no_worker_report_debt"
-    | "D_milestone_report_and_continue"
-    | "E_policy_version_mismatch";
+    | "good_clean"
+    | "missing_worker"
+    | "duplicate_worker"
+    | "pending_report"
+    | "stale_runtime"
+    | "corrupted_pointer";
   passed: boolean;
   decision: CleanupWatchdogControllerDecision;
   proof: {
@@ -128,15 +132,21 @@ export type CleanupWatchdogReceiptConsumptionResult =
       status: "observed";
       reason: string;
       decision: CleanupWatchdogControllerDecision;
+      reconciliationArtifact?: CleanupWatchdogNeedsReviewReconciliationArtifact;
+      reconciliationArtifactPath?: string;
     }
   | {
       status: "blocked";
       reason: string;
       decision: CleanupWatchdogControllerDecision;
+      reconciliationArtifact?: CleanupWatchdogNeedsReviewReconciliationArtifact;
+      reconciliationArtifactPath?: string;
     }
   | {
       status: "dispatched";
       decision: CleanupWatchdogControllerDecision;
+      reconciliationArtifact: CleanupWatchdogNeedsReviewReconciliationArtifact;
+      reconciliationArtifactPath: string;
       repair: {
         route: "foreground_cleanup_crew_taskflow";
         flowId: string;
@@ -311,7 +321,30 @@ export function runCleanupWatchdogControlledCanaries(params?: {
   const mode = getCleanupWatchdogLiveControllerState({
     workspaceDir: params?.workspaceDir,
   }).controllerMode;
-  const canaryAInitial = reconcileCleanupWatchdogMission({
+  const goodCleanDecision = reconcileCleanupWatchdogMission({
+    mode,
+    suspiciousCount: 0,
+    cleanDimensions,
+    observedPolicyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    missionCoverage: {
+      missionId: "canary-good-clean",
+      unfinished: true,
+      activeProduction: true,
+      executorCount: 1,
+      executorLeaseCurrent: true,
+    },
+  });
+  const goodClean = canaryResult(
+    "good_clean",
+    goodCleanDecision,
+    ["all dimensions present", "exactly one executor present", "clean closure allowed"],
+    goodCleanDecision.canCloseClean &&
+      goodCleanDecision.requiredRepairTasks.length === 0 &&
+      goodCleanDecision.shadowDisagreements.length === 0,
+    { repair: "no repair route created for good-clean canary" },
+  );
+
+  const missingWorkerInitial = reconcileCleanupWatchdogMission({
     mode,
     suspiciousCount: 1,
     cleanDimensions,
@@ -323,7 +356,7 @@ export function runCleanupWatchdogControlledCanaries(params?: {
       executorCount: 0,
     },
   });
-  const canaryARepaired = reconcileCleanupWatchdogMission({
+  const missingWorkerRepaired = reconcileCleanupWatchdogMission({
     mode,
     suspiciousCount: 0,
     cleanDimensions,
@@ -336,96 +369,88 @@ export function runCleanupWatchdogControlledCanaries(params?: {
       executorLeaseCurrent: true,
     },
   });
-  const canaryA = canaryResult(
-    "A_active_no_executor",
-    canaryAInitial,
+  const missingWorker = canaryResult(
+    "missing_worker",
+    missingWorkerInitial,
     [
       "missing executor detected",
       "repair task required",
       "repaired projection has exactly one executor",
       "duplicate execution not created",
     ],
-    canaryAInitial.selectedPriority === "P2_ACTIVE_NO_WORKER" &&
-      canaryAInitial.requiredRepairTasks.length > 0 &&
-      canaryARepaired.coverageOk,
+    missingWorkerInitial.selectedPriority === "P2_ACTIVE_NO_WORKER" &&
+      missingWorkerInitial.requiredRepairTasks.length > 0 &&
+      missingWorkerRepaired.coverageOk,
   );
 
-  const canaryBDecision = reconcileCleanupWatchdogMission({
+  const duplicateWorkerDecision = reconcileCleanupWatchdogMission({
     mode,
     suspiciousCount: 1,
     cleanDimensions,
     observedPolicyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
     missionCoverage: {
-      missionId: "canary-b",
+      missionId: "canary-duplicate-worker",
       unfinished: true,
       activeProduction: true,
-      executorCount: 0,
+      executorCount: 2,
+      executorLeaseCurrent: true,
     },
-    findings: [
-      {
-        findingId: "canary-b:blocker",
-        category: "review_required_for_safe_work",
-        entityType: "flow_run",
-        entityId: "canary-b",
-        evidence: ["blocked state cannot erase coverage requirement"],
-        reason: "blocked unfinished mission lacks durable coverage",
-      },
-    ],
   });
-  const canaryB = canaryResult(
-    "B_blocked_false_clean",
-    canaryBDecision,
+  const duplicateWorker = canaryResult(
+    "duplicate_worker",
+    duplicateWorkerDecision,
     [
-      "blocked mission remains visible",
+      "duplicate executor coverage detected",
       "false clean is refused",
-      "coverage repair remains required",
+      "duplicate repair preempts lower-priority work",
     ],
-    !canaryBDecision.canCloseClean &&
-      !canaryBDecision.coverageOk &&
-      canaryBDecision.requiredRepairTasks.length > 0 &&
-      canaryBDecision.orderedFindings.some((finding) => finding.findingId === "canary-b:blocker"),
-    { repair: "blocked mission must gain valid durable coverage before clean closure" },
+    !duplicateWorkerDecision.canCloseClean &&
+      duplicateWorkerDecision.selectedPriority === "P1_SAFETY_OR_DUPLICATE_EXECUTION" &&
+      duplicateWorkerDecision.requiredRepairTasks.length > 0,
+    { repair: "duplicate executor state must be reconciled before new executor launch" },
   );
 
-  const canaryCDecision = reconcileCleanupWatchdogMission({
+  const pendingReportDecision = reconcileCleanupWatchdogMission({
     mode,
-    suspiciousCount: 2,
+    suspiciousCount: 1,
     cleanDimensions,
     observedPolicyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
     missionCoverage: {
-      missionId: "canary-c",
+      missionId: "canary-pending-report",
       unfinished: true,
       activeProduction: true,
-      executorCount: 0,
+      executorCount: 1,
+      executorLeaseCurrent: true,
     },
     findings: [
       {
-        findingId: "canary-c:report-debt",
+        findingId: "canary-pending-report:report-debt",
         category: "pending_report_delivery",
         entityType: "report",
-        entityId: "canary-c-report",
+        entityId: "canary-pending-report-report",
         evidence: ["report pending"],
         reason: "report debt remains durable",
       },
     ],
   });
-  const canaryC = canaryResult(
-    "C_priority_no_worker_report_debt",
-    canaryCDecision,
-    ["active_no_worker outranks report debt", "report debt remains in ordered findings"],
-    canaryCDecision.selectedPriority === "P2_ACTIVE_NO_WORKER" &&
-      canaryCDecision.orderedFindings.some(
-        (finding) => finding.findingId === "canary-c:report-debt",
-      ),
+  const pendingReport = canaryResult(
+    "pending_report",
+    pendingReportDecision,
+    ["pending report detected", "report debt remains visible", "clean closure refused"],
+    pendingReportDecision.selectedPriority === "P7_PENDING_REPORT_DELIVERY" &&
+      !pendingReportDecision.canCloseClean,
   );
 
-  const canaryDDecision = reconcileCleanupWatchdogMission({
+  const staleRuntimeDecision = reconcileCleanupWatchdogMission({
     mode,
     suspiciousCount: 1,
-    cleanDimensions,
+    cleanDimensions: {
+      ...cleanDimensions,
+      runtime_health: false,
+    },
     observedPolicyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
     missionCoverage: {
-      missionId: "canary-d",
+      missionId: "canary-stale-runtime",
       unfinished: true,
       activeProduction: true,
       executorCount: 1,
@@ -433,54 +458,62 @@ export function runCleanupWatchdogControlledCanaries(params?: {
     },
     findings: [
       {
-        findingId: "canary-d:milestone",
-        category: "pending_milestone_report",
-        entityType: "milestone",
-        entityId: "canary-d-milestone",
-        evidence: ["milestone body delivered", "next step recorded"],
-        reason: "milestone report-and-continue must not terminate mission",
+        findingId: "canary-stale-runtime:runtime",
+        category: "runtime_recovery_failure",
+        entityType: "runtime",
+        entityId: "gateway-runtime",
+        evidence: ["stale runtime proof"],
+        reason: "stale runtime must stay visible",
       },
     ],
   });
-  const canaryD = canaryResult(
-    "D_milestone_report_and_continue",
-    canaryDDecision,
-    ["milestone delivery recorded", "next executable step remains durable"],
-    canaryDDecision.selectedPriority === "P7_PENDING_REPORT_DELIVERY" &&
-      !canaryDDecision.canCloseClean,
-    {
-      repair: "deliver milestone and continue with recorded next executable step",
-      continuation: {
-        milestoneDelivered: true,
-        nextExecutableStepId: "canary-d-next-executable-step",
-        nextExecutableStepRecorded: true,
-        missionTerminatedByMilestone: false,
-      },
-    },
+  const staleRuntime = canaryResult(
+    "stale_runtime",
+    staleRuntimeDecision,
+    ["runtime health dimension failed", "runtime repair task required", "clean closure refused"],
+    staleRuntimeDecision.selectedPriority === "P4_RESTART_OR_RUNTIME_RECOVERY" &&
+      !staleRuntimeDecision.canCloseClean,
   );
 
-  const canaryEDecision = reconcileCleanupWatchdogMission({
+  const corruptedPointerDecision = reconcileCleanupWatchdogMission({
     mode,
-    suspiciousCount: 0,
+    suspiciousCount: 1,
     cleanDimensions,
-    observedPolicyVersion: "stale-policy",
+    observedPolicyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
     missionCoverage: {
-      missionId: "canary-e",
+      missionId: "canary-corrupted-pointer",
       unfinished: true,
       activeProduction: true,
       executorCount: 1,
       executorLeaseCurrent: true,
     },
+    findings: [
+      {
+        findingId: "canary-corrupted-pointer:pointer",
+        category: "corrupted_pointer",
+        entityType: "flow_run",
+        entityId: "canary-corrupted-pointer",
+        evidence: ["parent flow pointer does not resolve"],
+        reason: "corrupted taskflow pointer requires reconciliation",
+      },
+    ],
   });
-  const canaryE = canaryResult(
-    "E_policy_version_mismatch",
-    canaryEDecision,
-    ["stale policy stays visible", "false closure refused", "migration required"],
-    canaryEDecision.selectedPriority === "P5_MISSING_PROOF_OR_POLICY_MIGRATION" &&
-      !canaryEDecision.canCloseClean,
+  const corruptedPointer = canaryResult(
+    "corrupted_pointer",
+    corruptedPointerDecision,
+    ["corrupted pointer detected", "pointer repair task required", "clean closure refused"],
+    corruptedPointerDecision.selectedPriority === "P3_CORRUPTED_STATE" &&
+      !corruptedPointerDecision.canCloseClean,
   );
 
-  const results = [canaryA, canaryB, canaryC, canaryD, canaryE] as const;
+  const results = [
+    goodClean,
+    missingWorker,
+    duplicateWorker,
+    pendingReport,
+    staleRuntime,
+    corruptedPointer,
+  ] as const;
   const suite: CleanupWatchdogCanarySuiteResult = {
     ranAt: new Date().toISOString(),
     policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
@@ -527,6 +560,53 @@ function findMissionTaskItem(
   return receipt.decisions?.suspicious_items?.find(
     (item) => item.entity_type === "task_run" && item.proof?.parent_flow_id === missionId,
   );
+}
+
+function firstNeedsReviewItem(
+  receipt: CleanupWatchdogReceiptSnapshot,
+  missionId: string,
+): CleanupWatchdogReceiptItemSnapshot | undefined {
+  return (
+    findMissionFlowItem(receipt, missionId) ??
+    findMissionTaskItem(receipt, missionId) ??
+    receipt.decisions?.suspicious_items?.[0]
+  );
+}
+
+function itemFromRepairFinding(
+  finding: CleanupWatchdogControllerDecision["requiredRepairTasks"][number] | undefined,
+): CleanupWatchdogReceiptItemSnapshot | undefined {
+  if (!finding) {
+    return undefined;
+  }
+  return {
+    entity_type: finding.entityType,
+    entity_id: finding.entityId,
+    category: finding.category,
+    reason: finding.reason,
+  };
+}
+
+function writeNeedsReviewReconciliationArtifact(params: {
+  workspaceDir?: string;
+  missionId: string;
+  item: CleanupWatchdogReceiptItemSnapshot;
+  now: number;
+}): {
+  artifact: CleanupWatchdogNeedsReviewReconciliationArtifact;
+  path: string;
+} {
+  const artifact = buildCleanupWatchdogNeedsReviewReconciliationArtifact({
+    missionId: params.missionId,
+    item: params.item,
+  });
+  const paths = resolveCleanupWatchdogLiveControllerPaths(params.workspaceDir);
+  const artifactPath = path.join(
+    paths.receiptDir,
+    `needs_review_reconciliation_${params.missionId}_${params.now}.json`,
+  );
+  writeJsonDurable(artifactPath, artifact);
+  return { artifact, path: artifactPath };
 }
 
 function isForegroundCleanupCrewFinding(
@@ -603,7 +683,7 @@ function isControllerReplacementTask(task: {
 function listActiveControllerReplacementTasks(flowId: string) {
   return listTasksForFlowId(flowId)
     .filter((task) => isActiveTaskStatus(task.status) && isControllerReplacementTask(task))
-    .sort(
+    .toSorted(
       (left, right) =>
         (right.lastEventAt ?? right.startedAt ?? right.createdAt) -
         (left.lastEventAt ?? left.startedAt ?? left.createdAt),
@@ -651,6 +731,10 @@ function maybeSupersedeExecutorFromReceipt(params: {
     taskItem: params.taskItem,
   });
   if (!lostTaskId) {
+    return undefined;
+  }
+  const originalTask = getTaskById(lostTaskId);
+  if (!originalTask || originalTask.status !== "lost") {
     return undefined;
   }
   const now = params.now;
@@ -708,25 +792,82 @@ export function consumeReceiptWithLiveController(params: {
   currentTurnText?: string | null;
   now?: number;
 }): CleanupWatchdogReceiptConsumptionResult {
+  const now = params.now ?? Date.now();
   const decision = evaluateReceiptWithLiveController({
     workspaceDir: params.workspaceDir,
     receipt: params.receipt,
     missionId: params.missionId,
   });
+  const needsReviewItem =
+    decision.requiredRepairTasks.length > 0
+      ? (firstNeedsReviewItem(params.receipt, params.missionId) ??
+        itemFromRepairFinding(decision.requiredRepairTasks[0]))
+      : undefined;
+  const reconciliation = needsReviewItem
+    ? writeNeedsReviewReconciliationArtifact({
+        workspaceDir: params.workspaceDir,
+        missionId: params.missionId,
+        item: needsReviewItem,
+        now,
+      })
+    : undefined;
   if (decision.mode !== "enforce") {
-    return { status: "observed", reason: "controller_not_in_enforce_mode", decision };
+    return {
+      status: "observed",
+      reason: "controller_not_in_enforce_mode",
+      decision,
+      ...(reconciliation
+        ? {
+            reconciliationArtifact: reconciliation.artifact,
+            reconciliationArtifactPath: reconciliation.path,
+          }
+        : {}),
+    };
   }
   if (!decision.policyVersionOk) {
-    return { status: "blocked", reason: "policy_version_mismatch", decision };
+    return {
+      status: "blocked",
+      reason: "policy_version_mismatch",
+      decision,
+      ...(reconciliation
+        ? {
+            reconciliationArtifact: reconciliation.artifact,
+            reconciliationArtifactPath: reconciliation.path,
+          }
+        : {}),
+    };
   }
   if (decision.requiredRepairTasks.length === 0) {
     return { status: "observed", reason: "no_repair_required", decision };
+  }
+  if (decision.selectedPriority === "P1_SAFETY_OR_DUPLICATE_EXECUTION") {
+    return {
+      status: "blocked",
+      reason: "duplicate_executor_reconciliation_required",
+      decision,
+      ...(reconciliation
+        ? {
+            reconciliationArtifact: reconciliation.artifact,
+            reconciliationArtifactPath: reconciliation.path,
+          }
+        : {}),
+    };
   }
 
   const flowItem = findMissionFlowItem(params.receipt, params.missionId);
   const taskItem = findMissionTaskItem(params.receipt, params.missionId);
   if (!isForegroundCleanupCrewFinding(flowItem) && !isForegroundCleanupCrewFinding(taskItem)) {
-    return { status: "blocked", reason: "unsupported_repair_route", decision };
+    return {
+      status: "blocked",
+      reason: "unsupported_repair_route",
+      decision,
+      ...(reconciliation
+        ? {
+            reconciliationArtifact: reconciliation.artifact,
+            reconciliationArtifactPath: reconciliation.path,
+          }
+        : {}),
+    };
   }
 
   const ownerKey =
@@ -737,7 +878,17 @@ export function consumeReceiptWithLiveController(params: {
     flowItem?.proof?.current_step ??
     "cleanup_watchdog_governance_watchdog_reconciliation";
   if (!ownerKey || !sessionKey) {
-    return { status: "blocked", reason: "repair_identity_missing", decision };
+    return {
+      status: "blocked",
+      reason: "repair_identity_missing",
+      decision,
+      ...(reconciliation
+        ? {
+            reconciliationArtifact: reconciliation.artifact,
+            reconciliationArtifactPath: reconciliation.path,
+          }
+        : {}),
+    };
   }
 
   const registration = ensureForegroundCleanupCrewTaskFlow({
@@ -756,9 +907,14 @@ export function consumeReceiptWithLiveController(params: {
       status: "blocked",
       reason: `taskflow_dispatch_${registration.status}:${registration.reason}`,
       decision,
+      ...(reconciliation
+        ? {
+            reconciliationArtifact: reconciliation.artifact,
+            reconciliationArtifactPath: reconciliation.path,
+          }
+        : {}),
     };
   }
-  const now = params.now ?? Date.now();
   const lostTaskId = findLostTaskIdForReceipt({ flowItem, taskItem });
   if (lostTaskId && registration.taskId && registration.taskId !== lostTaskId) {
     markTaskLostById({
@@ -781,6 +937,8 @@ export function consumeReceiptWithLiveController(params: {
   return {
     status: "dispatched",
     decision,
+    reconciliationArtifact: reconciliation!.artifact,
+    reconciliationArtifactPath: reconciliation!.path,
     repair: {
       route: "foreground_cleanup_crew_taskflow",
       flowId: registration.flow.flowId,

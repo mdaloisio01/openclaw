@@ -135,9 +135,9 @@ function requireMockCallArg(mock: ReturnType<typeof vi.fn>, callIndex: number, l
   return requireRecord(mock.mock.calls[callIndex]?.[0], label);
 }
 
-function requireNestedRecord(value: unknown, label: string, path: string[]) {
+function requireNestedRecord(value: unknown, label: string, recordPath: string[]) {
   let current = value;
-  for (const key of path) {
+  for (const key of recordPath) {
     current = requireRecord(current, label)[key];
   }
   return requireRecord(current, label);

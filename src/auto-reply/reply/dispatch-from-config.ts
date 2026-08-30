@@ -35,6 +35,7 @@ import { resolveCleanupCrewPostReportContinuation } from "../../agents/report-de
 import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
 import {
   persistSourceTurnDeliveryState,
+  type SourceTurnDeliveryContext,
   type SourceTurnDeliveryRow,
 } from "../../agents/source-turn-delivery-store.js";
 import {
@@ -475,9 +476,79 @@ function buildSourceTurnDeliveryRecordId(params: {
   return `source:${sourceSessionKey}:${sourceMessageId}`;
 }
 
+function resolveSourceTurnDeliveryMetadata(params: {
+  ctx: FinalizedMsgContext;
+  recordId?: string;
+  route?: {
+    channel?: string;
+    to?: string;
+    accountId?: string;
+    threadId?: string | number;
+  };
+  deliveryChannel?: string;
+}): {
+  sourceSessionKey?: string;
+  sourceMessageId?: string;
+  sourceChannel?: string;
+  deliveryContext?: SourceTurnDeliveryContext;
+} {
+  const [, rawSourceSessionKey, rawSourceMessageId] =
+    params.recordId?.match(/^source:(.*):([^:]+)$/) ?? [];
+  const sourceSessionKey =
+    normalizeOptionalString(rawSourceSessionKey) ??
+    normalizeOptionalString(params.ctx.SessionKey) ??
+    normalizeOptionalString(params.ctx.CommandTargetSessionKey);
+  const sourceMessageId =
+    normalizeOptionalString(rawSourceMessageId) ??
+    normalizeOptionalString(params.ctx.MessageSidFull) ??
+    normalizeOptionalString(params.ctx.MessageSid) ??
+    normalizeOptionalString(params.ctx.MessageSidFirst) ??
+    normalizeOptionalString(params.ctx.MessageSidLast);
+  const sourceChannel = normalizeOptionalString(
+    params.ctx.OriginatingChannel ??
+      params.deliveryChannel ??
+      params.ctx.Provider ??
+      params.ctx.Surface,
+  );
+  const deliveryContext: SourceTurnDeliveryContext = {
+    ...(sourceChannel ? { channel: sourceChannel } : {}),
+    ...(normalizeOptionalString(params.route?.to ?? params.ctx.OriginatingTo ?? params.ctx.To)
+      ? {
+          to: normalizeOptionalString(
+            params.route?.to ?? params.ctx.OriginatingTo ?? params.ctx.To,
+          ),
+        }
+      : {}),
+    ...(normalizeOptionalString(params.route?.accountId ?? params.ctx.AccountId)
+      ? { accountId: normalizeOptionalString(params.route?.accountId ?? params.ctx.AccountId) }
+      : {}),
+    ...(normalizeOptionalString(
+      params.route?.threadId ?? params.ctx.MessageThreadId ?? params.ctx.TransportThreadId,
+    )
+      ? {
+          threadId: normalizeOptionalString(
+            params.route?.threadId ?? params.ctx.MessageThreadId ?? params.ctx.TransportThreadId,
+          ),
+        }
+      : {}),
+  };
+  return {
+    ...(sourceSessionKey ? { sourceSessionKey } : {}),
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+    ...(sourceChannel ? { sourceChannel } : {}),
+    ...(Object.keys(deliveryContext).length > 0 ? { deliveryContext } : {}),
+  };
+}
+
 async function persistDispatchSourceTurnDeliveryState(params: {
   registryPath?: string;
   recordId?: string;
+  metadata?: {
+    sourceSessionKey?: string;
+    sourceMessageId?: string;
+    sourceChannel?: string;
+    deliveryContext?: SourceTurnDeliveryContext;
+  };
   facts: SourceTurnDeliveryFacts;
   currentStage: string;
 }): Promise<SourceTurnDeliveryRow | undefined> {
@@ -489,6 +560,7 @@ async function persistDispatchSourceTurnDeliveryState(params: {
       registryPath: params.registryPath,
       id: params.recordId,
       sourceTurnId: params.recordId,
+      ...params.metadata,
       facts: params.facts,
       currentStage: params.currentStage,
     });
@@ -1574,7 +1646,7 @@ export async function dispatchReplyFromConfig(
       reportText,
       finalDeliveryDelivered: options.finalDeliveryDelivered,
     });
-    if (decision.state === "terminal_stop_allowed_lawful_blocker") {
+    if (decision.state === "terminal_stop_allowed_verified_hard_stop") {
       recordLawfulBlocker(dispatcher, "blocker");
       cleanupCrewPostReportContinuationRecorded = true;
       return;
@@ -1657,7 +1729,7 @@ export async function dispatchReplyFromConfig(
       reportText,
       finalDeliveryDelivered: true,
     });
-    if (decision.state === "terminal_stop_allowed_lawful_blocker") {
+    if (decision.state === "terminal_stop_allowed_verified_hard_stop") {
       recordLawfulBlocker(dispatcher, "blocker");
       cleanupCrewPostReportContinuationRecorded = true;
       return;
@@ -2222,10 +2294,22 @@ export async function dispatchReplyFromConfig(
     runId: params.replyOptions?.runId,
     sessionKey: acpDispatchSessionKey ?? sessionStoreEntry.sessionKey ?? sessionKey,
   });
+  const sourceTurnDeliveryMetadata = resolveSourceTurnDeliveryMetadata({
+    ctx,
+    recordId: sourceTurnDeliveryRecordId,
+    route: {
+      channel: replyRoute.channel,
+      to: replyRoute.to,
+      accountId: replyRoute.accountId,
+      threadId: routeReplyThreadId,
+    },
+    deliveryChannel,
+  });
   const recordSourceTurnDeliveryState = (facts: SourceTurnDeliveryFacts, currentStage: string) =>
     persistDispatchSourceTurnDeliveryState({
       registryPath: sourceTurnDeliveryRegistryPath,
       recordId: sourceTurnDeliveryRecordId,
+      metadata: sourceTurnDeliveryMetadata,
       facts,
       currentStage,
     });
@@ -2826,12 +2910,12 @@ export async function dispatchReplyFromConfig(
       }
       return `${collapsed.slice(0, 77).trimEnd()}...`;
     };
-    const buildProgressHeartbeatText = (params: {
+    const buildProgressHeartbeatText = (heartbeatParams: {
       progress?: string;
       currentStep: string;
     }): string => {
-      const progress = normalizeOptionalString(params.progress);
-      const currentStep = normalizeOptionalString(params.currentStep) ?? "continuing work";
+      const progress = normalizeOptionalString(heartbeatParams.progress);
+      const currentStep = normalizeOptionalString(heartbeatParams.currentStep) ?? "continuing work";
       return [
         "Status: still working.",
         ...(progress ? [`Progress: ${progress}`] : []),
@@ -2852,7 +2936,7 @@ export async function dispatchReplyFromConfig(
         currentStep,
       };
     };
-    const createProgressHeartbeatPayload = (params: {
+    const createProgressHeartbeatPayload = (heartbeatParams: {
       category: "plan" | "working";
       progress?: string;
       currentStep: string;
@@ -2860,12 +2944,12 @@ export async function dispatchReplyFromConfig(
       markReplyPayloadAsProgressHeartbeat(
         {
           text: buildProgressHeartbeatText({
-            progress: params.progress,
-            currentStep: params.currentStep,
+            progress: heartbeatParams.progress,
+            currentStep: heartbeatParams.currentStep,
           }),
           isStatusNotice: true,
         },
-        { category: params.category, activeRunContinues: true },
+        { category: heartbeatParams.category, activeRunContinues: true },
       );
     const maybeSendWorkingStatus = async (label: string): Promise<void> => {
       if (shouldSuppressProgressDelivery()) {

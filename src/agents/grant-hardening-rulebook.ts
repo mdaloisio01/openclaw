@@ -76,7 +76,9 @@ let grantHardeningRulebookModulePromise: Promise<GrantHardeningRulebookModule> |
 let grantHardeningRulebookModule: GrantHardeningRulebookModule | undefined;
 
 async function loadModule(): Promise<GrantHardeningRulebookModule> {
-  if (grantHardeningRulebookModule) return grantHardeningRulebookModule;
+  if (grantHardeningRulebookModule) {
+    return grantHardeningRulebookModule;
+  }
   grantHardeningRulebookModulePromise ??= import(
     grantHardeningRulebookModuleUrl
   ) as Promise<GrantHardeningRulebookModule>;

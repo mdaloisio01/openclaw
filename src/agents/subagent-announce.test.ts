@@ -217,6 +217,14 @@ function requireAgentCall() {
   return call;
 }
 
+function requireAgentMessage(): string {
+  const message = requireAgentCall().params?.message;
+  if (typeof message !== "string") {
+    throw new Error("expected agent call message");
+  }
+  return message;
+}
+
 describe("subagent wait outcome timing", () => {
   it.each([
     { wait: { status: "ok" }, expected: { status: "ok" } },
@@ -666,7 +674,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("[Grant Closeout Gate Result] rejected_closeout_missing_truth");
     expect(msg).toContain("This run does not count as truthfully complete yet.");
     expect(msg).toContain("Keep the item open and require a corrected Grant closeout.");
@@ -710,7 +718,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("[Grant Closeout Gate Result] accepted_closeout_fields_present");
     expect(msg).toContain("Grant closeout gate review required");
     expect(msg).toContain(
@@ -751,7 +759,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("[Grant Closeout Gate Result] rejected_closeout_missing_truth");
     expect(msg).toContain("actual execution owner");
     expect(msg).toContain("Grant closeout gate failed: rejected_closeout_missing_truth");
@@ -787,7 +795,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("[Grant Closeout Gate Result] rejected_proof_missing");
     expect(msg).toContain("This run does not count as truthfully complete yet.");
     expect(msg).toContain("Missing or unreadable proof path(s):");
@@ -820,7 +828,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("The result says the build is still open.");
     expect(msg).toContain("Lead the user-facing update with that open truth.");
     expect(msg).toContain(
@@ -904,7 +912,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("[Grant Closeout Gate Result] accepted_closeout_fields_present");
     expect(msg).not.toContain("rejected_proof_missing");
   });
@@ -948,7 +956,7 @@ describe("subagent announce seam flow", () => {
     });
 
     expect(didAnnounce).toBe(true);
-    const msg = String(requireAgentCall().params?.message ?? "");
+    const msg = requireAgentMessage();
     expect(msg).toContain("[Grant Closeout Gate Result] accepted_closeout_fields_present");
     expect(msg).not.toContain("rejected_proof_missing");
   });

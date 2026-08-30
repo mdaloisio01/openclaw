@@ -236,7 +236,9 @@ function removeStaleNativeHookRelaySlot(slotPath: string): boolean {
 }
 
 function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, ms));
+  });
 }
 
 export function createReadableTextStream(text: string): NodeJS.ReadableStream {

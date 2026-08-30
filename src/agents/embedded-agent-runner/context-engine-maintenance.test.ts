@@ -768,7 +768,7 @@ describe("runContextEngineMaintenance", () => {
             ? getTaskFlowProductionContinuation(getTaskFlowById(maintenanceTask.parentFlowId)!)
             : null,
         ).toBeNull();
-        expect(resolveTaskBuildExecutionTruth(maintenanceTask!)).toMatchObject({
+        expect(resolveTaskBuildExecutionTruth(maintenanceTask)).toMatchObject({
           state: "paused_pending_parent_review",
           broaderBuildOpen: true,
         });

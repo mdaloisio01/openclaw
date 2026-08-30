@@ -28,7 +28,7 @@ function latestReceiptForGate(
 ): EvidenceReceipt | undefined {
   return receipts
     .filter((receipt) => receipt.gateId === gateId && receipt.status === "passed")
-    .sort((a, b) => Date.parse(b.producedAt) - Date.parse(a.producedAt))[0];
+    .toSorted((a, b) => Date.parse(b.producedAt) - Date.parse(a.producedAt))[0];
 }
 
 function isSha256(value: string | undefined): boolean {
@@ -62,7 +62,7 @@ export function evaluateFalseCloseoutAdmission(input: CloseoutAdmissionInput): C
   }
   if (
     input.manifest.authorizedScopeHash !== input.manifest.scopeHash ||
-    input.manifest.planRevisionAuthorized !== true
+    !input.manifest.planRevisionAuthorized
   ) {
     reject(rejections, "FCAC_PLAN_REVISION_UNAUTHORIZED", "plan revision is not authorized");
   }

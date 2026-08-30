@@ -1,3 +1,4 @@
+import { resolveCleanupCrewReportCloseoutAcceptance } from "../../agents/report-delivery-guard.js";
 import { persistCleanupCrewContinuityGateDecision } from "../../commands/cleanup-plan.js";
 import type {
   AuthoritySource,
@@ -302,6 +303,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   currentTurnText?: string;
   responseText?: string;
   activeCleanupCrewMission?: boolean;
+  falseCloseoutAdmissionMode?: MissionMode;
 }): CleanupCrewFinalResponseGateDecision {
   const currentTurnText = normalizeText(params.currentTurnText);
   const responseText = normalizeText(params.responseText);
@@ -331,6 +333,16 @@ export function resolveCleanupCrewFinalResponseGate(params: {
     typedDecisionIsHardTerminalBlocker(typedDecisionReceipt) &&
     hasTerminalBlockerProofArtifacts(responseText);
   const typedTerminalBlocker = typedDecisionBlocksTerminalCloseout(typedDecisionReceipt);
+  const reportCloseoutAcceptance = resolveCleanupCrewReportCloseoutAcceptance({
+    currentTurnText: params.currentTurnText,
+    reportText: params.responseText,
+    activeCleanupCrewMission,
+    reportBodyDeliveredInChat: true,
+    milestoneStageCompleted: milestoneVisibilityReport,
+    milestoneReportDelivered: milestoneVisibilityReport,
+  });
+  const reportAcceptanceAdvisoryOnly =
+    params.falseCloseoutAdmissionMode === "shadow" || params.falseCloseoutAdmissionMode === "off";
 
   if (!activeCleanupCrewMission || !terminalAttempt) {
     return {
@@ -346,6 +358,24 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       blockerArtifactPresent,
       laneCDecisionRequired,
       typedDecisionReceipt,
+    };
+  }
+
+  if (!reportAcceptanceAdvisoryOnly && !reportCloseoutAcceptance.allowedToAcceptReport) {
+    return {
+      allowed: false,
+      activeCleanupCrewMission,
+      terminalAttempt,
+      explicitReportOnlyRequest,
+      explicitStopRequest,
+      milestoneVisibilityReport,
+      repairableBlocker,
+      nextRepairPathKnown,
+      hardBlockerNamedWithProof,
+      blockerArtifactPresent,
+      laneCDecisionRequired,
+      typedDecisionReceipt,
+      violationReason: `Cleanup Crew report/closeout acceptance rejected final response: ${reportCloseoutAcceptance.reason}`,
     };
   }
 
@@ -394,7 +424,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   if (
     typedTerminalBlocker &&
     typedDecisionIsHardTerminalBlocker(typedDecisionReceipt) &&
-    hardBlockerNamedWithProof === false
+    !hardBlockerNamedWithProof
   ) {
     return {
       allowed: false,
@@ -452,9 +482,9 @@ export function resolveCleanupCrewFinalResponseGate(params: {
 function shouldRejectTerminalCloseout(state: GuardState): boolean {
   return (
     hasPendingContinuationRequirement(state) &&
-    state.operatorPauseHold === false &&
-    state.blocker === false &&
-    state.nextExecutableStepStarted === false
+    !state.operatorPauseHold &&
+    !state.blocker &&
+    !state.nextExecutableStepStarted
   );
 }
 
@@ -694,6 +724,7 @@ export function allowTerminalCloseout(
       currentTurnText: state.cleanupCrewFinalResponse?.currentTurnText,
       activeCleanupCrewMission: state.cleanupCrewFinalResponse?.activeCleanupCrewMission,
       responseText: payload?.text,
+      falseCloseoutAdmissionMode: state.cleanupCrewFinalResponse?.falseCloseoutAdmissionMode,
     });
     const falseCloseoutAdmission =
       (payload ? getReplyPayloadMetadata(payload)?.falseCloseoutAdmission : undefined) ??
@@ -751,7 +782,7 @@ export function allowTerminalCloseout(
     if (
       cleanupCrewDecision.activeCleanupCrewMission &&
       cleanupCrewDecision.milestoneVisibilityReport &&
-      cleanupCrewDecision.terminalAttempt === false
+      !cleanupCrewDecision.terminalAttempt
     ) {
       if (state.nextExecutableStepStarted) {
         recordEvent(

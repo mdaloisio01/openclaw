@@ -79,7 +79,7 @@ export type CrestodianConfigSetCommonChangeAdapter = (
 ) => Promise<CrestodianConfigSetAdapterResult>;
 
 function requireText(value: string | undefined, field: string): string {
-  const trimmed = String(value ?? "").trim();
+  const trimmed = (value ?? "").trim();
   if (!trimmed) {
     throw new Error(`common_change_config_set_blocked:missing_${field}`);
   }
@@ -134,7 +134,7 @@ function collectDiffPaths(before: unknown, after: unknown, prefix = ""): string[
     ...(afterIsObject ? Object.keys(after as Record<string, unknown>) : []),
   ]);
   const out: string[] = [];
-  for (const key of [...keys].sort()) {
+  for (const key of [...keys].toSorted()) {
     const nextPrefix = prefix ? `${prefix}.${key}` : key;
     out.push(
       ...collectDiffPaths(

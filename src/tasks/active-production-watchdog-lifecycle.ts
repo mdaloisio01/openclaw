@@ -125,7 +125,7 @@ export function flowRequiresActiveWorkWatchdog(flow: TaskFlowRecord): boolean {
     return false;
   }
   if (continuation.lawfulStopReason && !continuation.continuationViolation) {
-    return continuation.parentRunOpen === true && continuation.nextExecutableUnitLaunched === true;
+    return continuation.parentRunOpen && continuation.nextExecutableUnitLaunched;
   }
   if (
     (flow.status === "succeeded" ||
@@ -234,10 +234,9 @@ async function persistProductionWatchdogContinuityGateDecision(params: {
           active: true,
         },
       ];
-  const actionSummary =
-    params.result.ok === false
-      ? `repair active production watchdog lifecycle action ${params.result.action}`
-      : `record active production watchdog lifecycle action ${params.result.action}`;
+  const actionSummary = !params.result.ok
+    ? `repair active production watchdog lifecycle action ${params.result.action}`
+    : `record active production watchdog lifecycle action ${params.result.action}`;
   try {
     await persistCleanupCrewContinuityGateDecision({
       outputDir,
@@ -255,7 +254,7 @@ async function persistProductionWatchdogContinuityGateDecision(params: {
           }
         : {
             summary: `Active production watchdog lifecycle result ${params.result.action} with ${params.decision.openTaskCount} open task(s).`,
-            blocker: params.result.ok === false ? "tooling gap" : "artifact missing",
+            blocker: !params.result.ok ? "tooling gap" : "artifact missing",
             pathRisk: "MEDIUM_RISK_RUNTIME",
             diffIntent: "proof_or_receipt_shape",
             behaviorImpact: "technical",

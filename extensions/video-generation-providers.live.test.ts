@@ -37,7 +37,6 @@ import {
 import type {
   GeneratedVideoAsset,
   VideoGenerationMode,
-  VideoGenerationModeCapabilities,
   VideoGenerationProvider,
   VideoGenerationRequest,
 } from "openclaw/plugin-sdk/test-env";
@@ -208,28 +207,38 @@ function maybeLoadShellEnvForVideoProviders(providerIds: string[]): void {
   maybeLoadShellEnvForGenerationProviders(providerIds);
 }
 
-function expectGeneratedVideo(video: GeneratedVideoAsset | undefined): LiveGeneratedVideo {
+function expectGeneratedVideo(video: unknown): LiveGeneratedVideo {
   if (!video) {
     throw new Error("expected generated video asset");
   }
-  expect(video.mimeType.startsWith("video/")).toBe(true);
-  if (video?.buffer) {
-    expect(video.buffer.byteLength).toBeGreaterThan(1024);
-    return video;
+  const generatedVideo = video as GeneratedVideoAsset;
+  expect(generatedVideo.mimeType.startsWith("video/")).toBe(true);
+  if (generatedVideo.buffer) {
+    expect(generatedVideo.buffer.byteLength).toBeGreaterThan(1024);
+    return generatedVideo;
   }
-  if (!video.url) {
+  if (!generatedVideo.url) {
     throw new Error("expected generated video buffer or url");
   }
-  expect(video.url).toMatch(/^https?:\/\//u);
-  return video;
+  expect(generatedVideo.url).toMatch(/^https?:\/\//u);
+  return generatedVideo;
 }
 
 function buildLiveCapabilityOverrides(params: {
-  caps: VideoGenerationModeCapabilities | undefined;
+  caps: unknown;
   liveResolution: VideoGenerationRequest["resolution"];
   liveSize: string | undefined;
 }): Pick<VideoGenerationRequest, "size" | "aspectRatio" | "resolution" | "audio" | "watermark"> {
-  const { caps, liveResolution, liveSize } = params;
+  const caps = params.caps as
+    | {
+        supportsAspectRatio?: boolean;
+        supportsAudio?: boolean;
+        supportsResolution?: boolean;
+        supportsSize?: boolean;
+        supportsWatermark?: boolean;
+      }
+    | undefined;
+  const { liveResolution, liveSize } = params;
   return {
     ...(caps?.supportsSize && liveSize ? { size: liveSize } : undefined),
     ...(caps?.supportsAspectRatio ? { aspectRatio: "16:9" } : undefined),

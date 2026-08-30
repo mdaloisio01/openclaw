@@ -51,6 +51,35 @@ describe("source turn delivery storage adapter", () => {
     expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [row] });
   });
 
+  it("persists source route metadata for later watchdog repair", async () => {
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:agent:orchestrator:main:message-1",
+      facts: {},
+      sourceSessionKey: "agent:orchestrator:main",
+      sourceMessageId: "message-1",
+      sourceChannel: "webchat",
+      deliveryContext: {
+        channel: "webchat",
+        to: "webchat:user-123",
+        accountId: "default",
+        threadId: 42,
+      },
+    });
+
+    expect(row).toMatchObject({
+      sourceSessionKey: "agent:orchestrator:main",
+      sourceMessageId: "message-1",
+      sourceChannel: "webchat",
+      deliveryContext: {
+        channel: "webchat",
+        to: "webchat:user-123",
+        accountId: "default",
+        threadId: "42",
+      },
+    });
+  });
+
   it("keys governed report delivery obligations by mission, run, report, delivery, and generation", async () => {
     const row = await persistSourceTurnDeliveryState({
       registryPath,
@@ -347,7 +376,7 @@ describe("source turn delivery storage adapter", () => {
       finalDeliveryDelivered: false,
       visibleDeliveryCount: 0,
     });
-    expect(classifySourceTurnDeliveryWatchdogStatus(registry.rows[0]!)).toBe("blocking_refused");
+    expect(classifySourceTurnDeliveryWatchdogStatus(registry.rows[0])).toBe("blocking_refused");
     expect(registry.rows[1]).toMatchObject({
       id: mismatchedDelivery.id,
       obligationStage: "delivered",
@@ -356,7 +385,7 @@ describe("source turn delivery storage adapter", () => {
       finalDeliveryDelivered: true,
       visibleDeliveryCount: 1,
     });
-    expect(classifySourceTurnDeliveryWatchdogStatus(registry.rows[1]!)).toBe(
+    expect(classifySourceTurnDeliveryWatchdogStatus(registry.rows[1])).toBe(
       "non_blocking_delivered",
     );
   });
@@ -392,6 +421,28 @@ describe("source turn delivery storage adapter", () => {
     });
     expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("blocking_failed");
     expect(sourceTurnDeliveryBlocksWatchdog(row)).toBe(true);
+  });
+
+  it("treats a visible source-chat failure notice as non-blocking delivery handling", async () => {
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:failure-visible",
+      facts: {
+        finalDeliveryRequired: true,
+        failureNoticeVisible: true,
+        evidenceKinds: ["source_chat_failure"],
+      },
+    });
+
+    expect(row).toMatchObject({
+      deliveryStatus: "failure_delivered",
+      obligationStage: "delivery_attempted",
+      sourceTurnState: "failure_delivered",
+      finalDeliveryDelivered: false,
+      visibleDeliveryCount: 1,
+    });
+    expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("non_blocking_delivered");
+    expect(sourceTurnDeliveryBlocksWatchdog(row)).toBe(false);
   });
 
   it("preserves blocked/refused state as watchdog-blocking", async () => {

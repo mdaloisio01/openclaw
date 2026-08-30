@@ -174,8 +174,8 @@ function buildCheckpoint(params: {
 }): ActiveWorkCheckpoint {
   const checkpointId = crypto.randomUUID();
   const expiresAtMs = params.nowMs + Math.max(1, Math.floor(params.ttlMs));
-  const safeToAutoResume = params.input.safeToAutoResume === true;
-  const requiresOperatorReview = params.input.requiresOperatorReview === true || !safeToAutoResume;
+  const safeToAutoResume = params.input.safeToAutoResume;
+  const requiresOperatorReview = params.input.requiresOperatorReview || !safeToAutoResume;
   return {
     kind: ACTIVE_WORK_CHECKPOINT_KIND,
     schemaVersion: ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION,
@@ -323,8 +323,7 @@ function parseCheckpoint(raw: string): ActiveWorkCheckpoint | undefined {
   return {
     ...(record as ActiveWorkCheckpoint),
     version: ACTIVE_WORK_CHECKPOINT_SCHEMA_VERSION,
-    updatedAt:
-      typeof record.updatedAt === "string" ? record.updatedAt : String(record.createdAt ?? ""),
+    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : (record.createdAt ?? ""),
     updatedAtMs:
       typeof record.updatedAtMs === "number" && Number.isFinite(record.updatedAtMs)
         ? record.updatedAtMs
@@ -374,7 +373,7 @@ export async function listActiveWorkCheckpoints(
     }
     checkpoints.push(checkpoint);
   }
-  return checkpoints.sort((a, b) => a.createdAtMs - b.createdAtMs);
+  return checkpoints.toSorted((a, b) => a.createdAtMs - b.createdAtMs);
 }
 
 export async function updateActiveWorkCheckpointStatus(params: {

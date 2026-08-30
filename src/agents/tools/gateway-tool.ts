@@ -262,9 +262,7 @@ function buildGatewayToolActivationContinuation(params: {
     ...(requiredChecks ? { requiredChecks } : {}),
     objective,
     ...(hardStopRules ? { hardStopRules } : {}),
-    requestedRestartAction: {
-      ...(params.reason ? { reason: params.reason } : {}),
-    },
+    requestedRestartAction: params.reason ? { reason: params.reason } : {},
   };
 }
 

@@ -171,8 +171,8 @@ function parseRawConfigOrRespond(
   return rawValue;
 }
 
-function sanitizeLookupPathForLog(path: string): string {
-  const sanitized = Array.from(path, (char) => {
+function sanitizeLookupPathForLog(lookupPath: string): string {
+  const sanitized = Array.from(lookupPath, (char) => {
     const code = char.charCodeAt(0);
     return code < 0x20 || code === 0x7f ? "?" : char;
   }).join("");
@@ -395,9 +395,11 @@ function parseValidateConfigFromRawOrRespond(
     respond(
       false,
       undefined,
-      errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(error), {
-        ...(issues ? { details: { issues } } : {}),
-      }),
+      errorShape(
+        ErrorCodes.INVALID_REQUEST,
+        formatErrorMessage(error),
+        issues ? { details: { issues } } : {},
+      ),
     );
     return null;
   }
@@ -727,9 +729,9 @@ export const configHandlers: GatewayRequestHandlers = {
     ) {
       return;
     }
-    const path = (params as { path: string }).path;
+    const schemaPath = (params as { path: string }).path;
     const schema = loadSchemaWithPlugins();
-    const result = lookupConfigSchema(schema, path, resolveConfigReloadMetadata);
+    const result = lookupConfigSchema(schema, schemaPath, resolveConfigReloadMetadata);
     if (!result) {
       respond(
         false,
@@ -741,7 +743,7 @@ export const configHandlers: GatewayRequestHandlers = {
     if (!validateConfigSchemaLookupResult(result)) {
       const errors = validateConfigSchemaLookupResult.errors ?? [];
       context.logGateway.warn(
-        `config.schema.lookup produced invalid payload for ${sanitizeLookupPathForLog(path)}: ${formatValidationErrors(errors)}`,
+        `config.schema.lookup produced invalid payload for ${sanitizeLookupPathForLog(schemaPath)}: ${formatValidationErrors(errors)}`,
       );
       respond(
         false,
@@ -860,9 +862,11 @@ export const configHandlers: GatewayRequestHandlers = {
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.INVALID_REQUEST, formatErrorMessage(error), {
-          ...(issues ? { details: { issues } } : {}),
-        }),
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          formatErrorMessage(error),
+          issues ? { details: { issues } } : {},
+        ),
       );
       return;
     }

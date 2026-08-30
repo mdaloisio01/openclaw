@@ -279,11 +279,10 @@ describe("applyCrestodianConfigSetThroughCommonChangeRegistry", () => {
       0,
       "idem-distinct:create",
     );
-    expect(
-      (commonChange.registry?.transition_operation as ReturnType<typeof vi.fn>).mock.calls.map(
-        (call) => call[8],
-      ),
-    ).toEqual([
+    const transitionOperation = commonChange.registry?.transition_operation as ReturnType<
+      typeof vi.fn
+    >;
+    expect(transitionOperation.mock.calls.map((call) => call[8])).toEqual([
       "idem-distinct:preflight_passed",
       "idem-distinct:applied",
       "idem-distinct:post_action_pending",
@@ -305,9 +304,10 @@ describe("applyCrestodianConfigSetThroughCommonChangeRegistry", () => {
       "applied",
       "post_action_pending",
     ]);
-    const appliedCall = (
-      commonChange.registry?.transition_operation as ReturnType<typeof vi.fn>
-    ).mock.calls.find((call) => call[1] === "applied");
+    const transitionOperation = commonChange.registry?.transition_operation as ReturnType<
+      typeof vi.fn
+    >;
+    const appliedCall = transitionOperation.mock.calls.find((call) => call[1] === "applied");
     expect(appliedCall?.[3]).toMatchObject({
       changed_paths: [],
       idempotent_noop: true,

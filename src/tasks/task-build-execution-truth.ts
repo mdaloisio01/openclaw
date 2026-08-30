@@ -58,14 +58,14 @@ function continuationRequiredAfterLocalSuccess(task: Pick<TaskRecord, "parentFlo
   const continuation = getTaskFlowProductionContinuation(flow);
   return (
     continuation?.activeProductionRun === true &&
-    continuation.continuationRequiredAfterLocalSuccess === true &&
-    continuation.nextExecutableUnitLaunched !== true &&
-    continuation.lawfulWholeRunCompletion !== true &&
-    continuation.blockerPresent !== true &&
-    continuation.ownerDecisionRequired !== true &&
-    continuation.restartOrReloadRequired !== true &&
-    continuation.hardStopPresent !== true &&
-    continuation.safetyStopPresent !== true
+    continuation.continuationRequiredAfterLocalSuccess &&
+    !continuation.nextExecutableUnitLaunched &&
+    !continuation.lawfulWholeRunCompletion &&
+    !continuation.blockerPresent &&
+    !continuation.ownerDecisionRequired &&
+    !continuation.restartOrReloadRequired &&
+    !continuation.hardStopPresent &&
+    !continuation.safetyStopPresent
   );
 }
 

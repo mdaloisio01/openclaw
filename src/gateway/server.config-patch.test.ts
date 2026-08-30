@@ -90,7 +90,7 @@ function stampedCandidateForManifest(config: Record<string, unknown>): Record<st
   return {
     ...config,
     meta: {
-      ...((config.meta as Record<string, unknown> | undefined) ?? {}),
+      ...(config.meta as Record<string, unknown> | undefined),
       lastTouchedVersion: VERSION,
       lastTouchedAt: TEST_ACTIVATION_AT,
     },
@@ -293,7 +293,7 @@ describe("gateway config methods", () => {
   });
 
   it("round-trips config.set and returns the live config path", async () => {
-    const { createConfigIO } = await import("../config/config.js");
+    const { createConfigIO: createConfigIOForSet } = await import("../config/config.js");
     const current = await getCurrentConfigObject();
 
     const res = await rpcReq<{
@@ -305,7 +305,7 @@ describe("gateway config methods", () => {
     });
 
     expect(res.ok).toBe(true);
-    expect(res.payload?.path).toBe(createConfigIO().configPath);
+    expect(res.payload?.path).toBe(createConfigIOForSet().configPath);
     requireConfigObject(res.payload?.config, "updated config");
   });
 
@@ -336,8 +336,9 @@ describe("gateway config methods", () => {
   });
 
   it("accepts runtime-shaped config.set when bundled provider baseUrl was only defaulted", async () => {
-    const { createConfigIO, resetConfigRuntimeState } = await import("../config/config.js");
-    const configPath = createConfigIO().configPath;
+    const { createConfigIO: createConfigIOForSet, resetConfigRuntimeState } =
+      await import("../config/config.js");
+    const configPath = createConfigIOForSet().configPath;
     try {
       await writeJsonFile(configPath, {
         models: {
@@ -382,8 +383,9 @@ describe("gateway config methods", () => {
   });
 
   it("redacts browser cdpUrl credentials from config.get responses", async () => {
-    const { createConfigIO, resetConfigRuntimeState } = await import("../config/config.js");
-    const configPath = createConfigIO().configPath;
+    const { createConfigIO: createConfigIOForRedaction, resetConfigRuntimeState } =
+      await import("../config/config.js");
+    const configPath = createConfigIOForRedaction().configPath;
     try {
       await writeJsonFile(configPath, {
         browser: {

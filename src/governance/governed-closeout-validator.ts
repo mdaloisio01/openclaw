@@ -110,7 +110,7 @@ export function validateGovernedCloseoutAndBuildReleaseState(
     contractHash: input.contract.contractHash,
     authorityHash: input.contract.authorityHash,
     ...(input.payloadHash ? { payloadHash: input.payloadHash } : {}),
-    requiredEvidenceReceiptRefs: [...input.requiredEvidenceReceiptRefs].sort(),
+    requiredEvidenceReceiptRefs: [...input.requiredEvidenceReceiptRefs].toSorted(),
     closeoutReceiptRef,
     closeoutReceiptHash,
     validatorVerdict: verdict,
@@ -204,7 +204,7 @@ function buildCloseoutReceipt(
     producedAt: input.producedAt,
     producer: input.producer,
     passed: releaseAllowed,
-    evidenceRefs: [...input.presentEvidenceReceiptRefs].sort(),
+    evidenceRefs: [...input.presentEvidenceReceiptRefs].toSorted(),
     ...(!releaseAllowed ? { failureState: failureStateFor(rejectionCodes) } : {}),
   };
 }
@@ -263,7 +263,7 @@ function sortForJson(value: unknown): unknown {
     return value;
   }
   const out: Record<string, unknown> = {};
-  for (const key of Object.keys(value).sort()) {
+  for (const key of Object.keys(value).toSorted()) {
     out[key] = sortForJson((value as Record<string, unknown>)[key]);
   }
   return out;

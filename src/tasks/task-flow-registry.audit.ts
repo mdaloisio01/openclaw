@@ -294,8 +294,8 @@ export function listTaskFlowAuditFindings(
     const continuation = getTaskFlowProductionContinuation(flow);
     if (
       continuation?.activeProductionRun === true &&
-      continuation.continuationRequiredAfterLocalSuccess === true &&
-      continuation.nextExecutableUnitLaunched !== true
+      continuation.continuationRequiredAfterLocalSuccess &&
+      !continuation.nextExecutableUnitLaunched
     ) {
       findings.push(
         createFinding({

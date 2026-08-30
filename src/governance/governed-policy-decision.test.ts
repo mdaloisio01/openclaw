@@ -4,7 +4,7 @@ import {
   type GovernedMissionContract,
 } from "./governed-mission-contract.js";
 import { createGovernedMissionState } from "./governed-mission-state.js";
-import { type GovernedOperatorOverrideRecord } from "./governed-operator-override.js";
+import type { GovernedOperatorOverrideRecord } from "./governed-operator-override.js";
 import { GOVERNED_ACTION_CLASSES, evaluateGovernedAction } from "./governed-policy-decision.js";
 
 const contract: GovernedMissionContract = {

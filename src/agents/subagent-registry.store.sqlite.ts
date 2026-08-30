@@ -271,12 +271,12 @@ function shouldPreservePersistedDeliveryState(params: {
     currentDelivery.status === "pending" || currentDelivery.status === "suspended";
   const persistedClearedPending = !persistedDelivery.payload;
   const currentStillCarriesPendingPayload = Boolean(currentDelivery.payload);
-  return Boolean(
+  return (
     persistedDelivered &&
     persistedClearedPending &&
     (persistedHasReplayRepair || typeof persistedDelivery.announcedAt === "number") &&
     currentPendingOrSuspended &&
-    (currentStillCarriesPendingPayload || !currentHasReplayRepair),
+    (currentStillCarriesPendingPayload || !currentHasReplayRepair)
   );
 }
 

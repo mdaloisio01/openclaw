@@ -182,10 +182,10 @@ async function sourceTurnDeliveryAlreadyFinalDelivered(params: {
       registry.rows.find(
         (candidate) => !candidate.idempotencyKey && candidate.id === params.recordId,
       );
-    return Boolean(
-      row?.finalDeliveryDelivered ||
+    return (
+      row?.finalDeliveryDelivered === true ||
       row?.sourceTurnState === "final_delivered" ||
-      row?.sourceTurnState === "failure_delivered",
+      row?.sourceTurnState === "failure_delivered"
     );
   } catch (error) {
     defaultRuntime.log(

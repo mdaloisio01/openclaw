@@ -16,8 +16,8 @@ export function reconcileTestManifest(
 ): TestManifestReconciliation {
   const requested = new Set(manifest?.requestedFiles ?? []);
   const executed = new Set((results ?? []).map((result) => result.file));
-  const missingFiles = [...requested].filter((file) => !executed.has(file)).sort();
-  const unexpectedFiles = [...executed].filter((file) => !requested.has(file)).sort();
+  const missingFiles = [...requested].filter((file) => !executed.has(file)).toSorted();
+  const unexpectedFiles = [...executed].filter((file) => !requested.has(file)).toSorted();
   const actualTotal = (results ?? []).reduce(
     (sum, result) => sum + result.passed + result.failed + (result.skipped ?? 0),
     0,

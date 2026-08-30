@@ -223,31 +223,28 @@ describe("cleanup-watchdog live controller", () => {
     expect(result.controllerMode).toBe("enforce");
     expect(result.passed).toBe(true);
     expect(result.results.map((item) => item.name)).toEqual([
-      "A_active_no_executor",
-      "B_blocked_false_clean",
-      "C_priority_no_worker_report_debt",
-      "D_milestone_report_and_continue",
-      "E_policy_version_mismatch",
+      "good_clean",
+      "missing_worker",
+      "duplicate_worker",
+      "pending_report",
+      "stale_runtime",
+      "corrupted_pointer",
     ]);
-    const blockedFalseClean = result.results.find((item) => item.name === "B_blocked_false_clean");
-    expect(blockedFalseClean?.decision.canCloseClean).toBe(false);
-    expect(blockedFalseClean?.decision.coverageOk).toBe(false);
-    expect(blockedFalseClean?.decision.requiredRepairTasks.length).toBeGreaterThan(0);
+    const goodClean = result.results.find((item) => item.name === "good_clean");
+    expect(goodClean?.decision.canCloseClean).toBe(true);
+    expect(goodClean?.decision.requiredRepairTasks).toEqual([]);
 
-    const milestone = result.results.find(
-      (item) => item.name === "D_milestone_report_and_continue",
-    );
-    expect(milestone?.proof.continuation).toMatchObject({
-      milestoneDelivered: true,
-      nextExecutableStepRecorded: true,
-      missionTerminatedByMilestone: false,
-    });
-    expect(milestone?.decision.canCloseClean).toBe(false);
+    const duplicateWorker = result.results.find((item) => item.name === "duplicate_worker");
+    expect(duplicateWorker?.decision.canCloseClean).toBe(false);
+    expect(duplicateWorker?.decision.selectedPriority).toBe("P1_SAFETY_OR_DUPLICATE_EXECUTION");
+
+    const missingWorker = result.results.find((item) => item.name === "missing_worker");
+    expect(missingWorker?.decision.selectedPriority).toBe("P2_ACTIVE_NO_WORKER");
 
     expect(
       result.results.every(
         (item) =>
-          item.proof.cleanup.productionMissionMutated === false &&
+          !item.proof.cleanup.productionMissionMutated &&
           item.proof.cleanup.residualMissionState === "none" &&
           item.proof.cleanup.evidenceRetention === "state_and_receipt_intentionally_retained",
       ),
@@ -327,6 +324,13 @@ describe("cleanup-watchdog live controller", () => {
     }
     expect(result.decision.mode).toBe("enforce");
     expect(result.decision.selectedPriority).toBe("P2_ACTIVE_NO_WORKER");
+    expect(result.reconciliationArtifact).toMatchObject({
+      trigger: "watchdog_needs_review",
+      classification: "stale_blocked_flow",
+      repairRoute: "foreground_cleanup_crew_taskflow",
+      validationResult: "repair_required",
+    });
+    expect(fs.existsSync(result.reconciliationArtifactPath)).toBe(true);
     expect(result.repair).toMatchObject({
       route: "foreground_cleanup_crew_taskflow",
       ownerKey: "agent:orchestrator:main",
@@ -554,6 +558,103 @@ describe("cleanup-watchdog live controller", () => {
       listTasksForFlowId(first.flow.flowId).find((task) => task.taskId === olderReplacement.taskId)
         ?.status,
     ).toBe("lost");
+  });
+
+  it("blocks duplicate executor receipts without launching another replacement", () => {
+    const workspaceDir = tempWorkspace();
+    activateCleanupWatchdogLiveController({
+      workspaceDir,
+      command: "cleanup-watchdog-live-controller activate",
+      gates: allGates,
+    });
+    const result = consumeReceiptWithLiveController({
+      workspaceDir,
+      missionId: "flow-duplicate",
+      receipt: {
+        policy_version: CLEANUP_WATCHDOG_POLICY_VERSION,
+        summary: { items_suspicious: 1 },
+        decisions: {
+          healthy_items: [],
+          suspicious_items: [
+            {
+              entity_type: "flow_run",
+              entity_id: "flow-duplicate",
+              category: "duplicate_execution_or_fencing_failure",
+              label: "Foreground Cleanup Crew production mission",
+              proof: {
+                active_child_tasks: 2,
+                current_step: "cleanup_watchdog_governance_repair",
+                owner_key: "agent:orchestrator:main",
+              },
+              reason: "duplicate executor coverage for unfinished mission",
+            },
+          ],
+        },
+      },
+      now: 1600,
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(result.reason).toBe("duplicate_executor_reconciliation_required");
+    expect(result.reconciliationArtifact).toMatchObject({
+      trigger: "watchdog_needs_review",
+      repairRoute: "production_blocker_reconciliation",
+    });
+    expect(listTaskFlowRecords()).toHaveLength(0);
+  });
+
+  it("does not create a replacement when the named original executor is not proven lost", () => {
+    const workspaceDir = tempWorkspace();
+    activateCleanupWatchdogLiveController({
+      workspaceDir,
+      command: "cleanup-watchdog-live-controller activate",
+      gates: allGates,
+    });
+    const first = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "agent:orchestrator:main",
+      currentTurnText: "Cleanup Crew production repair build.",
+      now: 1000,
+    });
+    if (first.status !== "registered" || !first.taskId) {
+      throw new Error("expected registered TaskFlow");
+    }
+
+    const result = consumeReceiptWithLiveController({
+      workspaceDir,
+      missionId: first.flow.flowId,
+      receipt: {
+        policy_version: CLEANUP_WATCHDOG_POLICY_VERSION,
+        summary: { items_suspicious: 1 },
+        decisions: {
+          healthy_items: [],
+          suspicious_items: [
+            {
+              entity_type: "flow_run",
+              entity_id: first.flow.flowId,
+              category: "active_no_worker",
+              label: "Foreground Cleanup Crew production mission",
+              proof: {
+                active_child_tasks: 0,
+                current_step: "cleanup_watchdog_governance_repair",
+                owner_key: "agent:orchestrator:main",
+                lost_child_task_ids: [first.taskId],
+              },
+              reason: "receipt claims no valid executor but original task is still running",
+            },
+          ],
+        },
+      },
+      now: 1700,
+    });
+
+    expect(result.status).toBe("dispatched");
+    if (result.status !== "dispatched") {
+      throw new Error("expected dispatched repair route without supersession");
+    }
+    expect(result.repair.supersession).toBeUndefined();
+    expect(
+      listTasksForFlowId(first.flow.flowId).filter((task) => task.status === "running"),
+    ).toHaveLength(1);
   });
 
   it("does not dispatch receipt repair while in shadow mode", () => {

@@ -119,8 +119,8 @@ function isOpenProductionFlow(flow: TaskFlowRecord): boolean {
     flow.controllerId === FOREGROUND_CLEANUP_CREW_CONTROLLER_ID &&
     (flow.status === "queued" || flow.status === "running" || flow.status === "blocked") &&
     continuation?.activeProductionRun === true &&
-    continuation.parentRunOpen === true &&
-    continuation.lawfulWholeRunCompletion !== true
+    continuation.parentRunOpen &&
+    !continuation.lawfulWholeRunCompletion
   );
 }
 
@@ -129,10 +129,10 @@ function isLawfullyBlockedWithoutLaunch(flow: TaskFlowRecord): boolean {
   return (
     flow.status === "blocked" &&
     continuation?.activeProductionRun === true &&
-    continuation.parentRunOpen === true &&
+    continuation.parentRunOpen &&
     continuation.currentUnitStatus === "blocked" &&
     continuation.lawfulStopReason === "blocker" &&
-    continuation.nextExecutableUnitLaunched !== true
+    !continuation.nextExecutableUnitLaunched
   );
 }
 
@@ -251,7 +251,7 @@ function settleObsoleteRestartBoundaryStateJson(params: {
   if (
     !continuation?.activeProductionRun ||
     continuation.lawfulStopReason !== "restart_or_reload" ||
-    continuation.restartOrReloadRequired !== true
+    !continuation.restartOrReloadRequired
   ) {
     return params.stateJson;
   }
@@ -844,7 +844,7 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   const currentStep =
     tracking.checkpointKind && tracking.nextExecutableAction
       ? (tracking.stageId ?? flow.currentStep ?? "foreground_cleanup_crew_checkpoint")
-      : flow.currentStep;
+      : (flow.currentStep ?? "foreground_cleanup_crew_checkpoint");
   const dispatchedFlow = recordForegroundCheckpointDispatch({
     flow,
     tracking,

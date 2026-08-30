@@ -9,6 +9,7 @@ import {
 import type {
   OpenKeyedStoreOptions,
   PluginDoctorStateMigrationContext,
+  PluginStateKeyedStore,
 } from "openclaw/plugin-sdk/runtime-doctor";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { stateMigrations } from "./doctor-contract-api.js";
@@ -22,7 +23,7 @@ import { clearVoiceCallStateRuntime, setVoiceCallStateRuntime } from "./src/runt
 
 function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigrationContext {
   return {
-    openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions) {
+    openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions): PluginStateKeyedStore<T> {
       return createPluginStateKeyedStoreForTests<T>("voice-call", {
         ...options,
         env: options.env ?? env,

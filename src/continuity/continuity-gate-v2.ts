@@ -1487,7 +1487,7 @@ function canonicalJson(value: unknown): string {
     return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
   }
   if (value && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>).sort(([left], [right]) =>
+    const entries = Object.entries(value as Record<string, unknown>).toSorted(([left], [right]) =>
       left.localeCompare(right),
     );
     return `{${entries
@@ -1562,7 +1562,7 @@ export function validateCleanupCrewMissionAbortExhaustionReceipt(
   >();
   for (const entry of receipt.entries) {
     if (!CLEANUP_CREW_MISSION_ABORT_CONTINUATION_CLASSES.includes(entry.class)) {
-      errors.push(`mission_abort_exhaustion_unknown_class:${String(entry.class)}`);
+      errors.push(`mission_abort_exhaustion_unknown_class:${entry.class}`);
       continue;
     }
     if (entry.status !== "unavailable" && entry.status !== "inapplicable") {
@@ -1669,7 +1669,7 @@ export function createCleanupCrewTypedDecisionReceipt(
       : "diagnose_policy_input_and_rerun_classifier",
     evidence: valid ? input.evidence.map((entry) => requiredText(entry, "evidence[]")) : [],
     rollback: {
-      available: input.rollback?.available === true,
+      available: input.rollback?.available,
       proof_ref: optionalText(input.rollback?.proofRef) ?? "missing_rollback_proof",
     },
     report_effect: valid ? requiredText(input.reportEffect, "reportEffect") : "action_blocked",
@@ -2079,9 +2079,9 @@ export function resolveAuthority(sources: AuthoritySource[]): AuthorityResolutio
     };
   }
 
-  const winner = [...active].sort(
+  const winner = [...active].toSorted(
     (left, right) => AUTHORITY_PRIORITY[left.kind] - AUTHORITY_PRIORITY[right.kind],
-  )[0]!;
+  )[0];
   const losingSources = sources
     .filter((source) => source.id !== winner.id)
     .map((source) => source.id);
@@ -2812,7 +2812,7 @@ export function resolveCleanupCrewRepairLoop(input: {
   const evidence = matchingAttempts.map((attempt) => attempt.receipt_id);
   const safeParallelWorkContinues = input.safeParallelWorkAvailable !== false;
 
-  if (latest?.rollback_required === true && latest.rollback_available !== true) {
+  if (latest?.rollback_required && !latest.rollback_available) {
     return {
       schema: "openclaw.cleanup_crew_repair_loop_decision.v1",
       decision_id: deterministicId("repair_loop", [missionId, reasonCode, evidence, "rollback"]),
@@ -3006,7 +3006,7 @@ export function resolveCleanupCrewDurableWait(input: {
   if (!isCleanupCrewGovernanceReasonCode(record.reason_code)) {
     validationErrors.push("durable_wait_reason_code_invalid");
   }
-  if (record.mission_remains_open !== true) {
+  if (!record.mission_remains_open) {
     validationErrors.push("durable_wait_must_keep_mission_open");
   }
 
@@ -3099,8 +3099,8 @@ export function resolveCleanupCrewNonterminalContinuation(input: {
     ]),
     mission_id: missionId,
     allowed_to_emit_nonterminal_response: errors.length === 0,
-    allowed_to_close_parent_mission: input.parentMissionOpen !== true && errors.length === 0,
-    required_durable_wait: input.parentMissionOpen === true && input.localStageComplete !== true,
+    allowed_to_close_parent_mission: !input.parentMissionOpen && errors.length === 0,
+    required_durable_wait: input.parentMissionOpen && !input.localStageComplete,
     next_action:
       errors.length === 0
         ? "continue_from_recorded_wait_or_next_executable_step"
@@ -3118,8 +3118,8 @@ function canExecutorPerform(
   capability: CleanupCrewExecutorCapability,
 ): boolean {
   return (
-    executor.available === true &&
-    executor.stale !== true &&
+    executor.available &&
+    !executor.stale &&
     executor.permitted.includes(capability) &&
     !executor.prohibited.includes(capability) &&
     hasExecutorIdentity(executor)
@@ -3173,7 +3173,7 @@ export function resolveCleanupCrewCapabilityRoute(input: {
 
   const staleIdentity = input.executors.find(
     (executor) =>
-      executor.stale === true &&
+      executor.stale &&
       (executor.permitted.includes(requiredCapability) ||
         executor.prohibited.includes(requiredCapability)),
   );
@@ -3244,8 +3244,8 @@ export function resolveCleanupCrewCapabilityRoute(input: {
 
   const identityPoor = input.executors.some(
     (executor) =>
-      executor.available === true &&
-      executor.stale !== true &&
+      executor.available &&
+      !executor.stale &&
       executor.permitted.includes(requiredCapability) &&
       !hasExecutorIdentity(executor),
   );

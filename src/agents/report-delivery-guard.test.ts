@@ -6,7 +6,9 @@ import {
 } from "../governance/cleanup-watchdog-policy.js";
 import {
   CLEANUP_CREW_CANONICAL_POLICY_PROMPT,
+  REQUIRED_CLEANUP_CREW_CLOSEOUT_TRUTH_FIELDS,
   resolveCleanupCrewPostReportContinuation,
+  resolveCleanupCrewReportCloseoutAcceptance,
   resolveCleanupCrewReportDeliveryRepair,
   resolveCleanupCrewStageTransition,
   resolveReportDeliveryGuard,
@@ -22,6 +24,26 @@ const VALID_MILESTONE_REPORT = [
   "NEXT STAGE: continue",
   "SAFETY CHECK: no blockers",
   "BLOCKERS: none",
+].join("\n");
+
+const VALID_CLEANUP_CREW_CLOSEOUT = [
+  "Cleanup Crew Runtime Enforcement Integration Slice 3 closeout",
+  "Artifact path(s):",
+  "- /home/will/.openclaw/workspace/file_hub/exports/slice_3_closeout.md",
+  "Proof path(s):",
+  "- src/agents/report-delivery-guard.ts",
+  "What is materially real now:",
+  "Slice 3 report/closeout acceptance is implemented.",
+  "What is still not real yet:",
+  "Slice 4 continuation/watchdog work has not started.",
+  "Who lawfully owns the next step:",
+  "Grant owns Slice 3 review.",
+  "Open/closed truth:",
+  "Slice 3 is locally closed; broader build remains open.",
+  "Exact next action:",
+  "Route the proof packet to Grant.",
+  "Short slice result:",
+  "Report acceptance gate passed focused proof.",
 ].join("\n");
 
 describe("report delivery guard", () => {
@@ -531,6 +553,134 @@ describe("report delivery guard", () => {
       repairWorkRequired: false,
       acknowledgementAllowed: true,
     });
+  });
+
+  it("acceptance gate keeps pending report delivery from closing a report-governed mission", () => {
+    expect(
+      resolveCleanupCrewReportCloseoutAcceptance({
+        currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+        reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+        reportBodyDeliveredInChat: false,
+      }),
+    ).toMatchObject({
+      state: "pending_report_delivery",
+      activeCleanupCrewMission: true,
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reportDelivery: {
+        state: "pending_report_delivery",
+        reason: "artifact_only_without_chat_body",
+      },
+    });
+  });
+
+  it("acceptance gate treats pending milestone report as visibility work before closeout", () => {
+    expect(
+      resolveCleanupCrewReportCloseoutAcceptance({
+        currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+        reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+        reportBodyDeliveredInChat: true,
+        milestoneStageCompleted: true,
+        milestoneReportRequired: true,
+        milestoneReportDelivered: false,
+      }),
+    ).toMatchObject({
+      state: "pending_milestone_report",
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reportDelivery: {
+        state: "pending_milestone_report",
+      },
+    });
+  });
+
+  it("acceptance gate requires Mark-facing export proof when required", () => {
+    const decision = resolveCleanupCrewReportCloseoutAcceptance({
+      currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+      reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+      reportBodyDeliveredInChat: true,
+      markFacingExportRequired: true,
+      markFacingExportPath: "/home/will/.openclaw/workspace/file_hub/exports/slice_3_closeout.md",
+      markFacingExportVerified: false,
+    });
+
+    expect(decision).toMatchObject({
+      state: "pending_mark_facing_export_delivery",
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reportDelivery: {
+        reason: "missing_mark_facing_export_proof",
+      },
+    });
+  });
+
+  it("acceptance gate rejects private-only final responses for Cleanup Crew closeouts", () => {
+    expect(
+      resolveCleanupCrewReportCloseoutAcceptance({
+        currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+        reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+        reportBodyDeliveredInChat: false,
+        privateOnlyFinalResponse: true,
+      }),
+    ).toMatchObject({
+      state: "blocked_private_only_report",
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+    });
+  });
+
+  it("acceptance gate rejects false complete paperwork-only closeouts", () => {
+    expect(
+      resolveCleanupCrewReportCloseoutAcceptance({
+        currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+        reportText: [
+          VALID_CLEANUP_CREW_CLOSEOUT,
+          "Status: closed.",
+          "Result: paperwork/setup done.",
+        ].join("\n"),
+        reportBodyDeliveredInChat: true,
+      }),
+    ).toMatchObject({
+      state: "blocked_paperwork_only_closeout",
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reason: "paperwork_only_work_cannot_close_cleanup_crew_mission",
+    });
+  });
+
+  it("acceptance gate accepts valid closeouts with exact truth fields and export proof", () => {
+    const decision = resolveCleanupCrewReportCloseoutAcceptance({
+      currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+      reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+      reportBodyDeliveredInChat: true,
+    });
+
+    expect(decision.missingTruthFields).toEqual([]);
+    expect(decision).toMatchObject({
+      state: "accepted_report_continue",
+      allowedToAcceptReport: true,
+      allowedToCloseMission: false,
+      nextAction: "Route the proof packet to Grant.",
+    });
+  });
+
+  it("acceptance gate reports every exact missing truth field", () => {
+    const decision = resolveCleanupCrewReportCloseoutAcceptance({
+      currentTurnText: "Cleanup Crew Runtime Enforcement Integration build.",
+      reportText: [
+        "Cleanup Crew Runtime Enforcement Integration Slice 3 closeout",
+        "Artifact path(s):",
+        "- /home/will/.openclaw/workspace/file_hub/exports/slice_3_closeout.md",
+      ].join("\n"),
+      reportBodyDeliveredInChat: true,
+    });
+
+    expect(decision).toMatchObject({
+      state: "blocked_missing_truth_fields",
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+    });
+    expect(decision.missingTruthFields).toEqual(REQUIRED_CLEANUP_CREW_CLOSEOUT_TRUTH_FIELDS);
   });
 
   it("rejects malformed report-delivery state and parent closeout attempts", () => {

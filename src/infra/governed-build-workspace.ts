@@ -240,8 +240,8 @@ export function validateGovernedBuildWorkspaceMetadata(
 ): ValidationResult {
   const errors: string[] = [];
   const requireString = (key: keyof GovernedBuildWorkspaceMetadata) => {
-    if (typeof metadata[key] !== "string" || !(metadata[key] as string).trim()) {
-      errors.push(`${String(key)} is required`);
+    if (typeof metadata[key] !== "string" || !metadata[key].trim()) {
+      errors.push(`${key} is required`);
     }
   };
   for (const key of [
@@ -297,8 +297,8 @@ export function validateSourceLockSnapshot(
 ): ValidationResult {
   const errors: string[] = [];
   const requireString = (key: keyof SourceLockSnapshot) => {
-    if (typeof snapshot[key] !== "string" || !(snapshot[key] as string).trim()) {
-      errors.push(`sourceLock.${String(key)} is required`);
+    if (typeof snapshot[key] !== "string" || !snapshot[key].trim()) {
+      errors.push(`sourceLock.${key} is required`);
     }
   };
   if (snapshot.schema !== "openclaw.source_lock_snapshot.v1") {

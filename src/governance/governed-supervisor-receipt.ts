@@ -132,7 +132,7 @@ export function buildGovernedSupervisorReceipt(params: {
     runId: params.runRecord?.runId,
     taskId: params.taskId,
     flowId: params.flowId,
-    pid: params.runRecord?.pid ?? params.session.pid,
+    pid: params.runRecord?.pid ?? ("pid" in params.session ? params.session.pid : undefined),
     processGroupId: params.runRecord?.processGroupId,
     timeoutMs: params.timeoutMs,
     noOutputTimeoutMs: params.noOutputTimeoutMs,

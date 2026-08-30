@@ -304,7 +304,7 @@ function readIndex(
 function upsertBy<T>(items: T[], item: T, keyFor: (item: T) => string): T[] {
   const key = keyFor(item);
   const filtered = items.filter((existing) => keyFor(existing) !== key);
-  return [...filtered, item].sort((left, right) => keyFor(left).localeCompare(keyFor(right)));
+  return [...filtered, item].toSorted((left, right) => keyFor(left).localeCompare(keyFor(right)));
 }
 
 function receiptKindFor(receipt: GovernedMissionReceipt): string {
@@ -371,7 +371,7 @@ function sortJson(value: unknown): unknown {
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .toSorted(([left], [right]) => left.localeCompare(right))
         .map(([key, item]) => [key, sortJson(item)]),
     );
   }

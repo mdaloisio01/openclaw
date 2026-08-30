@@ -14,7 +14,7 @@ function resolveBuiltLibraryModule() {
     .readdirSync(distDir)
     .filter((name) => /^library-[A-Za-z0-9_-]+\.js$/.test(name))
     .map((name) => path.join(distDir, name))
-    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    .toSorted((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
   if (candidates.length === 0) {
     throw new Error("No built library module found in dist");
   }
@@ -23,7 +23,7 @@ function resolveBuiltLibraryModule() {
 
 const lib = await import(pathToFileURL(resolveBuiltLibraryModule()).href);
 
-function arg(name, fallback = undefined) {
+function arg(name, fallback) {
   const idx = process.argv.indexOf(`--${name}`);
   return idx >= 0 ? process.argv[idx + 1] : fallback;
 }

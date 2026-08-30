@@ -131,7 +131,7 @@ describe("activation restart continuations", () => {
   });
 
   it("rejects incomplete governed restart bindings on store read", async () => {
-    const record = await testing.createContinuationRecord({
+    const record = testing.createContinuationRecord({
       id: "activation-incomplete-governed-restart",
       now: 10,
       route: { sessionKey: "agent:orchestrator:main" },
@@ -533,7 +533,7 @@ describe("activation restart continuations", () => {
   });
 
   it("persists diagnostic-only Continuity Gate evidence for answer-only restart recovery overrides", async () => {
-    const record = await testing.createContinuationRecord({
+    const record = testing.createContinuationRecord({
       id: "activation-answer-only-continuity",
       now: 100,
       route: { sessionKey: "main" },
@@ -593,7 +593,7 @@ describe("activation restart continuations", () => {
   });
 
   it("does not persist a Continuity Gate repair receipt for successful completed recovery", async () => {
-    const record = await testing.createContinuationRecord({
+    const record = testing.createContinuationRecord({
       id: "activation-success-continuity",
       now: 100,
       route: { sessionKey: "main" },
@@ -660,7 +660,7 @@ describe("activation restart continuations", () => {
   });
 
   it("reports old persisted unregistered checks clearly", async () => {
-    const record = await testing.createContinuationRecord({
+    const record = testing.createContinuationRecord({
       id: "activation-old-smoke",
       now: 100,
       route: { sessionKey: "main" },
@@ -886,7 +886,7 @@ describe("activation restart continuations", () => {
     process.chdir(tempRoot);
     try {
       const check = await testing.runDefaultCheck(
-        await testing.createContinuationRecord({
+        testing.createContinuationRecord({
           id: "runtime-identity",
           now: 100,
           route: { sessionKey: "main" },
@@ -911,7 +911,7 @@ describe("activation restart continuations", () => {
     process.chdir(tempRoot);
     try {
       const check = await testing.runDefaultCheck(
-        await testing.createContinuationRecord({
+        testing.createContinuationRecord({
           id: "runtime-identity-missing",
           now: 100,
           route: { sessionKey: "main" },

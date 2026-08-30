@@ -366,7 +366,7 @@ function createDatabaseSnapshot(params: {
     throw new Error(`Snapshot was not created at ${params.snapshotPath}`);
   }
   recordOpenClawStateBackupRun({
-    ...(params.options ?? {}),
+    ...params.options,
     createdAt: params.createdAt,
     archivePath: params.snapshotPath,
     status: "completed",

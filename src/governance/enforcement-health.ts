@@ -139,4 +139,5 @@ export function requiredCapabilitiesForOperation(
     case "governed_final_release":
       return [...PROTECTED_MUTATION_REQUIRED, ...FINAL_RELEASE_EXTRA];
   }
+  return [];
 }

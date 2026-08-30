@@ -204,7 +204,7 @@ function providerDisplayName(provider: string): string {
 function usageSummaryCacheKey(params: { agentDir: string; providers: UsageProviderId[] }): string {
   return JSON.stringify({
     agentDir: params.agentDir,
-    providers: [...params.providers].sort(),
+    providers: [...params.providers].toSorted(),
   });
 }
 
@@ -281,7 +281,7 @@ async function loadUsageSummaryForAuthStatus(params: {
   const promise = load();
   usageSummaryInFlight = { key, promise };
   void promise
-    .catch((err) => {
+    .catch((err: unknown) => {
       log.debug(
         `usage enrichment warm failed (auth status still returned): providers=${params.providers.join(",")} error=${formatForLog(err)}`,
       );

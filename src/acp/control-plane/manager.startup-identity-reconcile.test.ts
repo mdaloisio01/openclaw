@@ -60,14 +60,11 @@ describe("AcpSessionManager startup identity reconcile", () => {
     });
     hoisted.upsertAcpSessionMetaMock.mockImplementation(async (paramsUnknown: unknown) => {
       const params = paramsUnknown as {
-        mutate: (
-          current: SessionAcpMeta | undefined,
-          entry: { acp?: SessionAcpMeta } | undefined,
-        ) => SessionAcpMeta | null | undefined;
+        mutate: (current: unknown, entry: { acp?: unknown } | undefined) => unknown;
       };
       const next = params.mutate(currentMeta, { acp: currentMeta });
       if (next) {
-        currentMeta = next;
+        currentMeta = next as typeof currentMeta;
       }
       return {
         sessionId: "session-1",

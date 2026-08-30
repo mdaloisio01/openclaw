@@ -355,7 +355,7 @@ function resolveLatestWatchdogReceiptSnapshot(): Pick<
         const filePath = path.join(WATCHDOG_RECEIPT_DIR, entry);
         return { filePath, mtimeMs: statSync(filePath).mtimeMs };
       })
-      .sort((left, right) => right.mtimeMs - left.mtimeMs)[0];
+      .toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
     return latest ? { receiptPath: latest.filePath, receiptMtimeMs: latest.mtimeMs } : {};
   } catch {
     return {};
@@ -436,8 +436,8 @@ function resolveWatchdogCronProofSummary(receiptPath?: string): string | undefin
   if (!receiptPath) {
     return undefined;
   }
-  const receipt = loadJsonFile<WatchdogReceiptRecord>(receiptPath);
-  const status = loadJsonFile<WatchdogStatusRecord>(WATCHDOG_STATUS_JSON_PATH);
+  const receipt = loadJsonFile(receiptPath) as WatchdogReceiptRecord | undefined;
+  const status = loadJsonFile(WATCHDOG_STATUS_JSON_PATH) as WatchdogStatusRecord | undefined;
   if (receipt?.watchdog !== "system_wide_active_work_watchdog") {
     return undefined;
   }
@@ -456,9 +456,9 @@ function resolveWatchdogCronProofSummary(receiptPath?: string): string | undefin
   ].join(" | ");
 }
 
-function loadJsonFile<T>(filePath: string): T | undefined {
+function loadJsonFile(filePath: string): unknown {
   try {
-    return JSON.parse(readFileSync(filePath, "utf8")) as T;
+    return JSON.parse(readFileSync(filePath, "utf8"));
   } catch {
     return undefined;
   }
@@ -567,7 +567,7 @@ function updateWatchdogChatDeliverySurface(
   filePath: string,
   delivery: WatchdogChatDeliveryRecord,
 ): void {
-  const payload = loadJsonFile<Record<string, unknown>>(filePath);
+  const payload = loadJsonFile(filePath) as Record<string, unknown> | undefined;
   if (!payload || typeof payload !== "object") {
     return;
   }
@@ -596,7 +596,9 @@ function finalizeWatchdogChatDeliveryState(params: {
     last_message_id: params.delivery.message_id,
     last_session_entry_id: params.delivery.session_entry_id ?? params.delivery.message_id,
   };
-  const latestPayload = loadJsonFile<Record<string, unknown>>(WATCHDOG_LATEST_JSON_PATH);
+  const latestPayload = loadJsonFile(WATCHDOG_LATEST_JSON_PATH) as
+    | Record<string, unknown>
+    | undefined;
   if (latestPayload) {
     state.last_label = latestPayload.status;
     state.last_suspicious_count = latestPayload.suspicious_count;
@@ -611,8 +613,8 @@ function consumeWatchdogProofCaptureRequestIfNeeded(delivery: WatchdogChatDelive
   if (!proofCapture || typeof proofCapture !== "object" || Array.isArray(proofCapture)) {
     return;
   }
-  (proofCapture as Record<string, unknown>).consumed = true;
-  (proofCapture as Record<string, unknown>).cleared_at = new Date().toISOString();
+  proofCapture.consumed = true;
+  proofCapture.cleared_at = new Date().toISOString();
   if (existsSync(WATCHDOG_PROOF_CAPTURE_REQUEST_JSON_PATH)) {
     rmSync(WATCHDOG_PROOF_CAPTURE_REQUEST_JSON_PATH, { force: true });
   }
@@ -624,7 +626,7 @@ async function maybeRecoverWatchdogChatDeliveryFromProofSurfaces(params: {
   if (!params.receiptPath) {
     return { ok: true, status: "not-needed" };
   }
-  const receipt = loadJsonFile<WatchdogReceiptRecord>(params.receiptPath);
+  const receipt = loadJsonFile(params.receiptPath) as WatchdogReceiptRecord | undefined;
   if (!receipt?.chat_delivery) {
     return { ok: true, status: "not-needed" };
   }

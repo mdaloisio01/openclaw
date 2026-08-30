@@ -317,13 +317,13 @@ function continuationRequiresImmediateReworkLaunch(
 ): continuation is NonNullable<ReturnType<typeof getTaskFlowProductionContinuation>> {
   return (
     continuation?.activeProductionRun === true &&
-    continuation.parentRunOpen === true &&
-    continuation.blockerPresent !== true &&
-    continuation.ownerDecisionRequired !== true &&
-    continuation.restartOrReloadRequired !== true &&
-    continuation.hardStopPresent !== true &&
-    continuation.safetyStopPresent !== true &&
-    continuation.lawfulWholeRunCompletion !== true
+    continuation.parentRunOpen &&
+    !continuation.blockerPresent &&
+    !continuation.ownerDecisionRequired &&
+    !continuation.restartOrReloadRequired &&
+    !continuation.hardStopPresent &&
+    !continuation.safetyStopPresent &&
+    !continuation.lawfulWholeRunCompletion
   );
 }
 const GRANT_CORRECTION_ARCHIVE_RELATIVE_PATH = path.join(
@@ -1376,8 +1376,12 @@ export function createSubagentRegistryLifecycleController(params: {
         ),
       };
     }
-    const replaceAfterSteer =
-      params.replaceSubagentRunAfterSteer ?? replaceSubagentRunAfterSteerDefault;
+    const replaceAfterSteer = (
+      replaceArgs: Parameters<typeof replaceSubagentRunAfterSteerDefault>[0],
+    ) =>
+      params.replaceSubagentRunAfterSteer
+        ? params.replaceSubagentRunAfterSteer(replaceArgs)
+        : replaceSubagentRunAfterSteerDefault(replaceArgs);
     if (
       !replaceAfterSteer({
         previousRunId: args.entry.runId,
@@ -1460,7 +1464,7 @@ export function createSubagentRegistryLifecycleController(params: {
         expectedRevision: launchedFlow.flow.revision,
         patch: {
           stateJson: {
-            ...(stateJson ?? {}),
+            ...stateJson,
             rework: {
               ...stateJson.rework,
               handbackStatus: "completed",
@@ -1574,9 +1578,8 @@ export function createSubagentRegistryLifecycleController(params: {
           } | null
         )?.rework ?? null;
       const canAttemptImmediateFollowThrough =
-        Boolean(
-          handbackState?.handbackStatus === "required" && handbackState.transferOwner !== "Will",
-        ) &&
+        handbackState?.handbackStatus === "required" &&
+        handbackState.transferOwner !== "Will" &&
         continuationRequiresImmediateReworkLaunch(postFailureContinuation) &&
         Boolean(linkedFlowId);
       if (canAttemptImmediateFollowThrough && linkedFlowId && postFailureFlow) {

@@ -701,7 +701,7 @@ export function evaluateControlPlaneActivation(
     ok: true,
     noOp: changedPaths.length === 0,
     changedPaths: changedPaths.map(formatConfigPath),
-    requiredApprovalClasses: [...requiredApprovalClasses].sort(),
+    requiredApprovalClasses: [...requiredApprovalClasses].toSorted(),
     candidateSha256,
   };
 }

@@ -145,7 +145,9 @@ async function waitForCronEnabled(cron: { job: CronJob }, enabled: boolean): Pro
     if (cron.job.enabled === enabled) {
       return;
     }
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
   }
   throw new Error(`timed out waiting for watchdog enabled=${enabled}`);
 }

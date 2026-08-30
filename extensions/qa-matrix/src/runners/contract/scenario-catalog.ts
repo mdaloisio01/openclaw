@@ -2,7 +2,7 @@ import type { QaProviderModeInput } from "../../run-config.js";
 import {
   collectLiveTransportStandardScenarioCoverage,
   selectLiveTransportScenarios,
-  type LiveTransportScenarioDefinition,
+  type LiveTransportStandardScenarioId,
 } from "../../shared/live-transport-scenarios.js";
 import type { MatrixQaConfigOverrides } from "../../substrate/config.js";
 import {
@@ -112,10 +112,15 @@ type MatrixQaScenarioId =
   | "matrix-e2ee-key-bootstrap-failure";
 export type MatrixQaE2eeScenarioId = Extract<MatrixQaScenarioId, `matrix-e2ee-${string}`>;
 
-export type MatrixQaScenarioDefinition = LiveTransportScenarioDefinition<MatrixQaScenarioId> & {
+export type MatrixQaScenarioDefinition = {
+  id: MatrixQaScenarioId;
+  standardId?: LiveTransportStandardScenarioId;
+  timeoutMs: number;
+  title: string;
   configOverrides?: MatrixQaConfigOverrides;
   providerMode?: QaProviderModeInput;
   topology?: MatrixQaTopologySpec;
+  [key: string]: unknown;
 };
 
 type MatrixQaProfile =

@@ -501,7 +501,7 @@ function collectParentYieldWaitMembers(waitId: string): SubagentRunRecord[] {
 }
 
 function uniqueSorted(values: string[]): string[] {
-  return Array.from(new Set(values.filter(Boolean))).sort();
+  return Array.from(new Set(values.filter(Boolean))).toSorted();
 }
 
 function updateParentYieldWaitFanIn(
@@ -647,7 +647,7 @@ export function markParentYieldWaitForController(params: {
     };
   }
 
-  updateParentYieldWaitFanIn(waitId, candidates[0]!, now);
+  updateParentYieldWaitFanIn(waitId, candidates[0], now);
   persistSubagentRuns();
   return {
     marked: candidates.length,

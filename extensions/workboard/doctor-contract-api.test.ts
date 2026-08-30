@@ -5,6 +5,7 @@ import { createPluginStateKeyedStoreForTests as createPluginStateKeyedStore } fr
 import type {
   OpenKeyedStoreOptions,
   PluginDoctorStateMigrationContext,
+  PluginStateKeyedStore,
 } from "openclaw/plugin-sdk/runtime-doctor";
 import { describe, expect, it } from "vitest";
 import { stateMigrations } from "./doctor-contract-api.js";
@@ -13,7 +14,7 @@ import { WorkboardStore, type PersistedWorkboardCard } from "./src/store.js";
 
 function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigrationContext {
   return {
-    openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions) {
+    openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions): PluginStateKeyedStore<T> {
       return createPluginStateKeyedStore<T>("workboard", {
         ...options,
         env: options.env ?? env,

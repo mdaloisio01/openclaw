@@ -342,7 +342,7 @@ describe("subagent registry seam flow", () => {
     mod.resetSubagentRegistryForTests({ persist: false });
     mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
       if (request.method === "agent.wait") {
-        return await new Promise<never>(() => undefined);
+        return await new Promise<never>(() => {});
       }
       return {};
     });
@@ -428,7 +428,7 @@ describe("subagent registry seam flow", () => {
     mod.resetSubagentRegistryForTests({ persist: false });
     mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
       if (request.method === "agent.wait") {
-        return await new Promise<never>(() => undefined);
+        return await new Promise<never>(() => {});
       }
       return {};
     });

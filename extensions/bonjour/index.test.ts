@@ -35,7 +35,21 @@ afterAll(() => {
 describe("bonjour plugin entry", () => {
   it("lazy-loads advertiser runtime when gateway discovery advertises", async () => {
     let discoveryService:
-      | Parameters<ReturnType<typeof createTestPluginApi>["registerGatewayDiscoveryService"]>[0]
+      | {
+          id: string;
+          advertise: (params: {
+            machineDisplayName: string;
+            gatewayPort: number;
+            gatewayTlsEnabled: boolean;
+            gatewayTlsFingerprintSha256: string;
+            gatewayDirectReachable: boolean;
+            canvasPort: number;
+            sshPort: number;
+            tailnetDns: string;
+            cliPath: string;
+            minimal: boolean;
+          }) => Promise<{ stop: unknown }>;
+        }
       | undefined;
     const logger = {
       info: vi.fn(),
@@ -46,7 +60,7 @@ describe("bonjour plugin entry", () => {
     const api = createTestPluginApi({
       logger,
       registerGatewayDiscoveryService(service) {
-        discoveryService = service;
+        discoveryService = service as typeof discoveryService;
       },
     });
 

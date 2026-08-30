@@ -122,7 +122,7 @@ function resolveRootDir(params = {}) {
 function resolveExpectedRootDir(params = {}) {
   const expectedRoot =
     params.expectedRoot ??
-    (Object.prototype.hasOwnProperty.call(params, "rootDir")
+    (Object.hasOwn(params, "rootDir")
       ? undefined
       : process.env.OPENCLAW_RUNTIME_GUARD_EXPECTED_ROOT);
   return expectedRoot ? path.resolve(expectedRoot) : undefined;
@@ -236,7 +236,7 @@ function listJsFiles(rootDir) {
     }
   };
   visit(distDir);
-  files.sort();
+  files.sort((left, right) => left.localeCompare(right));
   return files;
 }
 
@@ -396,7 +396,7 @@ function listPreviousBackupCandidates(backupRoot) {
       .readdirSync(backupRoot, { withFileTypes: true })
       .filter((dirent) => dirent.isDirectory() && dirent.name.startsWith("previous-"))
       .map((dirent) => ({ label: dirent.name, path: path.join(backupRoot, dirent.name) }))
-      .sort((a, b) => b.label.localeCompare(a.label));
+      .toSorted((a, b) => b.label.localeCompare(a.label));
   } catch {
     return [];
   }
@@ -404,7 +404,7 @@ function listPreviousBackupCandidates(backupRoot) {
 
 function cleanupPartialRuntimeBackups(backupRoot) {
   const removed = [];
-  let dirents = [];
+  let dirents;
   try {
     dirents = fs.readdirSync(backupRoot, { withFileTypes: true });
   } catch {
@@ -489,7 +489,7 @@ export function applyRuntimeBackupPolicy(params = {}) {
   mkdirRecursiveWithParentRetry(backupRoot);
   const partialRemoved = cleanupPartialRuntimeBackups(backupRoot);
   const removed = [];
-  let previous = listPreviousBackupCandidates(backupRoot);
+  const previous = listPreviousBackupCandidates(backupRoot);
 
   while (previous.length > limits.previousRetention) {
     const oldest = previous.pop();
@@ -763,15 +763,15 @@ function listBackupCandidates(backupRoot) {
   if (fs.existsSync(latestRoot)) {
     candidates.push({ label: "last-known-good", path: latestRoot });
   }
-  let previous = [];
+  let previous;
   try {
     previous = fs
       .readdirSync(backupRoot, { withFileTypes: true })
       .filter((dirent) => dirent.isDirectory() && dirent.name.startsWith("previous-"))
       .map((dirent) => ({ label: dirent.name, path: path.join(backupRoot, dirent.name) }))
-      .sort((a, b) => b.label.localeCompare(a.label));
+      .toSorted((a, b) => b.label.localeCompare(a.label));
   } catch {
-    previous = [];
+    return candidates;
   }
   return [...candidates, ...previous];
 }

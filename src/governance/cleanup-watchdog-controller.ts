@@ -70,6 +70,39 @@ export type CleanupWatchdogControllerDecision = {
   watchdogMayDeclareMissionSuccess: false;
 };
 
+export type CleanupWatchdogNeedsReviewClassification =
+  | "true_active_worker"
+  | "stale_blocked_flow"
+  | "stale_running_state"
+  | "missing_closeout"
+  | "orphaned_task"
+  | "corrupted_taskflow_pointer"
+  | "cron_watchdog_state_mismatch"
+  | "real_production_blocker";
+
+export type CleanupWatchdogNeedsReviewReconciliationArtifact = {
+  schema: "openclaw.cleanup_watchdog.needs_review_reconciliation.v1";
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  trigger: "watchdog_needs_review";
+  missionId: string;
+  classification: CleanupWatchdogNeedsReviewClassification;
+  suspiciousEntity: {
+    type: string;
+    id: string;
+  };
+  violatedInvariant: string;
+  repairRoute:
+    | "no_repair_required_true_active_worker"
+    | "foreground_cleanup_crew_taskflow"
+    | "report_delivery_repair"
+    | "taskflow_pointer_repair"
+    | "runtime_recovery"
+    | "cron_watchdog_reconciliation"
+    | "production_blocker_reconciliation";
+  validationResult: "repair_required" | "clean_claim_rejected" | "no_repair_required";
+  evidence: readonly string[];
+};
+
 export type CleanupWatchdogActivationMode = "shadow_observe" | "enforce";
 
 export type CleanupWatchdogActivationGateInput = {
@@ -172,13 +205,124 @@ const CANONICAL_RECEIPT_CATEGORIES = new Set<CleanupWatchdogFindingCategory>([
   "non_executable_reporting_debt",
 ]);
 
+function itemText(item: CleanupWatchdogReceiptItemSnapshot): string {
+  return [item.category, item.reason, item.label, item.proof?.current_step, item.proof?.run_id]
+    .filter((value): value is string => Boolean(value))
+    .join(" ")
+    .toLowerCase();
+}
+
+export function classifyCleanupWatchdogNeedsReviewItem(
+  item: CleanupWatchdogReceiptItemSnapshot,
+): CleanupWatchdogNeedsReviewClassification {
+  const text = itemText(item);
+  if (item.category === "active_with_worker") {
+    return "true_active_worker";
+  }
+  if (item.category === "duplicate_execution_or_fencing_failure") {
+    return "real_production_blocker";
+  }
+  if (
+    item.category === "pending_report_delivery" ||
+    item.category === "pending_milestone_report" ||
+    item.category === "needs_final_delivery" ||
+    text.includes("awaiting closeout") ||
+    text.includes("missing closeout")
+  ) {
+    return "missing_closeout";
+  }
+  if (
+    item.category === "corrupted_pointer" ||
+    text.includes("corrupted pointer") ||
+    text.includes("taskflow pointer")
+  ) {
+    return "corrupted_taskflow_pointer";
+  }
+  if (item.entity_type === "task_run" && !item.proof?.parent_flow_id) {
+    return "orphaned_task";
+  }
+  if (text.includes("cron") && text.includes("watchdog")) {
+    return "cron_watchdog_state_mismatch";
+  }
+  if (item.category === "stale" || item.category === "stale_lease") {
+    return "stale_blocked_flow";
+  }
+  if (
+    item.category === "runtime_recovery_failure" ||
+    item.category === "restart_recovery_failure" ||
+    item.category === "revision_mismatch" ||
+    text.includes("stale runtime")
+  ) {
+    return "stale_running_state";
+  }
+  if (
+    item.category === "review_required_for_safe_work" ||
+    text.includes("blocked") ||
+    text.includes("blocker")
+  ) {
+    return "real_production_blocker";
+  }
+  return "stale_running_state";
+}
+
+function repairRouteForClassification(
+  classification: CleanupWatchdogNeedsReviewClassification,
+): CleanupWatchdogNeedsReviewReconciliationArtifact["repairRoute"] {
+  switch (classification) {
+    case "true_active_worker":
+      return "no_repair_required_true_active_worker";
+    case "missing_closeout":
+      return "report_delivery_repair";
+    case "corrupted_taskflow_pointer":
+      return "taskflow_pointer_repair";
+    case "stale_running_state":
+      return "runtime_recovery";
+    case "cron_watchdog_state_mismatch":
+      return "cron_watchdog_reconciliation";
+    case "real_production_blocker":
+      return "production_blocker_reconciliation";
+    case "orphaned_task":
+    case "stale_blocked_flow":
+      return "foreground_cleanup_crew_taskflow";
+  }
+  return "runtime_recovery";
+}
+
+export function buildCleanupWatchdogNeedsReviewReconciliationArtifact(params: {
+  missionId: string;
+  item: CleanupWatchdogReceiptItemSnapshot;
+}): CleanupWatchdogNeedsReviewReconciliationArtifact {
+  const classification = classifyCleanupWatchdogNeedsReviewItem(params.item);
+  return {
+    schema: "openclaw.cleanup_watchdog.needs_review_reconciliation.v1",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    trigger: "watchdog_needs_review",
+    missionId: params.missionId,
+    classification,
+    suspiciousEntity: {
+      type: params.item.entity_type ?? "unknown",
+      id: params.item.entity_id ?? "unknown",
+    },
+    violatedInvariant:
+      classification === "true_active_worker"
+        ? "watchdog receipt describes a healthy active worker, so no repair route is required"
+        : "watchdog NEEDS_REVIEW may not be suppressed or treated as CLEAN without reconciliation",
+    repairRoute: repairRouteForClassification(classification),
+    validationResult:
+      classification === "true_active_worker" ? "no_repair_required" : "repair_required",
+    evidence: [params.item.category, params.item.reason, params.item.label].filter(
+      (value): value is string => Boolean(value),
+    ),
+  };
+}
+
 export function evaluateCleanupWatchdogActivationGate(
   input: CleanupWatchdogActivationGateInput,
 ): CleanupWatchdogActivationGateDecision {
-  const missingGates: string[] = ACTIVATION_GATE_KEYS.filter(([key]) => input[key] !== true).map(
+  const missingGates: string[] = ACTIVATION_GATE_KEYS.filter(([key]) => !input[key]).map(
     ([, label]) => label,
   );
-  if (input.watchdogClean !== true && input.knownRepairStateCovered === true) {
+  if (!input.watchdogClean && input.knownRepairStateCovered === true) {
     const idx = missingGates.indexOf("watchdog_clean");
     if (idx >= 0) {
       missingGates.splice(idx, 1);
@@ -298,13 +442,13 @@ export function reconcileCleanupWatchdogMission(
   const staleGovernedPausedStateProof = isStaleGovernedPausedStateProof(input.governedMissionState);
   const awaitingCloseout =
     input.governedMissionState?.state === "AWAITING_CLOSEOUT" &&
-    input.governedMissionState.proofCurrent === true;
+    input.governedMissionState.proofCurrent;
   const releasePending =
     input.governedMissionState?.requiredReleaseDecisionPassed === false &&
-    input.governedMissionState.proofCurrent === true;
+    input.governedMissionState.proofCurrent;
   const enforcementHealthFailed =
     input.governedMissionState?.enforcementHealthOk === false &&
-    input.governedMissionState.proofCurrent === true;
+    input.governedMissionState.proofCurrent;
   const coverageOk = coverage.ok || governedPausedStateOk;
   const policyVersionOk = isCleanupWatchdogPolicyVersionCompatible(input.observedPolicyVersion);
   const cleanDimensions = {
@@ -410,7 +554,7 @@ export function reconcileCleanupWatchdogMission(
         category: "policy_version_mismatch",
         entityType: "mission",
         entityId: input.missionCoverage.missionId,
-        evidence: [String(input.observedPolicyVersion ?? "missing")],
+        evidence: [input.observedPolicyVersion ?? "missing"],
         reason: "policy version is missing or incompatible",
         priority: getCleanupWatchdogPriority("policy_version_mismatch"),
         repairTaskRequired: true,
@@ -419,12 +563,11 @@ export function reconcileCleanupWatchdogMission(
 
   const explicitFindings = (input.findings ?? []).map((finding) => {
     const priority = getCleanupWatchdogPriority(finding.category);
-    return {
-      ...finding,
+    return Object.assign({}, finding, {
       priority,
       repairTaskRequired: true,
       preemptsLowerPriorityWork: priority !== undefined,
-    } satisfies CleanupWatchdogControllerFinding;
+    }) satisfies CleanupWatchdogControllerFinding;
   });
 
   const orderedFindings = [
@@ -492,9 +635,9 @@ export function reconcileCleanupWatchdogMission(
 function isCurrentGovernedPausedState(
   state: CleanupWatchdogControllerInput["governedMissionState"],
 ): boolean {
-  return Boolean(
+  return (
     state?.proofCurrent === true &&
-    (state.state === "GOVERNED_MISSION_PENDING_OVERRIDE" || state.state === "AWAITING_CLOSEOUT"),
+    (state.state === "GOVERNED_MISSION_PENDING_OVERRIDE" || state.state === "AWAITING_CLOSEOUT")
   );
 }
 
@@ -503,7 +646,7 @@ function isStaleGovernedPausedStateProof(
 ): boolean {
   return Boolean(
     state &&
-    state.proofCurrent !== true &&
+    !state.proofCurrent &&
     (state.state === "GOVERNED_MISSION_PENDING_OVERRIDE" || state.state === "AWAITING_CLOSEOUT"),
   );
 }

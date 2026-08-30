@@ -239,7 +239,7 @@ describe("Codex app-server approval bridge", () => {
         return { id: "plugin:restart-abort", status: "accepted" };
       }
       abortController.abort("gateway_restart_interrupted_turn");
-      return await new Promise<never>(() => undefined);
+      return await new Promise<never>(() => {});
     });
 
     const result = await handleCodexAppServerApprovalRequest({

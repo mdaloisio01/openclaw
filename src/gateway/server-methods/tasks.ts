@@ -157,7 +157,9 @@ function normalizeTaskStatusFilter(status: TasksListParams["status"]): Set<TaskS
 }
 
 function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 class WatchdogProbeDiagnosticError extends Error {
@@ -562,7 +564,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     });
   },
   "tasks.startProductionFlow": ({ params, respond }) => {
-    const input = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const input = params && typeof params === "object" ? params : {};
     const required = [
       "ownerKey",
       "controllerId",
@@ -588,13 +590,13 @@ export const tasksHandlers: GatewayRequestHandlers = {
       fields[name] = field.value;
     }
     const ownerLaneGuard = evaluateProductionOwnerLaneGuard({
-      buildPlanRef: fields.authorityPath!,
-      buildItem: fields.buildItem!,
-      requiredOwnerLane: fields.requiredOwnerLane!,
-      attemptedOwnerLane: fields.attemptedOwnerLane!,
-      attemptedExecutor: fields.attemptedExecutor!,
-      executorRole: fields.executorRole!,
-      lawfulRouteRequired: fields.lawfulRouteRequired!,
+      buildPlanRef: fields.authorityPath,
+      buildItem: fields.buildItem,
+      requiredOwnerLane: fields.requiredOwnerLane,
+      attemptedOwnerLane: fields.attemptedOwnerLane,
+      attemptedExecutor: fields.attemptedExecutor,
+      executorRole: fields.executorRole,
+      lawfulRouteRequired: fields.lawfulRouteRequired,
       override: readOwnerLaneOverride(input.operatorOverride),
     });
     if (!ownerLaneGuard.allowed) {
@@ -609,9 +611,9 @@ export const tasksHandlers: GatewayRequestHandlers = {
     }
     const now = Date.now();
     const flow = createManagedTaskFlow({
-      ownerKey: fields.ownerKey!,
-      controllerId: fields.controllerId!,
-      goal: fields.goal!,
+      ownerKey: fields.ownerKey,
+      controllerId: fields.controllerId,
+      goal: fields.goal,
       status: "running",
       notifyPolicy: "done_only",
       currentStep: optionalStringField(input.currentStep) ?? "production_slice_started",
@@ -621,16 +623,16 @@ export const tasksHandlers: GatewayRequestHandlers = {
       },
       stateJson: {
         kind: PRODUCTION_FLOW_KIND,
-        sliceId: fields.sliceId!,
-        sliceOwner: fields.sliceOwner!,
-        authorityPath: fields.authorityPath!,
-        authorityBasis: fields.authorityBasis!,
-        buildItem: fields.buildItem!,
-        requiredOwnerLane: fields.requiredOwnerLane!,
-        attemptedOwnerLane: fields.attemptedOwnerLane!,
-        attemptedExecutor: fields.attemptedExecutor!,
-        executorRole: fields.executorRole!,
-        lawfulRouteRequired: fields.lawfulRouteRequired!,
+        sliceId: fields.sliceId,
+        sliceOwner: fields.sliceOwner,
+        authorityPath: fields.authorityPath,
+        authorityBasis: fields.authorityBasis,
+        buildItem: fields.buildItem,
+        requiredOwnerLane: fields.requiredOwnerLane,
+        attemptedOwnerLane: fields.attemptedOwnerLane,
+        attemptedExecutor: fields.attemptedExecutor,
+        executorRole: fields.executorRole,
+        lawfulRouteRequired: fields.lawfulRouteRequired,
         ownerLaneGuard: ownerLaneGuard.details,
         blockers: readStringArrayParam(input.blockers),
       },
@@ -648,7 +650,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     respond(true, { flow });
   },
   "tasks.resumeProductionFlow": ({ params, respond }) => {
-    const input = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const input = params && typeof params === "object" ? params : {};
     const lookup = requireStringParam(input, "lookup");
     if (!lookup.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, lookup.message));
@@ -716,7 +718,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     respond(true, { flow: resumed.flow });
   },
   "tasks.runTaskInFlow": ({ params, respond }) => {
-    const input = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const input = params && typeof params === "object" ? params : {};
     const required = [
       "lookup",
       "workPacketRef",
@@ -756,7 +758,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const flow = resolveTaskFlowForLookupToken(fields.lookup!);
+    const flow = resolveTaskFlowForLookupToken(fields.lookup);
     if (!flow) {
       respond(
         false,
@@ -818,13 +820,13 @@ export const tasksHandlers: GatewayRequestHandlers = {
       return;
     }
     const ownerLaneGuard = evaluateProductionOwnerLaneGuard({
-      buildPlanRef: fields.buildPlanRef!,
-      buildItem: fields.buildItem!,
-      requiredOwnerLane: fields.requiredOwnerLane!,
-      attemptedOwnerLane: fields.attemptedOwnerLane!,
-      attemptedExecutor: fields.attemptedExecutor!,
-      executorRole: fields.executorRole!,
-      lawfulRouteRequired: fields.lawfulRouteRequired!,
+      buildPlanRef: fields.buildPlanRef,
+      buildItem: fields.buildItem,
+      requiredOwnerLane: fields.requiredOwnerLane,
+      attemptedOwnerLane: fields.attemptedOwnerLane,
+      attemptedExecutor: fields.attemptedExecutor,
+      executorRole: fields.executorRole,
+      lawfulRouteRequired: fields.lawfulRouteRequired,
       override: readOwnerLaneOverride(input.operatorOverride),
     });
     if (!ownerLaneGuard.allowed) {
@@ -865,13 +867,13 @@ export const tasksHandlers: GatewayRequestHandlers = {
       callerOwnerKey: flow.ownerKey,
       flowId: flow.flowId,
       runtime,
-      sourceId: optionalStringField(input.sourceId) ?? fields.workPacketRef!,
+      sourceId: optionalStringField(input.sourceId) ?? fields.workPacketRef,
       childSessionKey,
       parentTaskId: optionalStringField(input.parentTaskId),
       agentId: optionalStringField(input.agentId),
       runId,
-      label: optionalStringField(input.label) ?? fields.buildItem!,
-      task: fields.task!,
+      label: optionalStringField(input.label) ?? fields.buildItem,
+      task: fields.task,
       notifyPolicy: readTaskNotifyPolicy(input.notifyPolicy),
       deliveryStatus: readTaskDeliveryStatus(input.deliveryStatus) ?? "pending",
       status: input.status === "running" ? "running" : "queued",
@@ -894,16 +896,16 @@ export const tasksHandlers: GatewayRequestHandlers = {
       return;
     }
     const proof = buildChildExecutionProof({
-      buildPlanRef: fields.buildPlanRef!,
-      buildItem: fields.buildItem!,
-      workPacketRef: fields.workPacketRef!,
-      requiredOwnerLane: fields.requiredOwnerLane!,
-      attemptedOwnerLane: fields.attemptedOwnerLane!,
-      attemptedExecutor: fields.attemptedExecutor!,
-      executorRole: fields.executorRole!,
-      lawfulRouteRequired: fields.lawfulRouteRequired!,
-      handoffRef: fields.handoffRef!,
-      handoffAcceptedBy: fields.handoffAcceptedBy!,
+      buildPlanRef: fields.buildPlanRef,
+      buildItem: fields.buildItem,
+      workPacketRef: fields.workPacketRef,
+      requiredOwnerLane: fields.requiredOwnerLane,
+      attemptedOwnerLane: fields.attemptedOwnerLane,
+      attemptedExecutor: fields.attemptedExecutor,
+      executorRole: fields.executorRole,
+      lawfulRouteRequired: fields.lawfulRouteRequired,
+      handoffRef: fields.handoffRef,
+      handoffAcceptedBy: fields.handoffAcceptedBy,
       ownerLaneGuard: ownerLaneGuard.details,
       taskId: child.task.taskId,
       flowId: flow.flowId,
@@ -917,7 +919,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     });
   },
   "tasks.recordTaskInFlowProgress": ({ params, respond }) => {
-    const input = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const input = params && typeof params === "object" ? params : {};
     const resolved = resolveProductionChildTaskForMutation(input);
     if (!resolved.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, resolved.message));
@@ -954,7 +956,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     });
   },
   "tasks.completeTaskInFlow": ({ params, respond }) => {
-    const input = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const input = params && typeof params === "object" ? params : {};
     const resolved = resolveProductionChildTaskForMutation(input);
     if (!resolved.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, resolved.message));
@@ -1079,7 +1081,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     });
   },
   "tasks.recordProductionFlowLawfulStop": ({ params, respond }) => {
-    const input = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
+    const input = params && typeof params === "object" ? params : {};
     const lookup = requireStringParam(input, "lookup");
     if (!lookup.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, lookup.message));

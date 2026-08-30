@@ -180,9 +180,7 @@ function resolveParentContinuationLink(params: {
   const parentFlowId = explicitParentFlowId ?? activeMission?.parentFlowId?.trim();
   const parentTaskId = explicitParentTaskId ?? activeMission?.taskId?.trim();
   if (!parentFlowId) {
-    return {
-      ...(parentTaskId ? { parentTaskId } : {}),
-    };
+    return parentTaskId ? { parentTaskId } : {};
   }
   const linkedFlow = getTaskFlowById(parentFlowId);
   const linkedContinuation = linkedFlow ? getTaskFlowProductionContinuation(linkedFlow) : null;

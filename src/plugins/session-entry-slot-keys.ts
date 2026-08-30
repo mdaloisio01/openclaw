@@ -126,6 +126,7 @@ const SESSION_ENTRY_RESERVED_SLOT_KEY_LIST = [
   "pluginDebugEntries",
   "acp",
   "quotaSuspension",
+  "trbRecovery",
 ] as const satisfies ReadonlyArray<keyof SessionEntry | "__proto__" | "constructor" | "prototype">;
 
 type ReservedSessionEntrySlotKey = Extract<

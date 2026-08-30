@@ -1507,7 +1507,7 @@ export async function runReplyAgent(params: {
       return undefined;
     }
   };
-  const updateMaintenanceCheckpoint = async (params: {
+  const updateMaintenanceCheckpoint = async (checkpointProgress: {
     maintenanceStatus?: "pending" | "completed" | "failed" | "skipped";
     continuationStatus?: "not_needed" | "pending" | "continued" | "blocked";
     blockerReason?: string;
@@ -1520,17 +1520,17 @@ export async function runReplyAgent(params: {
     try {
       activeTurnCheckpoint = await updateActiveWorkCheckpointProgress({
         checkpoint: activeTurnCheckpoint,
-        maintenanceStatus: params.maintenanceStatus,
-        continuationStatus: params.continuationStatus,
-        blockerReason: params.blockerReason,
-        sessionId: params.sessionId,
-        runId: params.runId,
+        maintenanceStatus: checkpointProgress.maintenanceStatus,
+        continuationStatus: checkpointProgress.continuationStatus,
+        blockerReason: checkpointProgress.blockerReason,
+        sessionId: checkpointProgress.sessionId,
+        runId: checkpointProgress.runId,
       });
     } catch (error) {
       logVerbose(`failed to update active turn maintenance checkpoint: ${String(error)}`);
     }
   };
-  const finishMaintenanceCheckpoint = async (params: {
+  const finishMaintenanceCheckpoint = async (checkpointFinish: {
     status: "continued" | "blocked";
     reason: string;
     maintenanceStatus?: "completed" | "failed" | "skipped";
@@ -1543,11 +1543,11 @@ export async function runReplyAgent(params: {
     try {
       activeTurnCheckpoint = await updateActiveWorkCheckpointStatus({
         checkpoint: activeTurnCheckpoint,
-        status: params.status,
-        reason: params.reason,
-        maintenanceStatus: params.maintenanceStatus,
-        continuationStatus: params.continuationStatus,
-        blockerReason: params.blockerReason,
+        status: checkpointFinish.status,
+        reason: checkpointFinish.reason,
+        maintenanceStatus: checkpointFinish.maintenanceStatus,
+        continuationStatus: checkpointFinish.continuationStatus,
+        blockerReason: checkpointFinish.blockerReason,
       });
     } catch (error) {
       logVerbose(`failed to finish active turn maintenance checkpoint: ${String(error)}`);

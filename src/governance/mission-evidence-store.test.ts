@@ -90,7 +90,7 @@ describe("mission evidence store", () => {
       receiptKind: "evidence",
     });
     expect(violationResult.record.absolutePath).toContain("/receipts/violation/");
-    expect(index.records.map((record) => record.receiptKind).sort()).toEqual([
+    expect(index.records.map((record) => record.receiptKind).toSorted()).toEqual([
       "evidence",
       "violation",
     ]);

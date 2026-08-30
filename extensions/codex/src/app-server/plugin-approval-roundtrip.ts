@@ -111,7 +111,7 @@ export function classifyPluginApprovalAbortReason(reason: unknown): string {
         ? reason
         : reason === undefined
           ? ""
-          : String(reason);
+          : (JSON.stringify(reason) ?? "");
   if (/gateway[_ -]?restart|restart[_ -]?interrupted|service restart/i.test(text)) {
     return "gateway_restart_interrupted_turn";
   }

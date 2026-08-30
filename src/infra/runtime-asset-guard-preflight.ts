@@ -31,6 +31,16 @@ function resolveSourceRoot(): string {
   return cwd;
 }
 
+function describeUnknown(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return "unknown";
+  }
+  return JSON.stringify(value) ?? "unknown";
+}
+
 function summarizeGuardOutput(stdout: string, stderr: string): string {
   try {
     const parsed = JSON.parse(stdout) as {
@@ -51,9 +61,9 @@ function summarizeGuardOutput(stdout: string, stderr: string): string {
     if (parsed.rootMismatch) {
       parts.push(
         [
-          `operation=${String(parsed.rootMismatch.operation ?? "unknown")}`,
-          `root=${String(parsed.rootMismatch.rootDir ?? "unknown")}`,
-          `expected=${String(parsed.rootMismatch.expectedRoot ?? "unknown")}`,
+          `operation=${describeUnknown(parsed.rootMismatch.operation)}`,
+          `root=${describeUnknown(parsed.rootMismatch.rootDir)}`,
+          `expected=${describeUnknown(parsed.rootMismatch.expectedRoot)}`,
         ].join(" "),
       );
     } else if (typeof parsed.rootDir === "string") {
@@ -64,10 +74,10 @@ function summarizeGuardOutput(stdout: string, stderr: string): string {
       for (const item of internalMissing as Array<Record<string, unknown>>) {
         parts.push(
           [
-            `operation=${String(item.operation ?? "unknown")}`,
-            `importer=${String(item.importerFile ?? "unknown")}`,
-            `specifier=${String(item.importSpecifier ?? "unknown")}`,
-            `missing=${String(item.missingTargetFile ?? "unknown")}`,
+            `operation=${describeUnknown(item.operation)}`,
+            `importer=${describeUnknown(item.importerFile)}`,
+            `specifier=${describeUnknown(item.importSpecifier)}`,
+            `missing=${describeUnknown(item.missingTargetFile)}`,
           ].join(" "),
         );
       }

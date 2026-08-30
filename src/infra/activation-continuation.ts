@@ -751,7 +751,9 @@ async function runDefaultCheck(
       latest?.status !== "failed" &&
       Date.now() < deadline
     ) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 250);
+      });
       latest = await readMainSessionRestartRecoveryStatus({ sessionKey });
     }
     if (!latest) {
@@ -1107,7 +1109,7 @@ export async function resumeActivationContinuation(
       detail: "no sessionKey route persisted for visible continuation delivery",
     });
   }
-  let failed = checks.some((check) => check.status === "fail");
+  const failed = checks.some((check) => check.status === "fail");
   let status: "continuation_completed" | "continuation_blocked" = failed
     ? "continuation_blocked"
     : "continuation_completed";
@@ -1143,7 +1145,6 @@ export async function resumeActivationContinuation(
         status: "fail",
         detail: `delivery failed: ${String(err)}`,
       });
-      failed = true;
       status = "continuation_blocked";
       message = formatResultMessage({ record: active, checks, status, proof });
       artifactPath = await writeContinuationArtifact({

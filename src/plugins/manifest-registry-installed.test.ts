@@ -95,7 +95,7 @@ function createIndexWithFileSignatures(rootDir: string): InstalledPluginIndex {
   };
 }
 
-function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+function deepFreeze<T>(value: T, seen = new WeakSet()): T {
   if (!value || typeof value !== "object") {
     return value;
   }

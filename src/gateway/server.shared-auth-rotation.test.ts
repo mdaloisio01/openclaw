@@ -167,7 +167,7 @@ function stampedCandidateForManifest(config: Record<string, unknown>): Record<st
   return {
     ...config,
     meta: {
-      ...((config.meta as Record<string, unknown> | undefined) ?? {}),
+      ...(config.meta as Record<string, unknown> | undefined),
       lastTouchedVersion: VERSION,
       lastTouchedAt: TEST_ACTIVATION_AT,
     },

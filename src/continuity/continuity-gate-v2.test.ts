@@ -1310,7 +1310,7 @@ describe("Continuity Gate v2", () => {
         kind: "telemetry_event",
       });
       expect(writes[0]?.path).toContain("cleanup_crew_recovery_events");
-      const saved = JSON.parse(await readFile(writes[0]!.path, "utf8")) as { schema: string };
+      const saved = JSON.parse(await readFile(writes[0].path, "utf8")) as { schema: string };
       expect(saved.schema).toBe("openclaw.cleanup_crew_recovery_event.v1");
     } finally {
       await rm(outputDir, { recursive: true, force: true });
@@ -1507,7 +1507,7 @@ describe("Continuity Gate v2", () => {
       resolveCleanupCrewRepairLoop({
         missionId: "cleanup-crew-governance",
         reasonCode: "watchdog_needs_review",
-        attempts: [attempts[0]!],
+        attempts: [attempts[0]],
       }),
     ).toMatchObject({
       outcome: "continue_repair",
@@ -2471,7 +2471,7 @@ describe("Continuity Gate v2", () => {
         "stop_report",
         "diagnostic_trace",
       ]);
-      const persistedRecord = JSON.parse(await readFile(writes[0]!.path, "utf8")) as {
+      const persistedRecord = JSON.parse(await readFile(writes[0].path, "utf8")) as {
         schema: string;
         decision_id: string;
       };

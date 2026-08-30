@@ -210,6 +210,46 @@ export type CleanupCrewPostReportContinuationDecision = {
   reason: string;
 };
 
+export const REQUIRED_CLEANUP_CREW_CLOSEOUT_TRUTH_FIELDS = [
+  "What is materially real now:",
+  "What is still not real yet:",
+  "Who lawfully owns the next step:",
+  "Open/closed truth:",
+  "Exact next action:",
+] as const;
+
+export type RequiredCleanupCrewCloseoutTruthField =
+  (typeof REQUIRED_CLEANUP_CREW_CLOSEOUT_TRUTH_FIELDS)[number];
+
+export type CleanupCrewReportCloseoutAcceptanceState =
+  | "not_cleanup_crew_report"
+  | "accepted_closeout"
+  | "accepted_report_continue"
+  | "stop_after_report_only_request"
+  | "not_required"
+  | "report_delivery_satisfied"
+  | "pending_report_delivery"
+  | "pending_milestone_report"
+  | "pending_mark_facing_export_delivery"
+  | "blocked_missing_report_path"
+  | "blocked_private_only_report"
+  | "blocked_missing_truth_fields"
+  | "blocked_paperwork_only_closeout";
+
+export type CleanupCrewReportCloseoutAcceptanceDecision = {
+  schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1";
+  state: CleanupCrewReportCloseoutAcceptanceState;
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  activeCleanupCrewMission: boolean;
+  allowedToAcceptReport: boolean;
+  allowedToCloseMission: boolean;
+  reportDelivery: ReportDeliveryGuardDecision;
+  postReportContinuation: CleanupCrewPostReportContinuationDecision;
+  missingTruthFields: RequiredCleanupCrewCloseoutTruthField[];
+  nextAction: string;
+  reason: string;
+};
+
 function reportNamesVerifiedHardStopOrExhaustion(text: string): boolean {
   return (
     reportTextIncludesAny(text, [
@@ -600,6 +640,81 @@ function isMilestoneReportText(text: string): boolean {
   );
 }
 
+function isCleanupCrewCloseoutOrStatusReportText(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "closeout",
+    "final report",
+    "status:",
+    "open/closed truth:",
+    "what is materially real now:",
+    "what is still not real yet:",
+    "short slice result:",
+    "slice result:",
+  ]);
+}
+
+function requiresCleanupCrewCloseoutTruthFields(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "closeout",
+    "final report",
+    "open/closed truth:",
+    "what is materially real now:",
+    "what is still not real yet:",
+    "short slice result:",
+    "slice result:",
+  ]);
+}
+
+function reportNamesArtifactSection(text: string): boolean {
+  return reportTextIncludesAny(text, ["artifact path(s):", "artifact path:", "proof path(s):"]);
+}
+
+function reportClaimsCompletion(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "status: done",
+    "status: complete",
+    "status: closed",
+    "truthfully closed",
+    "is complete",
+    "is closed",
+    "closed.",
+    "complete.",
+  ]);
+}
+
+function reportNamesArtifactOnlyPermission(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "artifact-only allowed",
+    "artifact only allowed",
+    "paperwork-only acceptable",
+    "report artifact only",
+    "no chat body required",
+  ]);
+}
+
+function reportNamesPaperworkOnlyWork(text: string): boolean {
+  return reportTextIncludesAny(text, [
+    "paperwork/setup done",
+    "paperwork only",
+    "paperwork-only",
+    "documentation-only",
+    "docs-only",
+    "package/docs/routing/prep",
+    "routing/prep/ready-for-activation",
+  ]);
+}
+
+function reportNamesMarkFacingExportPath(text: string): boolean {
+  return text.includes("/home/will/.openclaw/workspace/file_hub/exports/");
+}
+
+function missingCleanupCrewCloseoutTruthFields(
+  reportText: string | undefined,
+): RequiredCleanupCrewCloseoutTruthField[] {
+  const text = reportText ?? "";
+  return REQUIRED_CLEANUP_CREW_CLOSEOUT_TRUTH_FIELDS.filter((field) => !text.includes(field));
+}
+
 function stripNextActionText(value: string): string | undefined {
   const stripped = value
     .trim()
@@ -777,6 +892,192 @@ export function resolveCleanupCrewPostReportContinuation(input: {
 }
 
 /**
+ * Acceptance gate for Cleanup Crew report/final/closeout payloads. It composes
+ * the older report-delivery and post-report-continuation helpers so the runtime
+ * final-response path uses the same report law as the standalone guard tests.
+ */
+export function resolveCleanupCrewReportCloseoutAcceptance(input: {
+  currentTurnText?: string;
+  reportText?: string;
+  activeCleanupCrewMission?: boolean;
+  reportGenerated?: boolean;
+  reportArtifactPath?: string;
+  markFacingExportRequired?: boolean;
+  markFacingExportPath?: string;
+  markFacingExportVerified?: boolean;
+  reportBodyDeliveredInChat?: boolean;
+  explicitArtifactOnlyAllowed?: boolean;
+  privateOnlyFinalResponse?: boolean;
+  milestoneStageCompleted?: boolean;
+  milestoneReportRequired?: boolean;
+  milestoneReportDelivered?: boolean;
+}): CleanupCrewReportCloseoutAcceptanceDecision {
+  const currentTurnText = normalizeReportText(input.currentTurnText);
+  const reportText = normalizeReportText(input.reportText);
+  const combinedText = `${currentTurnText}\n${reportText}`;
+  const activeCleanupCrewMission =
+    input.activeCleanupCrewMission === true || isCleanupCrewReportText(combinedText);
+  const reportGenerated =
+    input.reportGenerated ??
+    (activeCleanupCrewMission && isCleanupCrewCloseoutOrStatusReportText(reportText));
+  const closeoutRequiresTruthFields =
+    activeCleanupCrewMission && requiresCleanupCrewCloseoutTruthFields(reportText);
+  const explicitArtifactOnlyAllowed =
+    input.explicitArtifactOnlyAllowed === true ||
+    reportNamesArtifactOnlyPermission(currentTurnText);
+  const operatorStopRequested = isOperatorStopText(currentTurnText);
+  const markFacingExportRequired =
+    input.markFacingExportRequired ??
+    (closeoutRequiresTruthFields &&
+      reportNamesArtifactSection(reportText) &&
+      !explicitArtifactOnlyAllowed &&
+      !operatorStopRequested);
+  const inferredMarkFacingExportVerified =
+    input.markFacingExportVerified ?? reportNamesMarkFacingExportPath(input.reportText ?? "");
+  const reportDelivery = resolveReportDeliveryGuard({
+    reportGenerated,
+    reportArtifactPath:
+      input.reportArtifactPath ?? (reportGenerated ? "final_response_body" : undefined),
+    markFacingExportRequired,
+    markFacingExportPath:
+      input.markFacingExportPath ??
+      (inferredMarkFacingExportVerified ? "mark_facing_export_path_in_report_body" : undefined),
+    markFacingExportVerified: inferredMarkFacingExportVerified,
+    reportBodyDeliveredInChat: input.reportBodyDeliveredInChat,
+    explicitArtifactOnlyAllowed,
+    privateOnlyFinalResponse: input.privateOnlyFinalResponse,
+    milestoneStageCompleted: input.milestoneStageCompleted,
+    milestoneReportRequired: input.milestoneReportRequired,
+    milestoneReportDelivered: input.milestoneReportDelivered,
+  });
+  const postReportContinuation = resolveCleanupCrewPostReportContinuation({
+    currentTurnText: input.currentTurnText,
+    reportText: input.reportText,
+    finalDeliveryDelivered: reportDelivery.reportDeliveryComplete,
+    activeCleanupCrewMission,
+  });
+  const missingTruthFields = closeoutRequiresTruthFields
+    ? missingCleanupCrewCloseoutTruthFields(input.reportText)
+    : [];
+  const completionClaimed = reportClaimsCompletion(reportText);
+
+  if (!activeCleanupCrewMission) {
+    return {
+      schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+      state: "not_cleanup_crew_report",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      activeCleanupCrewMission: false,
+      allowedToAcceptReport: true,
+      allowedToCloseMission: true,
+      reportDelivery,
+      postReportContinuation,
+      missingTruthFields: [],
+      nextAction: "continue normal final-response delivery",
+      reason: "not_cleanup_crew_report",
+    };
+  }
+
+  if (!reportDelivery.allowed) {
+    return {
+      schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+      state: reportDelivery.state,
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      activeCleanupCrewMission,
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reportDelivery,
+      postReportContinuation,
+      missingTruthFields,
+      nextAction: "deliver the missing Mark-facing report body/export proof before closeout",
+      reason: reportDelivery.reason,
+    };
+  }
+
+  if (missingTruthFields.length > 0) {
+    return {
+      schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+      state: "blocked_missing_truth_fields",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      activeCleanupCrewMission,
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reportDelivery,
+      postReportContinuation,
+      missingTruthFields,
+      nextAction: "rewrite the Cleanup Crew report with every required truth field",
+      reason: "cleanup_crew_report_missing_required_truth_fields",
+    };
+  }
+
+  if (completionClaimed && reportNamesPaperworkOnlyWork(reportText)) {
+    return {
+      schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+      state: "blocked_paperwork_only_closeout",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      activeCleanupCrewMission,
+      allowedToAcceptReport: false,
+      allowedToCloseMission: false,
+      reportDelivery,
+      postReportContinuation,
+      missingTruthFields,
+      nextAction: "state paperwork/setup truth without closing the Cleanup Crew mission",
+      reason: "paperwork_only_work_cannot_close_cleanup_crew_mission",
+    };
+  }
+
+  if (isOperatorStopText(currentTurnText)) {
+    return {
+      schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+      state: "stop_after_report_only_request",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      activeCleanupCrewMission,
+      allowedToAcceptReport: true,
+      allowedToCloseMission: true,
+      reportDelivery,
+      postReportContinuation,
+      missingTruthFields,
+      nextAction: "stop because Mark explicitly requested report-only/status-only/stop",
+      reason: "operator_requested_report_only_or_stop",
+    };
+  }
+
+  if (
+    postReportContinuation.state === "continuation_dispatch_required" ||
+    postReportContinuation.state === "pending_continuation_action"
+  ) {
+    return {
+      schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+      state: "accepted_report_continue",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      activeCleanupCrewMission,
+      allowedToAcceptReport: true,
+      allowedToCloseMission: false,
+      reportDelivery,
+      postReportContinuation,
+      missingTruthFields,
+      nextAction:
+        postReportContinuation.nextExecutableAction ??
+        "record the next executable Cleanup Crew action before terminal stop",
+      reason: postReportContinuation.reason,
+    };
+  }
+
+  return {
+    schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
+    state: "accepted_closeout",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    activeCleanupCrewMission,
+    allowedToAcceptReport: true,
+    allowedToCloseMission: true,
+    reportDelivery,
+    postReportContinuation,
+    missingTruthFields,
+    nextAction: "accept Cleanup Crew report/closeout",
+    reason: "cleanup_crew_report_closeout_acceptance_passed",
+  };
+}
+
+/**
  * Keeps report delivery and mission completion separate. A generated report
  * may require visible delivery or later verified settlement, but delivery
  * failure is not a parent-mission closeout and not a reason to drop
@@ -798,7 +1099,7 @@ export function resolveCleanupCrewReportDeliveryRepair(
       reportId,
       state: "not_required",
       allowedToAdvance: true,
-      allowedToCloseMission: facts.parentMissionOpen === true ? false : true,
+      allowedToCloseMission: facts.parentMissionOpen !== true,
       missionRemainsOpen: facts.parentMissionOpen === true,
       registryWorkRequired: false,
       repairWorkRequired: false,

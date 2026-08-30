@@ -44,7 +44,7 @@ describe("cleanup plan Continuity Gate v2 integration", () => {
       expect(result.writes[0]?.kind).toBe("stoppage_receipt");
       expect(result.writes[0]?.path).toContain("cleanup_crew_stoppage_receipts");
 
-      const receipt = JSON.parse(await readFile(result.writes[0]!.path, "utf8")) as {
+      const receipt = JSON.parse(await readFile(result.writes[0].path, "utf8")) as {
         schema: string;
         mission_id: string;
         task_flow_id: string;
@@ -483,7 +483,7 @@ describe("cleanup plan Continuity Gate v2 integration", () => {
       expect(result.decision.askMark).toBe(false);
       expect(result.writes.map((write) => write.kind)).toEqual(["diagnostic_trace"]);
 
-      const trace = JSON.parse(await readFile(result.writes[0]!.path, "utf8")) as {
+      const trace = JSON.parse(await readFile(result.writes[0].path, "utf8")) as {
         schema: string;
         selected_state: string;
       };

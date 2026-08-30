@@ -51,7 +51,7 @@ function normalizeStringArray(value: unknown, maxLength: number): string[] | und
 }
 
 function hasOwn(value: Record<string, unknown>, key: string): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
+  return Object.hasOwn(value, key);
 }
 
 function normalizeDeliveryContext(
@@ -268,9 +268,7 @@ function normalizeActivationContinuation(
 export const restartHandlers: GatewayRequestHandlers = {
   "gateway.restart.request": async ({ respond, params }) => {
     const activationContinuation =
-      params && typeof params === "object"
-        ? normalizeActivationContinuation(params as Record<string, unknown>)
-        : null;
+      params && typeof params === "object" ? normalizeActivationContinuation(params) : null;
     if (activationContinuation && !activationContinuation.ok) {
       respond(
         false,

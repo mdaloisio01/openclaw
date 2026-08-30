@@ -639,7 +639,9 @@ describe("matrix live qa scenarios", () => {
     );
 
     expect(new Set(shardIds).size).toBe(shardIds.length);
-    expect(shardIds.toSorted()).toEqual(allIds.toSorted());
+    expect(shardIds.toSorted((left, right) => left.localeCompare(right))).toEqual(
+      allIds.toSorted((left, right) => left.localeCompare(right)),
+    );
   });
 
   it("waits for the driver Matrix approval reaction echo before awaiting the decision", async () => {

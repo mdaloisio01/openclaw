@@ -4,13 +4,15 @@ import type { QaProviderMode } from "../run-config.js";
 import { normalizeQaProviderMode } from "../run-config.js";
 import type { LiveTransportQaCommandOptions } from "./live-transport-cli.js";
 
-export function resolveLiveTransportQaRunOptions(
-  opts: LiveTransportQaCommandOptions,
-): LiveTransportQaCommandOptions & {
+interface ResolvedLiveTransportQaCommandOptions extends LiveTransportQaCommandOptions {
   outputDir: string;
   repoRoot: string;
   providerMode: QaProviderMode;
-} {
+}
+
+export function resolveLiveTransportQaRunOptions(
+  opts: LiveTransportQaCommandOptions,
+): ResolvedLiveTransportQaCommandOptions {
   const repoRoot = path.resolve(opts.repoRoot ?? process.cwd());
   const outputDir =
     resolveRepoRelativeOutputDir(repoRoot, opts.outputDir) ??

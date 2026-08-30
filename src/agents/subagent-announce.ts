@@ -254,7 +254,7 @@ function extractReferencedFilePaths(text: string): string[] {
     }
   }
 
-  const absolutePathPattern = /(^|[\s`<])((?:\/[A-Za-z0-9._~\-]+)+)(?::\d+)?(?=$|[\s`>),.;])/gm;
+  const absolutePathPattern = /(^|[\s`<])((?:\/[A-Za-z0-9._~-]+)+)(?::\d+)?(?=$|[\s`>),.;])/gm;
   let absoluteMatch: RegExpExecArray | null;
   while ((absoluteMatch = absolutePathPattern.exec(text)) !== null) {
     const normalized = normalizeReferencedFilePath(absoluteMatch[2] ?? "");

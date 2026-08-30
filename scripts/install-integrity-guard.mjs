@@ -9,7 +9,6 @@ const allowedLifecyclePackageManagers = new Set(["pnpm", "npm", "yarn", "bun"]);
 const DEFAULT_ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const NON_PNPM_BYPASS_ENV = "OPENCLAW_ALLOW_NON_PNPM_INSTALL";
 const NPM_ARTIFACT_BYPASS_ENV = "OPENCLAW_ALLOW_NPM_INSTALL_ARTIFACTS";
-const PREFERRED_INSTALL_COMMAND = "corepack pnpm install";
 
 function normalizeEnvValue(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -108,6 +107,7 @@ function gitStatusForPath(rootDir, relativePath, options = {}) {
           : result.stderr?.trim() || `git status exited ${result.status}`,
     };
   }
+  return { ok: true, status: result.stdout ?? "" };
 }
 
 function classifyRootShrinkwrap(rootDir, options = {}) {
@@ -156,7 +156,7 @@ function npmArtifactWarnings(rootDir, options = {}) {
   const fsImpl = options.fs ?? fs;
   const entries = fsImpl.existsSync(rootDir) ? fsImpl.readdirSync(rootDir) : [];
   return entries
-    .filter((entry) => /^npm-shrinkwrap\.json\.bak-/u.test(entry))
+    .filter((entry) => entry.startsWith("npm-shrinkwrap.json.bak-"))
     .map((entry) => ({
       relativePath: entry,
       path: path.join(rootDir, entry),

@@ -159,12 +159,12 @@ function hasActiveProductionParentFlow(parentFlowId: string): boolean {
     return false;
   }
   return (
-    continuation.lawfulWholeRunCompletion !== true &&
-    continuation.blockerPresent !== true &&
-    continuation.ownerDecisionRequired !== true &&
-    continuation.restartOrReloadRequired !== true &&
-    continuation.hardStopPresent !== true &&
-    continuation.safetyStopPresent !== true
+    !continuation.lawfulWholeRunCompletion &&
+    !continuation.blockerPresent &&
+    !continuation.ownerDecisionRequired &&
+    !continuation.restartOrReloadRequired &&
+    !continuation.hardStopPresent &&
+    !continuation.safetyStopPresent
   );
 }
 
@@ -270,7 +270,7 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
   }
 
   for (const missionTasks of tasksByMissionId.values()) {
-    const latestTask = [...missionTasks].sort((left, right) => {
+    const latestTask = [...missionTasks].toSorted((left, right) => {
       const diff = taskMissionReferenceAt(right) - taskMissionReferenceAt(left);
       if (diff !== 0) {
         return diff;
@@ -426,7 +426,7 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
     if (hasActiveExecutor || !hasLostChild) {
       continue;
     }
-    const latestTask = [...flowTasks].sort((left, right) => {
+    const latestTask = [...flowTasks].toSorted((left, right) => {
       const diff = taskFlowReferenceAt([right]) - taskFlowReferenceAt([left]);
       if (diff !== 0) {
         return diff;

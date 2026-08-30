@@ -45,9 +45,18 @@ const WORKSPACE_ORCHESTRATOR_DIR_ENV = "OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR";
 type SourceTurnDeliveryRegistryForTest = {
   rows?: Array<{
     currentStage?: string;
+    deliveryContext?: {
+      accountId?: string;
+      channel?: string;
+      threadId?: string | number;
+      to?: string;
+    };
     deliveryStatus?: string;
     finalDeliveryDelivered?: boolean;
     failureReason?: string;
+    sourceChannel?: string;
+    sourceMessageId?: string;
+    sourceSessionKey?: string;
     sourceTurnState?: string;
     visibleDeliveryCount?: number;
   }>;
@@ -397,14 +406,14 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
         currentCheckpointKind: "milestone_delivered",
         nextExecutableAction: "dispatch ISSUE-040 post-milestone continuation repair",
       });
-      expect(getTaskFlowProductionContinuation(flow!)).toMatchObject({
+      expect(getTaskFlowProductionContinuation(flow)).toMatchObject({
         activeProductionRun: true,
         parentRunOpen: true,
         nextExecutableUnitIdentified: true,
         nextExecutableUnitLaunched: true,
         continuationRequiredAfterLocalSuccess: true,
       });
-      expect(getTaskFlowActiveProductionContinuation(flow!)).toMatchObject({
+      expect(getTaskFlowActiveProductionContinuation(flow)).toMatchObject({
         broaderBuildOpen: true,
         status: "dispatched",
         boundary: "plan_next_step",
@@ -413,7 +422,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
           dispatchProofRef: "dispatch ISSUE-040 post-milestone continuation repair",
         },
       });
-      expect(listTasksForFlowId(flow!.flowId)).toHaveLength(1);
+      expect(listTasksForFlowId(flow.flowId)).toHaveLength(1);
     });
   });
 
@@ -437,10 +446,9 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       });
       const [firstFlow] = listTaskFlowRecords();
       expect(firstFlow).toBeDefined();
-      const firstTaskId = listTasksForFlowId(firstFlow!.flowId)[0]?.taskId;
-      const firstReceipt = getTaskFlowActiveProductionContinuation(
-        firstFlow!,
-      )?.lastDispatchReceiptId;
+      const firstTaskId = listTasksForFlowId(firstFlow.flowId)[0]?.taskId;
+      const firstReceipt =
+        getTaskFlowActiveProductionContinuation(firstFlow)?.lastDispatchReceiptId;
 
       await dispatchReplyFromConfig({
         ctx,
@@ -452,20 +460,18 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       const flows = listTaskFlowRecords();
       expect(flows).toHaveLength(1);
       const [secondFlow] = flows;
-      expect(listTasksForFlowId(secondFlow!.flowId).map((task) => task.taskId)).toEqual([
+      expect(listTasksForFlowId(secondFlow.flowId).map((task) => task.taskId)).toEqual([
         firstTaskId,
       ]);
-      expect(getTaskFlowActiveProductionContinuation(secondFlow!)).toMatchObject({
+      expect(getTaskFlowActiveProductionContinuation(secondFlow)).toMatchObject({
         status: "dispatched",
         nextAction: {
           summary: "dispatch ISSUE-040 post-milestone continuation repair",
         },
       });
-      expect(getTaskFlowActiveProductionContinuation(secondFlow!)?.dispatchReceipts).toHaveLength(
-        1,
-      );
+      expect(getTaskFlowActiveProductionContinuation(secondFlow)?.dispatchReceipts).toHaveLength(1);
       expect(
-        getTaskFlowActiveProductionContinuation(secondFlow!)?.lastDispatchReceiptId,
+        getTaskFlowActiveProductionContinuation(secondFlow)?.lastDispatchReceiptId,
       ).not.toBeUndefined();
       expect(firstReceipt).not.toBeUndefined();
     });
@@ -505,7 +511,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       expect(flow).toBeDefined();
       expect(flow?.status).toBe("terminal_pending_watchdog");
       expect(flow?.currentStep).toBe("cleanup_crew_full_build_complete_report_delivered");
-      expect(getTaskFlowProductionContinuation(flow!)).toMatchObject({
+      expect(getTaskFlowProductionContinuation(flow)).toMatchObject({
         activeProductionRun: true,
         parentRunOpen: false,
         lawfulWholeRunCompletion: true,
@@ -584,9 +590,16 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       currentStage: "final_dispatch_delivery_failed",
+      deliveryContext: {
+        channel: "discord",
+        to: "source-user-1",
+      },
       deliveryStatus: "delivery_failed",
       failureReason: "delivery_tool_failed",
       finalDeliveryDelivered: false,
+      sourceChannel: "discord",
+      sourceMessageId: "source-turn-message-1",
+      sourceSessionKey: "agent:test:session",
       sourceTurnState: "final_delivery_failed",
       visibleDeliveryCount: 0,
     });

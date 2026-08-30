@@ -712,8 +712,7 @@ function buildActiveProductionContinuationFromLegacy(params: {
   continuation: ProductionContinuationState;
 }): ActiveProductionContinuationState {
   const { flow, continuation } = params;
-  const broaderBuildOpen =
-    continuation.parentRunOpen === true && continuation.lawfulWholeRunCompletion !== true;
+  const broaderBuildOpen = continuation.parentRunOpen && !continuation.lawfulWholeRunCompletion;
   const boundary = broaderBuildOpen
     ? mapContinuationStopReasonToBoundary(continuation.lawfulStopReason)
     : "complete";
@@ -1754,6 +1753,7 @@ export function finishFlow(params: {
     }
   }
   const terminalAt = params.endedAt ?? params.updatedAt ?? Date.now();
+  let stateJson = params.stateJson;
   const continuation = getTaskFlowProductionContinuation(current);
   if (continuation?.activeProductionRun === true) {
     const passedContinuation =
@@ -1794,14 +1794,11 @@ export function finishFlow(params: {
         blockedSummary: detail,
       };
     }
-    params = {
-      ...params,
-      stateJson: attachProductionContinuationToStateJson({
-        flow: current,
-        stateJson: params.stateJson,
-        continuation: passedContinuation,
-      }),
-    };
+    stateJson = attachProductionContinuationToStateJson({
+      flow: current,
+      stateJson,
+      continuation: passedContinuation,
+    });
   }
   const endedAt = terminalAt;
   return updateFlowRecordByIdExpectedRevision({
@@ -1810,7 +1807,7 @@ export function finishFlow(params: {
     patch: {
       status: "succeeded",
       currentStep: params.currentStep,
-      stateJson: params.stateJson,
+      stateJson,
       waitJson: null,
       blockedTaskId: null,
       blockedSummary: null,

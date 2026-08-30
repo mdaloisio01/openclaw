@@ -46,10 +46,21 @@ export type SourceTurnMarkFacingExportDelivery = {
   verified: boolean;
 };
 
+export type SourceTurnDeliveryContext = {
+  channel?: string;
+  to?: string;
+  accountId?: string;
+  threadId?: string | number;
+};
+
 export type SourceTurnDeliveryRow = {
   id: string;
   kind: typeof SOURCE_TURN_DELIVERY_ROW_KIND;
   sourceTurnId: string;
+  sourceSessionKey?: string;
+  sourceMessageId?: string;
+  sourceChannel?: string;
+  deliveryContext?: SourceTurnDeliveryContext;
   acceptedAt: string;
   updatedAt: string;
   deliveryStatus: string;
@@ -75,6 +86,10 @@ export type PersistSourceTurnDeliveryParams = {
   registryPath: string;
   id: string;
   sourceTurnId?: string;
+  sourceSessionKey?: string;
+  sourceMessageId?: string;
+  sourceChannel?: string;
+  deliveryContext?: SourceTurnDeliveryContext;
   facts: SourceTurnDeliveryFacts;
   now?: string;
   currentStage?: string;
@@ -135,8 +150,11 @@ async function writeRegistry(path: string, registry: SourceTurnDeliveryRegistry)
 }
 
 function statusForDecision(decision: SourceTurnDeliveryDecision): string {
-  if (decision.state === "final_delivery_failed" || decision.state === "failure_delivered") {
+  if (decision.state === "final_delivery_failed") {
     return "delivery_failed";
+  }
+  if (decision.state === "failure_delivered") {
+    return "failure_delivered";
   }
   if (decision.state === "blocked_refused") {
     return "blocked";
@@ -248,6 +266,9 @@ function deriveObligationStage(params: {
   if (params.decision.state === "final_delivery_failed") {
     return "failed";
   }
+  if (params.decision.state === "failure_delivered") {
+    return "delivery_attempted";
+  }
   if (params.decision.state === "progress_delivered") {
     return "delivery_attempted";
   }
@@ -292,6 +313,24 @@ function normalizeMarkFacingExportDelivery(
   };
 }
 
+function normalizeDeliveryContext(
+  context: SourceTurnDeliveryContext | undefined,
+): SourceTurnDeliveryContext | undefined {
+  const channel = normalizeIdentityPart(context?.channel);
+  const to = normalizeIdentityPart(context?.to);
+  const accountId = normalizeIdentityPart(context?.accountId);
+  const threadId = normalizeIdentityPart(context?.threadId);
+  if (!channel && !to && !accountId && !threadId) {
+    return undefined;
+  }
+  return {
+    ...(channel ? { channel } : {}),
+    ...(to ? { to } : {}),
+    ...(accountId ? { accountId } : {}),
+    ...(threadId ? { threadId } : {}),
+  };
+}
+
 export async function loadSourceTurnDeliveryRegistry(
   registryPath: string,
 ): Promise<SourceTurnDeliveryRegistry> {
@@ -323,10 +362,25 @@ export async function persistSourceTurnDeliveryState(
     needsReview: params.needsReview,
   });
   const markFacingExport = normalizeMarkFacingExportDelivery(params.facts);
+  const sourceSessionKey =
+    normalizeIdentityPart(params.sourceSessionKey) ??
+    normalizeIdentityPart(existing?.sourceSessionKey);
+  const sourceMessageId =
+    normalizeIdentityPart(params.sourceMessageId) ??
+    normalizeIdentityPart(existing?.sourceMessageId);
+  const sourceChannel =
+    normalizeIdentityPart(params.sourceChannel) ?? normalizeIdentityPart(existing?.sourceChannel);
+  const deliveryContext =
+    normalizeDeliveryContext(params.deliveryContext) ??
+    normalizeDeliveryContext(existing?.deliveryContext);
   const row: SourceTurnDeliveryRow = {
     id: params.id,
     kind: SOURCE_TURN_DELIVERY_ROW_KIND,
     sourceTurnId,
+    ...(sourceSessionKey ? { sourceSessionKey } : {}),
+    ...(sourceMessageId ? { sourceMessageId } : {}),
+    ...(sourceChannel ? { sourceChannel } : {}),
+    ...(deliveryContext ? { deliveryContext } : {}),
     acceptedAt: existing?.acceptedAt ?? now,
     updatedAt: now,
     deliveryStatus: statusForDecision(decision),
@@ -382,6 +436,9 @@ export function classifySourceTurnDeliveryWatchdogStatus(
   }
   if (reconciliationStatus === "settled_resolved_later") {
     return "non_blocking_settled";
+  }
+  if (row.sourceTurnState === "failure_delivered" || deliveryStatus === "failure_delivered") {
+    return "non_blocking_delivered";
   }
   if (deliveryStatus === "delivery_failed" || row.sourceTurnState === "final_delivery_failed") {
     return "blocking_failed";

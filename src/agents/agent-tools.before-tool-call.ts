@@ -9,6 +9,13 @@ import type { SourceReplyDeliveryMode } from "../auto-reply/get-reply-options.ty
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
 import {
+  evaluateCleanupCrewToolPreflight,
+  type CleanupCrewRuntimeEnforcementMode,
+  type CleanupCrewRuntimeMissionContract,
+  type CleanupCrewRuntimeToolPermissionMode,
+  type CleanupCrewRuntimeToolPreflightDecision,
+} from "../governance/cleanup-crew-runtime-enforcement.js";
+import {
   evaluateMissionSpecificToolEnforcement,
   type MissionSpecificToolEnforcementAuthority,
 } from "../governance/mission-specific-tool-enforcement.js";
@@ -135,6 +142,18 @@ export type HookContext = {
     missionId?: string;
     nextAnalysisOwner?: string;
   };
+  cleanupCrewRuntimePreflight?: {
+    mode: Exclude<CleanupCrewRuntimeEnforcementMode, "disabled"> | "disabled";
+    activationGatesPassed?: boolean;
+    activeMissionScope?: string;
+    contract?: CleanupCrewRuntimeMissionContract;
+    permissionMode?: CleanupCrewRuntimeToolPermissionMode;
+    approvalClassSatisfied?: boolean;
+    lawfulOwnerMatched?: boolean;
+    idempotencyKeyPresent?: boolean;
+    rollbackProofPreserved?: boolean;
+    onDecision?: (decision: CleanupCrewRuntimeToolPreflightDecision) => void;
+  };
   governedBuildWorkspace?: RootMutationGuardContext;
   governedMissionToolEnforcement?: {
     active: boolean;
@@ -158,6 +177,7 @@ type HookBlockedReason =
   | "tool-loop"
   | "dirty-tree-hygiene"
   | "cleanup-crew-analysis-mode"
+  | "cleanup-crew-runtime-preflight"
   | "governed-build-root-mutation-guard"
   | "governed-mission-tool-enforcement";
 type HookOutcome =
@@ -826,6 +846,77 @@ function resolveCleanupCrewAnalysisModeBlock(args: {
       `Mission: ${mission}.`,
       `Stoppage: ${stoppage}.`,
       "Pause/analyze mode permits read-only inspection only; write the active build plan amendment before repair execution resumes.",
+    ].join(" "),
+    params: args.params,
+  };
+}
+
+function hasIdempotencyKey(params: unknown): boolean {
+  return Boolean(
+    getStringParam(params, ["idempotency_key", "idempotencyKey", "operation_id", "operationId"]),
+  );
+}
+
+function hasExplicitApprovalSignal(params: unknown): boolean {
+  return (
+    getBooleanParam(params, ["explicitApproval", "approvalClassSatisfied", "userApproved"]) === true
+  );
+}
+
+function hasRollbackOrProofSignal(params: unknown): boolean {
+  return getBooleanParam(params, ["rollbackProofPreserved", "proofPreserved"]) === true;
+}
+
+function resolveCleanupCrewRuntimePreflightBlock(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+}): HookOutcome | undefined {
+  const preflight = args.ctx?.cleanupCrewRuntimePreflight;
+  if (!preflight || preflight.mode === "disabled") {
+    return undefined;
+  }
+  const decision = evaluateCleanupCrewToolPreflight({
+    toolName: args.toolName,
+    params: args.params,
+    targetPath: resolveProtectedActionTargetPath(args.params, args.ctx),
+    contract: preflight.contract,
+    activeMissionScope: preflight.activeMissionScope,
+    permissionMode: preflight.permissionMode,
+    approvalClassSatisfied:
+      preflight.approvalClassSatisfied ?? hasExplicitApprovalSignal(args.params),
+    lawfulOwnerMatched: preflight.lawfulOwnerMatched,
+    idempotencyKeyPresent: preflight.idempotencyKeyPresent ?? hasIdempotencyKey(args.params),
+    rollbackProofPreserved:
+      preflight.rollbackProofPreserved ?? hasRollbackOrProofSignal(args.params),
+  });
+  preflight.onDecision?.(decision);
+  if (decision.gate.state === "fail") {
+    log.warn(
+      [
+        "Cleanup Crew tool preflight would block tool call.",
+        `mode=${preflight.mode}`,
+        `tool=${args.toolName}`,
+        `risks=${decision.riskClasses.join(",")}`,
+        `obligations=${decision.gate.obligations.join(",") || "none"}`,
+      ].join(" "),
+    );
+  }
+  if (preflight.mode !== "enforce" || preflight.activationGatesPassed !== true) {
+    return undefined;
+  }
+  if (decision.gate.state !== "fail") {
+    return undefined;
+  }
+  return {
+    blocked: true,
+    kind: "veto",
+    deniedReason: "cleanup-crew-runtime-preflight",
+    reason: [
+      "Cleanup Crew runtime preflight blocked this tool call.",
+      `Risks: ${decision.riskClasses.join(", ") || "none"}.`,
+      `Reason: ${decision.gate.reason}.`,
+      `Obligations: ${decision.gate.obligations.join(", ") || "none"}.`,
     ].join(" "),
     params: args.params,
   };
@@ -1637,6 +1728,15 @@ export async function runBeforeToolCallHook(args: {
   });
   if (cleanupCrewAnalysisBlock) {
     return cleanupCrewAnalysisBlock;
+  }
+
+  const cleanupCrewRuntimePreflightBlock = resolveCleanupCrewRuntimePreflightBlock({
+    toolName,
+    params,
+    ctx: args.ctx,
+  });
+  if (cleanupCrewRuntimePreflightBlock) {
+    return cleanupCrewRuntimePreflightBlock;
   }
 
   const governedMissionToolBlock = resolveGovernedMissionToolEnforcementBlock({

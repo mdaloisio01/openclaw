@@ -143,6 +143,6 @@ function replaceCapability(
   patch: Partial<EnforcementHealthCapabilityRecord>,
 ): EnforcementHealthCapabilityRecord[] {
   return healthyCapabilities.map((record) =>
-    record.capability === capability ? { ...record, ...patch } : record,
+    record.capability === capability ? Object.assign({}, record, patch) : record,
   );
 }

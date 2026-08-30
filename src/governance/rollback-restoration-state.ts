@@ -12,7 +12,7 @@ export function rollbackReceiptValid(
   return Boolean(
     receipt &&
     receipt.schema === "openclaw.rollback_receipt.v1" &&
-    receipt.executed === true &&
+    receipt.executed &&
     receipt.targetStateSha256 &&
     identityMatches(receipt, identity),
   );
@@ -25,7 +25,7 @@ export function restorationReceiptValid(
   return Boolean(
     receipt &&
     receipt.schema === "openclaw.restoration_receipt.v1" &&
-    receipt.executed === true &&
+    receipt.executed &&
     receipt.restoredStateSha256 &&
     identityMatches(receipt, identity),
   );

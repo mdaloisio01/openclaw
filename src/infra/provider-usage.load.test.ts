@@ -170,7 +170,7 @@ describe("provider-usage.load", () => {
     resolveProviderUsageSnapshotWithPluginMock.mockImplementation(
       async ({ provider }): Promise<ProviderUsageSnapshot | null> => ({
         provider: provider as ProviderUsageSnapshot["provider"],
-        displayName: String(provider),
+        displayName: provider,
         windows: [{ label: "3h", usedPercent: 12 }],
       }),
     );
@@ -189,7 +189,7 @@ describe("provider-usage.load", () => {
       onPerfMeasure: (name, durationMs) => measures.push({ name, durationMs }),
     });
 
-    expect(measures.map((measure) => measure.name).sort()).toEqual([
+    expect(measures.map((measure) => measure.name).toSorted()).toEqual([
       "provider_fetch_anthropic",
       "provider_fetch_openai",
     ]);
@@ -207,7 +207,7 @@ describe("provider-usage.load", () => {
         active -= 1;
         return {
           provider: provider as ProviderUsageSnapshot["provider"],
-          displayName: String(provider),
+          displayName: provider,
           windows: [{ label: "3h", usedPercent: 12 }],
         };
       },

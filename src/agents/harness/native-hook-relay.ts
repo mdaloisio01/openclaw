@@ -1419,7 +1419,7 @@ function runNativeHookRelayPostToolUse(params: {
       ...(params.registration.channelId ? { channelId: params.registration.channelId } : {}),
       startArgs,
       result,
-    }).catch((error) => {
+    }).catch((error: unknown) => {
       log.warn(
         `native hook relay PostToolUse observer failed runId=${JSON.stringify(params.registration.runId)} ` +
           `toolName=${JSON.stringify(toolName)} toolCallId=${JSON.stringify(toolCallId)} ` +

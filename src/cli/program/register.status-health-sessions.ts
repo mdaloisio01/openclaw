@@ -88,9 +88,7 @@ function collectOptionValue(value: string, previous: string[]): string[] {
 
 function hasJsonOption(opts: { json?: boolean }, command?: Command): boolean {
   return Boolean(
-    opts.json ||
-    (command?.parent?.opts() as { json?: boolean } | undefined)?.json ||
-    (command?.parent?.parent?.opts() as { json?: boolean } | undefined)?.json,
+    opts.json || command?.parent?.opts()?.json || command?.parent?.parent?.opts()?.json,
   );
 }
 

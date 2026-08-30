@@ -184,10 +184,10 @@ function recoverPendingSessionDeliveries(params: {
 function recoverPendingActivationContinuations(params: { log: GatewayRuntimeServiceLogger }): void {
   const timer = setTimeout(() => {
     void (async () => {
-      const { recoverPendingActivationContinuations } =
+      const { recoverPendingActivationContinuations: recoverContinuations } =
         await import("../infra/activation-continuation.js");
       const logRecovery = params.log.child("activation-continuation");
-      const recovered = await recoverPendingActivationContinuations({ log: logRecovery });
+      const recovered = await recoverContinuations({ log: logRecovery });
       if (recovered.length > 0) {
         logRecovery.info(`recovered ${recovered.length} activation continuation(s)`);
       }
