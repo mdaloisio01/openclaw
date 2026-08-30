@@ -423,6 +423,43 @@ describe("source turn delivery storage adapter", () => {
     expect(sourceTurnDeliveryBlocksWatchdog(row)).toBe(true);
   });
 
+  it("preserves unknown-after-send delivery as pending settlement review", async () => {
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:unknown-after-send",
+      sourceTurnId: "source-turn-unknown",
+      missionId: "mission",
+      reportId: "final-closeout",
+      deliveryId: "queue-entry-1",
+      facts: {
+        finalDeliveryRequired: true,
+        deliveryOutcomeUnknown: true,
+        evidenceKinds: ["delivery_unknown_after_send"],
+        reportRequired: true,
+        reportArtifactPath: "/tmp/report.md",
+      },
+      reportPrepared: true,
+      deliveryAttempted: true,
+      reportArtifactPaths: ["/tmp/report.md"],
+    });
+
+    expect(row).toMatchObject({
+      deliveryStatus: "delivery_unknown",
+      obligationStage: "needs_review",
+      sourceTurnState: "final_delivery_unknown",
+      finalDeliveryDelivered: false,
+      visibleDeliveryCount: 0,
+      failureReason: "delivery_outcome_unknown_after_send",
+      obligationIdentity: {
+        missionId: "mission",
+        reportId: "final-closeout",
+        deliveryId: "queue-entry-1",
+      },
+    });
+    expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("blocking_pending");
+    expect(sourceTurnDeliveryBlocksWatchdog(row)).toBe(true);
+  });
+
   it("treats a visible source-chat failure notice as non-blocking delivery handling", async () => {
     const row = await persistSourceTurnDeliveryState({
       registryPath,

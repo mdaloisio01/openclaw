@@ -153,6 +153,9 @@ function statusForDecision(decision: SourceTurnDeliveryDecision): string {
   if (decision.state === "final_delivery_failed") {
     return "delivery_failed";
   }
+  if (decision.state === "final_delivery_unknown") {
+    return "delivery_unknown";
+  }
   if (decision.state === "failure_delivered") {
     return "failure_delivered";
   }
@@ -265,6 +268,9 @@ function deriveObligationStage(params: {
   }
   if (params.decision.state === "final_delivery_failed") {
     return "failed";
+  }
+  if (params.decision.state === "final_delivery_unknown") {
+    return "needs_review";
   }
   if (params.decision.state === "failure_delivered") {
     return "delivery_attempted";
@@ -391,7 +397,9 @@ export async function persistSourceTurnDeliveryState(
     finalDeliveryDelivered: decision.finalDeliveryDelivered,
     visibleDeliveryCount: visibleDeliveryCountForDecision(decision),
     ...(params.currentStage ? { currentStage: params.currentStage } : {}),
-    ...(decision.state === "final_delivery_failed" || decision.state === "blocked_refused"
+    ...(decision.state === "final_delivery_failed" ||
+    decision.state === "final_delivery_unknown" ||
+    decision.state === "blocked_refused"
       ? { failureReason: decision.reason }
       : {}),
     ...(params.reportArtifactPaths && params.reportArtifactPaths.length > 0
@@ -442,6 +450,9 @@ export function classifySourceTurnDeliveryWatchdogStatus(
   }
   if (deliveryStatus === "delivery_failed" || row.sourceTurnState === "final_delivery_failed") {
     return "blocking_failed";
+  }
+  if (deliveryStatus === "delivery_unknown" || row.sourceTurnState === "final_delivery_unknown") {
+    return "blocking_pending";
   }
   if (deliveryStatus === "blocked" || row.sourceTurnState === "blocked_refused") {
     return "blocking_refused";

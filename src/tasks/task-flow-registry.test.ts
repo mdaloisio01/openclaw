@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resolveMissionSettlementTail } from "../agents/mission-settlement-tail.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   BLIND_TEST_SLICE_CONTROLLER_ID,
+  attachMissionSettlementToTaskFlowStateJson,
   createBlindTestSliceFlow as createBlindTestSliceFlowOrNull,
   createNextBlindTestSliceFlow,
   createFlowRecord as createFlowRecordOrNull,
@@ -10,8 +12,9 @@ import {
   deleteTaskFlowRecordById,
   failFlow,
   finishFlow,
-  getTaskFlowProductionContinuation,
   getTaskFlowById,
+  getTaskFlowMissionSettlement,
+  getTaskFlowProductionContinuation,
   listTaskFlowRecords,
   recordFlowLawfulStop,
   recordFlowNextExecutableLaunch,
@@ -625,6 +628,237 @@ describe("task-flow-registry", () => {
       }
       expect(closed.flow.status).toBe("succeeded");
       expect(closed.flow.endedAt).toBe(130);
+    });
+  });
+
+  it("attaches mission settlement state to managed TaskFlow stateJson without changing revision semantics", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const settlement = resolveMissionSettlementTail({
+        missionId: "mission-settlement-flow",
+        workState: "completed",
+        resultDurable: true,
+        closeoutReady: true,
+        closeout: {
+          runLabel: "TaskFlow settlement",
+          targetHandled: "mission settlement",
+          scopeHandled: "managed TaskFlow stateJson",
+          actualExecutionOwner: "Cleanup Crew",
+          artifactPaths: ["/tmp/closeout.md"],
+          proofPaths: ["src/tasks/task-flow-registry.test.ts"],
+          whatIsMateriallyRealNow: "Work result is durable.",
+          whatIsStillNotRealYet: "Delivery is unknown.",
+          whoLawfullyOwnsNextStep: "Will",
+          openClosedTruth: "owner execution in progress, build still open.",
+          exactNextAction: "reconcile delivery acknowledgement",
+          shortResult: "Settlement tail is attached to TaskFlow state.",
+        },
+        reportRequired: true,
+        reportRendered: true,
+        deliveryState: "unknown",
+      });
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Track mission settlement tail",
+        currentStep: "delivery_recovery",
+        stateJson: attachMissionSettlementToTaskFlowStateJson({
+          stateJson: { phase: "delivery_recovery" },
+          settlement,
+        }),
+      });
+
+      expect(created.revision).toBe(0);
+      expect(created.stateJson).toMatchObject({
+        phase: "delivery_recovery",
+        governedMissionSettlement: {
+          schema: "openclaw.mission_settlement_tail_decision.v1",
+          missionId: "mission-settlement-flow",
+          state: "DELIVERY_UNKNOWN",
+          settled: false,
+          nextIncompleteBoundary: "delivery_unknown",
+        },
+      });
+      expect(getTaskFlowMissionSettlement(created)).toMatchObject({
+        missionId: "mission-settlement-flow",
+        state: "DELIVERY_UNKNOWN",
+        recoveryAction: "reconcile_ambiguous_delivery_ack",
+      });
+
+      const updated = updateFlowRecordByIdExpectedRevision({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        patch: {
+          currentStep: "delivery_reconciliation_running",
+          stateJson: attachMissionSettlementToTaskFlowStateJson({
+            stateJson: created.stateJson,
+            settlement: {
+              ...settlement,
+              state: "DELIVERY_FAILED",
+              recoveryAction: "retry_delivery_only_with_idempotency",
+              nextIncompleteBoundary: "delivery_retry",
+            },
+          }),
+        },
+      });
+      expect(updated.applied).toBe(true);
+      if (!updated.applied) {
+        throw new Error("Expected settlement update to apply");
+      }
+      expect(updated.flow.revision).toBe(1);
+      expect(updated.flow.stateJson).toMatchObject({
+        phase: "delivery_recovery",
+        governedMissionSettlement: {
+          state: "DELIVERY_FAILED",
+          nextIncompleteBoundary: "delivery_retry",
+        },
+      });
+    });
+  });
+
+  it("ignores malformed TaskFlow mission settlement blobs", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Reject malformed settlement state",
+        stateJson: {
+          governedMissionSettlement: {
+            schema: "wrong.schema",
+            state: "SETTLED",
+          },
+        },
+      });
+
+      expect(getTaskFlowMissionSettlement(created)).toBeNull();
+    });
+  });
+
+  it("blocks managed TaskFlow close while mission settlement tail is open", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const settlement = resolveMissionSettlementTail({
+        missionId: "mission-open-tail",
+        workState: "completed",
+        resultDurable: true,
+        closeoutReady: true,
+        closeout: {
+          runLabel: "Open settlement",
+          targetHandled: "mission settlement close gate",
+          scopeHandled: "managed TaskFlow terminal close",
+          actualExecutionOwner: "Cleanup Crew",
+          artifactPaths: ["/tmp/closeout.md"],
+          proofPaths: ["src/tasks/task-flow-registry.test.ts"],
+          whatIsMateriallyRealNow: "Work result is durable.",
+          whatIsStillNotRealYet: "Final report delivery is unknown.",
+          whoLawfullyOwnsNextStep: "Will",
+          openClosedTruth: "owner execution in progress, build still open.",
+          exactNextAction: "reconcile delivery acknowledgement",
+          shortResult: "TaskFlow close must wait for settlement.",
+        },
+        reportRequired: true,
+        reportRendered: true,
+        deliveryState: "unknown",
+      });
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Do not close before delivery settlement",
+        currentStep: "delivery_recovery",
+        stateJson: attachMissionSettlementToTaskFlowStateJson({
+          stateJson: { phase: "delivery_recovery" },
+          settlement,
+        }),
+      });
+      if (!created) {
+        throw new Error("Expected managed flow creation");
+      }
+
+      const closed = finishFlow({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        currentStep: "attempted_close",
+      });
+
+      expect(closed.applied).toBe(false);
+      expect(closed.reason).toBe("guard_blocked");
+      expect(closed.blockedSummary).toContain("Mission settlement tail is not settled");
+      expect(closed.blockedSummary).toContain("DELIVERY_UNKNOWN");
+      expect(closed.current).toMatchObject({
+        status: "blocked",
+        currentStep: "mission_settlement_tail_open",
+      });
+    });
+  });
+
+  it("blocks whole-run completion stop while mission settlement tail is open", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+
+      const settlement = resolveMissionSettlementTail({
+        missionId: "mission-open-tail-stop",
+        workState: "completed",
+        resultDurable: true,
+        closeoutReady: true,
+        closeout: {
+          runLabel: "Open settlement stop",
+          targetHandled: "mission settlement lawful stop gate",
+          scopeHandled: "active production whole-run completion",
+          actualExecutionOwner: "Cleanup Crew",
+          artifactPaths: ["/tmp/closeout.md"],
+          proofPaths: ["src/tasks/task-flow-registry.test.ts"],
+          whatIsMateriallyRealNow: "Work result is durable.",
+          whatIsStillNotRealYet: "Final report delivery failed.",
+          whoLawfullyOwnsNextStep: "Will",
+          openClosedTruth: "owner execution in progress, build still open.",
+          exactNextAction: "retry delivery only",
+          shortResult: "Whole-run complete must wait for delivery settlement.",
+        },
+        reportRequired: true,
+        reportRendered: true,
+        deliveryState: "failed",
+      });
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Do not mark whole run complete before delivery settlement",
+        currentStep: "delivery_retry",
+        continuation: {
+          activeProductionRun: true,
+          currentUnitStatus: "passed",
+          continuationRequiredAfterLocalSuccess: false,
+        },
+        stateJson: attachMissionSettlementToTaskFlowStateJson({
+          stateJson: { phase: "delivery_retry" },
+          settlement,
+        }),
+      });
+      if (!created) {
+        throw new Error("Expected managed flow creation");
+      }
+
+      const stopped = recordFlowLawfulStop({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        reason: "whole_run_complete",
+      });
+
+      expect(stopped.applied).toBe(false);
+      expect(stopped.reason).toBe("guard_blocked");
+      expect(stopped.blockedSummary).toContain("Mission settlement tail is not settled");
+      expect(stopped.blockedSummary).toContain("DELIVERY_FAILED");
+      expect(stopped.current).toMatchObject({
+        status: "blocked",
+        currentStep: "mission_settlement_tail_open",
+      });
     });
   });
 

@@ -12,6 +12,7 @@ describe("source turn delivery state contract", () => {
       "progress_delivered",
       "final_delivered",
       "final_delivery_failed",
+      "final_delivery_unknown",
       "failure_delivered",
       "settled_resolved_later",
       "blocked_refused",
@@ -155,6 +156,20 @@ describe("source turn delivery state contract", () => {
       finalDeliveryDelivered: false,
       refused: false,
       reason: "delivery_tool_failed",
+    });
+  });
+
+  it("keeps unknown-after-send delivery distinct from failed and delivered", () => {
+    expect(
+      resolveSourceTurnDeliveryState({
+        finalDeliveryRequired: true,
+        deliveryOutcomeUnknown: true,
+      }),
+    ).toEqual({
+      state: "final_delivery_unknown",
+      finalDeliveryDelivered: false,
+      refused: false,
+      reason: "delivery_outcome_unknown_after_send",
     });
   });
 

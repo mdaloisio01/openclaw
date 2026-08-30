@@ -1,11 +1,107 @@
 import { describe, expect, it } from "vitest";
+import { resolveMissionSettlementTail } from "../agents/mission-settlement-tail.js";
 import { CLEANUP_WATCHDOG_POLICY_VERSION } from "../governance/cleanup-watchdog-policy.js";
 import {
   classifyWatchdogSuspiciousItem,
+  projectMissionSettlementForWatchdog,
   resolveWatchdogNeedsReviewReconciliation,
 } from "./active-work-watchdog-reconciliation.js";
 
 describe("active work watchdog reconciliation", () => {
+  it("projects delivery-failed settlement as delivery-tail blocker without work rerun", () => {
+    const decision = resolveMissionSettlementTail({
+      missionId: "mission-delivery-failed",
+      workState: "completed",
+      resultDurable: true,
+      closeoutReady: true,
+      closeout: {
+        runLabel: "Mission delivery failed",
+        targetHandled: "delivery tail",
+        scopeHandled: "watchdog projection",
+        actualExecutionOwner: "Cleanup Crew",
+        artifactPaths: ["/tmp/closeout.md"],
+        proofPaths: ["src/tasks/active-work-watchdog-reconciliation.test.ts"],
+        whatIsMateriallyRealNow: "Work is complete.",
+        whatIsStillNotRealYet: "Delivery failed.",
+        whoLawfullyOwnsNextStep: "Will",
+        openClosedTruth: "owner execution in progress, build still open.",
+        exactNextAction: "retry delivery only",
+        shortResult: "Delivery tail remains open.",
+      },
+      reportRequired: true,
+      reportRendered: true,
+      deliveryState: "failed",
+    });
+
+    expect(projectMissionSettlementForWatchdog(decision)).toEqual({
+      schema: "openclaw.mission_settlement_watchdog_projection.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId: "mission-delivery-failed",
+      settlementState: "DELIVERY_FAILED",
+      classification: "real production blocker",
+      canonicalPriority: "P7_PENDING_REPORT_DELIVERY",
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: true,
+      recoveryMayRerunWork: false,
+      recoveryBoundary: "delivery_retry",
+      nextAction: "retry_delivery_only_with_idempotency",
+      reason: "delivery_tail_open_completed_work_must_not_be_restarted",
+    });
+  });
+
+  it("projects delivery-unknown settlement as reconciliation work without blind resend", () => {
+    const decision = resolveMissionSettlementTail({
+      missionId: "mission-delivery-unknown",
+      workState: "completed",
+      resultDurable: true,
+      closeoutReady: true,
+      closeout: {
+        runLabel: "Mission delivery unknown",
+        targetHandled: "delivery tail",
+        scopeHandled: "watchdog projection",
+        actualExecutionOwner: "Cleanup Crew",
+        artifactPaths: ["/tmp/closeout.md"],
+        proofPaths: ["src/tasks/active-work-watchdog-reconciliation.test.ts"],
+        whatIsMateriallyRealNow: "Work is complete.",
+        whatIsStillNotRealYet: "Delivery acknowledgement is unknown.",
+        whoLawfullyOwnsNextStep: "Will",
+        openClosedTruth: "owner execution in progress, build still open.",
+        exactNextAction: "reconcile ambiguous delivery",
+        shortResult: "Delivery acknowledgement remains unresolved.",
+      },
+      reportRequired: true,
+      reportRendered: true,
+      deliveryState: "unknown",
+    });
+
+    expect(projectMissionSettlementForWatchdog(decision)).toMatchObject({
+      settlementState: "DELIVERY_UNKNOWN",
+      classification: "real production blocker",
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: true,
+      recoveryMayRerunWork: false,
+      recoveryBoundary: "delivery_unknown",
+      nextAction: "reconcile_ambiguous_delivery_ack",
+    });
+  });
+
+  it("excludes watchdog and recovery work from production liveness", () => {
+    const decision = resolveMissionSettlementTail({
+      missionId: "mission-self-work",
+      workState: "running",
+    });
+
+    expect(
+      projectMissionSettlementForWatchdog(decision, { watchdogOrRecoverySelfWork: true }),
+    ).toMatchObject({
+      classification: "watchdog_self_work",
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: true,
+      recoveryMayRerunWork: false,
+      reason: "watchdog_or_recovery_work_is_subordinate_and_cannot_prove_original_mission_liveness",
+    });
+  });
+
   it("treats a clean watchdog receipt as closed only by fresh clean proof", () => {
     expect(
       resolveWatchdogNeedsReviewReconciliation({

@@ -222,6 +222,28 @@ export {
 } from "./governance/rollback-restoration-state.js";
 export { exportManifestComplete } from "./governance/mission-export-packager.js";
 export { grantApprovalFresh } from "./agents/grant-evidence-review.js";
+export {
+  MISSION_SETTLEMENT_FAILURE_STATES,
+  MISSION_SETTLEMENT_STAGES,
+  STRUCTURED_CLOSEOUT_REQUIRED_FIELDS,
+  missionDeliveryStateFromSourceTurnDelivery,
+  renderMissionCloseoutReport,
+  resolveMissionSettlementTail,
+  resolveMissionSettlementTailFromSourceTurnDelivery,
+  validateStructuredMissionCloseout,
+  type MissionDeliveryState,
+  type MissionSettlementDecision,
+  type MissionSettlementFailureState,
+  type MissionSettlementRecoveryAction,
+  type MissionSettlementStage,
+  type MissionSettlementState,
+  type MissionSettlementTailFacts,
+  type MissionWorkState,
+  type SourceTurnMissionSettlementFacts,
+  type StructuredCloseoutRequiredField,
+  type StructuredCloseoutValidation,
+  type StructuredMissionCloseout,
+} from "./agents/mission-settlement-tail.js";
 export type {
   AcceptanceGate,
   CloseoutAdmissionInput,

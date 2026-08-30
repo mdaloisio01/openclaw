@@ -26,6 +26,11 @@ import {
 } from "../../agents/agent-tools.policy.js";
 import { selectAgentHarness } from "../../agents/harness/selection.js";
 import {
+  resolveMissionSettlementTail,
+  type MissionDeliveryState,
+  type StructuredMissionCloseout,
+} from "../../agents/mission-settlement-tail.js";
+import {
   buildModelAliasIndex,
   resolveDefaultModelForAgent,
   resolveModelRefFromString,
@@ -94,7 +99,12 @@ import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveSilentReplyPolicyFromPolicies } from "../../shared/silent-reply-policy.js";
 import { ensureForegroundCleanupCrewTaskFlow } from "../../tasks/foreground-cleanup-crew-taskflow.js";
-import { recordFlowLawfulStop } from "../../tasks/task-flow-registry.js";
+import {
+  attachMissionSettlementToTaskFlowStateJson,
+  recordFlowLawfulStop,
+  updateFlowRecordByIdExpectedRevision,
+} from "../../tasks/task-flow-registry.js";
+import type { TaskFlowRecord } from "../../tasks/task-flow-registry.types.js";
 import {
   buildActiveMissionContextBlockForLookup,
   resolveMissionBoundFollowupForLookup,
@@ -1172,27 +1182,6 @@ function captureDeliveredSourceReplyTranscriptMirror(params: {
   return () => deliveredMetadata;
 }
 
-async function mirrorInternalSourceReplyAfterDispatcherDelivery(params: {
-  dispatcher: ReplyDispatcher;
-  before: { cancelled: number; failed: number };
-  metadata: () => SourceReplyTranscriptMirror | undefined;
-  cfg: OpenClawConfig;
-}): Promise<void> {
-  await params.dispatcher.waitForIdle();
-  const after = getDispatcherFinalOutcomeCounts(params.dispatcher);
-  if (after.cancelled > params.before.cancelled || after.failed > params.before.failed) {
-    return;
-  }
-  const metadata = params.metadata();
-  if (!metadata) {
-    return;
-  }
-  await mirrorInternalSourceReplyToTranscript({
-    metadata,
-    cfg: params.cfg,
-  });
-}
-
 function runWithDispatchAbortSignal<T>(
   signal: AbortSignal | undefined,
   run: () => Promise<T> | T,
@@ -1629,6 +1618,154 @@ export async function dispatchReplyFromConfig(
       `cleanup_crew_taskflow_${cleanupCrewTaskFlowRegistration.status}:${cleanupCrewTaskFlowRegistration.flow.flowId}`,
     );
   }
+  let cleanupCrewMissionSettlementFlow: TaskFlowRecord | undefined =
+    cleanupCrewTaskFlowRegistration.status === "registered" ||
+    cleanupCrewTaskFlowRegistration.status === "attached"
+      ? cleanupCrewTaskFlowRegistration.flow
+      : undefined;
+  const extractCleanupCrewReportField = (reportText: string, label: string): string => {
+    const lowerLabel = label.toLowerCase();
+    for (const line of reportText.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.toLowerCase().startsWith(lowerLabel)) {
+        continue;
+      }
+      return trimmed.slice(label.length).trim();
+    }
+    return "";
+  };
+  const extractCleanupCrewReportPaths = (reportText: string, label: string): string[] => {
+    const lines = reportText.split(/\r?\n/);
+    const lowerLabel = label.toLowerCase();
+    const paths: string[] = [];
+    for (let index = 0; index < lines.length; index += 1) {
+      const trimmed = lines[index]?.trim() ?? "";
+      if (!trimmed.toLowerCase().startsWith(lowerLabel)) {
+        continue;
+      }
+      const sameLine = trimmed.slice(label.length).trim();
+      if (sameLine) {
+        paths.push(sameLine.replace(/^[-*]\s*/, ""));
+      }
+      for (let next = index + 1; next < lines.length; next += 1) {
+        const nextLine = lines[next]?.trim() ?? "";
+        if (!nextLine) {
+          break;
+        }
+        if (!nextLine.startsWith("- ") && !nextLine.startsWith("* ")) {
+          break;
+        }
+        paths.push(nextLine.replace(/^[-*]\s*/, "").trim());
+      }
+      break;
+    }
+    return paths.filter(Boolean);
+  };
+  const buildStructuredCleanupCrewCloseout = (
+    reportText: string,
+  ): StructuredMissionCloseout | null => {
+    const targetHandled = extractCleanupCrewReportField(reportText, "Target handled:");
+    const scopeHandled = extractCleanupCrewReportField(reportText, "Scope handled:");
+    const actualExecutionOwner = extractCleanupCrewReportField(
+      reportText,
+      "Actual execution owner:",
+    );
+    const whatIsMateriallyRealNow = extractCleanupCrewReportField(
+      reportText,
+      "What is materially real now:",
+    );
+    const whatIsStillNotRealYet = extractCleanupCrewReportField(
+      reportText,
+      "What is still not real yet:",
+    );
+    const whoLawfullyOwnsNextStep = extractCleanupCrewReportField(
+      reportText,
+      "Who lawfully owns the next step:",
+    );
+    const openClosedTruth = extractCleanupCrewReportField(reportText, "Open/closed truth:");
+    const exactNextAction = extractCleanupCrewReportField(reportText, "Exact next action:");
+    if (
+      !targetHandled &&
+      !scopeHandled &&
+      !actualExecutionOwner &&
+      !whatIsMateriallyRealNow &&
+      !whatIsStillNotRealYet &&
+      !whoLawfullyOwnsNextStep &&
+      !openClosedTruth &&
+      !exactNextAction
+    ) {
+      return null;
+    }
+    const runLabel =
+      reportText
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find(Boolean) ?? "Cleanup Crew closeout";
+    return {
+      runLabel,
+      targetHandled,
+      scopeHandled,
+      actualExecutionOwner,
+      artifactPaths: extractCleanupCrewReportPaths(reportText, "Artifact path(s):"),
+      proofPaths: extractCleanupCrewReportPaths(reportText, "Proof path(s):"),
+      whatIsMateriallyRealNow,
+      whatIsStillNotRealYet,
+      whoLawfullyOwnsNextStep,
+      openClosedTruth,
+      exactNextAction,
+      shortResult: whatIsMateriallyRealNow || runLabel,
+    };
+  };
+  const recordCleanupCrewMissionSettlement = (
+    payload: ReplyPayload,
+    deliveryState: MissionDeliveryState,
+  ): TaskFlowRecord | undefined => {
+    const flow = cleanupCrewMissionSettlementFlow;
+    if (!flow) {
+      return undefined;
+    }
+    const reportText = normalizeOptionalString(payload.text);
+    if (!reportText) {
+      return flow;
+    }
+    const closeout = buildStructuredCleanupCrewCloseout(reportText);
+    if (!closeout) {
+      return flow;
+    }
+    const settlement = resolveMissionSettlementTail({
+      missionId: flow.flowId,
+      workState: "completed",
+      resultDurable: true,
+      closeoutReady: true,
+      closeout,
+      reportRequired: true,
+      reportRendered: true,
+      deliveryState,
+    });
+    const update = updateFlowRecordByIdExpectedRevision({
+      flowId: flow.flowId,
+      expectedRevision: flow.revision,
+      patch: {
+        currentStep: settlement.settled
+          ? "mission_settlement_tail_settled"
+          : `mission_settlement_tail_${settlement.nextIncompleteBoundary}`,
+        stateJson: attachMissionSettlementToTaskFlowStateJson({
+          stateJson: flow.stateJson,
+          settlement,
+        }),
+        updatedAt: Date.now(),
+      },
+    });
+    if (update.applied) {
+      cleanupCrewMissionSettlementFlow = update.flow;
+      return update.flow;
+    }
+    if (update.current) {
+      cleanupCrewMissionSettlementFlow = update.current;
+      return update.current;
+    }
+    return flow;
+  };
   let cleanupCrewPostReportContinuationRecorded = false;
   const recordCleanupCrewPostReportContinuation = (
     payload: ReplyPayload,
@@ -1654,13 +1791,16 @@ export async function dispatchReplyFromConfig(
     if (decision.state === "terminal_stop_allowed_full_build_complete") {
       recordLawfulBlocker(dispatcher, "whole_run_complete");
       cleanupCrewPostReportContinuationRecorded = true;
+      const settledFlow = recordCleanupCrewMissionSettlement(payload, "proven");
       if (
         cleanupCrewTaskFlowRegistration.status === "registered" ||
         cleanupCrewTaskFlowRegistration.status === "attached"
       ) {
+        const flow =
+          settledFlow ?? cleanupCrewMissionSettlementFlow ?? cleanupCrewTaskFlowRegistration.flow;
         recordFlowLawfulStop({
-          flowId: cleanupCrewTaskFlowRegistration.flow.flowId,
-          expectedRevision: cleanupCrewTaskFlowRegistration.flow.revision,
+          flowId: flow.flowId,
+          expectedRevision: flow.revision,
           reason: "whole_run_complete",
           currentStep: "cleanup_crew_full_build_complete_report_delivered",
           detail: "Delivered Cleanup Crew report records full build completion.",
@@ -1737,21 +1877,36 @@ export async function dispatchReplyFromConfig(
     if (decision.state !== "terminal_stop_allowed_full_build_complete") {
       return;
     }
-    recordLawfulBlocker(dispatcher, "whole_run_complete");
-    cleanupCrewPostReportContinuationRecorded = true;
-    if (
-      cleanupCrewTaskFlowRegistration.status !== "registered" &&
-      cleanupCrewTaskFlowRegistration.status !== "attached"
-    ) {
+    recordCleanupCrewMissionSettlement(payload, "intent_durable");
+    recordNonTerminalBuildUpdateEmitted(
+      dispatcher,
+      "cleanup_crew_final_delivery_pending_settlement",
+    );
+  };
+  const primeCleanupCrewContinuationGuardBeforeFinalDelivery = (payload: ReplyPayload): void => {
+    if (cleanupCrewPostReportContinuationRecorded) {
       return;
     }
-    recordFlowLawfulStop({
-      flowId: cleanupCrewTaskFlowRegistration.flow.flowId,
-      expectedRevision: cleanupCrewTaskFlowRegistration.flow.revision,
-      reason: "whole_run_complete",
-      currentStep: "cleanup_crew_full_build_complete_report_delivered",
-      detail: "Cleanup Crew final report records full build completion.",
+    const reportText = normalizeOptionalString(payload.text);
+    if (!reportText) {
+      return;
+    }
+    const decision = resolveCleanupCrewPostReportContinuation({
+      currentTurnText: currentTurnTextForCleanupCrewGuard,
+      reportText,
+      finalDeliveryDelivered: true,
     });
+    if (decision.state !== "continuation_dispatch_required") {
+      return;
+    }
+    const nextExecutableAction = normalizeOptionalString(decision.nextExecutableAction);
+    if (!nextExecutableAction) {
+      return;
+    }
+    recordNextExecutableStepStarted(
+      dispatcher,
+      `cleanup_crew_report_delivery_pending_continuation:${nextExecutableAction}`,
+    );
   };
   let dispatchReplyOperation: ReplyOperation | undefined;
   let dispatchAbortOperation: ReplyOperation | undefined;
@@ -2683,7 +2838,12 @@ export async function dispatchReplyFromConfig(
     const sendFinalPayload = async (
       payload: ReplyPayload,
       options: { abortSignal?: AbortSignal } = {},
-    ): Promise<{ queuedFinal: boolean; routedFinalCount: number }> => {
+    ): Promise<{
+      queuedFinal: boolean;
+      routedFinalCount: number;
+      finalDeliveryDelivered: boolean;
+      finalDeliveryUnknown: boolean;
+    }> => {
       const abortSignal = options.abortSignal ?? getDispatchAbortSignal();
       const throwIfFinalDeliveryAborted = () => {
         if (abortSignal?.aborted) {
@@ -2712,6 +2872,8 @@ export async function dispatchReplyFromConfig(
       const normalizedPayload = await normalizeReplyMediaPayload(ttsPayload);
       throwIfFinalDeliveryAborted();
       recordCleanupCrewTerminalStopBeforeFinalDelivery(normalizedPayload);
+      primeCleanupCrewContinuationGuardBeforeFinalDelivery(normalizedPayload);
+      recordCleanupCrewMissionSettlement(normalizedPayload, "intent_durable");
       const result = await routeReplyToOriginating(normalizedPayload, {
         abortSignal,
         kind: "final",
@@ -2722,7 +2884,9 @@ export async function dispatchReplyFromConfig(
             `dispatch-from-config: route-reply (final) failed: ${result.error ?? "unknown error"}`,
           );
         }
-        if (isRoutedReplyDelivered(result)) {
+        const finalDeliveryDelivered = isRoutedReplyDelivered(result);
+        const finalDeliveryUnknown = result.ok && result.suppressed === true;
+        if (finalDeliveryDelivered) {
           recordCleanupCrewPostReportContinuation(normalizedPayload, {
             finalDeliveryDelivered: true,
           });
@@ -2730,10 +2894,17 @@ export async function dispatchReplyFromConfig(
             metadata: sourceReplyTranscriptMirror,
             cfg,
           });
+        } else {
+          recordCleanupCrewMissionSettlement(
+            normalizedPayload,
+            finalDeliveryUnknown ? "unknown" : "failed",
+          );
         }
         return {
           queuedFinal: result.ok,
-          routedFinalCount: isRoutedReplyDelivered(result) ? 1 : 0,
+          routedFinalCount: finalDeliveryDelivered ? 1 : 0,
+          finalDeliveryDelivered,
+          finalDeliveryUnknown,
         };
       }
       throwIfFinalDeliveryAborted();
@@ -2744,21 +2915,44 @@ export async function dispatchReplyFromConfig(
         metadata: sourceReplyTranscriptMirror,
       });
       recordCleanupCrewTerminalStopBeforeFinalDelivery(normalizedPayload);
-      recordCleanupCrewPostReportContinuation(normalizedPayload, {
-        finalDeliveryDelivered: true,
-      });
+      primeCleanupCrewContinuationGuardBeforeFinalDelivery(normalizedPayload);
+      recordCleanupCrewMissionSettlement(normalizedPayload, "intent_durable");
       const queuedFinal = runtimeDispatcher.sendFinalReply(normalizedPayload);
+      let finalDeliveryDelivered = false;
+      let finalDeliveryUnknown = false;
       if (queuedFinal) {
-        await mirrorInternalSourceReplyAfterDispatcherDelivery({
-          dispatcher,
-          before: finalOutcomeBefore,
-          metadata: deliveredSourceReplyTranscriptMirror,
-          cfg,
-        });
+        await dispatcher.waitForIdle();
+        const finalOutcomeAfter = getDispatcherFinalOutcomeCounts(dispatcher);
+        const finalFailed = finalOutcomeAfter.failed > finalOutcomeBefore.failed;
+        const finalCancelled = finalOutcomeAfter.cancelled > finalOutcomeBefore.cancelled;
+        finalDeliveryDelivered = !finalFailed && !finalCancelled;
+        finalDeliveryUnknown = !finalFailed && finalCancelled;
+        if (finalDeliveryDelivered) {
+          recordCleanupCrewPostReportContinuation(normalizedPayload, {
+            finalDeliveryDelivered: true,
+          });
+          const metadata = deliveredSourceReplyTranscriptMirror();
+          if (metadata) {
+            await mirrorInternalSourceReplyToTranscript({
+              metadata,
+              cfg,
+            });
+          }
+        }
+      } else {
+        recordCleanupCrewMissionSettlement(normalizedPayload, "failed");
+      }
+      if (queuedFinal && !finalDeliveryDelivered) {
+        recordCleanupCrewMissionSettlement(
+          normalizedPayload,
+          finalDeliveryUnknown ? "unknown" : "failed",
+        );
       }
       return {
         queuedFinal,
         routedFinalCount: 0,
+        finalDeliveryDelivered,
+        finalDeliveryUnknown,
       };
     };
     // Run before_dispatch hook — let plugins inspect or handle before model dispatch.
@@ -2802,8 +2996,7 @@ export async function dispatchReplyFromConfig(
           );
           queuedFinal = handledReply.queuedFinal;
           routedFinalCount += handledReply.routedFinalCount;
-          const handledFinalDelivered =
-            handledReply.queuedFinal || handledReply.routedFinalCount > 0;
+          const handledFinalDelivered = handledReply.finalDeliveryDelivered;
           await recordSourceTurnDeliveryState(
             handledFinalDelivered
               ? {
@@ -2814,14 +3007,22 @@ export async function dispatchReplyFromConfig(
                       ? ["direct_source_final"]
                       : ["source_chat_final"],
                 }
-              : {
-                  finalDeliveryRequired: true,
-                  deliveryToolFailed: true,
-                  evidenceKinds: ["delivery_tool_failure"],
-                },
+              : handledReply.finalDeliveryUnknown
+                ? {
+                    finalDeliveryRequired: true,
+                    deliveryOutcomeUnknown: true,
+                    evidenceKinds: ["delivery_unknown_after_send"],
+                  }
+                : {
+                    finalDeliveryRequired: true,
+                    deliveryToolFailed: true,
+                    evidenceKinds: ["delivery_tool_failure"],
+                  },
             handledFinalDelivered
               ? "before_dispatch_final_delivered"
-              : "before_dispatch_final_delivery_failed",
+              : handledReply.finalDeliveryUnknown
+                ? "before_dispatch_final_delivery_unknown"
+                : "before_dispatch_final_delivery_failed",
           );
         } else if (text && suppressDelivery) {
           await recordSourceTurnDeliveryState(
@@ -3607,7 +3808,8 @@ export async function dispatchReplyFromConfig(
     let queuedFinal = false;
     let routedFinalCount = 0;
     let attemptedFinalDelivery = false;
-    let finalDeliveryFailed = false;
+    let finalDeliveryUnknown = false;
+    let finalDeliveryProven = false;
     let privateOnlyFinalSuppressed = false;
     // Explicit command turns (native or authorized text-slash like /compact) are
     // user-initiated, so a marked terminal reply for the command bypasses
@@ -3660,26 +3862,34 @@ export async function dispatchReplyFromConfig(
       const finalReply = await sendFinalPayload(reply);
       queuedFinal = finalReply.queuedFinal || queuedFinal;
       routedFinalCount += finalReply.routedFinalCount;
-      if (!finalReply.queuedFinal && finalReply.routedFinalCount === 0) {
-        finalDeliveryFailed = true;
-      }
+      finalDeliveryProven = finalReply.finalDeliveryDelivered || finalDeliveryProven;
+      finalDeliveryUnknown = finalReply.finalDeliveryUnknown || finalDeliveryUnknown;
     }
 
     if (attemptedFinalDelivery) {
-      const finalDelivered = !finalDeliveryFailed && (queuedFinal || routedFinalCount > 0);
       await recordSourceTurnDeliveryState(
-        finalDelivered
+        finalDeliveryProven
           ? {
               finalDeliveryRequired: true,
               finalDeliveryDelivered: true,
               evidenceKinds: routedFinalCount > 0 ? ["direct_source_final"] : ["source_chat_final"],
             }
-          : {
-              finalDeliveryRequired: true,
-              deliveryToolFailed: true,
-              evidenceKinds: ["delivery_tool_failure"],
-            },
-        finalDelivered ? "final_dispatch_delivered" : "final_dispatch_delivery_failed",
+          : finalDeliveryUnknown
+            ? {
+                finalDeliveryRequired: true,
+                deliveryOutcomeUnknown: true,
+                evidenceKinds: ["delivery_unknown_after_send"],
+              }
+            : {
+                finalDeliveryRequired: true,
+                deliveryToolFailed: true,
+                evidenceKinds: ["delivery_tool_failure"],
+              },
+        finalDeliveryProven
+          ? "final_dispatch_delivered"
+          : finalDeliveryUnknown
+            ? "final_dispatch_delivery_unknown"
+            : "final_dispatch_delivery_failed",
       );
     } else if (privateOnlyFinalSuppressed) {
       await recordSourceTurnDeliveryState(
@@ -3692,7 +3902,7 @@ export async function dispatchReplyFromConfig(
       );
     }
 
-    if (attemptedFinalDelivery && !finalDeliveryFailed) {
+    if (attemptedFinalDelivery && finalDeliveryProven) {
       throwIfDispatchOperationAborted();
       await clearPendingFinalDeliveryAfterSuccess({
         storePath: sessionStoreEntry.storePath,

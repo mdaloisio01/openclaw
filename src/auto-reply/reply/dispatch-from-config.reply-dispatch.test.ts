@@ -7,6 +7,7 @@ import type { PluginHookReplyDispatchResult } from "../../plugins/hooks.js";
 import { listTasksForFlowId, resetTaskRegistryForTests } from "../../tasks/runtime-internal.js";
 import {
   getTaskFlowActiveProductionContinuation,
+  getTaskFlowMissionSettlement,
   getTaskFlowProductionContinuation,
   listTaskFlowRecords,
   resetTaskFlowRegistryForTests,
@@ -77,8 +78,14 @@ const CLEANUP_CREW_OPEN_MILESTONE_REPORT = [
 const CLEANUP_CREW_FULL_BUILD_COMPLETE_REPORT = [
   "Cleanup Crew final closeout",
   "Status: closed",
+  "Target handled: Cleanup Crew issue-list repair",
+  "Scope handled: full build closeout delivery",
+  "Actual execution owner: Cleanup Crew",
+  "Artifact path(s): /home/will/.openclaw/workspace/file_hub/exports/cleanup_crew_closeout.md",
+  "Proof path(s): /home/will/.openclaw/workspace/file_hub/exports/cleanup_crew_proof.json",
   "What is materially real now: Cleanup Crew issue-list repair is truthfully complete.",
   "What is still not real yet: nothing.",
+  "Who lawfully owns the next step: none.",
   "Open/closed truth: Cleanup Crew issue-list repair is truthfully closed.",
   "Exact next action: none; whole run complete.",
 ].join("\n");
@@ -511,11 +518,67 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       expect(flow).toBeDefined();
       expect(flow?.status).toBe("terminal_pending_watchdog");
       expect(flow?.currentStep).toBe("cleanup_crew_full_build_complete_report_delivered");
+      expect(getTaskFlowMissionSettlement(flow)).toMatchObject({
+        state: "SETTLED",
+        settled: true,
+        allowedToCloseMission: true,
+        recoveryAction: "settlement_complete",
+      });
       expect(getTaskFlowProductionContinuation(flow)).toMatchObject({
         activeProductionRun: true,
         parentRunOpen: false,
         lawfulWholeRunCompletion: true,
         lawfulStopReason: "whole_run_complete",
+      });
+    });
+  });
+
+  it("keeps full-build complete Cleanup Crew report open when final delivery fails", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+
+    await withCleanupCrewDispatchState(async () => {
+      const dispatcher = createDispatcher();
+      vi.mocked(dispatcher.sendFinalReply).mockReturnValue(false);
+      const result = await dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx({
+          SessionKey: "webchat:direct:mark",
+          Body: "Cleanup Crew production repair build.",
+          BodyForAgent: "Cleanup Crew production repair build.",
+          BodyForCommands: "Cleanup Crew production repair build.",
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver: async () => ({ text: CLEANUP_CREW_FULL_BUILD_COMPLETE_REPORT }),
+      });
+
+      expect(result.queuedFinal).toBe(false);
+      expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+        }),
+      );
+      const rows = await readSourceTurnDeliveryRows(registryPath);
+      expect(rows[0]).toMatchObject({
+        currentStage: "final_dispatch_delivery_failed",
+        deliveryStatus: "delivery_failed",
+        sourceTurnState: "final_delivery_failed",
+      });
+      const [flow] = listTaskFlowRecords();
+      expect(flow).toBeDefined();
+      expect(flow?.status).toBe("running");
+      expect(flow?.currentStep).toBe("mission_settlement_tail_delivery_retry");
+      expect(getTaskFlowMissionSettlement(flow)).toMatchObject({
+        state: "DELIVERY_FAILED",
+        settled: false,
+        allowedToCloseMission: false,
+        workCompletionSettledSeparately: true,
+        recoveryAction: "retry_delivery_only_with_idempotency",
+        nextIncompleteBoundary: "delivery_retry",
+      });
+      expect(getTaskFlowProductionContinuation(flow)).toMatchObject({
+        activeProductionRun: true,
+        parentRunOpen: true,
       });
     });
   });

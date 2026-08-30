@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import type { MissionSettlementDecision } from "../agents/mission-settlement-tail.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
@@ -848,6 +849,43 @@ function attachProductionContinuationToStateJson(params: {
   };
 }
 
+function cloneMissionSettlementDecision(decision: MissionSettlementDecision): JsonValue {
+  return cloneStructuredValue(decision) as JsonValue;
+}
+
+export function attachMissionSettlementToTaskFlowStateJson(params: {
+  stateJson?: JsonValue | null;
+  settlement: MissionSettlementDecision;
+}): JsonValue {
+  const governedMissionSettlement = cloneMissionSettlementDecision(params.settlement);
+  if (isRecord(params.stateJson)) {
+    return {
+      ...cloneStructuredValue(params.stateJson),
+      governedMissionSettlement,
+    };
+  }
+  return {
+    kind: "managed_controller_state",
+    governedMissionSettlement,
+  };
+}
+
+export function getTaskFlowMissionSettlement(
+  flow: TaskFlowRecord,
+): MissionSettlementDecision | null {
+  if (!isRecord(flow.stateJson)) {
+    return null;
+  }
+  const settlement = flow.stateJson.governedMissionSettlement;
+  if (
+    !isRecord(settlement) ||
+    settlement.schema !== "openclaw.mission_settlement_tail_decision.v1"
+  ) {
+    return null;
+  }
+  return cloneStructuredValue(settlement) as MissionSettlementDecision;
+}
+
 export function getBlindTestProductionContinuation(
   flow: TaskFlowRecord,
 ): ProductionContinuationState | null {
@@ -887,6 +925,20 @@ function buildGuardBlockedResult(
     current: cloneFlowRecord(current),
     blockedSummary,
   };
+}
+
+function buildMissionSettlementCloseBlockedSummary(decision: MissionSettlementDecision): string {
+  return `Mission settlement tail is not settled: ${decision.state} at ${decision.nextIncompleteBoundary}; next action is ${decision.recoveryAction}.`;
+}
+
+function getBlockingTaskFlowMissionSettlement(
+  flow: TaskFlowRecord,
+): MissionSettlementDecision | null {
+  const decision = getTaskFlowMissionSettlement(flow);
+  if (!decision || decision.allowedToCloseMission || decision.settled) {
+    return null;
+  }
+  return decision;
 }
 
 function assertFlowOwnerKey(ownerKey: string): string {
@@ -1706,6 +1758,28 @@ export function finishFlow(params: {
       reason: "not_found",
     };
   }
+  const missionSettlement = getBlockingTaskFlowMissionSettlement(current);
+  if (missionSettlement) {
+    const detail = buildMissionSettlementCloseBlockedSummary(missionSettlement);
+    const blockedAt = params.updatedAt ?? params.endedAt ?? Date.now();
+    const violationUpdate = updateFlowRecordByIdExpectedRevision({
+      flowId: current.flowId,
+      expectedRevision: params.expectedRevision,
+      patch: {
+        status: "blocked",
+        currentStep: "mission_settlement_tail_open",
+        blockedSummary: detail,
+        endedAt: null,
+        updatedAt: blockedAt,
+      },
+    });
+    return {
+      applied: false,
+      reason: "guard_blocked",
+      ...(violationUpdate.applied ? { current: violationUpdate.flow } : { current }),
+      blockedSummary: detail,
+    };
+  }
   if (isBlindTestSliceFlow(current)) {
     const state = getBlindTestSliceState(current);
     if (!state) {
@@ -1924,6 +1998,30 @@ export function recordFlowLawfulStop(params: {
       current,
       "Flow is not currently bound to an active production continuation contract.",
     );
+  }
+  if (params.reason === "whole_run_complete") {
+    const missionSettlement = getBlockingTaskFlowMissionSettlement(current);
+    if (missionSettlement) {
+      const detail = buildMissionSettlementCloseBlockedSummary(missionSettlement);
+      const blockedAt = params.updatedAt ?? Date.now();
+      const violationUpdate = updateFlowRecordByIdExpectedRevision({
+        flowId: current.flowId,
+        expectedRevision: params.expectedRevision,
+        patch: {
+          status: "blocked",
+          currentStep: "mission_settlement_tail_open",
+          blockedSummary: detail,
+          endedAt: null,
+          updatedAt: blockedAt,
+        },
+      });
+      return {
+        applied: false,
+        reason: "guard_blocked",
+        ...(violationUpdate.applied ? { current: violationUpdate.flow } : { current }),
+        blockedSummary: detail,
+      };
+    }
   }
   const updatedAt = params.updatedAt ?? Date.now();
   const nextContinuation = updateContinuationForLawfulStop({

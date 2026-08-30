@@ -1,3 +1,4 @@
+import type { MissionSettlementDecision } from "../agents/mission-settlement-tail.js";
 import {
   CLEANUP_WATCHDOG_POLICY_VERSION,
   type CleanupWatchdogFindingCategory,
@@ -131,6 +132,128 @@ export type WatchdogReconciliationContext = {
   lifecycleProbeAvailable?: boolean;
   sourceOnlyProof?: boolean;
 };
+
+export type MissionSettlementWatchdogProjection = {
+  schema: "openclaw.mission_settlement_watchdog_projection.v1";
+  policyVersion: typeof CLEANUP_WATCHDOG_POLICY_VERSION;
+  missionId: string;
+  settlementState: MissionSettlementDecision["state"];
+  classification: WatchdogReconciliationClass | "settled" | "watchdog_self_work";
+  canonicalPriority?: CleanupWatchdogPriorityCode;
+  countsAsProductionLiveness: boolean;
+  blocksMissionSettlement: boolean;
+  recoveryMayRerunWork: boolean;
+  recoveryBoundary: MissionSettlementDecision["nextIncompleteBoundary"];
+  nextAction: MissionSettlementDecision["recoveryAction"];
+  reason: string;
+};
+
+export function projectMissionSettlementForWatchdog(
+  decision: MissionSettlementDecision,
+  opts: { watchdogOrRecoverySelfWork?: boolean } = {},
+): MissionSettlementWatchdogProjection {
+  if (opts.watchdogOrRecoverySelfWork === true) {
+    return {
+      schema: "openclaw.mission_settlement_watchdog_projection.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId: decision.missionId,
+      settlementState: decision.state,
+      classification: "watchdog_self_work",
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: !decision.settled,
+      recoveryMayRerunWork: false,
+      recoveryBoundary: decision.nextIncompleteBoundary,
+      nextAction: decision.recoveryAction,
+      reason: "watchdog_or_recovery_work_is_subordinate_and_cannot_prove_original_mission_liveness",
+    };
+  }
+
+  if (decision.settled) {
+    return {
+      schema: "openclaw.mission_settlement_watchdog_projection.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId: decision.missionId,
+      settlementState: decision.state,
+      classification: "settled",
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: false,
+      recoveryMayRerunWork: false,
+      recoveryBoundary: decision.nextIncompleteBoundary,
+      nextAction: decision.recoveryAction,
+      reason: "mission_settlement_tail_is_complete",
+    };
+  }
+
+  const deliveryTailOpen =
+    decision.state === "REPORT_RENDERED" ||
+    decision.state === "DELIVERY_INTENT_DURABLE" ||
+    decision.state === "DELIVERY_STARTED" ||
+    decision.state === "DELIVERY_FAILED" ||
+    decision.state === "DELIVERY_UNKNOWN";
+  if (deliveryTailOpen) {
+    return {
+      schema: "openclaw.mission_settlement_watchdog_projection.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId: decision.missionId,
+      settlementState: decision.state,
+      classification: "real production blocker",
+      canonicalPriority: getCleanupWatchdogPriority("pending_report_delivery"),
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: true,
+      recoveryMayRerunWork: false,
+      recoveryBoundary: decision.nextIncompleteBoundary,
+      nextAction: decision.recoveryAction,
+      reason: "delivery_tail_open_completed_work_must_not_be_restarted",
+    };
+  }
+
+  if (
+    decision.state === "RESULT_DURABLE" ||
+    decision.state === "CLOSEOUT_READY" ||
+    decision.state === "CLOSEOUT_VALIDATED" ||
+    decision.state === "CLOSEOUT_BLOCKED" ||
+    decision.state === "REPORT_BLOCKED"
+  ) {
+    return {
+      schema: "openclaw.mission_settlement_watchdog_projection.v1",
+      policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+      missionId: decision.missionId,
+      settlementState: decision.state,
+      classification: "missing closeout",
+      canonicalPriority: getCleanupWatchdogPriority("missing_correctness_proof"),
+      countsAsProductionLiveness: false,
+      blocksMissionSettlement: true,
+      recoveryMayRerunWork: false,
+      recoveryBoundary: decision.nextIncompleteBoundary,
+      nextAction: decision.recoveryAction,
+      reason: "work_result_exists_repair_closeout_or_report_only",
+    };
+  }
+
+  const workMayNeedRerun =
+    decision.state === "WORK_PENDING" ||
+    decision.state === "WORK_RUNNING" ||
+    decision.state === "WORK_FAILED" ||
+    decision.state === "WORK_UNCERTAIN";
+  return {
+    schema: "openclaw.mission_settlement_watchdog_projection.v1",
+    policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
+    missionId: decision.missionId,
+    settlementState: decision.state,
+    classification: workMayNeedRerun ? "stale running state" : "real production blocker",
+    canonicalPriority: workMayNeedRerun
+      ? getCleanupWatchdogPriority("corrupted_state")
+      : getCleanupWatchdogPriority("review_required_for_safe_work"),
+    countsAsProductionLiveness: decision.state === "WORK_RUNNING",
+    blocksMissionSettlement: true,
+    recoveryMayRerunWork: !decision.workCompletionSettledSeparately,
+    recoveryBoundary: decision.nextIncompleteBoundary,
+    nextAction: decision.recoveryAction,
+    reason: workMayNeedRerun
+      ? "work_boundary_still_open_reconcile_worker_before_rerun"
+      : "settlement_boundary_requires_owner_review",
+  };
+}
 
 function normalize(value: unknown): string {
   return typeof value === "string" ? value.trim().toLowerCase() : "";

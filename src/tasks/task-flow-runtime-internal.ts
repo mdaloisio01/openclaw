@@ -11,6 +11,7 @@ export {
   finishFlow,
   getTaskFlowActiveProductionContinuation,
   getTaskFlowById,
+  getTaskFlowMissionSettlement,
   listTaskFlowRecords,
   listTaskFlowsForOwnerKey,
   recordFlowLawfulStop,

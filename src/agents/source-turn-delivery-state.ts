@@ -3,6 +3,7 @@ export const SOURCE_TURN_DELIVERY_STATES = [
   "progress_delivered",
   "final_delivered",
   "final_delivery_failed",
+  "final_delivery_unknown",
   "failure_delivered",
   "settled_resolved_later",
   "blocked_refused",
@@ -31,6 +32,7 @@ export type SourceTurnDeliveryEvidenceKind =
   | "internal_evidence_record"
   | "private_final_response"
   | "delivery_tool_failure"
+  | "delivery_unknown_after_send"
   | "settled_resolved_later";
 
 export type SourceTurnDeliveryGuardReason =
@@ -38,6 +40,7 @@ export type SourceTurnDeliveryGuardReason =
   | "progress_visible_but_final_not_proven"
   | "final_visible_delivery_proven"
   | "delivery_tool_failed"
+  | "delivery_outcome_unknown_after_send"
   | "failure_notice_visible"
   | "historical_debt_settled_not_delivered"
   | "private_final_without_visible_delivery"
@@ -60,6 +63,7 @@ export type SourceTurnDeliveryFacts = {
   markFacingExportVerified?: boolean;
   privateOnlyFinalResponse?: boolean;
   deliveryToolFailed?: boolean;
+  deliveryOutcomeUnknown?: boolean;
   failureNoticeVisible?: boolean;
   historicalSettlement?: boolean;
 };
@@ -169,6 +173,18 @@ export function resolveSourceTurnDeliveryState(
       finalDeliveryDelivered: false,
       refused: false,
       reason: "delivery_tool_failed",
+    };
+  }
+
+  if (
+    facts.deliveryOutcomeUnknown === true ||
+    (facts.evidenceKinds ?? []).includes("delivery_unknown_after_send")
+  ) {
+    return {
+      state: "final_delivery_unknown",
+      finalDeliveryDelivered: false,
+      refused: false,
+      reason: "delivery_outcome_unknown_after_send",
     };
   }
 
