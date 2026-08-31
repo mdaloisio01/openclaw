@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearAgentHarnesses } from "../../agents/harness/registry.js";
+import type { StructuredMissionCloseout } from "../../agents/mission-settlement-tail.js";
 import type { PluginHookReplyDispatchResult } from "../../plugins/hooks.js";
 import { listTasksForFlowId, resetTaskRegistryForTests } from "../../tasks/runtime-internal.js";
 import {
@@ -14,6 +15,7 @@ import {
 } from "../../tasks/task-flow-runtime-internal.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { setReplyPayloadMetadata } from "../reply-payload.js";
 import {
   acpManagerRuntimeMocks,
   acpMocks,
@@ -89,6 +91,21 @@ const CLEANUP_CREW_FULL_BUILD_COMPLETE_REPORT = [
   "Open/closed truth: Cleanup Crew issue-list repair is truthfully closed.",
   "Exact next action: none; whole run complete.",
 ].join("\n");
+
+const STRUCTURED_CLEANUP_CREW_CLOSEOUT: StructuredMissionCloseout = {
+  runLabel: "Cleanup Crew structured final closeout",
+  targetHandled: "Cleanup Crew issue-list repair",
+  scopeHandled: "full build closeout delivery",
+  actualExecutionOwner: "Cleanup Crew",
+  artifactPaths: ["/home/will/.openclaw/workspace/file_hub/exports/cleanup_crew_closeout.md"],
+  proofPaths: ["/home/will/.openclaw/workspace/file_hub/exports/cleanup_crew_proof.json"],
+  whatIsMateriallyRealNow: "Cleanup Crew issue-list repair is truthfully complete.",
+  whatIsStillNotRealYet: "nothing.",
+  whoLawfullyOwnsNextStep: "none.",
+  openClosedTruth: "Cleanup Crew issue-list repair is truthfully closed.",
+  exactNextAction: "none; whole run complete.",
+  shortResult: "Structured closeout metadata settles the mission tail.",
+};
 
 async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
   sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-delivery-"));
@@ -579,6 +596,60 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       expect(getTaskFlowProductionContinuation(flow)).toMatchObject({
         activeProductionRun: true,
         parentRunOpen: true,
+      });
+    });
+  });
+
+  it("settles Cleanup Crew mission tail from structured closeout metadata instead of prose parsing", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+
+    await withCleanupCrewDispatchState(async () => {
+      const structuredPayload = setReplyPayloadMetadata(
+        {
+          text: [
+            "Cleanup Crew final closeout",
+            "Status: closed",
+            "What is materially real now: Cleanup Crew issue-list repair is truthfully complete.",
+            "What is still not real yet: nothing.",
+            "Who lawfully owns the next step: none.",
+            "Open/closed truth: Cleanup Crew issue-list repair is truthfully closed.",
+            "Exact next action: none; whole run complete.",
+          ].join("\n"),
+        },
+        { structuredMissionCloseout: STRUCTURED_CLEANUP_CREW_CLOSEOUT },
+      );
+      const result = await dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx({
+          SessionKey: "webchat:direct:mark",
+          Body: "Cleanup Crew production repair build.",
+          BodyForAgent: "Cleanup Crew production repair build.",
+          BodyForCommands: "Cleanup Crew production repair build.",
+        }),
+        cfg: emptyConfig,
+        dispatcher: createDispatcher(),
+        replyResolver: async () => structuredPayload,
+      });
+
+      expect(result.queuedFinal).toBe(true);
+      const rows = await readSourceTurnDeliveryRows(registryPath);
+      expect(rows[0]).toMatchObject({
+        currentStage: "final_dispatch_delivered",
+        deliveryStatus: "final_delivered",
+        sourceTurnState: "final_delivered",
+      });
+      const [flow] = listTaskFlowRecords();
+      expect(flow?.status).toBe("terminal_pending_watchdog");
+      expect(flow?.currentStep).toBe("cleanup_crew_full_build_complete_report_delivered");
+      expect(getTaskFlowMissionSettlement(flow)).toMatchObject({
+        state: "SETTLED",
+        settled: true,
+        allowedToCloseMission: true,
+        closeoutValidation: {
+          valid: true,
+          missingFields: [],
+          missingSupportFields: [],
+        },
       });
     });
   });

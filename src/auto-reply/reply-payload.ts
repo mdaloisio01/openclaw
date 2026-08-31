@@ -1,3 +1,4 @@
+import type { StructuredMissionCloseout } from "../agents/mission-settlement-tail.js";
 import type { GovernedFinalReleaseDecisionInput } from "../governance/governed-final-release-decision.js";
 import type { CloseoutAdmissionInput } from "../governance/mission-manifest.types.js";
 import type {
@@ -196,6 +197,11 @@ export type ReplyPayloadMetadata = {
   falseCloseoutAdmission?: CloseoutAdmissionInput;
   /** Shared governed final-release check for hard final-output adapters. */
   governedFinalRelease?: GovernedFinalReleaseDecisionInput;
+  /**
+   * Structured mission-settlement closeout state. This is machine authority for
+   * governed settlement; human report text remains the rendered delivery copy.
+   */
+  structuredMissionCloseout?: StructuredMissionCloseout;
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();

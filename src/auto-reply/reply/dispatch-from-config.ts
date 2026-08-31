@@ -1662,8 +1662,13 @@ export async function dispatchReplyFromConfig(
     return paths.filter(Boolean);
   };
   const buildStructuredCleanupCrewCloseout = (
+    payload: ReplyPayload,
     reportText: string,
   ): StructuredMissionCloseout | null => {
+    const metadataCloseout = getReplyPayloadMetadata(payload)?.structuredMissionCloseout;
+    if (metadataCloseout) {
+      return metadataCloseout;
+    }
     const targetHandled = extractCleanupCrewReportField(reportText, "Target handled:");
     const scopeHandled = extractCleanupCrewReportField(reportText, "Scope handled:");
     const actualExecutionOwner = extractCleanupCrewReportField(
@@ -1728,7 +1733,7 @@ export async function dispatchReplyFromConfig(
     if (!reportText) {
       return flow;
     }
-    const closeout = buildStructuredCleanupCrewCloseout(reportText);
+    const closeout = buildStructuredCleanupCrewCloseout(payload, reportText);
     if (!closeout) {
       return flow;
     }
