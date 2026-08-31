@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   missionDeliveryStateFromSourceTurnDelivery,
   renderMissionCloseoutReport,
+  resolveGovernedTurnSettlement,
   resolveMissionSettlementTail,
   resolveMissionSettlementTailFromSourceTurnDelivery,
   validateStructuredMissionCloseout,
@@ -24,6 +25,172 @@ const VALID_CLOSEOUT: StructuredMissionCloseout = {
 };
 
 describe("mission settlement tail", () => {
+  describe("governed turn settlement", () => {
+    const BASE_SETTLEMENT = {
+      settlementId: "settlement-1",
+      missionId: "issue-040",
+      finalReportRequired: true,
+      finalReportArtifactWritten: true,
+      finalReportVisibleDeliveryProven: true,
+      issueFamilyNamed: true,
+      issueRegisterActionProven: true,
+      broaderMissionOpen: false,
+      toolBoundaryClean: true,
+      watchdogProofCollected: true,
+    };
+
+    it("does not accept an artifact as final visible delivery proof", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          finalReportVisibleDeliveryProven: false,
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        allowedToCloseMission: false,
+        allowedToAcceptReport: false,
+        watchdogVisible: true,
+        recoveryAction: "deliver_final_report",
+        nextIncompleteBoundary: "visible_final_delivery",
+      });
+    });
+
+    it("settles a closed mission only after final visible delivery and issue action proof", () => {
+      expect(resolveGovernedTurnSettlement(BASE_SETTLEMENT)).toMatchObject({
+        state: "settled_delivered",
+        allowedToCloseMission: true,
+        allowedToAcceptReport: true,
+        watchdogVisible: false,
+        recoveryAction: "settlement_complete",
+        nextIncompleteBoundary: "none",
+      });
+    });
+
+    it("requires issue register proof or a lawful no-update reason when an issue family is named", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          issueRegisterActionProven: false,
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        recoveryAction: "record_issue_register_action",
+        nextIncompleteBoundary: "issue_register_action",
+      });
+
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          issueRegisterActionProven: false,
+          lawfulNoIssueUpdateReason: "same current-blocker recurrence already logged in this turn",
+        }),
+      ).toMatchObject({
+        state: "settled_delivered",
+        allowedToCloseMission: true,
+      });
+    });
+
+    it("keeps broader open work unsettled until next-step coverage exists", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          broaderMissionOpen: true,
+          nextExecutableStepStarted: false,
+          durableWaitRecorded: false,
+          lawfulBlockerRecorded: false,
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        watchdogVisible: true,
+        recoveryAction: "record_next_step_coverage",
+        nextIncompleteBoundary: "next_step_coverage",
+      });
+
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          broaderMissionOpen: true,
+          nextExecutableStepStarted: true,
+        }),
+      ).toMatchObject({
+        state: "settled_handoff",
+        allowedToCloseMission: false,
+        allowedToAcceptReport: true,
+        recoveryAction: "continue_from_handoff",
+      });
+    });
+
+    it("accepts a proven lawful blocker without closing the broader mission", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          broaderMissionOpen: true,
+          lawfulBlockerRecorded: true,
+        }),
+      ).toMatchObject({
+        state: "settled_blocked",
+        allowedToCloseMission: false,
+        allowedToAcceptReport: true,
+        recoveryAction: "keep_lawful_blocker_visible",
+      });
+    });
+
+    it("requires tool boundary failure proof when tool integrity is dirty", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          toolBoundaryClean: false,
+          toolBoundaryFailureRecorded: false,
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        recoveryAction: "record_tool_boundary_failure",
+        nextIncompleteBoundary: "tool_boundary_integrity",
+      });
+
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          toolBoundaryClean: false,
+          toolBoundaryFailureRecorded: true,
+          broaderMissionOpen: true,
+          lawfulBlockerRecorded: true,
+        }),
+      ).toMatchObject({
+        state: "settled_blocked",
+        allowedToAcceptReport: true,
+      });
+    });
+
+    it("requires watchdog proof when a governed settlement explicitly depends on it", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          watchdogProofCollected: false,
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        recoveryAction: "collect_watchdog_proof",
+        nextIncompleteBoundary: "watchdog_proof",
+      });
+    });
+
+    it("fails closed when settlement identity is missing", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          settlementId: "",
+          missionId: "",
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        recoveryAction: "record_settlement_identity",
+        nextIncompleteBoundary: "settlement_identity",
+        validationErrors: ["settlement_id_missing", "mission_id_missing"],
+      });
+    });
+  });
+
   it("validates structured closeout state without reparsing human prose", () => {
     expect(validateStructuredMissionCloseout(VALID_CLOSEOUT)).toEqual({
       valid: true,

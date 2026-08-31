@@ -132,12 +132,230 @@ export type MissionSettlementDecision = {
   nextIncompleteBoundary: string;
 };
 
-function hasText(value: string | undefined): boolean {
+export const GOVERNED_TURN_SETTLEMENT_STATES = [
+  "unsettled",
+  "settled_delivered",
+  "settled_handoff",
+  "settled_blocked",
+] as const;
+
+export type GovernedTurnSettlementState = (typeof GOVERNED_TURN_SETTLEMENT_STATES)[number];
+
+export type GovernedTurnSettlementBoundary =
+  | "none"
+  | "settlement_identity"
+  | "final_report_artifact"
+  | "visible_final_delivery"
+  | "issue_register_action"
+  | "tool_boundary_integrity"
+  | "watchdog_proof"
+  | "next_step_coverage";
+
+export type GovernedTurnSettlementRecoveryAction =
+  | "record_settlement_identity"
+  | "write_final_report_artifact"
+  | "deliver_final_report"
+  | "record_issue_register_action"
+  | "record_tool_boundary_failure"
+  | "collect_watchdog_proof"
+  | "record_next_step_coverage"
+  | "continue_from_handoff"
+  | "keep_lawful_blocker_visible"
+  | "settlement_complete";
+
+export type GovernedTurnSettlementFacts = {
+  settlementId?: string;
+  missionId?: string;
+  finalReportRequired?: boolean;
+  finalReportArtifactWritten?: boolean;
+  finalReportVisibleDeliveryProven?: boolean;
+  issueFamilyNamed?: boolean;
+  issueRegisterActionProven?: boolean;
+  lawfulNoIssueUpdateReason?: string;
+  broaderMissionOpen?: boolean;
+  nextExecutableStepStarted?: boolean;
+  durableWaitRecorded?: boolean;
+  lawfulBlockerRecorded?: boolean;
+  toolBoundaryClean?: boolean;
+  toolBoundaryFailureRecorded?: boolean;
+  watchdogProofCollected?: boolean;
+};
+
+export type GovernedTurnSettlementDecision = {
+  schema: "openclaw.governed_turn_settlement_decision.v1";
+  settlementId: string;
+  missionId: string;
+  state: GovernedTurnSettlementState;
+  allowedToCloseMission: boolean;
+  allowedToAcceptReport: boolean;
+  watchdogVisible: boolean;
+  recoveryAction: GovernedTurnSettlementRecoveryAction;
+  nextIncompleteBoundary: GovernedTurnSettlementBoundary;
+  validationErrors: string[];
+};
+
+function hasText(value: string | undefined): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
 function hasEntries(value: string[] | undefined): boolean {
   return Array.isArray(value) && value.some((entry) => hasText(entry));
+}
+
+function normalizeSettlementId(value: string | undefined, fallback: string): string {
+  return hasText(value) ? value.trim() : fallback;
+}
+
+function hasNextStepCoverage(facts: GovernedTurnSettlementFacts): boolean {
+  return (
+    facts.nextExecutableStepStarted === true ||
+    facts.durableWaitRecorded === true ||
+    facts.lawfulBlockerRecorded === true
+  );
+}
+
+function createGovernedTurnSettlementDecision(
+  facts: GovernedTurnSettlementFacts,
+  params: {
+    state: GovernedTurnSettlementState;
+    allowedToCloseMission: boolean;
+    allowedToAcceptReport: boolean;
+    watchdogVisible: boolean;
+    recoveryAction: GovernedTurnSettlementRecoveryAction;
+    nextIncompleteBoundary: GovernedTurnSettlementBoundary;
+    validationErrors: string[];
+  },
+): GovernedTurnSettlementDecision {
+  return {
+    schema: "openclaw.governed_turn_settlement_decision.v1",
+    settlementId: normalizeSettlementId(facts.settlementId, "unknown"),
+    missionId: normalizeSettlementId(facts.missionId, "unknown"),
+    ...params,
+  };
+}
+
+export function resolveGovernedTurnSettlement(
+  facts: GovernedTurnSettlementFacts,
+): GovernedTurnSettlementDecision {
+  const validationErrors: string[] = [];
+  if (!hasText(facts.settlementId)) {
+    validationErrors.push("settlement_id_missing");
+  }
+  if (!hasText(facts.missionId)) {
+    validationErrors.push("mission_id_missing");
+  }
+  if (validationErrors.length > 0) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "record_settlement_identity",
+      nextIncompleteBoundary: "settlement_identity",
+      validationErrors,
+    });
+  }
+  if (facts.finalReportRequired === true && facts.finalReportArtifactWritten !== true) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "write_final_report_artifact",
+      nextIncompleteBoundary: "final_report_artifact",
+      validationErrors,
+    });
+  }
+  if (facts.finalReportRequired === true && facts.finalReportVisibleDeliveryProven !== true) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "deliver_final_report",
+      nextIncompleteBoundary: "visible_final_delivery",
+      validationErrors,
+    });
+  }
+  if (
+    facts.issueFamilyNamed === true &&
+    facts.issueRegisterActionProven !== true &&
+    !hasText(facts.lawfulNoIssueUpdateReason)
+  ) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "record_issue_register_action",
+      nextIncompleteBoundary: "issue_register_action",
+      validationErrors,
+    });
+  }
+  if (facts.toolBoundaryClean === false && facts.toolBoundaryFailureRecorded !== true) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "record_tool_boundary_failure",
+      nextIncompleteBoundary: "tool_boundary_integrity",
+      validationErrors,
+    });
+  }
+  if (facts.watchdogProofCollected === false) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "collect_watchdog_proof",
+      nextIncompleteBoundary: "watchdog_proof",
+      validationErrors,
+    });
+  }
+  if (facts.broaderMissionOpen === true && !hasNextStepCoverage(facts)) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "unsettled",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: false,
+      watchdogVisible: true,
+      recoveryAction: "record_next_step_coverage",
+      nextIncompleteBoundary: "next_step_coverage",
+      validationErrors,
+    });
+  }
+  if (facts.lawfulBlockerRecorded === true) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "settled_blocked",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: true,
+      watchdogVisible: false,
+      recoveryAction: "keep_lawful_blocker_visible",
+      nextIncompleteBoundary: "none",
+      validationErrors,
+    });
+  }
+  if (facts.broaderMissionOpen === true) {
+    return createGovernedTurnSettlementDecision(facts, {
+      state: "settled_handoff",
+      allowedToCloseMission: false,
+      allowedToAcceptReport: true,
+      watchdogVisible: false,
+      recoveryAction: "continue_from_handoff",
+      nextIncompleteBoundary: "none",
+      validationErrors,
+    });
+  }
+  return createGovernedTurnSettlementDecision(facts, {
+    state: "settled_delivered",
+    allowedToCloseMission: true,
+    allowedToAcceptReport: true,
+    watchdogVisible: false,
+    recoveryAction: "settlement_complete",
+    nextIncompleteBoundary: "none",
+    validationErrors,
+  });
 }
 
 export function validateStructuredMissionCloseout(
