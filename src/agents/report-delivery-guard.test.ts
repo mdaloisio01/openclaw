@@ -404,6 +404,27 @@ describe("report delivery guard", () => {
     });
   });
 
+  it("does not treat non-action wording as executable continuation coverage", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Cleanup Crew production repair build.",
+        reportText: [
+          "Cleanup Crew scoped closeout",
+          "Status: closed for the local slice",
+          "Open/closed truth: broader ISSUE-040 remains open.",
+          "Exact next action: not recorded yet",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "pending_continuation_action",
+      broaderBuildOpen: true,
+      stopAllowed: false,
+      pendingContinuationVisible: true,
+      reason: "broader_build_open_next_action_missing",
+    });
+  });
+
   it("blocks phase transition when the required milestone report is missing or malformed", () => {
     expect(
       resolveCleanupCrewStageTransition({

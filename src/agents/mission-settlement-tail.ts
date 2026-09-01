@@ -23,6 +23,7 @@ export const MISSION_SETTLEMENT_FAILURE_STATES = [
   "WORK_UNCERTAIN",
   "CLOSEOUT_BLOCKED",
   "REPORT_BLOCKED",
+  "PARENT_SCOPE_CONTINUATION_REQUIRED",
   "RECOVERY_REQUIRED",
   "OPERATOR_REVIEW_REQUIRED",
   "RECOVERY_EXHAUSTED_VERIFIED_BLOCKER",
@@ -84,6 +85,11 @@ export type StructuredCloseoutValidation = {
 
 export type MissionSettlementTailFacts = {
   missionId: string;
+  activeMissionScope?: string;
+  closeoutScope?: string;
+  reviewScope?: string;
+  remainingParentScope?: string;
+  parentContinuationCoverage?: ParentContinuationCoverageFacts;
   workState: MissionWorkState;
   resultDurable?: boolean;
   closeout?: StructuredMissionCloseout;
@@ -116,6 +122,7 @@ export type MissionSettlementRecoveryAction =
   | "reconcile_ambiguous_delivery_ack"
   | "record_bounded_evidence_reference"
   | "record_verified_blocker"
+  | "record_parent_scope_continuation_coverage"
   | "reread_after_revision_conflict"
   | "settlement_complete";
 
@@ -163,9 +170,36 @@ export type GovernedTurnSettlementRecoveryAction =
   | "keep_lawful_blocker_visible"
   | "settlement_complete";
 
+export const PARENT_CONTINUATION_COVERAGE_KINDS = [
+  "missing",
+  "next_executable_parent_step_started",
+  "durable_wait",
+  "lawful_blocker",
+  "operator_scope_change",
+  "parent_scope_proven_closed",
+] as const;
+
+export type ParentContinuationCoverageKind = (typeof PARENT_CONTINUATION_COVERAGE_KINDS)[number];
+
+export type ParentContinuationCoverageFacts = {
+  kind?: ParentContinuationCoverageKind;
+  owner?: string;
+  reason?: string;
+  nextCheck?: string;
+  deadline?: string;
+  evidence?: string[];
+  exhaustedPaths?: string[];
+  approvalProof?: string;
+};
+
 export type GovernedTurnSettlementFacts = {
   settlementId?: string;
   missionId?: string;
+  activeMissionScope?: string;
+  closeoutScope?: string;
+  reviewScope?: string;
+  remainingParentScope?: string;
+  parentContinuationCoverage?: ParentContinuationCoverageFacts;
   finalReportRequired?: boolean;
   finalReportArtifactWritten?: boolean;
   finalReportVisibleDeliveryProven?: boolean;
@@ -202,16 +236,95 @@ function hasEntries(value: string[] | undefined): boolean {
   return Array.isArray(value) && value.some((entry) => hasText(entry));
 }
 
+function normalizedText(value: string | undefined): string | undefined {
+  return hasText(value) ? value.trim().replace(/\s+/gu, " ").toLowerCase() : undefined;
+}
+
 function normalizeSettlementId(value: string | undefined, fallback: string): string {
   return hasText(value) ? value.trim() : fallback;
 }
 
-function hasNextStepCoverage(facts: GovernedTurnSettlementFacts): boolean {
+function scopeValuesDiffer(first: string | undefined, second: string | undefined): boolean {
+  const normalizedFirst = normalizedText(first);
+  const normalizedSecond = normalizedText(second);
+  return Boolean(normalizedFirst && normalizedSecond && normalizedFirst !== normalizedSecond);
+}
+
+function hasOpenParentScope(facts: GovernedTurnSettlementFacts): boolean {
   return (
-    facts.nextExecutableStepStarted === true ||
-    facts.durableWaitRecorded === true ||
-    facts.lawfulBlockerRecorded === true
+    facts.broaderMissionOpen === true ||
+    hasText(facts.remainingParentScope) ||
+    scopeValuesDiffer(facts.activeMissionScope, facts.closeoutScope) ||
+    scopeValuesDiffer(facts.activeMissionScope, facts.reviewScope)
   );
+}
+
+function validateParentContinuationCoverage(facts: GovernedTurnSettlementFacts): {
+  covered: boolean;
+  parentProvenClosed: boolean;
+  validationErrors: string[];
+} {
+  const validationErrors: string[] = [];
+  const coverage = facts.parentContinuationCoverage;
+  if (coverage?.kind === "parent_scope_proven_closed") {
+    return { covered: true, parentProvenClosed: true, validationErrors };
+  }
+  if (coverage?.kind === "next_executable_parent_step_started") {
+    return { covered: true, parentProvenClosed: false, validationErrors };
+  }
+  if (coverage?.kind === "durable_wait") {
+    if (!hasText(coverage.owner)) {
+      validationErrors.push("durable_wait_owner_missing");
+    }
+    if (!hasText(coverage.reason)) {
+      validationErrors.push("durable_wait_reason_missing");
+    }
+    if (!hasText(coverage.nextCheck)) {
+      validationErrors.push("durable_wait_next_check_missing");
+    }
+    if (!hasText(coverage.deadline)) {
+      validationErrors.push("durable_wait_deadline_missing");
+    }
+    return {
+      covered: validationErrors.length === 0,
+      parentProvenClosed: false,
+      validationErrors,
+    };
+  }
+  if (coverage?.kind === "lawful_blocker") {
+    if (!hasEntries(coverage.evidence)) {
+      validationErrors.push("lawful_blocker_evidence_missing");
+    }
+    if (!hasEntries(coverage.exhaustedPaths)) {
+      validationErrors.push("lawful_blocker_exhausted_paths_missing");
+    }
+    return {
+      covered: validationErrors.length === 0,
+      parentProvenClosed: false,
+      validationErrors,
+    };
+  }
+  if (coverage?.kind === "operator_scope_change") {
+    if (!hasText(coverage.approvalProof)) {
+      validationErrors.push("operator_scope_change_approval_proof_missing");
+    }
+    return {
+      covered: validationErrors.length === 0,
+      parentProvenClosed: false,
+      validationErrors,
+    };
+  }
+  if (facts.nextExecutableStepStarted === true) {
+    return { covered: true, parentProvenClosed: false, validationErrors };
+  }
+  if (facts.durableWaitRecorded === true) {
+    return { covered: true, parentProvenClosed: false, validationErrors };
+  }
+  if (facts.lawfulBlockerRecorded === true) {
+    return { covered: true, parentProvenClosed: false, validationErrors };
+  }
+  validationErrors.push("parent_scope_continuation_required");
+  return { covered: false, parentProvenClosed: false, validationErrors };
 }
 
 function createGovernedTurnSettlementDecision(
@@ -314,7 +427,10 @@ export function resolveGovernedTurnSettlement(
       validationErrors,
     });
   }
-  if (facts.broaderMissionOpen === true && !hasNextStepCoverage(facts)) {
+  const parentContinuation = validateParentContinuationCoverage(facts);
+  validationErrors.push(...parentContinuation.validationErrors);
+  const parentScopeOpen = hasOpenParentScope(facts) && !parentContinuation.parentProvenClosed;
+  if (parentScopeOpen && !parentContinuation.covered) {
     return createGovernedTurnSettlementDecision(facts, {
       state: "unsettled",
       allowedToCloseMission: false,
@@ -325,7 +441,10 @@ export function resolveGovernedTurnSettlement(
       validationErrors,
     });
   }
-  if (facts.lawfulBlockerRecorded === true) {
+  if (
+    facts.lawfulBlockerRecorded === true ||
+    facts.parentContinuationCoverage?.kind === "lawful_blocker"
+  ) {
     return createGovernedTurnSettlementDecision(facts, {
       state: "settled_blocked",
       allowedToCloseMission: false,
@@ -336,7 +455,7 @@ export function resolveGovernedTurnSettlement(
       validationErrors,
     });
   }
-  if (facts.broaderMissionOpen === true) {
+  if (parentScopeOpen) {
     return createGovernedTurnSettlementDecision(facts, {
       state: "settled_handoff",
       allowedToCloseMission: false,
@@ -747,12 +866,29 @@ export function resolveMissionSettlementTail(
       nextIncompleteBoundary: deliveryState === "failed" ? "delivery_retry" : "delivery_unknown",
     };
   }
+  const parentContinuation = validateParentContinuationCoverage(facts);
+  validationErrors.push(...parentContinuation.validationErrors);
+  const parentScopeOpen = hasOpenParentScope(facts) && !parentContinuation.parentProvenClosed;
+  if (parentScopeOpen && !parentContinuation.covered) {
+    return {
+      schema: "openclaw.mission_settlement_tail_decision.v1",
+      missionId,
+      state: "PARENT_SCOPE_CONTINUATION_REQUIRED",
+      settled: false,
+      allowedToCloseMission: false,
+      workCompletionSettledSeparately: true,
+      closeoutValidation,
+      recoveryAction: "record_parent_scope_continuation_coverage",
+      validationErrors,
+      nextIncompleteBoundary: "parent_scope_continuation_required",
+    };
+  }
   return {
     schema: "openclaw.mission_settlement_tail_decision.v1",
     missionId,
     state: "SETTLED",
     settled: true,
-    allowedToCloseMission: true,
+    allowedToCloseMission: !parentScopeOpen,
     workCompletionSettledSeparately: true,
     closeoutValidation,
     recoveryAction: "settlement_complete",

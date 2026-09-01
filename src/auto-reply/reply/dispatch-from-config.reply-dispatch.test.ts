@@ -92,6 +92,21 @@ const CLEANUP_CREW_FULL_BUILD_COMPLETE_REPORT = [
   "Exact next action: none; whole run complete.",
 ].join("\n");
 
+const CLEANUP_CREW_SCOPED_CLOSEOUT_WITHOUT_PARENT_CONTINUATION = [
+  "Cleanup Crew scoped closeout",
+  "Status: closed for this scoped slice",
+  "Target handled: ISSUE-040 b84ac82 activation slice",
+  "Scope handled: b84ac82 scoped activation slice",
+  "Actual execution owner: Cleanup Crew",
+  "Artifact path(s): /home/will/.openclaw/workspace/file_hub/exports/issue_040_b84ac82.md",
+  "Proof path(s): /home/will/.openclaw/workspace/file_hub/exports/issue_040_b84ac82_proof.json",
+  "What is materially real now: The b84ac82 scoped activation slice is closed.",
+  "What is still not real yet: Broader ISSUE-040 remains open.",
+  "Who lawfully owns the next step: Will / Cleanup Crew owns parent continuation.",
+  "Open/closed truth: scoped slice closed; broader ISSUE-040 remains open.",
+  "Exact next action: not recorded yet",
+].join("\n");
+
 const STRUCTURED_CLEANUP_CREW_CLOSEOUT: StructuredMissionCloseout = {
   runLabel: "Cleanup Crew structured final closeout",
   targetHandled: "Cleanup Crew issue-list repair",
@@ -396,6 +411,43 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       finalDeliveryDelivered: true,
       sourceTurnState: "final_delivered",
       visibleDeliveryCount: 1,
+    });
+  });
+
+  it("keeps parent-scope mission settlement open when a delivered scoped closeout has no real parent continuation coverage", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
+
+    await withCleanupCrewDispatchState(async () => {
+      const dispatcher = createDispatcher();
+      const result = await dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx({
+          SessionKey: "webchat:direct:mark",
+          Body: "run all of ISSUE-040 under Cleanup Crew",
+          BodyForAgent: "run all of ISSUE-040 under Cleanup Crew",
+          BodyForCommands: "run all of ISSUE-040 under Cleanup Crew",
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyResolver: async () => ({
+          text: CLEANUP_CREW_SCOPED_CLOSEOUT_WITHOUT_PARENT_CONTINUATION,
+        }),
+      });
+
+      expect(result.queuedFinal).toBe(false);
+      const rows = await readSourceTurnDeliveryRows(registryPath);
+      expect(rows).toHaveLength(1);
+      expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+        }),
+      );
+      expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          text: expect.stringContaining("broader_build_open_next_action_missing"),
+        }),
+      );
     });
   });
 

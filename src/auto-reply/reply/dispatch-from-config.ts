@@ -36,7 +36,10 @@ import {
   resolveModelRefFromString,
   type ModelAliasIndex,
 } from "../../agents/model-selection.js";
-import { resolveCleanupCrewPostReportContinuation } from "../../agents/report-delivery-guard.js";
+import {
+  resolveCleanupCrewPostReportContinuation,
+  type CleanupCrewPostReportContinuationDecision,
+} from "../../agents/report-delivery-guard.js";
 import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
 import {
   persistSourceTurnDeliveryState,
@@ -1690,13 +1693,13 @@ export async function dispatchReplyFromConfig(
     const openClosedTruth = extractCleanupCrewReportField(reportText, "Open/closed truth:");
     const exactNextAction = extractCleanupCrewReportField(reportText, "Exact next action:");
     if (
-      !targetHandled &&
-      !scopeHandled &&
-      !actualExecutionOwner &&
-      !whatIsMateriallyRealNow &&
-      !whatIsStillNotRealYet &&
-      !whoLawfullyOwnsNextStep &&
-      !openClosedTruth &&
+      !targetHandled ||
+      !scopeHandled ||
+      !actualExecutionOwner ||
+      !whatIsMateriallyRealNow ||
+      !whatIsStillNotRealYet ||
+      !whoLawfullyOwnsNextStep ||
+      !openClosedTruth ||
       !exactNextAction
     ) {
       return null;
@@ -1721,6 +1724,63 @@ export async function dispatchReplyFromConfig(
       shortResult: whatIsMateriallyRealNow || runLabel,
     };
   };
+  let cleanupCrewLastPostReportContinuationDecision:
+    | CleanupCrewPostReportContinuationDecision
+    | undefined;
+  const resolveCleanupCrewSettlementScopeFacts = (
+    closeout: StructuredMissionCloseout,
+    deliveryState: MissionDeliveryState,
+  ) => {
+    const decision =
+      cleanupCrewLastPostReportContinuationDecision ??
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: currentTurnTextForCleanupCrewGuard,
+        reportText: [
+          closeout.runLabel,
+          closeout.targetHandled,
+          closeout.scopeHandled,
+          closeout.whatIsStillNotRealYet,
+          closeout.openClosedTruth,
+          closeout.exactNextAction,
+        ].join("\n"),
+        finalDeliveryDelivered: deliveryState === "proven",
+      });
+    const activeMissionScope =
+      normalizeOptionalString(currentTurnTextForCleanupCrewGuard) ?? closeout.targetHandled;
+    const parentOpen =
+      decision.broaderBuildOpen ||
+      decision.state === "continuation_dispatch_required" ||
+      decision.state === "pending_continuation_action";
+    const continuationRecorded =
+      cleanupCrewPostReportContinuationRecorded &&
+      decision.state === "continuation_dispatch_required";
+    return {
+      activeMissionScope,
+      closeoutScope: closeout.scopeHandled,
+      reviewScope: closeout.scopeHandled,
+      remainingParentScope: parentOpen
+        ? (decision.nextExecutableAction ?? decision.reason)
+        : undefined,
+      parentContinuationCoverage:
+        decision.state === "terminal_stop_allowed_full_build_complete"
+          ? ({ kind: "parent_scope_proven_closed" } as const)
+          : decision.state === "terminal_stop_allowed_verified_hard_stop"
+            ? ({
+                kind: "lawful_blocker",
+                evidence: ["Cleanup Crew report names verified hard stop/blocker proof"],
+                exhaustedPaths: ["continuation not lawful per delivered report"],
+              } satisfies {
+                kind: "lawful_blocker";
+                evidence: string[];
+                exhaustedPaths: string[];
+              })
+            : continuationRecorded
+              ? ({ kind: "next_executable_parent_step_started" } as const)
+              : parentOpen
+                ? ({ kind: "missing" } as const)
+                : undefined,
+    };
+  };
   const recordCleanupCrewMissionSettlement = (
     payload: ReplyPayload,
     deliveryState: MissionDeliveryState,
@@ -1739,6 +1799,7 @@ export async function dispatchReplyFromConfig(
     }
     const settlement = resolveMissionSettlementTail({
       missionId: flow.flowId,
+      ...resolveCleanupCrewSettlementScopeFacts(closeout, deliveryState),
       workState: "completed",
       resultDurable: true,
       closeoutReady: true,
@@ -1752,7 +1813,9 @@ export async function dispatchReplyFromConfig(
       expectedRevision: flow.revision,
       patch: {
         currentStep: settlement.settled
-          ? "mission_settlement_tail_settled"
+          ? settlement.allowedToCloseMission
+            ? "mission_settlement_tail_settled"
+            : "mission_settlement_tail_parent_scope_covered"
           : `mission_settlement_tail_${settlement.nextIncompleteBoundary}`,
         stateJson: attachMissionSettlementToTaskFlowStateJson({
           stateJson: flow.stateJson,
@@ -1788,6 +1851,7 @@ export async function dispatchReplyFromConfig(
       reportText,
       finalDeliveryDelivered: options.finalDeliveryDelivered,
     });
+    cleanupCrewLastPostReportContinuationDecision = decision;
     if (decision.state === "terminal_stop_allowed_verified_hard_stop") {
       recordLawfulBlocker(dispatcher, "blocker");
       cleanupCrewPostReportContinuationRecorded = true;
@@ -1849,6 +1913,7 @@ export async function dispatchReplyFromConfig(
       postReportRegistration.status === "registered" ||
       postReportRegistration.status === "attached"
     ) {
+      cleanupCrewMissionSettlementFlow = postReportRegistration.flow;
       cleanupCrewPostReportContinuationRecorded = true;
       recordNextExecutableStepStarted(
         dispatcher,
@@ -2895,6 +2960,7 @@ export async function dispatchReplyFromConfig(
           recordCleanupCrewPostReportContinuation(normalizedPayload, {
             finalDeliveryDelivered: true,
           });
+          recordCleanupCrewMissionSettlement(normalizedPayload, "proven");
           await mirrorInternalSourceReplyToTranscript({
             metadata: sourceReplyTranscriptMirror,
             cfg,
@@ -2936,6 +3002,7 @@ export async function dispatchReplyFromConfig(
           recordCleanupCrewPostReportContinuation(normalizedPayload, {
             finalDeliveryDelivered: true,
           });
+          recordCleanupCrewMissionSettlement(normalizedPayload, "proven");
           const metadata = deliveredSourceReplyTranscriptMirror();
           if (metadata) {
             await mirrorInternalSourceReplyToTranscript({

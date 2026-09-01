@@ -732,6 +732,21 @@ function stripNextActionText(value: string): string | undefined {
     .replace(/^[-*]\s*/u, "")
     .replace(/^["']|["']$/gu, "")
     .trim();
+  const lowered = stripped.toLowerCase();
+  if (
+    !stripped ||
+    lowered === "none" ||
+    lowered === "n/a" ||
+    lowered === "not applicable" ||
+    lowered === "not recorded" ||
+    lowered === "not recorded yet" ||
+    lowered === "unknown" ||
+    lowered === "tbd" ||
+    lowered.startsWith("none;") ||
+    lowered.startsWith("none,")
+  ) {
+    return undefined;
+  }
   return stripped.length > 0 ? stripped : undefined;
 }
 

@@ -94,23 +94,79 @@ describe("mission settlement tail", () => {
       expect(
         resolveGovernedTurnSettlement({
           ...BASE_SETTLEMENT,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "b84ac82 scoped activation slice",
+          reviewScope: "b84ac82 scoped activation slice",
+          remainingParentScope: "remaining ISSUE-040 continuation/report-delivery family",
           broaderMissionOpen: true,
           nextExecutableStepStarted: false,
           durableWaitRecorded: false,
           lawfulBlockerRecorded: false,
+          parentContinuationCoverage: {
+            kind: "missing",
+          },
         }),
       ).toMatchObject({
         state: "unsettled",
         watchdogVisible: true,
         recoveryAction: "record_next_step_coverage",
         nextIncompleteBoundary: "next_step_coverage",
+        validationErrors: ["parent_scope_continuation_required"],
       });
 
       expect(
         resolveGovernedTurnSettlement({
           ...BASE_SETTLEMENT,
-          broaderMissionOpen: true,
-          nextExecutableStepStarted: true,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "b84ac82 scoped activation slice",
+          reviewScope: "b84ac82 scoped activation slice",
+          remainingParentScope: "remaining ISSUE-040 continuation/report-delivery family",
+          parentContinuationCoverage: {
+            kind: "next_executable_parent_step_started",
+          },
+        }),
+      ).toMatchObject({
+        state: "settled_handoff",
+        allowedToCloseMission: false,
+        allowedToAcceptReport: true,
+        recoveryAction: "continue_from_handoff",
+      });
+    });
+
+    it("requires durable wait coverage to name owner, reason, next check, and deadline", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "ISSUE-040 scoped slice",
+          remainingParentScope: "remaining ISSUE-040 family",
+          parentContinuationCoverage: {
+            kind: "durable_wait",
+            owner: "Will / Cleanup Crew",
+            reason: "waiting on protected restart window",
+            nextCheck: "2026-09-01 22:00 PDT",
+          },
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        recoveryAction: "record_next_step_coverage",
+        nextIncompleteBoundary: "next_step_coverage",
+        validationErrors: ["durable_wait_deadline_missing"],
+      });
+
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "ISSUE-040 scoped slice",
+          remainingParentScope: "remaining ISSUE-040 family",
+          parentContinuationCoverage: {
+            kind: "durable_wait",
+            owner: "Will / Cleanup Crew",
+            reason: "waiting on protected restart window",
+            nextCheck: "2026-09-01 22:00 PDT",
+            deadline: "2026-09-02 09:00 PDT",
+          },
         }),
       ).toMatchObject({
         state: "settled_handoff",
@@ -124,14 +180,76 @@ describe("mission settlement tail", () => {
       expect(
         resolveGovernedTurnSettlement({
           ...BASE_SETTLEMENT,
-          broaderMissionOpen: true,
-          lawfulBlockerRecorded: true,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "ISSUE-040 scoped slice",
+          remainingParentScope: "remaining ISSUE-040 family",
+          parentContinuationCoverage: {
+            kind: "lawful_blocker",
+            evidence: ["blocker artifact path"],
+            exhaustedPaths: ["safe restart rejected by protected-surface policy"],
+          },
         }),
       ).toMatchObject({
         state: "settled_blocked",
         allowedToCloseMission: false,
         allowedToAcceptReport: true,
         recoveryAction: "keep_lawful_blocker_visible",
+      });
+    });
+
+    it("does not let slice review scope close an active parent mission", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "b84ac82 scoped activation slice",
+          reviewScope: "b84ac82 scoped activation slice",
+          remainingParentScope: "",
+          parentContinuationCoverage: {
+            kind: "missing",
+          },
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        allowedToCloseMission: false,
+        recoveryAction: "record_next_step_coverage",
+        nextIncompleteBoundary: "next_step_coverage",
+        validationErrors: ["parent_scope_continuation_required"],
+      });
+    });
+
+    it("allows explicit operator scope change only with structured approval proof", () => {
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "b84ac82 scoped activation slice",
+          reviewScope: "b84ac82 scoped activation slice",
+          parentContinuationCoverage: {
+            kind: "operator_scope_change",
+          },
+        }),
+      ).toMatchObject({
+        state: "unsettled",
+        recoveryAction: "record_next_step_coverage",
+        validationErrors: ["operator_scope_change_approval_proof_missing"],
+      });
+
+      expect(
+        resolveGovernedTurnSettlement({
+          ...BASE_SETTLEMENT,
+          activeMissionScope: "all of ISSUE-040",
+          closeoutScope: "b84ac82 scoped activation slice",
+          reviewScope: "b84ac82 scoped activation slice",
+          parentContinuationCoverage: {
+            kind: "operator_scope_change",
+            approvalProof: "Mark approved stop-at-slice scope change in current turn",
+          },
+        }),
+      ).toMatchObject({
+        state: "settled_handoff",
+        allowedToCloseMission: false,
+        allowedToAcceptReport: true,
       });
     });
 
