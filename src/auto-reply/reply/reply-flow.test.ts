@@ -678,6 +678,29 @@ describe("createReplyDispatcher", () => {
     });
   });
 
+  it("rejects terminal scoped closeout when broader issue-family work remains open", () => {
+    expect(
+      resolveCleanupCrewFinalResponseGate({
+        activeCleanupCrewMission: true,
+        currentTurnText: "Run Cleanup Crew SOP for ISSUE-040.",
+        responseText: [
+          "ISSUE-040 Tail Settlement Reliability first slice final closeout",
+          "STATUS: Closed for the scoped first source slice.",
+          "MODE: Cleanup Crew SOP.",
+          "What is materially real now: scoped first source slice is live.",
+          "What is still not real yet: broader ISSUE-040 reliability family remains open.",
+          "Who lawfully owns the next step: Will / Cleanup Crew controller.",
+          "Open/closed truth: Scoped first source slice is closed. Broader ISSUE-040 family remains open.",
+          "Exact next action: continue ISSUE-040 family triage from the updated register.",
+        ].join("\n"),
+      }),
+    ).toMatchObject({
+      allowed: false,
+      violationReason:
+        "Cleanup Crew final response attempted terminal closeout while broader work remains open: broader_build_open_next_action_named",
+    });
+  });
+
   it("rejects Cleanup Crew final closeout missing exact truth fields in the final path", () => {
     const dispatcher = createGuardedDispatcher();
     installActiveRunContinuationGuard(dispatcher, {

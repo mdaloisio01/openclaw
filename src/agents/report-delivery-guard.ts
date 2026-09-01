@@ -574,10 +574,21 @@ function isOperatorStopText(text: string): boolean {
 }
 
 function reportNamesBroaderBuildOpen(text: string): boolean {
+  const namesBroaderOpenFamily =
+    /\bbroader\b.{0,96}\b(remains|is|still)\s+open\b/.test(text) ||
+    /\b(entire|whole|historical)\b.{0,96}\bnot\b.{0,48}\b(closed|complete|globally closed)\b/.test(
+      text,
+    );
+  if (namesBroaderOpenFamily) {
+    return true;
+  }
   return reportTextIncludesAny(text, [
     "broader build remains open",
     "broader mission remains open",
     "broader cleanup crew remains open",
+    "broader issue family remains open",
+    "broader issue remains open",
+    "broader reliability family remains open",
     "broader cleanup crew issue-list repair remains open",
     "cleanup crew issue-list repair remains open",
     "cleanup crew mission remains open",

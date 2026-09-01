@@ -295,6 +295,28 @@ describe("report delivery guard", () => {
     });
   });
 
+  it("treats broader issue-family wording as open work requiring continuation coverage", () => {
+    expect(
+      resolveCleanupCrewPostReportContinuation({
+        currentTurnText: "Run Cleanup Crew SOP.",
+        reportText: [
+          "ISSUE-040 scoped slice closeout",
+          "STATUS: Closed for the scoped first source slice.",
+          "MODE: Cleanup Crew SOP.",
+          "Open/closed truth: Scoped first slice closed. Broader ISSUE-040 reliability family remains open.",
+          "Exact next action: continue ISSUE-040 family triage from the updated register.",
+        ].join("\n"),
+        finalDeliveryDelivered: true,
+      }),
+    ).toMatchObject({
+      state: "continuation_dispatch_required",
+      activeCleanupCrewMission: true,
+      broaderBuildOpen: true,
+      stopAllowed: false,
+      nextExecutableAction: "continue ISSUE-040 family triage from the updated register.",
+    });
+  });
+
   it("allows post-report stop when the full Cleanup Crew build is complete", () => {
     expect(
       resolveCleanupCrewPostReportContinuation({

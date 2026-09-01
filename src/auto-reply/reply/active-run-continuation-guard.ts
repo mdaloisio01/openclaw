@@ -155,10 +155,21 @@ function isMilestoneVisibilityReport(text: string): boolean {
 }
 
 function reportNamesBroaderBuildOpen(text: string): boolean {
+  const namesBroaderOpenFamily =
+    /\bbroader\b.{0,96}\b(remains|is|still)\s+open\b/.test(text) ||
+    /\b(entire|whole|historical)\b.{0,96}\bnot\b.{0,48}\b(closed|complete|globally closed)\b/.test(
+      text,
+    );
+  if (namesBroaderOpenFamily) {
+    return true;
+  }
   return includesAny(text, [
     "broader build remains open",
     "broader mission remains open",
     "broader cleanup crew remains open",
+    "broader issue family remains open",
+    "broader issue remains open",
+    "broader reliability family remains open",
     "cleanup crew issue-list repair remains open",
     "build still open",
     "mission still open",
@@ -343,6 +354,9 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   });
   const reportAcceptanceAdvisoryOnly =
     params.falseCloseoutAdmissionMode === "shadow" || params.falseCloseoutAdmissionMode === "off";
+  const postReportContinuationRequiresWork =
+    reportCloseoutAcceptance.postReportContinuation.state === "continuation_dispatch_required" ||
+    reportCloseoutAcceptance.postReportContinuation.state === "pending_continuation_action";
 
   if (!activeCleanupCrewMission || !terminalAttempt) {
     return {
@@ -444,7 +458,7 @@ export function resolveCleanupCrewFinalResponseGate(params: {
     };
   }
 
-  if (repairableBlocker || nextRepairPathKnown) {
+  if (repairableBlocker || nextRepairPathKnown || postReportContinuationRequiresWork) {
     return {
       allowed: false,
       activeCleanupCrewMission,
@@ -458,8 +472,9 @@ export function resolveCleanupCrewFinalResponseGate(params: {
       blockerArtifactPresent,
       laneCDecisionRequired,
       typedDecisionReceipt,
-      violationReason:
-        "Cleanup Crew final response attempted terminal blocked/done/closeout while a lawful repair path is known or derivable",
+      violationReason: postReportContinuationRequiresWork
+        ? `Cleanup Crew final response attempted terminal closeout while broader work remains open: ${reportCloseoutAcceptance.postReportContinuation.reason}`
+        : "Cleanup Crew final response attempted terminal blocked/done/closeout while a lawful repair path is known or derivable",
     };
   }
 
