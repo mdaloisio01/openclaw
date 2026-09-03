@@ -310,6 +310,19 @@ function noVisiblePayloadStatus(): AgentCommandDeliveryStatus {
   };
 }
 
+function requiredVisibleFinalMissingStatus(): AgentCommandDeliveryStatus {
+  return {
+    requested: true,
+    attempted: false,
+    status: "failed",
+    succeeded: false,
+    error: true,
+    errorMessage: "required visible final delivery produced no payload",
+    reason: "required_visible_final_missing",
+    resultCount: 0,
+  };
+}
+
 async function normalizeReplyMediaPathsForDelivery(params: {
   cfg: OpenClawConfig;
   payloads: ReplyPayload[];
@@ -665,6 +678,20 @@ export async function deliverAgentCommandResult(
 
   const deliveryPayloads = projectOutboundPayloadPlanForOutbound(outboundPayloadPlan);
   if (deliveryPayloads.length === 0) {
+    if (deliver && opts.requireVisibleFinalDelivery === true && !deliveryStatus) {
+      deliveryStatus = requiredVisibleFinalMissingStatus();
+      emitJsonEnvelope(deliveryStatus);
+      if (!bestEffortDeliver && !opts.json) {
+        throw new Error(deliveryStatus.errorMessage);
+      }
+      return buildDeliveryResult({
+        payloads: normalizedPayloads,
+        meta: resultMeta,
+        result,
+        deliverySucceeded: false,
+        deliveryStatus,
+      });
+    }
     deliveryStatus = deliver ? (deliveryStatus ?? noVisiblePayloadStatus()) : undefined;
     const deliverySucceeded = deliveryStatus?.succeeded === true ? true : undefined;
     emitJsonEnvelope(deliveryStatus);

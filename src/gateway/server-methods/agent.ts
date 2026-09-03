@@ -343,6 +343,7 @@ async function deliverBareSessionResetResult(params: {
     accountId?: string;
     threadId?: string | number;
     bestEffortDeliver?: boolean;
+    requireVisibleFinalDelivery?: boolean;
   };
   bestEffortDeliver?: boolean;
   deliveryTargetMode?: AgentCommandOpts["deliveryTargetMode"];
@@ -1207,6 +1208,10 @@ function dispatchAgentRunFromGateway(params: {
   const parentContinuationLink = shouldTrackTask
     ? resolveGatewayAgentParentContinuationLink(params.ingressOpts.sessionKey)
     : {};
+  const requireVisibleFinalDelivery =
+    params.ingressOpts.requireVisibleFinalDelivery === true ||
+    Boolean(parentContinuationLink.parentFlowId) ||
+    isCleanupCrewGatewayAgentTurn(params.ingressOpts.message);
   if (shouldTrackTask) {
     try {
       taskTracked = Boolean(
@@ -1245,6 +1250,8 @@ function dispatchAgentRunFromGateway(params: {
       const falseCloseoutAdmission = admitGatewayAgentTerminalPayloads({
         message: params.ingressOpts.message,
         payloads: normalizeGatewayAgentTerminalPayloads(result?.payloads),
+        forceGuardEvaluation: requireVisibleFinalDelivery,
+        activeCleanupCrewMission: requireVisibleFinalDelivery,
       });
       if (taskTracked) {
         tryFinalizeTrackedAgentTask({
@@ -1494,6 +1501,7 @@ export const agentHandlers: GatewayRequestHandlers = {
       disableMessageTool?: boolean;
       timeout?: number;
       bestEffortDeliver?: boolean;
+      requireVisibleFinalDelivery?: boolean;
       cleanupBundleMcpOnRunEnd?: boolean;
       label?: string;
       inputProvenance?: InputProvenance;
@@ -2834,6 +2842,12 @@ export const agentHandlers: GatewayRequestHandlers = {
               spawnedBy: spawnedByValue,
               timeout: request.timeout?.toString(),
               bestEffortDeliver,
+              requireVisibleFinalDelivery:
+                request.requireVisibleFinalDelivery === true ||
+                Boolean(
+                  resolveGatewayAgentParentContinuationLink(resolvedSessionKey).parentFlowId,
+                ) ||
+                isCleanupCrewGatewayAgentTurn(message),
               messageChannel: originMessageChannel,
               runId,
               lane: request.lane,

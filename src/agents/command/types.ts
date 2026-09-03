@@ -63,6 +63,12 @@ export type AgentCommandOpts = {
   json?: boolean;
   timeout?: string;
   deliver?: boolean;
+  /**
+   * Governed/reporting runs must produce a visible final payload when delivery
+   * is requested. Empty payloads remain allowed for ordinary NO_REPLY/silent
+   * turns unless this flag is set.
+   */
+  requireVisibleFinalDelivery?: boolean;
   /** Override delivery target (separate from session routing). */
   replyTo?: string;
   /** Override delivery channel (separate from session routing). */

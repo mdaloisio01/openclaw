@@ -2086,6 +2086,36 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     );
   });
 
+  it("passes required visible final delivery through direct agent delivery", async () => {
+    setupSingleAttemptFallback();
+    state.runAgentAttemptMock.mockResolvedValue(makeEmptyResult("openai", "gpt-5.4"));
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-1",
+      updatedAt: 1,
+    };
+    state.sessionEntryMock = sessionEntry;
+    state.sessionStoreMock = { "agent:main:main": sessionEntry };
+    state.storePathMock = "/tmp/openclaw-sessions.json";
+    state.deliverAgentCommandResultMock.mockResolvedValue({ deliverySucceeded: false });
+
+    await agentCommand({
+      message: "resume build",
+      channel: "webchat",
+      to: "webchat:mark",
+      accountId: "main",
+      deliver: true,
+      requireVisibleFinalDelivery: true,
+    });
+
+    expect(state.deliverAgentCommandResultMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        opts: expect.objectContaining({
+          requireVisibleFinalDelivery: true,
+        }),
+      }),
+    );
+  });
+
   it("clears stale flag-only pending final delivery when there is no final payload", async () => {
     setupSingleAttemptFallback();
     state.runAgentAttemptMock.mockResolvedValue(makeEmptyResult("openai", "gpt-5.4"));
