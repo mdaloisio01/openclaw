@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   isPinnedReleaseStateValidForPayload,
   recomputePinnedReleaseStateHash,
+  validateIssueFamilyClosureAdmission,
   validateGovernedCloseoutAndBuildReleaseState,
 } from "./governed-closeout-validator.js";
 import {
@@ -173,5 +174,143 @@ describe("governed closeout validator", () => {
         payloadHash: "payload-hash-2",
       }),
     ).toBe(false);
+  });
+
+  describe("issue-family closure admission", () => {
+    function closureInput(
+      overrides: Partial<Parameters<typeof validateIssueFamilyClosureAdmission>[0]> = {},
+    ): Parameters<typeof validateIssueFamilyClosureAdmission>[0] {
+      return {
+        issueFamilyId: "ISSUE-040",
+        missionId: contract.missionId,
+        requestedClosureScope: "whole_family",
+        evidenceScope: "whole_family",
+        releaseState: validate().releaseState,
+        finalVisibleDeliveryProof: true,
+        finalCloseoutArtifactProof: true,
+        grantAcceptanceProof: true,
+        watchdogCleanProof: true,
+        openSettlementRows: 0,
+        issueRegisterActionProof: true,
+        ...overrides,
+      };
+    }
+
+    it("allows whole-family issue closure only after every same-identity gate passes", () => {
+      expect(validateIssueFamilyClosureAdmission(closureInput())).toEqual({
+        schema: "openclaw.issue_family_closure_admission_result.v1",
+        issueFamilyId: "ISSUE-040",
+        missionId: contract.missionId,
+        closureAllowed: true,
+        requestedClosureScope: "whole_family",
+        evidenceScope: "whole_family",
+        rejectionCodes: [],
+        nextAction: "write issue-register closure row for the same governed mission identity",
+      });
+    });
+
+    it("rejects artifact or register proof without visible final delivery", () => {
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            finalVisibleDeliveryProof: false,
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: false,
+        rejectionCodes: ["FINAL_VISIBLE_DELIVERY_PROOF_MISSING"],
+        nextAction: "deliver the final Mark-facing report visibly and record proof before closure",
+      });
+    });
+
+    it("rejects scoped evidence when whole-family closure is requested", () => {
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            evidenceScope: "scoped_slice",
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: false,
+        rejectionCodes: ["SCOPED_SLICE_CANNOT_CLOSE_WHOLE_FAMILY"],
+        nextAction: "use scoped closure only for the slice or collect whole-family evidence",
+      });
+    });
+
+    it("rejects missing Grant, watchdog, closeout, and settlement proof", () => {
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            finalCloseoutArtifactProof: false,
+            grantAcceptanceProof: false,
+            watchdogCleanProof: false,
+            openSettlementRows: 2,
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: false,
+        rejectionCodes: [
+          "FINAL_CLOSEOUT_ARTIFACT_PROOF_MISSING",
+          "GRANT_ACCEPTANCE_PROOF_MISSING",
+          "WATCHDOG_CLEAN_PROOF_MISSING",
+          "OPEN_SETTLEMENT_ROWS_REMAIN",
+        ],
+      });
+    });
+
+    it("rejects release and mission identity mismatch before register closure", () => {
+      const releaseState = validate().releaseState;
+
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            missionId: "different-mission",
+            releaseState,
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: false,
+        rejectionCodes: ["MISSION_IDENTITY_MISMATCH"],
+      });
+    });
+
+    it("requires issue-register action proof or a lawful no-update reason", () => {
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            issueRegisterActionProof: false,
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: false,
+        rejectionCodes: ["ISSUE_REGISTER_ACTION_PROOF_MISSING"],
+      });
+
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            issueRegisterActionProof: false,
+            lawfulNoIssueUpdateReason: "closure row already exists for this mission identity",
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: true,
+        rejectionCodes: [],
+      });
+    });
+
+    it("rejects denied release state before issue-family closure", () => {
+      expect(
+        validateIssueFamilyClosureAdmission(
+          closureInput({
+            releaseState: validate({ noBlockingState: false }).releaseState,
+          }),
+        ),
+      ).toMatchObject({
+        closureAllowed: false,
+        rejectionCodes: ["RELEASE_NOT_ALLOWED"],
+        nextAction: "obtain an allowed governed release state before issue-family closure",
+      });
+    });
   });
 });

@@ -68,6 +68,47 @@ export type GovernedCloseoutValidationResult = {
   releaseState: GovernedPinnedReleaseState;
 };
 
+export type IssueFamilyClosureScope = "whole_family" | "scoped_slice";
+
+export type IssueFamilyClosureAdmissionRejectionCode =
+  | "ISSUE_FAMILY_ID_MISSING"
+  | "MISSION_ID_MISSING"
+  | "MISSION_IDENTITY_MISMATCH"
+  | "RELEASE_NOT_ALLOWED"
+  | "FINAL_VISIBLE_DELIVERY_PROOF_MISSING"
+  | "FINAL_CLOSEOUT_ARTIFACT_PROOF_MISSING"
+  | "GRANT_ACCEPTANCE_PROOF_MISSING"
+  | "WATCHDOG_CLEAN_PROOF_MISSING"
+  | "OPEN_SETTLEMENT_ROWS_REMAIN"
+  | "ISSUE_REGISTER_ACTION_PROOF_MISSING"
+  | "SCOPED_SLICE_CANNOT_CLOSE_WHOLE_FAMILY";
+
+export type IssueFamilyClosureAdmissionInput = {
+  issueFamilyId: string;
+  missionId: string;
+  requestedClosureScope: IssueFamilyClosureScope;
+  evidenceScope: IssueFamilyClosureScope;
+  releaseState: GovernedPinnedReleaseState;
+  finalVisibleDeliveryProof: boolean;
+  finalCloseoutArtifactProof: boolean;
+  grantAcceptanceProof: boolean;
+  watchdogCleanProof: boolean;
+  openSettlementRows: number;
+  issueRegisterActionProof: boolean;
+  lawfulNoIssueUpdateReason?: string;
+};
+
+export type IssueFamilyClosureAdmissionResult = {
+  schema: "openclaw.issue_family_closure_admission_result.v1";
+  issueFamilyId: string;
+  missionId: string;
+  closureAllowed: boolean;
+  requestedClosureScope: IssueFamilyClosureScope;
+  evidenceScope: IssueFamilyClosureScope;
+  rejectionCodes: IssueFamilyClosureAdmissionRejectionCode[];
+  nextAction: string;
+};
+
 export function validateGovernedCloseoutAndBuildReleaseState(
   input: GovernedCloseoutValidationInput,
 ): GovernedCloseoutValidationResult {
@@ -142,6 +183,90 @@ export function validateGovernedCloseoutAndBuildReleaseState(
     releaseReceipt,
     releaseState,
   };
+}
+
+export function validateIssueFamilyClosureAdmission(
+  input: IssueFamilyClosureAdmissionInput,
+): IssueFamilyClosureAdmissionResult {
+  const rejectionCodes: IssueFamilyClosureAdmissionRejectionCode[] = [];
+  const issueFamilyId = input.issueFamilyId.trim();
+  const missionId = input.missionId.trim();
+  if (!issueFamilyId) {
+    rejectionCodes.push("ISSUE_FAMILY_ID_MISSING");
+  }
+  if (!missionId) {
+    rejectionCodes.push("MISSION_ID_MISSING");
+  }
+  if (missionId && input.releaseState.missionId !== missionId) {
+    rejectionCodes.push("MISSION_IDENTITY_MISMATCH");
+  }
+  if (!input.releaseState.releaseAllowed) {
+    rejectionCodes.push("RELEASE_NOT_ALLOWED");
+  }
+  if (!input.finalVisibleDeliveryProof) {
+    rejectionCodes.push("FINAL_VISIBLE_DELIVERY_PROOF_MISSING");
+  }
+  if (!input.finalCloseoutArtifactProof) {
+    rejectionCodes.push("FINAL_CLOSEOUT_ARTIFACT_PROOF_MISSING");
+  }
+  if (!input.grantAcceptanceProof) {
+    rejectionCodes.push("GRANT_ACCEPTANCE_PROOF_MISSING");
+  }
+  if (!input.watchdogCleanProof) {
+    rejectionCodes.push("WATCHDOG_CLEAN_PROOF_MISSING");
+  }
+  if (input.openSettlementRows > 0) {
+    rejectionCodes.push("OPEN_SETTLEMENT_ROWS_REMAIN");
+  }
+  if (!input.issueRegisterActionProof && !input.lawfulNoIssueUpdateReason?.trim()) {
+    rejectionCodes.push("ISSUE_REGISTER_ACTION_PROOF_MISSING");
+  }
+  if (input.requestedClosureScope === "whole_family" && input.evidenceScope !== "whole_family") {
+    rejectionCodes.push("SCOPED_SLICE_CANNOT_CLOSE_WHOLE_FAMILY");
+  }
+
+  const closureAllowed = rejectionCodes.length === 0;
+  return {
+    schema: "openclaw.issue_family_closure_admission_result.v1",
+    issueFamilyId: issueFamilyId || "unknown",
+    missionId: missionId || "unknown",
+    closureAllowed,
+    requestedClosureScope: input.requestedClosureScope,
+    evidenceScope: input.evidenceScope,
+    rejectionCodes,
+    nextAction: closureAllowed
+      ? "write issue-register closure row for the same governed mission identity"
+      : nextIssueFamilyClosureAction(rejectionCodes[0]),
+  };
+}
+
+function nextIssueFamilyClosureAction(
+  code: IssueFamilyClosureAdmissionRejectionCode | undefined,
+): string {
+  switch (code) {
+    case "ISSUE_FAMILY_ID_MISSING":
+    case "MISSION_ID_MISSING":
+    case "MISSION_IDENTITY_MISMATCH":
+      return "repair the issue-family and governed mission identity binding before closure";
+    case "RELEASE_NOT_ALLOWED":
+      return "obtain an allowed governed release state before issue-family closure";
+    case "FINAL_VISIBLE_DELIVERY_PROOF_MISSING":
+      return "deliver the final Mark-facing report visibly and record proof before closure";
+    case "FINAL_CLOSEOUT_ARTIFACT_PROOF_MISSING":
+      return "write and verify the final closeout artifact before closure";
+    case "GRANT_ACCEPTANCE_PROOF_MISSING":
+      return "obtain Grant accepted-review proof before closure";
+    case "WATCHDOG_CLEAN_PROOF_MISSING":
+      return "run fresh watchdog proof and require suspicious_count=0 before closure";
+    case "OPEN_SETTLEMENT_ROWS_REMAIN":
+      return "settle, supersede, or lawfully block every open settlement row before closure";
+    case "ISSUE_REGISTER_ACTION_PROOF_MISSING":
+      return "record issue-register action proof or a lawful no-update reason before closure";
+    case "SCOPED_SLICE_CANNOT_CLOSE_WHOLE_FAMILY":
+      return "use scoped closure only for the slice or collect whole-family evidence";
+    default:
+      return "collect required issue-family closure proof before closure";
+  }
 }
 
 export function isPinnedReleaseStateValidForPayload(
