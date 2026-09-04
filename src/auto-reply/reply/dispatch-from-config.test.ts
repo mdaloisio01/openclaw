@@ -3096,6 +3096,53 @@ describe("dispatchReplyFromConfig", () => {
     );
   });
 
+  it("allows planning-only setup closeout text without triggering BLOCKED_CLOSEOUT", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "webchat",
+      Surface: "webchat",
+      ChatType: "direct",
+    });
+
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+      _cfg?: OpenClawConfig,
+    ) => {
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Write build plan", "Write prompt", "Write work order"],
+      });
+      return {
+        text: "paperwork/setup done, build still open.",
+      } satisfies ReplyPayload;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "paperwork/setup done, build still open.",
+    });
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        { type: "BLOCKER_STATE", detail: "true:paperwork_only_setup" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
   it("rejects terminal closeout when the final payload says the local slice is complete but the broader mission is still open", async () => {
     setNoAbort();
     const cfg = {

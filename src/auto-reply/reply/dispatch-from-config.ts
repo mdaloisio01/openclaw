@@ -329,8 +329,8 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
   }
   if (normalized.includes("paperwork/setup done, build still open")) {
     return {
-      stopAllowed: false,
-      stopReason: "paperwork_only_still_open",
+      stopAllowed: true,
+      stopReason: "paperwork_only_setup",
       openTruth: "paperwork/setup done, build still open.",
     };
   }
@@ -1253,7 +1253,8 @@ function createAbortAwareDispatcher(params: {
         continuation.stopReason === "approval_blocked" ||
         continuation.stopReason === "restart_or_reload" ||
         continuation.stopReason === "hard_stop" ||
-        continuation.stopReason === "safety_stop")
+        continuation.stopReason === "safety_stop" ||
+        continuation.stopReason === "paperwork_only_setup")
     ) {
       recordLawfulBlocker(params.dispatcher, continuation.stopReason);
     }

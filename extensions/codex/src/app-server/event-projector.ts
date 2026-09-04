@@ -2095,7 +2095,7 @@ function itemStatus(item: CodexThreadItem): "completed" | "failed" | "running" |
 }
 
 function formatMissingToolResultError(params: { id: string; name: string }): string {
-  return `${MISSING_TOOL_RESULT_ERROR} toolCallId=${params.id}; toolName=${params.name}`;
+  return `${MISSING_TOOL_RESULT_ERROR} toolCallId=${params.id}; toolName=${params.name}. Next action: treat this as a recoverable tool boundary, resume from the last visible proof, retry or route an alternate execution surface, and record exact exhaustion proof before stopping.`;
 }
 
 function isNonSuccessItemStatus(status: ReturnType<typeof itemStatus>): boolean {

@@ -1728,6 +1728,10 @@ describe("CodexAppServerEventProjector", () => {
     expect(toolResultMessage.isError).toBe(true);
     const toolResultContent = requireArray(toolResultMessage.content, "tool result content");
     expect(JSON.stringify(toolResultContent)).toContain("matching tool.result");
+    expect(JSON.stringify(toolResultContent)).toContain(
+      "treat this as a recoverable tool boundary",
+    );
+    expect(JSON.stringify(toolResultContent)).toContain("alternate execution surface");
     expect(trajectoryRecorder.recordEvent).toHaveBeenCalledWith("tool.call", {
       threadId: THREAD_ID,
       turnId: TURN_ID,

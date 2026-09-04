@@ -627,6 +627,45 @@ describe("createReplyDispatcher", () => {
     );
   });
 
+  it("records operator pause instead of BLOCKED_CLOSEOUT when Mark says do not work, just answer", async () => {
+    const dispatcher = {
+      sendToolResult: vi.fn(() => true),
+      sendBlockReply: vi.fn(() => true),
+      sendFinalReply: vi.fn(() => true),
+      waitForIdle: vi.fn(async () => {}),
+      getQueuedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      getFailedCounts: vi.fn(() => ({ tool: 0, block: 0, final: 0 })),
+      markComplete: vi.fn(),
+    };
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        currentTurnText: "Do not do any work. Just answer my question.",
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "operator_answer_only_request");
+
+    expect(allowTerminalCloseout(dispatcher, "sendFinalReply").allowed).toBe(true);
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("OPERATOR_PAUSED"),
+        isStatusNotice: true,
+      }),
+    );
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("BLOCKED_CLOSEOUT"),
+      }),
+    );
+  });
+
   it("rejects Cleanup Crew final closeout on a repairable blocker with a lawful next repair path", () => {
     const dispatcher = createGuardedDispatcher();
     installActiveRunContinuationGuard(dispatcher, {
