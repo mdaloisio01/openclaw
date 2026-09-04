@@ -1,3 +1,6 @@
+import crypto from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { resolveCleanupCrewReportCloseoutAcceptance } from "../../agents/report-delivery-guard.js";
 import { persistCleanupCrewContinuityGateDecision } from "../../commands/cleanup-plan.js";
 import type {
@@ -8,6 +11,10 @@ import type {
 import { createCleanupCrewBootstrapB0TypedDecisionReceipt } from "../../continuity/continuity-gate-v2.js";
 import { evaluateFalseCloseoutAdmission } from "../../governance/false-closeout-admission-controller.js";
 import { writeFalseCloseoutAdmissionDecisionReceipt } from "../../governance/false-closeout-runtime-evidence.js";
+import {
+  resolveGovernedRunDurability,
+  type GovernedRunDurabilityDecision,
+} from "../../governance/governed-run-durability-contract.js";
 import type { CompletionDecision, MissionMode } from "../../governance/mission-manifest.types.js";
 import { getReplyPayloadMetadata, type ReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
@@ -27,6 +34,8 @@ export type ActiveRunContinuationEventType =
   | "FALSE_CLOSEOUT_ADMISSION_ALLOWED"
   | "CLEANUP_CREW_TERMINAL_CLOSEOUT_REJECTED"
   | "OPERATOR_PAUSE_HOLD_RECORDED"
+  | "GOVERNED_RUN_DURABILITY_CONTRACT_REJECTED"
+  | "GOVERNED_RUN_DURABILITY_OBLIGATION_WRITTEN"
   | "ACTIVE_RUN_CONTINUITY_VIOLATION";
 
 export type ActiveRunContinuationEvent = {
@@ -499,12 +508,27 @@ export function resolveCleanupCrewFinalResponseGate(params: {
 }
 
 function shouldRejectTerminalCloseout(state: GuardState): boolean {
-  return (
-    hasPendingContinuationRequirement(state) &&
-    !state.operatorPauseHold &&
-    !state.blocker &&
-    !state.nextExecutableStepStarted
-  );
+  return !resolveActiveRunDurabilityDecision(state).allowedToSettle;
+}
+
+function resolveActiveRunDurabilityDecision(state: GuardState): GovernedRunDurabilityDecision {
+  return resolveGovernedRunDurability({
+    governedRunActive: state.activeRunStarted,
+    nonTerminalUpdateEmitted: state.lastUpdateWasNonTerminal,
+    nextExecutableStepStarted: state.nextExecutableStepStarted,
+    lawfulBlockerRecorded: state.blocker || state.operatorPauseHold,
+    idempotencyKey: buildActiveRunDurabilityIdempotencyKey(state, "active-run-continuation"),
+  });
+}
+
+function buildActiveRunDurabilityIdempotencyKey(state: GuardState, reason: string): string {
+  const seed = [
+    state.persistence?.activeMission ?? "active-run-continuation",
+    state.persistence?.sourceSurface ?? "active-run-continuation-guard",
+    state.lastNonTerminalDetail ?? "no-detail",
+    reason,
+  ].join("|");
+  return crypto.createHash("sha256").update(seed).digest("hex").slice(0, 32);
 }
 
 function buildViolationNoticePayload(reason: string): ReplyPayload {
@@ -595,6 +619,45 @@ function createContinuityGateIssueForViolation(params: {
   };
 }
 
+async function persistActiveRunDurabilityObligation(
+  state: GuardState,
+  params: {
+    reason: string;
+    kind: "terminal_closeout_rejected" | "blocked_closeout";
+    decision: GovernedRunDurabilityDecision;
+  },
+): Promise<void> {
+  if (!state.persistence) {
+    return;
+  }
+  const idempotencyKey = buildActiveRunDurabilityIdempotencyKey(state, params.reason);
+  const outputDir = path.join(state.persistence.outputDir, "durability_obligations");
+  const filePath = path.join(outputDir, `${idempotencyKey}.json`);
+  const now = state.persistence.now ?? new Date().toISOString();
+  const record = {
+    kind: "openclaw.governed-run-durability-obligation",
+    schemaVersion: 1,
+    idempotencyKey,
+    status: "open",
+    createdAt: now,
+    updatedAt: now,
+    sourceSurface: state.persistence.sourceSurface ?? "active-run-continuation-guard",
+    activeMission: state.persistence.activeMission,
+    eventKind: params.kind,
+    reason: params.reason,
+    obligatedOwner: "active_run_controller",
+    watchdogVisible: params.decision.watchdogVisible,
+    requiredActions: params.decision.requiredActions,
+    durabilityDecision: params.decision,
+    lastNonTerminalDetail: state.lastNonTerminalDetail ?? null,
+    proofRefs: state.persistence.proofRefs ?? [],
+    authoritySources: state.persistence.authoritySources,
+  };
+  await mkdir(outputDir, { recursive: true });
+  await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+  recordEvent(state, "GOVERNED_RUN_DURABILITY_OBLIGATION_WRITTEN", filePath);
+}
+
 function persistContinuityGateDecision(
   state: GuardState,
   params: {
@@ -609,6 +672,21 @@ function persistContinuityGateDecision(
     return;
   }
   state.continuityGatePersistenceQueued = true;
+  const durabilityDecision = resolveActiveRunDurabilityDecision(state);
+  recordEvent(
+    state,
+    "GOVERNED_RUN_DURABILITY_CONTRACT_REJECTED",
+    `${durabilityDecision.state}:${durabilityDecision.requiredActions.join(",")}`,
+  );
+  const durabilityWrite = persistActiveRunDurabilityObligation(state, {
+    reason: params.reason,
+    kind: params.kind,
+    decision: durabilityDecision,
+  }).then(
+    () => undefined,
+    () => undefined,
+  );
+  state.pendingPersistenceWrites.push(durabilityWrite);
   const write = persistCleanupCrewContinuityGateDecision({
     outputDir: state.persistence.outputDir,
     activeMission: state.persistence.activeMission,

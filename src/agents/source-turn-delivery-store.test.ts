@@ -112,6 +112,11 @@ describe("source turn delivery storage adapter", () => {
         "source:source-turn-040|mission:cleanupcrew-issue-list-repair|run:run-1|report:final-closeout|delivery:webchat-final|generation:3",
       deliveryStatus: "blocked",
       finalDeliveryDelivered: false,
+      durabilityDecision: {
+        state: "needs_delivery_recovery",
+        allowedToSettle: false,
+        watchdogVisible: true,
+      },
     });
     expect(sourceTurnDeliveryBlocksWatchdog(row)).toBe(true);
   });
@@ -163,6 +168,11 @@ describe("source turn delivery storage adapter", () => {
       finalDeliveryDelivered: false,
       visibleDeliveryCount: 0,
       failureReason: "false_final_delivery_delivered_refused",
+      durabilityDecision: {
+        state: "settled",
+        allowedToSettle: true,
+        watchdogVisible: false,
+      },
     });
     expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("blocking_refused");
   });
@@ -189,6 +199,10 @@ describe("source turn delivery storage adapter", () => {
       sourceTurnState: "blocked_refused",
       finalDeliveryDelivered: false,
       visibleDeliveryCount: 0,
+      durabilityDecision: {
+        state: "needs_delivery_recovery",
+        allowedToSettle: false,
+      },
     });
     expect(row.reportArtifactPaths).toEqual([
       "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/report.md",
@@ -237,6 +251,63 @@ describe("source turn delivery storage adapter", () => {
       },
     });
     expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("blocking_refused");
+  });
+
+  it("keeps failed required delivery blocking until retry or handoff coverage exists", async () => {
+    const failed = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:delivery-failed",
+      sourceTurnId: "source-turn-delivery-failed",
+      missionId: "mission",
+      runId: "run",
+      reportId: "final",
+      deliveryId: "webchat",
+      facts: {
+        finalDeliveryRequired: true,
+        deliveryToolFailed: true,
+      },
+    });
+
+    expect(failed).toMatchObject({
+      obligationStage: "failed",
+      deliveryStatus: "delivery_failed",
+      durabilityDecision: {
+        state: "needs_delivery_recovery",
+        allowedToSettle: false,
+        requiredActions: [
+          "enqueue_delivery_retry",
+          "record_delivery_recovery_handoff",
+          "record_delivery_exhausted_blocker",
+        ],
+      },
+    });
+    expect(classifySourceTurnDeliveryWatchdogStatus(failed)).toBe("blocking_failed");
+
+    const retryCovered = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:delivery-failed",
+      sourceTurnId: "source-turn-delivery-failed",
+      missionId: "mission",
+      runId: "run",
+      reportId: "final",
+      deliveryId: "webchat",
+      facts: {
+        finalDeliveryRequired: true,
+        deliveryToolFailed: true,
+      },
+      watchdogReconciliation: {
+        status: "retry_scheduled",
+        action: "enqueue_delivery_retry",
+        proofPath: "/tmp/retry-proof.json",
+      },
+    });
+
+    expect(retryCovered).toMatchObject({
+      durabilityDecision: {
+        state: "settled",
+        allowedToSettle: true,
+      },
+    });
   });
 
   it("acknowledges Mark-facing export delivery with chat and visible export proof", async () => {

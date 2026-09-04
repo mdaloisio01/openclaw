@@ -1,6 +1,11 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
+  resolveGovernedRunDurability,
+  type GovernedRunDeliveryObligationStage,
+  type GovernedRunDurabilityDecision,
+} from "../governance/governed-run-durability-contract.js";
+import {
   resolveSourceTurnDeliveryState,
   type SourceTurnDeliveryDecision,
   type SourceTurnDeliveryFacts,
@@ -76,6 +81,7 @@ export type SourceTurnDeliveryRow = {
   markFacingExport?: SourceTurnMarkFacingExportDelivery;
   watchdogReconciliation?: SourceTurnDeliveryWatchdogReconciliation;
   deliveryDecision: SourceTurnDeliveryDecision;
+  durabilityDecision: GovernedRunDurabilityDecision;
 };
 
 export type SourceTurnDeliveryRegistry = {
@@ -294,6 +300,22 @@ function deriveObligationStage(params: {
   return "owed";
 }
 
+function toGovernedRunDeliveryObligationStage(
+  stage: SourceTurnDeliveryObligationStage,
+): GovernedRunDeliveryObligationStage {
+  return stage;
+}
+
+function hasRetryOrRecoveryCoverage(
+  reconciliation: SourceTurnDeliveryWatchdogReconciliation | undefined,
+): boolean {
+  return Boolean(
+    reconciliation?.action ||
+    reconciliation?.proofPath ||
+    reconciliation?.status === "settled_resolved_later",
+  );
+}
+
 function normalizeMarkFacingExportDelivery(
   facts: SourceTurnDeliveryFacts,
 ): SourceTurnMarkFacingExportDelivery | undefined {
@@ -379,6 +401,17 @@ export async function persistSourceTurnDeliveryState(
   const deliveryContext =
     normalizeDeliveryContext(params.deliveryContext) ??
     normalizeDeliveryContext(existing?.deliveryContext);
+  const retryOrRecoveryRecorded = hasRetryOrRecoveryCoverage(params.watchdogReconciliation);
+  const durabilityDecision = resolveGovernedRunDurability({
+    finalDeliveryRequired:
+      params.facts.finalDeliveryRequired === true || params.facts.reportRequired === true,
+    deliveryObligationStage: toGovernedRunDeliveryObligationStage(obligationStage),
+    deliveryRetryScheduled: retryOrRecoveryRecorded,
+    deliveryRecoveryHandoffRecorded: retryOrRecoveryRecorded,
+    deliveryExhaustedBlockerRecorded:
+      params.watchdogReconciliation?.status?.toLowerCase() === "closed_verified_blocked",
+    idempotencyKey,
+  });
   const row: SourceTurnDeliveryRow = {
     id: params.id,
     kind: SOURCE_TURN_DELIVERY_ROW_KIND,
@@ -420,6 +453,7 @@ export async function persistSourceTurnDeliveryState(
           }
         : {}),
     deliveryDecision: decision,
+    durabilityDecision,
   };
   const nextRows = existing
     ? registry.rows.map((candidate) => (candidate === existing ? row : candidate))
@@ -431,6 +465,24 @@ export async function persistSourceTurnDeliveryState(
 export function classifySourceTurnDeliveryWatchdogStatus(
   row: SourceTurnDeliveryRow,
 ): SourceTurnDeliveryWatchdogStatus {
+  if (!row.durabilityDecision?.allowedToSettle && row.durabilityDecision?.watchdogVisible) {
+    if (
+      row.deliveryStatus === "delivery_failed" ||
+      row.sourceTurnState === "final_delivery_failed"
+    ) {
+      return "blocking_failed";
+    }
+    if (
+      row.deliveryStatus === "delivery_unknown" ||
+      row.sourceTurnState === "final_delivery_unknown"
+    ) {
+      return "blocking_pending";
+    }
+    if (row.deliveryStatus === "blocked" || row.sourceTurnState === "blocked_refused") {
+      return "blocking_refused";
+    }
+    return "blocking_pending";
+  }
   const reconciliationStatus = row.watchdogReconciliation?.status?.toLowerCase() ?? "";
   const deliveryStatus = row.deliveryStatus.toLowerCase();
   if (row.finalDeliveryDelivered || deliveryStatus === "final_delivered") {

@@ -16,6 +16,7 @@ export type ActiveWorkCheckpointSource =
   | "preflight_compaction"
   | "gateway_restart"
   | "recoverable_tool_error"
+  | "run_failed"
   | "runtime_maintenance";
 export type ActiveWorkCheckpointMaintenanceStatus = "pending" | "completed" | "failed" | "skipped";
 export type ActiveWorkCheckpointContinuationStatus =
@@ -135,6 +136,7 @@ function normalizeCheckpointSource(value: unknown): ActiveWorkCheckpointSource {
     value === "preflight_compaction" ||
     value === "gateway_restart" ||
     value === "recoverable_tool_error" ||
+    value === "run_failed" ||
     value === "runtime_maintenance"
     ? value
     : "runtime_maintenance";
@@ -382,26 +384,31 @@ export async function updateActiveWorkCheckpointStatus(params: {
   reason?: string;
   stateDir?: string;
   nowMs?: number;
+  source?: ActiveWorkCheckpointSource;
   maintenanceStatus?: ActiveWorkCheckpointMaintenanceStatus;
   continuationStatus?: ActiveWorkCheckpointContinuationStatus;
   blockerReason?: string;
 }): Promise<ActiveWorkCheckpoint> {
   const nowMs = params.nowMs ?? Date.now();
+  const reason = normalizeOptionalString(params.reason, 500);
+  const blockerReason = normalizeOptionalString(params.blockerReason, 500);
+  const source =
+    params.source ??
+    (reason?.includes("run_failed") || blockerReason?.includes("run_failed")
+      ? "run_failed"
+      : params.checkpoint.source);
   const next: ActiveWorkCheckpoint = {
     ...params.checkpoint,
     status: params.status,
+    source,
     updatedAt: new Date(nowMs).toISOString(),
     updatedAtMs: nowMs,
     maintenanceStatus: params.maintenanceStatus ?? params.checkpoint.maintenanceStatus,
     continuationStatus: params.continuationStatus ?? params.checkpoint.continuationStatus,
-    ...(normalizeOptionalString(params.blockerReason, 500)
-      ? { blockerReason: normalizeOptionalString(params.blockerReason, 500) }
-      : {}),
+    ...(blockerReason ? { blockerReason } : {}),
     completedAt: new Date(nowMs).toISOString(),
     completedAtMs: nowMs,
-    ...(normalizeOptionalString(params.reason, 500)
-      ? { completionReason: normalizeOptionalString(params.reason, 500) }
-      : {}),
+    ...(reason ? { completionReason: reason } : {}),
   };
   await writeCheckpointFile(next, params.stateDir);
   return next;

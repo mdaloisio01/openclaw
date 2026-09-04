@@ -100,4 +100,61 @@ describe("active work checkpoints", () => {
       completionReason: "queued continuation",
     });
   });
+
+  it("preserves run_failed as an explicit checkpoint source", async () => {
+    const checkpoint = await writeActiveWorkCheckpoint({
+      input: {
+        ...baseInput(),
+        source: "run_failed",
+        maintenanceStatus: "failed",
+        continuationStatus: "blocked",
+        blockerReason: "reply operation failed: run_failed",
+      },
+      stateDir: tmpDir,
+      nowMs: 1_000,
+      ttlMs: 5_000,
+    });
+
+    expect(checkpoint).toMatchObject({
+      source: "run_failed",
+      maintenanceStatus: "failed",
+      continuationStatus: "blocked",
+      blockerReason: "reply operation failed: run_failed",
+      safeToAutoResume: true,
+    });
+  });
+
+  it("promotes blocked maintenance checkpoints to run_failed source when the failure reason says run_failed", async () => {
+    const checkpoint = await writeActiveWorkCheckpoint({
+      input: baseInput(),
+      stateDir: tmpDir,
+      nowMs: 1_000,
+      ttlMs: 5_000,
+    });
+
+    await updateActiveWorkCheckpointStatus({
+      checkpoint,
+      status: "blocked",
+      reason: "original turn failed after maintenance: run_failed",
+      blockerReason: "reply operation failed: run_failed",
+      continuationStatus: "blocked",
+      maintenanceStatus: "failed",
+      stateDir: tmpDir,
+      nowMs: 2_000,
+    });
+
+    const checkpoints = await listActiveWorkCheckpoints({
+      stateDir: tmpDir,
+      nowMs: 3_000,
+      includeCompleted: true,
+    });
+    expect(checkpoints[0]).toMatchObject({
+      source: "run_failed",
+      status: "blocked",
+      maintenanceStatus: "failed",
+      continuationStatus: "blocked",
+      completionReason: "original turn failed after maintenance: run_failed",
+      blockerReason: "reply operation failed: run_failed",
+    });
+  });
 });
