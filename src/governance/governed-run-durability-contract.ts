@@ -22,6 +22,7 @@ export type GovernedRunDeliveryObligationStage =
 
 export type GovernedRunDurabilityRequiredAction =
   | "record_durable_next_executable_step"
+  | "record_owner_boundary_handoff"
   | "record_lawful_blocker"
   | "record_terminal_completion_proof"
   | "enqueue_delivery_retry"
@@ -36,6 +37,7 @@ export type GovernedRunDurabilityFacts = {
   nonTerminalUpdateEmitted?: boolean;
   nextExecutableStepStarted?: boolean;
   durableNextExecutableStepRecorded?: boolean;
+  ownerBoundaryHandoffRecorded?: boolean;
   lawfulBlockerRecorded?: boolean;
   terminalCompletionProofRecorded?: boolean;
   finalDeliveryRequired?: boolean;
@@ -64,6 +66,7 @@ function hasDurableContinuationCoverage(facts: GovernedRunDurabilityFacts): bool
   return (
     facts.nextExecutableStepStarted === true ||
     facts.durableNextExecutableStepRecorded === true ||
+    facts.ownerBoundaryHandoffRecorded === true ||
     facts.lawfulBlockerRecorded === true ||
     facts.terminalCompletionProofRecorded === true
   );
@@ -134,6 +137,7 @@ export function resolveGovernedRunDurability(
       watchdogVisible: true,
       requiredActions: [
         "record_durable_next_executable_step",
+        "record_owner_boundary_handoff",
         "record_lawful_blocker",
         "record_terminal_completion_proof",
       ],

@@ -149,6 +149,7 @@ import {
   recordLawfulBlocker,
   recordNextExecutableStepStarted,
   recordNonTerminalBuildUpdateEmitted,
+  recordOwnerBoundaryHandoff,
   testing as activeRunContinuationTesting,
 } from "./active-run-continuation-guard.js";
 import { resolveActiveRunContinuityGatePersistence } from "./active-run-continuity-gate-persistence.js";
@@ -304,6 +305,39 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
       stopAllowed: true,
       stopReason: "owner_boundary_stop",
       openTruth: "routed to lawful owner, build still open.",
+    };
+  }
+  if (
+    (normalized.includes("status: blocked") ||
+      normalized.includes("current blocker") ||
+      normalized.includes("open and blocked") ||
+      normalized.includes("blocked. full drill build remains open") ||
+      normalized.includes("blocked; full drill open")) &&
+    (normalized.includes("exact next action") ||
+      normalized.includes("who lawfully owns") ||
+      normalized.includes("lawful next") ||
+      normalized.includes("lawful blocker") ||
+      normalized.includes("blocker proof"))
+  ) {
+    return {
+      stopAllowed: true,
+      stopReason: "blocker",
+      openTruth: "blocked with lawful next action recorded.",
+    };
+  }
+  if (
+    (normalized.includes("session init") ||
+      normalized.includes("session initialization") ||
+      normalized.includes("route binding") ||
+      normalized.includes("metadata is missing") ||
+      normalized.includes("recreate/rebind") ||
+      normalized.includes("recreated/rebound")) &&
+    normalized.includes("blocked")
+  ) {
+    return {
+      stopAllowed: true,
+      stopReason: "hard_stop",
+      openTruth: "build still open; route/session binding blocker recorded.",
     };
   }
   if (normalized.includes("owner execution in progress, build still open")) {
@@ -1250,12 +1284,18 @@ function createAbortAwareDispatcher(params: {
       continuation.stopAllowed === true &&
       (continuation.stopReason === "blocker" ||
         continuation.stopReason === "whole_run_complete" ||
+        continuation.stopReason === "owner_boundary_stop" ||
         continuation.stopReason === "approval_blocked" ||
+        continuation.stopReason === "approval_unavailable" ||
         continuation.stopReason === "restart_or_reload" ||
         continuation.stopReason === "hard_stop" ||
         continuation.stopReason === "safety_stop" ||
         continuation.stopReason === "paperwork_only_setup")
     ) {
+      if (continuation.stopReason === "owner_boundary_stop") {
+        recordOwnerBoundaryHandoff(params.dispatcher, continuation.openTruth);
+        return;
+      }
       recordLawfulBlocker(params.dispatcher, continuation.stopReason);
     }
   };

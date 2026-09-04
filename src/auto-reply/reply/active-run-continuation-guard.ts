@@ -24,6 +24,7 @@ import type { ReplyDispatcher } from "./reply-dispatcher.types.js";
 export type ActiveRunContinuationEventType =
   | "ACTIVE_RUN_STARTED"
   | "NON_TERMINAL_BUILD_UPDATE_EMITTED"
+  | "OWNER_BOUNDARY_HANDOFF_RECORDED"
   | "BLOCKER_STATE"
   | "NEXT_EXECUTABLE_STEP_STARTED"
   | "TERMINAL_CLOSEOUT_ATTEMPTED"
@@ -50,6 +51,8 @@ type GuardState = {
   lastNonTerminalDetail?: string;
   blocker: boolean;
   blockerType?: string;
+  ownerBoundaryHandoffRecorded: boolean;
+  ownerBoundaryHandoffDetail?: string;
   operatorPauseHold: boolean;
   nextExecutableStepStarted: boolean;
   violationNoticeQueued: boolean;
@@ -516,6 +519,7 @@ function resolveActiveRunDurabilityDecision(state: GuardState): GovernedRunDurab
     governedRunActive: state.activeRunStarted,
     nonTerminalUpdateEmitted: state.lastUpdateWasNonTerminal,
     nextExecutableStepStarted: state.nextExecutableStepStarted,
+    ownerBoundaryHandoffRecorded: state.ownerBoundaryHandoffRecorded,
     lawfulBlockerRecorded: state.blocker || state.operatorPauseHold,
     idempotencyKey: buildActiveRunDurabilityIdempotencyKey(state, "active-run-continuation"),
   });
@@ -650,6 +654,7 @@ async function persistActiveRunDurabilityObligation(
     requiredActions: params.decision.requiredActions,
     durabilityDecision: params.decision,
     lastNonTerminalDetail: state.lastNonTerminalDetail ?? null,
+    ownerBoundaryHandoffDetail: state.ownerBoundaryHandoffDetail ?? null,
     proofRefs: state.persistence.proofRefs ?? [],
     authoritySources: state.persistence.authoritySources,
   };
@@ -742,6 +747,7 @@ export function installActiveRunContinuationGuard(
     activeRunStarted: false,
     lastUpdateWasNonTerminal: false,
     blocker: false,
+    ownerBoundaryHandoffRecorded: false,
     operatorPauseHold: false,
     nextExecutableStepStarted: false,
     violationNoticeQueued: false,
@@ -775,6 +781,8 @@ export function recordNonTerminalBuildUpdateEmitted(
   state.lastUpdateWasNonTerminal = true;
   state.lastNonTerminalDetail = detail;
   state.nextExecutableStepStarted = false;
+  state.ownerBoundaryHandoffRecorded = false;
+  state.ownerBoundaryHandoffDetail = undefined;
   state.continuityGatePersistenceQueued = false;
   recordEvent(state, "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail);
   recordEvent(
@@ -782,6 +790,16 @@ export function recordNonTerminalBuildUpdateEmitted(
     "BLOCKER_STATE",
     state.blocker ? `true:${state.blockerType ?? "unknown"}` : "false",
   );
+}
+
+export function recordOwnerBoundaryHandoff(dispatcher: ReplyDispatcher, detail?: string): void {
+  const state = guardStateByDispatcher.get(dispatcher);
+  if (!state) {
+    return;
+  }
+  state.ownerBoundaryHandoffRecorded = true;
+  state.ownerBoundaryHandoffDetail = detail;
+  recordEvent(state, "OWNER_BOUNDARY_HANDOFF_RECORDED", detail);
 }
 
 export function recordNextExecutableStepStarted(

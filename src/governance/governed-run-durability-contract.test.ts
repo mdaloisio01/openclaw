@@ -28,6 +28,7 @@ describe("governed run durability contract", () => {
       watchdogVisible: true,
       requiredActions: [
         "record_durable_next_executable_step",
+        "record_owner_boundary_handoff",
         "record_lawful_blocker",
         "record_terminal_completion_proof",
       ],
@@ -40,6 +41,19 @@ describe("governed run durability contract", () => {
         governedRunActive: true,
         nonTerminalUpdateEmitted: true,
         durableNextExecutableStepRecorded: true,
+      }),
+    ).toMatchObject({
+      state: "settled",
+      allowedToSettle: true,
+    });
+  });
+
+  it("allows a non-terminal governed update when owner-boundary handoff is recorded", () => {
+    expect(
+      resolveGovernedRunDurability({
+        governedRunActive: true,
+        nonTerminalUpdateEmitted: true,
+        ownerBoundaryHandoffRecorded: true,
       }),
     ).toMatchObject({
       state: "settled",

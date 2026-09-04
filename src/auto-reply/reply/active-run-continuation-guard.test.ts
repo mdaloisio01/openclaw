@@ -9,6 +9,7 @@ import {
   recordActiveRunStarted,
   recordNextExecutableStepStarted,
   recordNonTerminalBuildUpdateEmitted,
+  recordOwnerBoundaryHandoff,
   testing,
 } from "./active-run-continuation-guard.js";
 import type { ReplyDispatcher } from "./reply-dispatcher.types.js";
@@ -100,6 +101,7 @@ describe("active run continuation guard durability obligations", () => {
       watchdogVisible: true,
       requiredActions: [
         "record_durable_next_executable_step",
+        "record_owner_boundary_handoff",
         "record_lawful_blocker",
         "record_terminal_completion_proof",
       ],
@@ -110,6 +112,32 @@ describe("active run continuation guard durability obligations", () => {
         allowedToSettle: false,
       },
     });
+  });
+
+  it("does not write a durability obligation after owner-boundary handoff is recorded", async () => {
+    const { dispatcher, finalPayloads } = createDispatcher();
+    installActiveRunContinuationGuard(dispatcher, {
+      persistence: {
+        outputDir: path.join(tempDir, "var", "continuity_gate_v2", "active_run_guard"),
+        activeMission: "system-wide department-flow drill",
+        authoritySources: [],
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "section_report_delivered");
+    recordOwnerBoundaryHandoff(dispatcher, "routed to lawful owner, build still open.");
+
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(finalPayloads).toHaveLength(0);
+    expect(testing.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        {
+          type: "OWNER_BOUNDARY_HANDOFF_RECORDED",
+          detail: "routed to lawful owner, build still open.",
+        },
+      ]),
+    );
   });
 
   it("does not write a durability obligation after the next executable step starts", async () => {
