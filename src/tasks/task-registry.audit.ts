@@ -334,29 +334,25 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
       );
     }
 
-    if (
-      truth.state === "paused_pending_parent_review" &&
-      !hasActiveExecutor &&
-      latestAgeMs >= staleQueuedMs
-    ) {
+    if (truth.state === "paused_pending_parent_review" && !hasActiveExecutor) {
       findings.push(
         createFinding({
-          severity: "warn",
+          severity: "error",
           code: "parent_review_state_without_active_executor",
           task: latestTask,
           ageMs: latestAgeMs,
           detail:
-            "latest mission state is paused pending parent review, but no active executor is currently running",
+            "latest mission state is paused pending parent review, but no active executor, next executable launch, or lawful current-run blocker is currently recorded",
         }),
       );
       findings.push(
         createFinding({
-          severity: "warn",
+          severity: "error",
           code: "owner_readout_finished_no_followthrough",
           task: latestTask,
           ageMs: latestAgeMs,
           detail:
-            "local readout or review-ready work finished, but no next-owner execution followthrough is currently running",
+            "local readout or review-ready work finished, but no next-owner execution followthrough or lawful current-run blocker is recorded",
         }),
       );
     }

@@ -247,11 +247,37 @@ describe("task-registry audit", () => {
     });
 
     expect(findings.map((finding) => [finding.code, finding.task.taskId])).toEqual([
+      ["parent_review_state_without_active_executor", "review-paused"],
+      ["owner_readout_finished_no_followthrough", "review-paused"],
       ["open_build_no_active_owner", "review-paused"],
       ["build_open_all_related_sessions_terminal", "review-paused"],
       ["missing_cleanup", "review-paused"],
-      ["parent_review_state_without_active_executor", "review-paused"],
-      ["owner_readout_finished_no_followthrough", "review-paused"],
+    ]);
+  });
+
+  it("flags parent-review handoff without followthrough immediately", () => {
+    const now = Date.parse("2026-03-30T01:00:00.000Z");
+    const findings = listTaskAuditFindings({
+      now,
+      staleQueuedMs: 5 * 60_000,
+      tasks: [
+        createTask({
+          taskId: "fresh-review-paused",
+          runtime: "acp",
+          status: "succeeded",
+          childSessionKey: "agent:main:acp:child",
+          missionId: "mission-fresh-review",
+          missionUpdatedAt: now - 30_000,
+          endedAt: now - 30_000,
+          terminalSummary: "Phase landed and passed tests.",
+        }),
+      ],
+    });
+
+    expect(findings.map((finding) => [finding.severity, finding.code])).toEqual([
+      ["error", "parent_review_state_without_active_executor"],
+      ["error", "owner_readout_finished_no_followthrough"],
+      ["warn", "missing_cleanup"],
     ]);
   });
 

@@ -4,6 +4,7 @@ import type { MsgContext } from "../auto-reply/templating.js";
 import type { SessionEntry, TrbRecoveryState } from "../config/sessions/types.js";
 
 export const TRB_RECOVERY_CLASSIFICATIONS = ["current_blocker", "deferred_issue"] as const;
+type TrbRecoveryClassification = (typeof TRB_RECOVERY_CLASSIFICATIONS)[number];
 
 export const TRB_STALL_PROOF_CONDITION_CODES = [
   "stalled run",
@@ -307,6 +308,24 @@ function parseBulletListUnderEmptyLabel(text: string, labels: string[]): string[
   return undefined;
 }
 
+function parseFirstBulletUnderEmptyLabel(text: string, labels: string[]): string | undefined {
+  return parseBulletListUnderEmptyLabel(text, labels)?.[0];
+}
+
+function inferClassificationFromStatus(text: string): TrbRecoveryClassification | undefined {
+  const status = parseLineValue(text, ["Status", "STATUS"]);
+  if (!status) {
+    return undefined;
+  }
+  if (/\bblocked\b/i.test(status)) {
+    return "current_blocker";
+  }
+  if (/\bdeferred\b/i.test(status)) {
+    return "deferred_issue";
+  }
+  return undefined;
+}
+
 function parseProofList(text: string): string[] | undefined {
   const value = parseLineValue(text, ["proof_checked", "proof checked", "PROOF"]);
   if (!value) {
@@ -380,7 +399,9 @@ export function parseTrbRecoveryContractFromText(text: string): TrbRecoveryContr
             parseLineValue(text, ["exact_next_action", "exact next action"]),
         }
       : undefined,
-    classification: parseRequiredScalarValue(text, ["classification", "TRB classification"]),
+    classification:
+      parseRequiredScalarValue(text, ["classification", "TRB classification"]) ??
+      inferClassificationFromStatus(text),
     active_mission_impact: parseLineValue(text, ["active_mission_impact", "active mission impact"]),
     active_mission_blocked:
       /active_mission_blocked\s*:\s*true|active mission blocked\s*:\s*true/i.test(text),
@@ -394,16 +415,12 @@ export function parseTrbRecoveryContractFromText(text: string): TrbRecoveryContr
       "lawful no-update reason",
       "lawful no update reason",
     ]),
-    recovery_artifact_path: parseLineValue(text, [
-      "recovery_artifact_path",
-      "recovery artifact path",
-      "artifact path",
-    ]),
-    exact_next_action: parseLineValue(text, [
-      "exact_next_action",
-      "exact next action",
-      "NEXT STAGE",
-    ]),
+    recovery_artifact_path:
+      parseLineValue(text, ["recovery_artifact_path", "recovery artifact path", "artifact path"]) ??
+      parseFirstBulletUnderEmptyLabel(text, ["Files/Reports", "Files and Reports"]),
+    exact_next_action:
+      parseLineValue(text, ["exact_next_action", "exact next action", "NEXT STAGE"]) ??
+      parseFirstBulletUnderEmptyLabel(text, ["Next Steps", "Next steps"]),
     session_tool_log_proof: sessionLogProofText
       ? {
           checked: /\b(checked|yes|true|inspected|present)\b/i.test(sessionLogProofText),

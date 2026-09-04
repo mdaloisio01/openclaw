@@ -538,7 +538,7 @@ describe("subagent announce formatting", () => {
       "Review/verify the result above before deciding whether the original task is done.",
     );
     expect(msg).toContain(
-      "If additional action is required, continue the task or record a follow-up; otherwise send a truthful user-facing update.",
+      "If additional action is required, launch or route the next executable unit now, or record a lawful current-run blocker tied to the active work; a follow-up note alone is not sufficient.",
     );
     expect(msg).toContain("Keep this internal context private");
     expect(call?.params?.internalEvents?.[0]?.type).toBe("task_completion");
@@ -785,7 +785,7 @@ describe("subagent announce formatting", () => {
     expect(msg).toContain("session_id: child-session-usage");
     expect(msg).toContain("A completed subagent task is ready for parent review.");
     expect(msg).toContain(
-      "If additional action is required, continue the task or record a follow-up; otherwise send a truthful user-facing update.",
+      "If additional action is required, launch or route the next executable unit now, or record a lawful current-run blocker tied to the active work; a follow-up note alone is not sufficient.",
     );
     expect(msg).toContain(
       `Reply ONLY: ${SILENT_REPLY_TOKEN} if this exact result was already delivered to the user in this same turn.`,

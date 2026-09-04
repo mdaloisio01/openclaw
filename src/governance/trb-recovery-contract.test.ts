@@ -219,6 +219,39 @@ describe("TRB recovery runtime contract", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("accepts required TRB fields embedded in the default Mark-facing report shape", () => {
+    const result = validateTrbFinalReplyPayloads({
+      state: createTrbRecoveryState({
+        ctx: { Body: "TRB why did this stop", MessageSid: "msg-default-report" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-default-report",
+        now: 654,
+      }),
+      payloads: {
+        text: [
+          "what_was_happening_before_misfire: Phase 5 ACP/session acknowledgement returned BLOCKED_CLOSEOUT and the controller stopped after naming the next repair.",
+          "proof_checked: session status; issue register; source hooks; watchdog receipt",
+          "actual_issue_identified: parent-review settlement did not force executable follow-through",
+          "root_cause: parent-review handoff allowed a follow-up note without launched repair or current-run blocker proof",
+          "active_mission_impact: original drill remains open at Phase 5",
+          "issue_list_action: appended OPEN_TRB_PARENT_REVIEW_STOP_AND_TRB_CONTRACT_GATE_RECURRENCE",
+          "",
+          "Systemwide Department-Flow Drill TRB",
+          "",
+          "Status: Blocked - root cause found.",
+          "",
+          "Next Steps:",
+          "- Start bounded source repair and validate it before retrying Phase 5.",
+          "",
+          "Files/Reports:",
+          "- /home/will/.openclaw/workspace-orchestrator/file_hub/exports/trb_parent_review_stop.md",
+        ].join("\n"),
+      },
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
   it("normalizes exact backticked classification values", () => {
     const parsed = parseTrbRecoveryContractFromText(
       [
