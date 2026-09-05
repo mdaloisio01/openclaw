@@ -51,6 +51,13 @@ export type SourceTurnMarkFacingExportDelivery = {
   verified: boolean;
 };
 
+export type SourceTurnTrbRecoveryLinkage = {
+  gateBlocked: boolean;
+  gateDecisionRecordId?: string;
+  gateDecisionStatus?: "pending" | "passed" | "blocked";
+  recoveryRecordId?: string;
+};
+
 export type SourceTurnDeliveryContext = {
   channel?: string;
   to?: string;
@@ -79,6 +86,7 @@ export type SourceTurnDeliveryRow = {
   failureReason?: string;
   reportArtifactPaths?: string[];
   markFacingExport?: SourceTurnMarkFacingExportDelivery;
+  trbRecovery?: SourceTurnTrbRecoveryLinkage;
   watchdogReconciliation?: SourceTurnDeliveryWatchdogReconciliation;
   deliveryDecision: SourceTurnDeliveryDecision;
   durabilityDecision: GovernedRunDurabilityDecision;
@@ -359,6 +367,28 @@ function normalizeDeliveryContext(
   };
 }
 
+function normalizeTrbRecoveryLinkage(
+  facts: SourceTurnDeliveryFacts,
+): SourceTurnTrbRecoveryLinkage | undefined {
+  const gateDecisionRecordId = normalizeIdentityPart(facts.trbGateDecisionRecordId);
+  const recoveryRecordId = normalizeIdentityPart(facts.trbRecoveryRecordId);
+  const gateDecisionStatus = facts.trbGateDecisionStatus;
+  if (
+    facts.trbGateBlocked !== true &&
+    !gateDecisionRecordId &&
+    !recoveryRecordId &&
+    !gateDecisionStatus
+  ) {
+    return undefined;
+  }
+  return {
+    gateBlocked: facts.trbGateBlocked === true || gateDecisionStatus === "blocked",
+    ...(gateDecisionRecordId ? { gateDecisionRecordId } : {}),
+    ...(gateDecisionStatus ? { gateDecisionStatus } : {}),
+    ...(recoveryRecordId ? { recoveryRecordId } : {}),
+  };
+}
+
 export async function loadSourceTurnDeliveryRegistry(
   registryPath: string,
 ): Promise<SourceTurnDeliveryRegistry> {
@@ -390,6 +420,7 @@ export async function persistSourceTurnDeliveryState(
     needsReview: params.needsReview,
   });
   const markFacingExport = normalizeMarkFacingExportDelivery(params.facts);
+  const trbRecovery = normalizeTrbRecoveryLinkage(params.facts);
   const sourceSessionKey =
     normalizeIdentityPart(params.sourceSessionKey) ??
     normalizeIdentityPart(existing?.sourceSessionKey);
@@ -439,6 +470,7 @@ export async function persistSourceTurnDeliveryState(
       ? { reportArtifactPaths: [...params.reportArtifactPaths] }
       : {}),
     ...(markFacingExport ? { markFacingExport } : {}),
+    ...(trbRecovery ? { trbRecovery } : {}),
     ...(params.watchdogReconciliation
       ? { watchdogReconciliation: params.watchdogReconciliation }
       : decision.state === "settled_resolved_later"

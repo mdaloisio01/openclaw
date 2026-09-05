@@ -30,6 +30,8 @@ export type SourceTurnDeliveryEvidenceKind =
   | "registry_entry"
   | "closeout_artifact"
   | "internal_evidence_record"
+  | "trb_gate_decision"
+  | "trb_recovery_record"
   | "private_final_response"
   | "delivery_tool_failure"
   | "delivery_unknown_after_send"
@@ -47,6 +49,8 @@ export type SourceTurnDeliveryGuardReason =
   | "missing_visible_final_delivery_proof"
   | "missing_mark_facing_export_proof"
   | "missing_report_path"
+  | "trb_gate_blocked_recovery_required"
+  | "trb_gate_pending_recovery_required"
   | "false_final_delivery_delivered_refused";
 
 export type SourceTurnDeliveryFacts = {
@@ -62,6 +66,10 @@ export type SourceTurnDeliveryFacts = {
   markFacingExportPath?: string;
   markFacingExportVerified?: boolean;
   privateOnlyFinalResponse?: boolean;
+  trbGateBlocked?: boolean;
+  trbGateDecisionRecordId?: string;
+  trbGateDecisionStatus?: "pending" | "passed" | "blocked";
+  trbRecoveryRecordId?: string;
   deliveryToolFailed?: boolean;
   deliveryOutcomeUnknown?: boolean;
   failureNoticeVisible?: boolean;
@@ -81,6 +89,8 @@ const nonVisibleFinalEvidence = new Set<SourceTurnDeliveryEvidenceKind>([
   "registry_entry",
   "closeout_artifact",
   "internal_evidence_record",
+  "trb_gate_decision",
+  "trb_recovery_record",
   "private_final_response",
 ]);
 
@@ -145,6 +155,24 @@ export function resolveSourceTurnDeliveryState(
   const markFacingExportProof = hasMarkFacingExportProof(facts);
   const markFacingExportMissing = facts.markFacingExportRequired === true && !markFacingExportProof;
   const claimsFinalDelivered = facts.finalDeliveryDelivered === true;
+
+  if (facts.trbGateBlocked === true || facts.trbGateDecisionStatus === "blocked") {
+    return {
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "trb_gate_blocked_recovery_required",
+    };
+  }
+
+  if (facts.trbGateDecisionStatus === "pending") {
+    return {
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "trb_gate_pending_recovery_required",
+    };
+  }
 
   if (claimsFinalDelivered && !visibleFinalDeliveryProof) {
     return {

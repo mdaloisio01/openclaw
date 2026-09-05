@@ -15,6 +15,8 @@ export type TaskAuditCode =
   | "routed_to_owner_not_proven_active"
   | "build_open_all_related_sessions_terminal"
   | "execution_truth_conflicts_with_status_text"
+  | "trb_gate_blocked_recovery_required"
+  | "trb_gate_pending_recovery_required"
   | "parent_continuity_violation"
   | "rework_follow_through_violation";
 
@@ -58,6 +60,8 @@ export function createEmptyTaskAuditSummary(): TaskAuditSummary {
       routed_to_owner_not_proven_active: 0,
       build_open_all_related_sessions_terminal: 0,
       execution_truth_conflicts_with_status_text: 0,
+      trb_gate_blocked_recovery_required: 0,
+      trb_gate_pending_recovery_required: 0,
       parent_continuity_violation: 0,
       rework_follow_through_violation: 0,
     },

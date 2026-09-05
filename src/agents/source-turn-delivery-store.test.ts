@@ -209,6 +209,37 @@ describe("source turn delivery storage adapter", () => {
     ]);
   });
 
+  it("persists TRB gate-decision linkage as blocking delivery evidence", async () => {
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:trb-blocked",
+      sourceTurnId: "source-turn-trb",
+      missionId: "trb-runtime-gate-repair",
+      reportId: "trb-recovery",
+      facts: {
+        finalDeliveryRequired: true,
+        evidenceKinds: ["trb_gate_decision", "trb_recovery_record"],
+        trbGateDecisionStatus: "blocked",
+        trbGateDecisionRecordId: "trb-gate:msg-1:blocked",
+        trbRecoveryRecordId: "trb-recovery-record-1",
+      },
+    });
+
+    expect(row).toMatchObject({
+      deliveryStatus: "blocked",
+      obligationStage: "needs_review",
+      sourceTurnState: "blocked_refused",
+      failureReason: "trb_gate_blocked_recovery_required",
+      trbRecovery: {
+        gateBlocked: true,
+        gateDecisionRecordId: "trb-gate:msg-1:blocked",
+        gateDecisionStatus: "blocked",
+        recoveryRecordId: "trb-recovery-record-1",
+      },
+    });
+    expect(sourceTurnDeliveryBlocksWatchdog(row)).toBe(true);
+  });
+
   it("keeps Mark-facing export obligations blocked until visible export proof exists", async () => {
     const row = await persistSourceTurnDeliveryState({
       registryPath,

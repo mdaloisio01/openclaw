@@ -61,6 +61,54 @@ describe("source turn delivery state contract", () => {
     });
   });
 
+  it("blocks source-turn delivery when the TRB gate itself is blocked", () => {
+    expect(
+      resolveSourceTurnDeliveryState({
+        finalDeliveryRequired: true,
+        trbGateDecisionStatus: "blocked",
+        trbGateDecisionRecordId: "trb-gate:msg-1:blocked",
+        evidenceKinds: ["trb_gate_decision"],
+      }),
+    ).toEqual({
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "trb_gate_blocked_recovery_required",
+    });
+  });
+
+  it("does not make passed TRB evidence block when visible final proof exists", () => {
+    expect(
+      resolveSourceTurnDeliveryState({
+        finalDeliveryRequired: true,
+        finalDeliveryDelivered: true,
+        trbGateDecisionStatus: "passed",
+        evidenceKinds: ["source_chat_final", "trb_gate_decision", "trb_recovery_record"],
+      }),
+    ).toEqual({
+      state: "final_delivered",
+      finalDeliveryDelivered: true,
+      refused: false,
+      reason: "final_visible_delivery_proven",
+    });
+  });
+
+  it("blocks source-turn delivery while the TRB gate decision is pending", () => {
+    expect(
+      resolveSourceTurnDeliveryState({
+        finalDeliveryRequired: true,
+        trbGateDecisionStatus: "pending",
+        trbGateDecisionRecordId: "trb-gate:msg-1:pending",
+        evidenceKinds: ["trb_gate_decision"],
+      }),
+    ).toEqual({
+      state: "blocked_refused",
+      finalDeliveryDelivered: false,
+      refused: true,
+      reason: "trb_gate_pending_recovery_required",
+    });
+  });
+
   it("does not treat a report artifact or closeout artifact as final delivery", () => {
     expect(
       resolveSourceTurnDeliveryState({
@@ -234,5 +282,7 @@ describe("source turn delivery state contract", () => {
     expect(isSourceTurnVisibleFinalProofKind("mark_facing_export_visible")).toBe(false);
     expect(isSourceTurnVisibleFinalProofKind("ledger_write")).toBe(false);
     expect(isSourceTurnVisibleFinalProofKind("report_artifact")).toBe(false);
+    expect(isSourceTurnVisibleFinalProofKind("trb_gate_decision")).toBe(false);
+    expect(isSourceTurnVisibleFinalProofKind("trb_recovery_record")).toBe(false);
   });
 });

@@ -127,6 +127,38 @@ function taskClaimsActiveExecutionWithoutProof(task: TaskRecord): boolean {
   );
 }
 
+function taskTextHaystack(task: TaskRecord): string {
+  return [
+    task.task,
+    task.label,
+    task.progressSummary,
+    task.terminalSummary,
+    task.missionSummary,
+    task.error,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n")
+    .toLowerCase();
+}
+
+function taskHasBlockedTrbGateState(task: TaskRecord): boolean {
+  const haystack = taskTextHaystack(task);
+  return (
+    haystack.includes("trb final response blocked") ||
+    haystack.includes("trb_gate_blocked_recovery_required") ||
+    (haystack.includes("final_response_gate") && haystack.includes("blocked"))
+  );
+}
+
+function taskHasPendingTrbGateState(task: TaskRecord): boolean {
+  const haystack = taskTextHaystack(task);
+  return (
+    haystack.includes("trb recovery gate") &&
+    haystack.includes("pending") &&
+    !taskHasBlockedTrbGateState(task)
+  );
+}
+
 function taskHasQueuedSameSliceReworkWithoutLaunchProof(task: TaskRecord): boolean {
   if (task.status !== "queued" || !task.parentFlowId?.trim()) {
     return false;
@@ -252,6 +284,30 @@ export function listTaskAuditFindings(options: TaskAuditOptions = {}): TaskAudit
     const inconsistency = findTimestampInconsistency(task);
     if (inconsistency) {
       findings.push(inconsistency);
+    }
+
+    if (taskHasBlockedTrbGateState(task)) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "trb_gate_blocked_recovery_required",
+          task,
+          ageMs,
+          detail:
+            "TRB final-response gate is blocked and requires structured recovery before this task can be treated as cleanly delivered",
+        }),
+      );
+    } else if (taskHasPendingTrbGateState(task)) {
+      findings.push(
+        createFinding({
+          severity: "warn",
+          code: "trb_gate_pending_recovery_required",
+          task,
+          ageMs,
+          detail:
+            "TRB final-response gate is pending and must resolve before this task can be treated as cleanly delivered",
+        }),
+      );
     }
   }
 

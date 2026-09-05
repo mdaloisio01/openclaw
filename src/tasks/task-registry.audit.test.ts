@@ -106,6 +106,8 @@ describe("task-registry audit", () => {
         routed_to_owner_not_proven_active: 0,
         build_open_all_related_sessions_terminal: 0,
         execution_truth_conflicts_with_status_text: 0,
+        trb_gate_blocked_recovery_required: 0,
+        trb_gate_pending_recovery_required: 0,
       },
     });
   });
@@ -183,6 +185,8 @@ describe("task-registry audit", () => {
         routed_to_owner_not_proven_active: 0,
         build_open_all_related_sessions_terminal: 0,
         execution_truth_conflicts_with_status_text: 0,
+        trb_gate_blocked_recovery_required: 0,
+        trb_gate_pending_recovery_required: 0,
       },
     });
     expect(summarizeRetainedLostTaskAuditFindings(findings, { now })).toEqual({
@@ -419,6 +423,24 @@ describe("task-registry audit", () => {
     expect(findings.map((finding) => finding.code)).toContain(
       "execution_truth_conflicts_with_status_text",
     );
+  });
+
+  it("flags blocked TRB gate state as task-audit visible", () => {
+    const now = Date.parse("2026-03-30T01:00:00.000Z");
+    const findings = listTaskAuditFindings({
+      now,
+      tasks: [
+        createTask({
+          taskId: "trb-gate-blocked",
+          status: "failed",
+          endedAt: now - 60_000,
+          terminalSummary:
+            "TRB final response blocked by runtime gate. Reason codes: TRB_FINAL_MISSING_REQUIRED_FIELDS",
+        }),
+      ],
+    });
+
+    expect(findings.map((finding) => finding.code)).toContain("trb_gate_blocked_recovery_required");
   });
 
   it("flags parent continuity violation when active production continuation requires next launch", () => {

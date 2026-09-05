@@ -1,12 +1,16 @@
 import { describe, expect, it } from "vitest";
+import type { SessionEntry, TrbRecoveryRecordV1 } from "../config/sessions/types.js";
 import {
+  buildTrbRecoverySystemPrompt,
   createTrbRecoveryState,
   evaluateTrbPostTurnWatchdog,
   inboundTrbRecoveryRequired,
+  markTrbGateResultOnSessionEntry,
   parseTrbRecoveryContractFromText,
   shouldDrainStaleTrbRecoveryState,
   validateTrbFinalReplyPayloads,
   validateTrbRecoveryContract,
+  validateTrbRecoveryRecord,
   type TrbRecoveryContract,
 } from "./trb-recovery-contract.js";
 
@@ -25,6 +29,22 @@ const completeContract: TrbRecoveryContract = {
     checked: true,
     evidence: "session history and transcript were inspected",
   },
+};
+
+const completeRecord: TrbRecoveryRecordV1 = {
+  schemaVersion: 1,
+  recordId: "trb-record-1",
+  createdAt: 1,
+  classification: "current_blocker",
+  whatWasHappeningBeforeMisfire: completeContract.what_was_happening_before_misfire!,
+  proofChecked: completeContract.proof_checked!,
+  actualIssueIdentified: completeContract.actual_issue_identified!,
+  rootCause: completeContract.root_cause,
+  activeMissionImpact: completeContract.active_mission_impact!,
+  lawfulNoUpdateReason: completeContract.lawful_no_update_reason,
+  recoveryArtifactPath: completeContract.recovery_artifact_path!,
+  exactNextAction: completeContract.exact_next_action!,
+  sessionToolLogProof: completeContract.session_tool_log_proof,
 };
 
 describe("TRB recovery runtime contract", () => {
@@ -184,6 +204,29 @@ describe("TRB recovery runtime contract", () => {
     expect(validateTrbRecoveryContract(completeContract).ok).toBe(true);
   });
 
+  it("passes a complete structured TRB recovery record", () => {
+    expect(validateTrbRecoveryRecord(completeRecord).ok).toBe(true);
+  });
+
+  it("prefers structured recovery records over plain visible prose", () => {
+    const state = createTrbRecoveryState({
+      ctx: { Body: "TRB", MessageSid: "msg-record" },
+      sessionKey: "agent:orchestrator:main",
+      sessionId: "session-record",
+      now: 111,
+    });
+    state.recovery_record = completeRecord;
+
+    const result = validateTrbFinalReplyPayloads({
+      state,
+      payloads: {
+        text: "Plain English report for Mark without machine field labels.",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+  });
+
   it("parses a Mark-facing report with a machine-readable contract block and prose", () => {
     const result = validateTrbFinalReplyPayloads({
       state: createTrbRecoveryState({
@@ -335,6 +378,77 @@ describe("TRB recovery runtime contract", () => {
     expect(result.reasonCodes).toContain("TRB_FINAL_MISSING_REQUIRED_FIELDS");
     expect(result.reasonCodes).toContain("TRB_ARTIFACT_MISSING");
     expect(result.reasonCodes).toContain("TRB_ISSUE_ACTION_MISSING");
+  });
+
+  it("stores a durable blocked gate decision with stable lineage and bounded redacted reply preview", () => {
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-blocked",
+      updatedAt: 1,
+      trbRecovery: createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-blocked" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-blocked",
+        now: 654,
+      }),
+    };
+    const candidateReplyText = `Plain prose only secret=12345 test@example.com ${"x".repeat(2_000)}`;
+    const result = validateTrbFinalReplyPayloads({
+      state: sessionEntry.trbRecovery,
+      payloads: {
+        text: candidateReplyText,
+      },
+    });
+
+    markTrbGateResultOnSessionEntry({
+      sessionEntry,
+      result,
+      checkedAt: 777,
+      candidateReplyText,
+    });
+
+    expect(sessionEntry.trbRecovery?.final_response_gate).toMatchObject({
+      status: "blocked",
+      checkedAt: 777,
+      decisionRecordId: "trb-gate:msg-blocked:blocked",
+      reasonCodes: expect.arrayContaining([
+        "TRB_FINAL_MISSING_REQUIRED_FIELDS",
+        "TRB_ARTIFACT_MISSING",
+        "TRB_ISSUE_ACTION_MISSING",
+      ]),
+      missingFields: expect.arrayContaining([
+        "classification",
+        "recovery_artifact_path",
+        "issue_list_action",
+      ]),
+    });
+    const firstDecision = sessionEntry.trbRecovery?.final_response_gate?.decisionRecord;
+    expect(firstDecision).toMatchObject({
+      recordId: "trb-gate:msg-blocked:blocked",
+      lineageKey:
+        "trb-gate|session-key:agent:orchestrator:main|session-id:session-blocked|message:msg-blocked|trigger:654",
+      attempt: 1,
+      issueActionPresent: false,
+    });
+    expect(firstDecision?.candidateReplyPreview?.length).toBeLessThanOrEqual(1_003);
+    expect(firstDecision?.candidateReplyPreview).toContain("[redacted-email]");
+    expect(firstDecision?.candidateReplyPreview).toContain("secret=[redacted]");
+    expect(firstDecision?.candidateReplySha256).toMatch(/^[a-f0-9]{64}$/);
+
+    const prompt = buildTrbRecoverySystemPrompt(sessionEntry.trbRecovery);
+    expect(prompt).toContain("Previous TRB gate decision:");
+    expect(prompt).toContain("TRB_ARTIFACT_MISSING");
+    expect(prompt).toContain("recovery_artifact_path is required");
+
+    markTrbGateResultOnSessionEntry({
+      sessionEntry,
+      result,
+      checkedAt: 888,
+      candidateReplyText,
+    });
+    expect(sessionEntry.trbRecovery?.final_response_gate?.decisionRecord).toMatchObject({
+      recordId: "trb-gate:msg-blocked:blocked",
+      attempt: 2,
+    });
   });
 
   it("drains stale TRB recovery state on the next non-TRB inbound turn", () => {

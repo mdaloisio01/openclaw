@@ -1,7 +1,13 @@
+import { createHash } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ReplyPayload } from "../auto-reply/reply-payload.js";
 import type { MsgContext } from "../auto-reply/templating.js";
-import type { SessionEntry, TrbRecoveryState } from "../config/sessions/types.js";
+import type {
+  SessionEntry,
+  TrbGateDecisionRecordV1,
+  TrbRecoveryRecordV1,
+  TrbRecoveryState,
+} from "../config/sessions/types.js";
 
 export const TRB_RECOVERY_CLASSIFICATIONS = ["current_blocker", "deferred_issue"] as const;
 type TrbRecoveryClassification = (typeof TRB_RECOVERY_CLASSIFICATIONS)[number];
@@ -142,6 +148,30 @@ function hasProofList(value: unknown): boolean {
   return Array.isArray(value) && value.some((entry) => hasText(entry));
 }
 
+function redactSensitiveText(value: string): string {
+  return value
+    .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[redacted-email]")
+    .replace(/\b(?:sk|pk|rk|xox[baprs])-[A-Za-z0-9_-]{12,}\b/g, "[redacted-token]")
+    .replace(/\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+}
+
+function boundedText(value: string | undefined, maxLength = 1_000): string | undefined {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    return undefined;
+  }
+  const trimmed = redactSensitiveText(normalized.trim());
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength)}...` : trimmed;
+}
+
+function sha256Text(value: string | undefined): string | undefined {
+  const normalized = normalizeOptionalString(value);
+  if (!normalized) {
+    return undefined;
+  }
+  return createHash("sha256").update(normalized).digest("hex");
+}
+
 function missingProofComplete(value: TrbRecoveryContract["missing_proof"]): boolean {
   return (
     hasText(value?.what_was_checked) &&
@@ -246,6 +276,136 @@ export function validateTrbRecoveryContract(
     ok: errors.length === 0,
     reasonCodes: [...reasonCodes],
     errors,
+  };
+}
+
+function contractFromRecoveryRecord(record: TrbRecoveryRecordV1): TrbRecoveryContract {
+  return {
+    what_was_happening_before_misfire: record.whatWasHappeningBeforeMisfire,
+    proof_checked: record.proofChecked,
+    actual_issue_identified: record.actualIssueIdentified,
+    root_cause: record.rootCause,
+    missing_proof: record.missingProof
+      ? {
+          what_was_checked: record.missingProof.whatWasChecked,
+          proof_missing: record.missingProof.proofMissing,
+          where_proof_should_exist: record.missingProof.whereProofShouldExist,
+          missing_proof_is_blocker: record.missingProof.missingProofIsBlocker,
+          exact_next_recovery_step: record.missingProof.exactNextRecoveryStep,
+        }
+      : undefined,
+    classification: record.classification,
+    active_mission_impact: record.activeMissionImpact,
+    active_mission_blocked: record.activeMissionBlocked,
+    issue_list_action: record.issueListAction,
+    lawful_no_update_reason: record.lawfulNoUpdateReason,
+    recovery_artifact_path: record.recoveryArtifactPath,
+    exact_next_action: record.exactNextAction,
+    session_tool_log_proof: record.sessionToolLogProof,
+    oversized_output: record.oversizedOutput
+      ? {
+          observed: record.oversizedOutput.observed,
+          summarized_or_checkpointed: record.oversizedOutput.summarizedOrCheckpointed,
+          final_recovery_report_delivered: record.oversizedOutput.finalRecoveryReportDelivered,
+        }
+      : undefined,
+  };
+}
+
+export function validateTrbRecoveryRecord(
+  record: TrbRecoveryRecordV1,
+  opts: { requireSessionToolLogProof?: boolean } = {},
+): TrbRecoveryValidationResult {
+  return validateTrbRecoveryContract(contractFromRecoveryRecord(record), opts);
+}
+
+function missingFieldsFromErrors(errors: string[]): string[] {
+  const fields = new Set<string>();
+  for (const error of errors) {
+    if (error.includes("classification")) fields.add("classification");
+    if (error.includes("what_was_happening_before_misfire")) {
+      fields.add("what_was_happening_before_misfire");
+    }
+    if (error.includes("actual_issue_identified")) fields.add("actual_issue_identified");
+    if (error.includes("root_cause")) fields.add("root_cause");
+    if (error.includes("missing_proof")) fields.add("missing_proof");
+    if (error.includes("exact_next_action")) fields.add("exact_next_action");
+    if (error.includes("recovery_artifact_path")) fields.add("recovery_artifact_path");
+    if (error.includes("issue_list_action")) fields.add("issue_list_action");
+    if (error.includes("lawful_no_update_reason")) fields.add("lawful_no_update_reason");
+    if (error.includes("proof_checked")) fields.add("proof_checked");
+    if (error.includes("session/tool-log")) fields.add("session_tool_log_proof");
+    if (error.includes("oversized output")) fields.add("oversized_output");
+  }
+  return [...fields];
+}
+
+function buildTrbGateDecisionRecord(params: {
+  state: TrbRecoveryState;
+  result: TrbRecoveryValidationResult;
+  checkedAt: number;
+  candidateReplyText?: string;
+}): TrbGateDecisionRecordV1 {
+  const recoveryRecord = params.state.recovery_record;
+  const status = params.result.ok ? "passed" : "blocked";
+  const triggerRef =
+    params.state.trigger_message_id ??
+    params.state.trigger_session_key ??
+    params.state.trigger_session_id ??
+    "trb";
+  const lineageKey = [
+    "trb-gate",
+    params.state.trigger_session_key
+      ? `session-key:${params.state.trigger_session_key}`
+      : undefined,
+    params.state.trigger_session_id ? `session-id:${params.state.trigger_session_id}` : undefined,
+    params.state.trigger_message_id ? `message:${params.state.trigger_message_id}` : undefined,
+    `trigger:${params.state.trigger_timestamp}`,
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join("|");
+  const previousDecision = params.state.final_response_gate?.decisionRecord;
+  const attempt =
+    previousDecision?.lineageKey === lineageKey &&
+    previousDecision.status === status &&
+    typeof previousDecision.attempt === "number"
+      ? previousDecision.attempt + 1
+      : 1;
+  const candidateReplyPreview = boundedText(params.candidateReplyText);
+  const candidateReplySha256 = sha256Text(params.candidateReplyText);
+  return {
+    schemaVersion: 1,
+    recordId: `trb-gate:${triggerRef}:${status}`,
+    lineageKey,
+    status,
+    checkedAt: params.checkedAt,
+    attempt,
+    ...(params.result.reasonCodes.length > 0 ? { reasonCodes: params.result.reasonCodes } : {}),
+    ...(params.result.errors.length > 0 ? { errors: params.result.errors } : {}),
+    ...(params.result.errors.length > 0
+      ? { missingFields: missingFieldsFromErrors(params.result.errors) }
+      : {}),
+    ...(params.state.trigger_message_id
+      ? { triggerMessageId: params.state.trigger_message_id }
+      : {}),
+    ...(params.state.trigger_session_key
+      ? { triggerSessionKey: params.state.trigger_session_key }
+      : {}),
+    ...(params.state.trigger_session_id
+      ? { triggerSessionId: params.state.trigger_session_id }
+      : {}),
+    ...(params.state.active_mission_session_ref
+      ? { activeMissionSessionRef: params.state.active_mission_session_ref }
+      : {}),
+    ...(recoveryRecord ? { recoveryRecordId: recoveryRecord.recordId } : {}),
+    ...(recoveryRecord?.recoveryArtifactPath
+      ? { recoveryArtifactPath: recoveryRecord.recoveryArtifactPath }
+      : {}),
+    issueActionPresent: Boolean(
+      recoveryRecord?.issueListAction || recoveryRecord?.lawfulNoUpdateReason,
+    ),
+    ...(candidateReplyPreview ? { candidateReplyPreview } : {}),
+    ...(candidateReplySha256 ? { candidateReplySha256 } : {}),
   };
 }
 
@@ -457,6 +617,11 @@ export function validateTrbFinalReplyPayloads(params: {
     .map((payload) => payload.text)
     .filter((value): value is string => typeof value === "string")
     .join("\n");
+  if (params.state.recovery_record) {
+    return validateTrbRecoveryRecord(params.state.recovery_record, {
+      requireSessionToolLogProof: params.state.requires_session_tool_log_proof,
+    });
+  }
   if (!text.trim()) {
     return {
       ok: false,
@@ -517,6 +682,7 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
   if (state.final_response_gate?.status === "passed") {
     return undefined;
   }
+  const decision = state.final_response_gate?.decisionRecord;
   return [
     "## Runtime TRB Recovery Gate",
     "This turn has mechanically entered TRB recovery mode.",
@@ -534,6 +700,16 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
     "exact_next_action:",
     state.requires_session_tool_log_proof
       ? "session_tool_log_proof: checked, with evidence. This TRB cannot close without session/tool-log proof."
+      : undefined,
+    decision?.status === "blocked" ? "Previous TRB gate decision:" : undefined,
+    decision?.status === "blocked"
+      ? `status: ${decision.status}; reason_codes: ${(decision.reasonCodes ?? []).join(", ") || "none"}`
+      : undefined,
+    decision?.status === "blocked" && decision.errors?.length
+      ? `missing_or_invalid: ${decision.errors.join("; ")}`
+      : undefined,
+    decision?.status === "blocked" && decision.recoveryArtifactPath
+      ? `recovery_artifact_path: ${decision.recoveryArtifactPath}`
       : undefined,
     "Put the required contract block before any prose. Each scalar field must be one same-line `field: value` entry with no extra explanation on that line.",
     "Use `proof_checked: item one; item two` on one line, or `proof_checked:` followed immediately by short `- item` bullet lines.",
@@ -556,16 +732,30 @@ export function markTrbGateResultOnSessionEntry(params: {
   sessionEntry?: SessionEntry;
   result: TrbRecoveryValidationResult;
   checkedAt?: number;
+  candidateReplyText?: string;
 }): void {
   if (!params.sessionEntry?.trbRecovery) {
     return;
   }
+  const checkedAt = params.checkedAt ?? Date.now();
+  const decisionRecord = buildTrbGateDecisionRecord({
+    state: params.sessionEntry.trbRecovery,
+    result: params.result,
+    checkedAt,
+    candidateReplyText: params.candidateReplyText,
+  });
   params.sessionEntry.trbRecovery = {
     ...params.sessionEntry.trbRecovery,
     final_response_gate: {
       status: params.result.ok ? "passed" : "blocked",
-      checkedAt: params.checkedAt ?? Date.now(),
+      checkedAt,
       ...(params.result.reasonCodes.length > 0 ? { reasonCodes: params.result.reasonCodes } : {}),
+      ...(params.result.errors.length > 0 ? { errors: params.result.errors } : {}),
+      ...(decisionRecord.missingFields && decisionRecord.missingFields.length > 0
+        ? { missingFields: decisionRecord.missingFields }
+        : {}),
+      decisionRecordId: decisionRecord.recordId,
+      decisionRecord,
     },
   };
 }

@@ -200,6 +200,60 @@ export type SessionGoal = {
   budgetLimitedAt?: number;
 };
 
+export type TrbRecoveryRecordV1 = {
+  schemaVersion: 1;
+  recordId: string;
+  createdAt: number;
+  classification: "current_blocker" | "deferred_issue";
+  whatWasHappeningBeforeMisfire: string;
+  proofChecked: string[];
+  actualIssueIdentified: string;
+  rootCause?: string;
+  missingProof?: {
+    whatWasChecked?: string;
+    proofMissing?: string;
+    whereProofShouldExist?: string;
+    missingProofIsBlocker?: boolean;
+    exactNextRecoveryStep?: string;
+  };
+  activeMissionImpact: string;
+  activeMissionBlocked?: boolean;
+  issueListAction?: string;
+  lawfulNoUpdateReason?: string;
+  recoveryArtifactPath: string;
+  exactNextAction: string;
+  sessionToolLogProof?: {
+    checked: boolean;
+    evidence?: string;
+  };
+  oversizedOutput?: {
+    observed: boolean;
+    summarizedOrCheckpointed?: boolean;
+    finalRecoveryReportDelivered?: boolean;
+  };
+};
+
+export type TrbGateDecisionRecordV1 = {
+  schemaVersion: 1;
+  recordId: string;
+  lineageKey: string;
+  status: "pending" | "passed" | "blocked";
+  checkedAt: number;
+  attempt: number;
+  reasonCodes?: string[];
+  errors?: string[];
+  missingFields?: string[];
+  triggerMessageId?: string;
+  triggerSessionKey?: string;
+  triggerSessionId?: string;
+  activeMissionSessionRef?: string;
+  recoveryRecordId?: string;
+  recoveryArtifactPath?: string;
+  issueActionPresent?: boolean;
+  candidateReplyPreview?: string;
+  candidateReplySha256?: string;
+};
+
 export type TrbRecoveryState = {
   schemaVersion: 1;
   trb_recovery_required: true;
@@ -210,10 +264,15 @@ export type TrbRecoveryState = {
   trigger_timestamp: number;
   active_mission_session_ref?: string;
   requires_session_tool_log_proof: boolean;
+  recovery_record?: TrbRecoveryRecordV1;
   final_response_gate?: {
     status: "pending" | "passed" | "blocked";
     checkedAt: number;
     reasonCodes?: string[];
+    errors?: string[];
+    missingFields?: string[];
+    decisionRecordId?: string;
+    decisionRecord?: TrbGateDecisionRecordV1;
   };
 };
 

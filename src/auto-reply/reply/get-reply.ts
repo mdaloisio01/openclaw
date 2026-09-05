@@ -578,7 +578,11 @@ export async function getReplyFromConfig(
       payloads: reply,
       state: sessionEntry.trbRecovery,
     });
-    markTrbGateResultOnSessionEntry({ sessionEntry, result });
+    const candidateReplyText = (Array.isArray(reply) ? reply : reply ? [reply] : [])
+      .map((payload) => payload.text)
+      .filter((value): value is string => typeof value === "string")
+      .join("\n");
+    markTrbGateResultOnSessionEntry({ sessionEntry, result, candidateReplyText });
     if (sessionKey && sessionStore) {
       sessionStore[sessionKey] = sessionEntry;
     }
