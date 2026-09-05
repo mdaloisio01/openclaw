@@ -152,7 +152,7 @@ function redactSensitiveText(value: string): string {
   return value
     .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, "[redacted-email]")
     .replace(/\b(?:sk|pk|rk|xox[baprs])-[A-Za-z0-9_-]{12,}\b/g, "[redacted-token]")
-    .replace(/\b(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+    .replace(/\b(api[_-]?key|token|secret|password)\s*[:=]\s*\S+/gi, "$1=[redacted]");
 }
 
 function boundedText(value: string | undefined, maxLength = 1_000): string | undefined {

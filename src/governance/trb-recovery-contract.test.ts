@@ -276,6 +276,7 @@ describe("TRB recovery runtime contract", () => {
           "proof_checked: session status; issue register; source hooks; watchdog receipt",
           "actual_issue_identified: parent-review settlement did not force executable follow-through",
           "root_cause: parent-review handoff allowed a follow-up note without launched repair or current-run blocker proof",
+          "session_tool_log_proof: checked session status and issue-register proof",
           "active_mission_impact: original drill remains open at Phase 5",
           "issue_list_action: appended OPEN_TRB_PARENT_REVIEW_STOP_AND_TRB_CONTRACT_GATE_RECURRENCE",
           "",
