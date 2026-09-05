@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { inspect } from "node:util";
@@ -15,6 +16,7 @@ import { prepareAcpxCodexAuthConfig } from "./codex-auth-bridge.js";
 import { DEFAULT_ACPX_TIMEOUT_SECONDS } from "./config-schema.js";
 import {
   resolveAcpxPluginConfig,
+  resolveAcpxPluginRoot,
   toAcpMcpServers,
   type ResolvedAcpxPluginConfig,
 } from "./config.js";
@@ -55,6 +57,44 @@ type CreateAcpxRuntimeServiceParams = {
   runtimeFactory?: (params: AcpxRuntimeFactoryParams) => AcpxRuntimeLike | Promise<AcpxRuntimeLike>;
   processCleanupDeps?: AcpxProcessCleanupDeps;
 };
+
+function quoteCommandArg(value: string): string {
+  if (/^[A-Za-z0-9_./:=@+-]+$/.test(value)) {
+    return value;
+  }
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function resolveOpenClawRootFromAcpxPluginRoot(pluginRoot: string): string {
+  const extensionsDir = path.dirname(pluginRoot);
+  const parent = path.dirname(extensionsDir);
+  return path.basename(parent) === "dist" ? path.dirname(parent) : parent;
+}
+
+function resolveBundledOpenClawBridgeCommand(): string {
+  const pluginRoot = resolveAcpxPluginRoot();
+  const openClawRoot = resolveOpenClawRootFromAcpxPluginRoot(pluginRoot);
+  const launcherPath = path.join(openClawRoot, "openclaw.mjs");
+  const entryPath = existsSync(launcherPath)
+    ? launcherPath
+    : path.join(openClawRoot, "dist", "index.js");
+  return `${process.execPath} ${quoteCommandArg(entryPath)} acp`;
+}
+
+function withDefaultOpenClawBridgeAgent(
+  pluginConfig: ResolvedAcpxPluginConfig,
+): ResolvedAcpxPluginConfig {
+  if (pluginConfig.agents.openclaw) {
+    return pluginConfig;
+  }
+  return {
+    ...pluginConfig,
+    agents: {
+      ...pluginConfig.agents,
+      openclaw: resolveBundledOpenClawBridgeCommand(),
+    },
+  };
+}
 
 function loadRuntimeModule(): Promise<AcpxRuntimeModule> {
   runtimeModulePromise ??= import("./runtime.js");
@@ -316,7 +356,7 @@ export function createAcpxRuntimeService(
         }),
       );
       const effectiveBasePluginConfig: ResolvedAcpxPluginConfig = {
-        ...basePluginConfig,
+        ...withDefaultOpenClawBridgeAgent(basePluginConfig),
         probeAgent: basePluginConfig.probeAgent ?? resolveAllowedAgentsProbeAgent(ctx),
       };
       const pluginConfig = await measureAcpxStartup(ctx, "config.prepare-codex-auth", () =>

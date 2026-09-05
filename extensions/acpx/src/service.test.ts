@@ -190,6 +190,7 @@ function readFirstRuntimeFactoryInput(runtimeFactory: { mock: { calls: Array<Arr
   }
   return input as {
     pluginConfig: {
+      agents: Record<string, string>;
       timeoutSeconds?: number;
       probeAgent?: string;
     };
@@ -674,6 +675,45 @@ describe("createAcpxRuntimeService", () => {
     await service.start(ctx);
 
     expect(readFirstRuntimeFactoryInput(runtimeFactory).pluginConfig.timeoutSeconds).toBe(120);
+
+    await service.stop?.(ctx);
+  });
+
+  it("adds a local OpenClaw ACP bridge command when no openclaw agent override exists", async () => {
+    const workspaceDir = await makeTempDir();
+    const ctx = createServiceContext(workspaceDir);
+    const runtime = createMockRuntime();
+    const runtimeFactory = vi.fn(() => runtime as never);
+    const service = createAcpxRuntimeService({
+      runtimeFactory,
+    });
+
+    await service.start(ctx);
+
+    const agents = readFirstRuntimeFactoryInput(runtimeFactory).pluginConfig.agents;
+    expect(agents.openclaw).toMatch(/node(?:\.exe)? .*openclaw\.mjs acp$/);
+
+    await service.stop?.(ctx);
+  });
+
+  it("keeps an explicit openclaw agent override ahead of the local bridge default", async () => {
+    const workspaceDir = await makeTempDir();
+    const ctx = createServiceContext(workspaceDir);
+    const runtime = createMockRuntime();
+    const runtimeFactory = vi.fn(() => runtime as never);
+    const service = createAcpxRuntimeService({
+      pluginConfig: {
+        agents: {
+          openclaw: { command: "custom-openclaw-acp" },
+        },
+      },
+      runtimeFactory,
+    });
+
+    await service.start(ctx);
+
+    const agents = readFirstRuntimeFactoryInput(runtimeFactory).pluginConfig.agents;
+    expect(agents.openclaw).toBe("custom-openclaw-acp");
 
     await service.stop?.(ctx);
   });
