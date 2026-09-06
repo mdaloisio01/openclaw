@@ -105,7 +105,7 @@ function createGuardedDispatcherHarness(): {
     }),
     sendBlockReply: vi.fn(() => true),
     sendFinalReply: vi.fn((payload) => {
-      const decision = allowTerminalCloseout(dispatcher, "sendFinalReply");
+      const decision = allowTerminalCloseout(dispatcher, "sendFinalReply", payload);
       if (!decision.allowed) {
         return false;
       }
@@ -122,6 +122,26 @@ function createGuardedDispatcherHarness(): {
 
   installActiveRunContinuationGuard(dispatcher);
   return { dispatcher, deliveredFinalPayloads, deliveredToolPayloads };
+}
+
+function validSystemwideDepartmentFlowAckText(): string {
+  return JSON.stringify({
+    schema: "openclaw.systemwide_department_flow_durability_drill.acknowledgement.v1",
+    run_label: "systemwide_department_flow_durability_validation_drill_2026-09-04T1352PDT",
+    department_lane_name: "ACP/session path",
+    received_mission: "Verify bounded Phase 5 ACP/session acknowledgement.",
+    controlling_prompt_recognized:
+      "systemwide_department_flow_durability_validation_drill_14_point_build_prompt_2026-09-04T1352PDT.md",
+    scope_understood: "ACP/session path owns only the bounded Phase 5 acknowledgement.",
+    durability_checks_performed: ["bounded ACP turn completed", "acknowledgement schema returned"],
+    result: "pass",
+    proof_path_or_durable_response_receipt: "file_hub/exports/phase5_ack.md",
+    what_is_materially_real_now: "ACP/session path returned a valid acknowledgement.",
+    what_is_still_not_real_yet: "Downstream drill phases remain uncollected.",
+    who_lawfully_owns_the_next_step: "Will / OpenClaw controller",
+    open_closed_truth_for_section: "Phase 5 ACP/session section closed; full drill open.",
+    exact_next_action: "Append the Phase 5 acknowledgement result to the drill ledger.",
+  });
 }
 
 function createCoordinator(onReplyStart?: (...args: unknown[]) => Promise<void>) {
@@ -1024,6 +1044,45 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
         { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
         expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
         { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "BLOCKED_CLOSEOUT" },
+      ]),
+    );
+  });
+
+  it("allows ACP final delivery when it carries the bounded drill acknowledgement schema", async () => {
+    const { dispatcher, deliveredFinalPayloads, deliveredToolPayloads } =
+      createGuardedDispatcherHarness();
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      inboundAudio: false,
+      shouldRouteToOriginating: false,
+    });
+
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "acp_progress_update");
+
+    const ackText = validSystemwideDepartmentFlowAckText();
+    const delivered = await coordinator.deliver("final", { text: ackText }, { skipTts: true });
+
+    expect(delivered).toBe(true);
+    expect(deliveredFinalPayloads).toEqual([{ text: ackText }]);
+    expect(deliveredToolPayloads).toEqual([]);
+    expect(activeRunContinuationGuardTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "acp_progress_update" },
+        { type: "BLOCKER_STATE", detail: "false" },
+        {
+          type: "TERMINAL_COMPLETION_PROOF_RECORDED",
+          detail: "systemwide_department_flow_acknowledgement",
+        },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
       ]),
     );
   });

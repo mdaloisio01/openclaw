@@ -16,6 +16,7 @@ import {
   type GovernedRunDurabilityDecision,
 } from "../../governance/governed-run-durability-contract.js";
 import type { CompletionDecision, MissionMode } from "../../governance/mission-manifest.types.js";
+import { isSystemwideDepartmentFlowAcknowledgementText } from "../../governance/systemwide-department-flow-acknowledgement.js";
 import { getReplyPayloadMetadata, type ReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
 import { buildRuntimeCloseoutAdmissionInput } from "./false-closeout-admission-producer.js";
@@ -27,6 +28,7 @@ export type ActiveRunContinuationEventType =
   | "OWNER_BOUNDARY_HANDOFF_RECORDED"
   | "BLOCKER_STATE"
   | "NEXT_EXECUTABLE_STEP_STARTED"
+  | "TERMINAL_COMPLETION_PROOF_RECORDED"
   | "TERMINAL_CLOSEOUT_ATTEMPTED"
   | "TERMINAL_CLOSEOUT_ALLOWED"
   | "FALSE_CLOSEOUT_ADMISSION_OFF_BYPASSED"
@@ -55,6 +57,7 @@ type GuardState = {
   ownerBoundaryHandoffDetail?: string;
   operatorPauseHold: boolean;
   nextExecutableStepStarted: boolean;
+  terminalCompletionProofRecorded: boolean;
   violationNoticeQueued: boolean;
   blockedCloseoutQueued: boolean;
   persistence?: ActiveRunContinuityGatePersistenceOptions;
@@ -521,6 +524,7 @@ function resolveActiveRunDurabilityDecision(state: GuardState): GovernedRunDurab
     nextExecutableStepStarted: state.nextExecutableStepStarted,
     ownerBoundaryHandoffRecorded: state.ownerBoundaryHandoffRecorded,
     lawfulBlockerRecorded: state.blocker || state.operatorPauseHold,
+    terminalCompletionProofRecorded: state.terminalCompletionProofRecorded,
     idempotencyKey: buildActiveRunDurabilityIdempotencyKey(state, "active-run-continuation"),
   });
 }
@@ -750,6 +754,7 @@ export function installActiveRunContinuationGuard(
     ownerBoundaryHandoffRecorded: false,
     operatorPauseHold: false,
     nextExecutableStepStarted: false,
+    terminalCompletionProofRecorded: false,
     violationNoticeQueued: false,
     blockedCloseoutQueued: false,
     persistence: options?.persistence,
@@ -783,6 +788,7 @@ export function recordNonTerminalBuildUpdateEmitted(
   state.nextExecutableStepStarted = false;
   state.ownerBoundaryHandoffRecorded = false;
   state.ownerBoundaryHandoffDetail = undefined;
+  state.terminalCompletionProofRecorded = false;
   state.continuityGatePersistenceQueued = false;
   recordEvent(state, "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail);
   recordEvent(
@@ -814,6 +820,15 @@ export function recordNextExecutableStepStarted(
   recordEvent(state, "NEXT_EXECUTABLE_STEP_STARTED", detail);
 }
 
+export function recordTerminalCompletionProof(dispatcher: ReplyDispatcher, detail?: string): void {
+  const state = guardStateByDispatcher.get(dispatcher);
+  if (!state || state.terminalCompletionProofRecorded) {
+    return;
+  }
+  state.terminalCompletionProofRecorded = true;
+  recordEvent(state, "TERMINAL_COMPLETION_PROOF_RECORDED", detail);
+}
+
 export function recordLawfulBlocker(dispatcher: ReplyDispatcher, blockerType: string): void {
   const state = guardStateByDispatcher.get(dispatcher);
   if (!state) {
@@ -835,6 +850,9 @@ export function allowTerminalCloseout(
   }
   recordEvent(state, "TERMINAL_CLOSEOUT_ATTEMPTED", kind);
   if (kind === "sendFinalReply") {
+    if (isSystemwideDepartmentFlowAcknowledgementText(payload?.text)) {
+      recordTerminalCompletionProof(dispatcher, "systemwide_department_flow_acknowledgement");
+    }
     const cleanupCrewDecision = resolveCleanupCrewFinalResponseGate({
       currentTurnText: state.cleanupCrewFinalResponse?.currentTurnText,
       activeCleanupCrewMission: state.cleanupCrewFinalResponse?.activeCleanupCrewMission,

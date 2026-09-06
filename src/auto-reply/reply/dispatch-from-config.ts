@@ -64,6 +64,7 @@ import { appendAssistantMessageToSessionTranscript } from "../../config/sessions
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
+import { isSystemwideDepartmentFlowAcknowledgementText } from "../../governance/systemwide-department-flow-acknowledgement.js";
 import { fireAndForgetHook } from "../../hooks/fire-and-forget.js";
 import {
   deriveInboundMessageHookContext,
@@ -150,6 +151,7 @@ import {
   recordNextExecutableStepStarted,
   recordNonTerminalBuildUpdateEmitted,
   recordOwnerBoundaryHandoff,
+  recordTerminalCompletionProof,
   testing as activeRunContinuationTesting,
 } from "./active-run-continuation-guard.js";
 import { resolveActiveRunContinuityGatePersistence } from "./active-run-continuity-gate-persistence.js";
@@ -282,6 +284,13 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
   const text = normalizeOptionalString(payload.text);
   if (!text) {
     return undefined;
+  }
+  if (isSystemwideDepartmentFlowAcknowledgementText(text)) {
+    return {
+      stopAllowed: true,
+      stopReason: "terminal_completion_proof",
+      openTruth: "bounded systemwide department-flow acknowledgement returned terminal proof.",
+    };
   }
   const normalized = text.toLowerCase();
   if (
@@ -1290,10 +1299,15 @@ function createAbortAwareDispatcher(params: {
         continuation.stopReason === "restart_or_reload" ||
         continuation.stopReason === "hard_stop" ||
         continuation.stopReason === "safety_stop" ||
+        continuation.stopReason === "terminal_completion_proof" ||
         continuation.stopReason === "paperwork_only_setup")
     ) {
       if (continuation.stopReason === "owner_boundary_stop") {
         recordOwnerBoundaryHandoff(params.dispatcher, continuation.openTruth);
+        return;
+      }
+      if (continuation.stopReason === "terminal_completion_proof") {
+        recordTerminalCompletionProof(params.dispatcher, continuation.openTruth);
         return;
       }
       recordLawfulBlocker(params.dispatcher, continuation.stopReason);

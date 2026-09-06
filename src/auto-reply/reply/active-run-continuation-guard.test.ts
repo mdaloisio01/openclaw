@@ -10,6 +10,7 @@ import {
   recordNextExecutableStepStarted,
   recordNonTerminalBuildUpdateEmitted,
   recordOwnerBoundaryHandoff,
+  recordTerminalCompletionProof,
   testing,
 } from "./active-run-continuation-guard.js";
 import type { ReplyDispatcher } from "./reply-dispatcher.types.js";
@@ -159,5 +160,24 @@ describe("active run continuation guard durability obligations", () => {
     expect(testing.getEvents(dispatcher).map((event) => event.type)).not.toContain(
       "GOVERNED_RUN_DURABILITY_OBLIGATION_WRITTEN",
     );
+  });
+
+  it("requires fresh terminal proof after a later non-terminal update", async () => {
+    const { dispatcher, finalPayloads } = createDispatcher();
+    installActiveRunContinuationGuard(dispatcher, {
+      persistence: {
+        outputDir: path.join(tempDir, "var", "continuity_gate_v2", "active_run_guard"),
+        activeMission: "system-wide department-flow drill",
+        authoritySources: [],
+      },
+    });
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "phase5_ack_progress");
+    recordTerminalCompletionProof(dispatcher, "phase5_acknowledgement_schema");
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "later_non_terminal_update");
+
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(finalPayloads.at(-1)?.text).toContain("BLOCKED_CLOSEOUT");
   });
 });

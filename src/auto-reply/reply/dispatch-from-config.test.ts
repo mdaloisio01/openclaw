@@ -3003,6 +3003,73 @@ describe("dispatchReplyFromConfig", () => {
     );
   });
 
+  it("allows terminal delivery after a non-terminal update when final text is a drill acknowledgement", async () => {
+    setNoAbort();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const dispatcher = createDispatcher();
+    const ctx = buildTestCtx({
+      Provider: "telegram",
+      ChatType: "direct",
+    });
+    const ackText = JSON.stringify({
+      schema: "openclaw.systemwide_department_flow_durability_drill.acknowledgement.v1",
+      run_label: "systemwide_department_flow_durability_validation_drill_2026-09-04T1352PDT",
+      department_lane_name: "ACP/session path",
+      received_mission: "Verify bounded Phase 5 ACP/session acknowledgement.",
+      controlling_prompt_recognized:
+        "systemwide_department_flow_durability_validation_drill_14_point_build_prompt_2026-09-04T1352PDT.md",
+      scope_understood: "ACP/session path owns only the bounded Phase 5 acknowledgement.",
+      durability_checks_performed: [
+        "bounded ACP turn completed",
+        "acknowledgement schema returned",
+      ],
+      result: "blocked",
+      proof_path_or_durable_response_receipt: "file_hub/exports/phase5_blocked.md",
+      what_is_materially_real_now: "ACP/session path returned a bounded blocked acknowledgement.",
+      what_is_still_not_real_yet: "A passing ACP/session acknowledgement is not collected.",
+      who_lawfully_owns_the_next_step: "Will / OpenClaw controller",
+      open_closed_truth_for_section:
+        "Phase 5 ACP/session path remains open and blocked; full drill open.",
+      exact_next_action: "Repair the named ACP/session blocker and rerun only Phase 5.",
+    });
+
+    const replyResolver = async (
+      _ctx: MsgContext,
+      opts?: GetReplyOptions,
+      _cfg?: OpenClawConfig,
+    ) => {
+      await opts?.onPlanUpdate?.({
+        phase: "update",
+        steps: ["Run bounded ACP acknowledgement"],
+      });
+      return { text: ackText } satisfies ReplyPayload;
+    };
+
+    await dispatchReplyFromConfig({ ctx, cfg, dispatcher, replyResolver });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: ackText });
+    expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
+        {
+          type: "TERMINAL_COMPLETION_PROOF_RECORDED",
+          detail: "bounded systemwide department-flow acknowledgement returned terminal proof.",
+        },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
   it("rejects terminal closeout when the final payload itself carries open-build continuation truth", async () => {
     setNoAbort();
     const cfg = {

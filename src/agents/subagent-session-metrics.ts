@@ -1,3 +1,4 @@
+import { isSystemwideDepartmentFlowAcknowledgementText } from "../governance/systemwide-department-flow-acknowledgement.js";
 import { SUBAGENT_ENDED_REASON_KILLED } from "./subagent-lifecycle-events.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
@@ -80,6 +81,7 @@ export function resolveSubagentMaterialProgressState(
   | "running_no_closeout_yet"
   | "closeout_rejected"
   | "closeout_review_passed"
+  | "acknowledgement_schema_returned"
   | "runtime_completed_no_closeout_gate"
   | "runtime_failed"
   | "runtime_timeout"
@@ -93,6 +95,9 @@ export function resolveSubagentMaterialProgressState(
   }
   if (gate?.reviewStatus === "passed" || gate?.passed === true) {
     return "closeout_review_passed";
+  }
+  if (isSystemwideDepartmentFlowAcknowledgementText(entry.completion?.resultText ?? undefined)) {
+    return "acknowledgement_schema_returned";
   }
   if (!entry.endedAt) {
     return "running_no_closeout_yet";
