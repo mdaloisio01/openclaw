@@ -575,15 +575,15 @@ export async function getReplyFromConfig(
     if (sessionEntry.trbRecovery.final_response_gate?.status === "passed") {
       return reply;
     }
-    const result = validateTrbFinalReplyPayloads({
-      payloads: reply,
-      state: sessionEntry.trbRecovery,
-    });
     const candidateReplyText = (Array.isArray(reply) ? reply : reply ? [reply] : [])
       .map((payload) => payload.text)
       .filter((value): value is string => typeof value === "string")
       .join("\n");
     captureTrbRecoveryRecordFromFinalReplyPayloads({ sessionEntry, payloads: reply });
+    const result = validateTrbFinalReplyPayloads({
+      payloads: reply,
+      state: sessionEntry.trbRecovery,
+    });
     markTrbGateResultOnSessionEntry({ sessionEntry, result, candidateReplyText });
     if (sessionKey && sessionStore) {
       sessionStore[sessionKey] = sessionEntry;

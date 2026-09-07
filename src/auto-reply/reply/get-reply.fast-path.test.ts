@@ -5,6 +5,9 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { testing as cliBackendsTesting } from "../../agents/cli-backends.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { getSessionEntry } from "../../config/sessions.js";
+import type { TrbRecoveryRecordV1 } from "../../config/sessions/types.js";
+import { createTrbRecoveryState } from "../../governance/trb-recovery-contract.js";
+import { setReplyPayloadMetadata } from "../reply-payload.js";
 import {
   buildFastReplyCommandContext,
   initFastReplySessionState,
@@ -214,6 +217,98 @@ describe("getReplyFromConfig fast test bootstrap", () => {
     expect(vi.mocked(loadConfigMock)).not.toHaveBeenCalled();
     expect(mocks.resolveReplyDirectives).not.toHaveBeenCalled();
     expect(vi.mocked(runPreparedReplyMock)).toHaveBeenCalledOnce();
+  });
+
+  it("persists structured TRB recovery metadata before final gate validation", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-trb-finalizer-"));
+    const storePath = path.join(home, "sessions.json");
+    const sessionKey = "agent:main:telegram:123";
+    const trbRecovery = createTrbRecoveryState({
+      ctx: {
+        Body: "TRB",
+        MessageSid: "msg-trb-finalizer",
+      },
+      sessionKey,
+      sessionId: "session-trb-finalizer",
+      now: 1_234,
+    });
+    const recoveryRecord: TrbRecoveryRecordV1 = {
+      schemaVersion: 1,
+      recordId: "trb-record-finalizer-1",
+      createdAt: 1_235,
+      classification: "current_blocker",
+      whatWasHappeningBeforeMisfire: "TRB finalizer validation was running",
+      proofChecked: ["session state", "source diff"],
+      actualIssueIdentified: "visible prose was still treated as the recovery contract",
+      rootCause: "structured recovery metadata was not captured before validation",
+      activeMissionImpact: "build remains open until recovery record persists",
+      lawfulNoUpdateReason: "current blocker is handled in active recovery path",
+      recoveryArtifactPath: "/tmp/trb-finalizer.md",
+      exactNextAction: "persist metadata-backed record before final gate settlement",
+    };
+    const sessionEntry = {
+      sessionId: "session-trb-finalizer",
+      updatedAt: 1,
+      trbRecovery,
+    };
+    const sessionStore = { [sessionKey]: sessionEntry };
+    await fs.writeFile(storePath, JSON.stringify(sessionStore), "utf8");
+    mocks.initSessionState.mockResolvedValue(
+      createGetReplySessionState({
+        sessionEntry,
+        sessionStore,
+        sessionKey,
+        sessionId: "session-trb-finalizer",
+        storePath,
+      }),
+    );
+    vi.mocked(runPreparedReplyMock).mockResolvedValue(
+      setReplyPayloadMetadata(
+        {
+          text: "Plain Mark-facing recovery report without visible machine fields.",
+        },
+        {
+          trbRecoveryRecord: recoveryRecord,
+        },
+      ),
+    );
+
+    await expect(
+      getReplyFromConfig(
+        buildGetReplyCtx({
+          Body: "TRB",
+          BodyForCommands: "TRB",
+          CommandBody: "TRB",
+          RawBody: "TRB",
+          MessageSid: "msg-trb-finalizer",
+        }),
+        undefined,
+        markCompleteReplyConfig({
+          agents: {
+            defaults: {
+              model: "openai/gpt-5.5",
+              workspace: home,
+            },
+          },
+          session: { store: storePath },
+        } as OpenClawConfig),
+      ),
+    ).resolves.toEqual({
+      text: "Plain Mark-facing recovery report without visible machine fields.",
+    });
+
+    const stored = JSON.parse(await fs.readFile(storePath, "utf8"))[sessionKey];
+    expect(stored.trbRecovery.recovery_record).toMatchObject({
+      recordId: "trb-record-finalizer-1",
+      recoveryArtifactPath: "/tmp/trb-finalizer.md",
+    });
+    expect(stored.trbRecovery.final_response_gate).toMatchObject({
+      status: "passed",
+      decisionRecord: {
+        recoveryRecordId: "trb-record-finalizer-1",
+        issueActionPresent: true,
+      },
+    });
   });
 
   it("clears stale ack-only heartbeat pending delivery before running heartbeat", async () => {

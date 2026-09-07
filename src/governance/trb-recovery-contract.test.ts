@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { setReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
 import type { SessionEntry, TrbRecoveryRecordV1 } from "../config/sessions/types.js";
 import {
   buildTrbRecoverySystemPrompt,
@@ -317,6 +318,81 @@ describe("TRB recovery runtime contract", () => {
       recoveryArtifactPath: "/tmp/trb-record-capture.md",
       issueActionPresent: true,
     });
+  });
+
+  it("captures structured TRB recovery metadata without requiring visible contract prose", () => {
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-metadata-capture",
+      updatedAt: 1,
+      trbRecovery: createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-metadata-capture" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-metadata-capture",
+        now: 123,
+      }),
+    };
+    const payload = setReplyPayloadMetadata(
+      {
+        text: "Plain English report for Mark. No machine-field block in the visible message.",
+      },
+      {
+        trbRecoveryRecord: completeRecord,
+      },
+    );
+
+    expect(
+      captureTrbRecoveryRecordFromFinalReplyPayloads({
+        sessionEntry,
+        payloads: payload,
+      }),
+    ).toBe(true);
+
+    const result = validateTrbFinalReplyPayloads({
+      state: sessionEntry.trbRecovery,
+      payloads: payload,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(sessionEntry.trbRecovery?.recovery_record).toBe(completeRecord);
+  });
+
+  it("refuses invalid structured TRB recovery metadata", () => {
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-invalid-metadata",
+      updatedAt: 1,
+      trbRecovery: createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-invalid-metadata" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-invalid-metadata",
+        now: 123,
+      }),
+    };
+    const payload = setReplyPayloadMetadata(
+      {
+        text: "Plain English report for Mark.",
+      },
+      {
+        trbRecoveryRecord: {
+          ...completeRecord,
+          recoveryArtifactPath: "",
+        },
+      },
+    );
+
+    expect(
+      captureTrbRecoveryRecordFromFinalReplyPayloads({
+        sessionEntry,
+        payloads: payload,
+      }),
+    ).toBe(false);
+
+    expect(sessionEntry.trbRecovery?.recovery_record).toBeUndefined();
+    expect(
+      validateTrbFinalReplyPayloads({
+        state: sessionEntry.trbRecovery,
+        payloads: payload,
+      }).ok,
+    ).toBe(false);
   });
 
   it("prefers structured recovery records over plain visible prose", () => {

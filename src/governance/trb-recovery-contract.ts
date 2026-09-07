@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { ReplyPayload } from "../auto-reply/reply-payload.js";
+import { getReplyPayloadMetadata, type ReplyPayload } from "../auto-reply/reply-payload.js";
 import type { MsgContext } from "../auto-reply/templating.js";
 import type {
   SessionEntry,
@@ -724,6 +724,18 @@ function replyPayloadsToText(payloads: ReplyPayload | ReplyPayload[] | undefined
     .join("\n");
 }
 
+function extractStructuredRecoveryRecordFromPayloads(
+  payloads: ReplyPayload | ReplyPayload[] | undefined,
+): TrbRecoveryRecordV1 | undefined {
+  for (const payload of Array.isArray(payloads) ? payloads : payloads ? [payloads] : []) {
+    const record = getReplyPayloadMetadata(payload)?.trbRecoveryRecord;
+    if (record) {
+      return record;
+    }
+  }
+  return undefined;
+}
+
 export function captureTrbRecoveryRecordFromFinalReplyPayloads(params: {
   sessionEntry?: SessionEntry;
   payloads: ReplyPayload | ReplyPayload[] | undefined;
@@ -732,6 +744,17 @@ export function captureTrbRecoveryRecordFromFinalReplyPayloads(params: {
   const state = params.sessionEntry?.trbRecovery;
   if (!state?.trb_recovery_required || state.recovery_record) {
     return false;
+  }
+  const structuredRecord = extractStructuredRecoveryRecordFromPayloads(params.payloads);
+  if (structuredRecord) {
+    const result = validateTrbRecoveryRecord(structuredRecord, {
+      requireSessionToolLogProof: state.requires_session_tool_log_proof,
+    });
+    if (!result.ok) {
+      return false;
+    }
+    state.recovery_record = structuredRecord;
+    return true;
   }
   const candidateReplyText = replyPayloadsToText(params.payloads);
   if (!candidateReplyText.trim()) {

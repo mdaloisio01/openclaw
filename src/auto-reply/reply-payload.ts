@@ -1,4 +1,5 @@
 import type { StructuredMissionCloseout } from "../agents/mission-settlement-tail.js";
+import type { TrbRecoveryRecordV1 } from "../config/sessions/types.js";
 import type { GovernedFinalReleaseDecisionInput } from "../governance/governed-final-release-decision.js";
 import type { CloseoutAdmissionInput } from "../governance/mission-manifest.types.js";
 import type {
@@ -202,6 +203,11 @@ export type ReplyPayloadMetadata = {
    * governed settlement; human report text remains the rendered delivery copy.
    */
   structuredMissionCloseout?: StructuredMissionCloseout;
+  /**
+   * Structured TRB recovery state. This is machine authority for runtime recovery;
+   * visible Mark-facing text remains only the rendered report.
+   */
+  trbRecoveryRecord?: TrbRecoveryRecordV1;
 };
 
 const replyPayloadMetadata = new WeakMap<object, ReplyPayloadMetadata>();
