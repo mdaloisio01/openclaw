@@ -441,6 +441,25 @@ function isOpenClawBridgeCommand(command: string | undefined): boolean {
   return /^openclaw(?:\.[cm]?js)?$/i.test(scriptName) && parts[2] === OPENCLAW_BRIDGE_SUBCOMMAND;
 }
 
+function hasOpenClawBridgeSessionArg(command: string | undefined): boolean {
+  if (!command) {
+    return false;
+  }
+  const parts = unwrapEnvCommand(splitCommandParts(command.trim()));
+  return parts.some((part) => part === "--session" || part.startsWith("--session="));
+}
+
+function appendOpenClawBridgeSessionArg(params: {
+  command: string | undefined;
+  sessionKey: string;
+}): string | undefined {
+  const command = params.command?.trim();
+  if (!command || !isOpenClawBridgeCommand(command) || hasOpenClawBridgeSessionArg(command)) {
+    return command;
+  }
+  return `${command} --session ${quoteShellArg(params.sessionKey)}`;
+}
+
 function isCodexAcpCommand(command: string | undefined): boolean {
   return isAcpCommand(command, {
     packageName: "@zed-industries/codex-acp",
@@ -929,15 +948,20 @@ export class AcpxRuntime implements AcpRuntime {
       agentName: input.agent,
       agentRegistry: this.agentRegistry,
     });
+    const sessionScopedCommand = appendOpenClawBridgeSessionArg({
+      command,
+      sessionKey: input.sessionKey,
+    });
     const delegate = this.resolveDelegateForCommand(command);
     const codexModelOverride =
-      normalizeAgentName(input.agent) === CODEX_ACP_AGENT_ID && isCodexAcpCommand(command)
+      normalizeAgentName(input.agent) === CODEX_ACP_AGENT_ID &&
+      isCodexAcpCommand(sessionScopedCommand)
         ? normalizeCodexAcpModelOverride(input.model, input.thinking)
         : undefined;
     const stableLaunchCommand =
-      codexModelOverride && command
-        ? appendCodexAcpConfigOverrides(command, codexModelOverride)
-        : command;
+      codexModelOverride && sessionScopedCommand
+        ? appendCodexAcpConfigOverrides(sessionScopedCommand, codexModelOverride)
+        : sessionScopedCommand;
     const shouldStartWithLease = !(await this.canReuseStablePersistentSession({
       sessionKey: input.sessionKey,
       mode: input.mode,
@@ -1237,6 +1261,7 @@ export {
 
 export const testing = {
   appendCodexAcpConfigOverrides,
+  appendOpenClawBridgeSessionArg,
   assertSupportedRuntimeSessionMode,
   codexAcpSessionModelId,
   isClaudeAcpCommand,
