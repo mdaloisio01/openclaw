@@ -1001,6 +1001,104 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     expect(coordinator.getRoutedCounts().block).toBe(0);
   });
 
+  it("allows routed ACP final delivery when it carries the bounded drill acknowledgement schema", async () => {
+    const { dispatcher, deliveredFinalPayloads, deliveredToolPayloads } =
+      createGuardedDispatcherHarness();
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      inboundAudio: false,
+      shouldRouteToOriginating: true,
+      originatingChannel: "visiblechat",
+      originatingTo: "channel:thread-1",
+    });
+
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "acp_progress_update");
+
+    const ackText = validSystemwideDepartmentFlowAckText();
+    const delivered = await coordinator.deliver("final", { text: ackText }, { skipTts: true });
+
+    expect(delivered).toBe(true);
+    expect(deliveryMocks.routeReply).toHaveBeenCalledTimes(1);
+    expect(deliveredFinalPayloads).toEqual([]);
+    expect(deliveredToolPayloads).toEqual([]);
+    expect(coordinator.hasDeliveredFinalReply()).toBe(true);
+    expect(coordinator.getRoutedCounts().final).toBe(1);
+
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(deliveredFinalPayloads).toEqual([]);
+    expect(activeRunContinuationGuardTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "acp_progress_update" },
+        { type: "BLOCKER_STATE", detail: "false" },
+        {
+          type: "TERMINAL_COMPLETION_PROOF_RECORDED",
+          detail: "systemwide_department_flow_acknowledgement",
+        },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
+  it("rejects routed ACP final delivery after a non-terminal update before routeReply", async () => {
+    const { dispatcher, deliveredFinalPayloads, deliveredToolPayloads } =
+      createGuardedDispatcherHarness();
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      inboundAudio: false,
+      shouldRouteToOriginating: true,
+      originatingChannel: "visiblechat",
+      originatingTo: "channel:thread-1",
+    });
+
+    recordActiveRunStarted(dispatcher);
+    recordNonTerminalBuildUpdateEmitted(dispatcher, "acp_progress_update");
+
+    const delivered = await coordinator.deliver("final", { text: "done" }, { skipTts: true });
+
+    expect(delivered).toBe(false);
+    expect(deliveryMocks.routeReply).not.toHaveBeenCalled();
+    expect(deliveredFinalPayloads).toEqual([]);
+    expect(deliveredToolPayloads).toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining("ACTIVE_RUN_CONTINUITY_VIOLATION"),
+      }),
+    );
+
+    await flushBlockedCloseoutIfNeeded(dispatcher);
+
+    expect(deliveredFinalPayloads).toContainEqual(
+      expect.objectContaining({
+        text: expect.stringContaining("BLOCKED_CLOSEOUT"),
+      }),
+    );
+    expect(activeRunContinuationGuardTesting.getEvents(dispatcher)).toEqual(
+      expect.arrayContaining([
+        { type: "ACTIVE_RUN_STARTED" },
+        { type: "NON_TERMINAL_BUILD_UPDATE_EMITTED", detail: "acp_progress_update" },
+        { type: "BLOCKER_STATE", detail: "false" },
+        { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+        { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "BLOCKED_CLOSEOUT" },
+      ]),
+    );
+  });
+
   it("rejects ACP final delivery after a non-terminal update when no next step started", async () => {
     const { dispatcher, deliveredFinalPayloads, deliveredToolPayloads } =
       createGuardedDispatcherHarness();

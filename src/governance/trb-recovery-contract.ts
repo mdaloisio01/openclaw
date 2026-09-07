@@ -312,6 +312,89 @@ function contractFromRecoveryRecord(record: TrbRecoveryRecordV1): TrbRecoveryCon
   };
 }
 
+function buildTrbRecoveryRecordId(params: {
+  state: TrbRecoveryState;
+  contract: TrbRecoveryContract;
+}): string {
+  const seed = [
+    params.state.trigger_session_key,
+    params.state.trigger_session_id,
+    params.state.trigger_message_id,
+    params.state.trigger_timestamp,
+    params.contract.classification,
+    params.contract.recovery_artifact_path,
+  ]
+    .filter((value): value is string | number => value !== undefined && value !== null)
+    .join("|");
+  const digest = createHash("sha256")
+    .update(seed || "trb-recovery")
+    .digest("hex")
+    .slice(0, 32);
+  return `trb-recovery:${digest}`;
+}
+
+export function createTrbRecoveryRecordFromContract(params: {
+  state: TrbRecoveryState;
+  contract: TrbRecoveryContract;
+  createdAt?: number;
+}): TrbRecoveryRecordV1 | undefined {
+  const result = validateTrbRecoveryContract(params.contract, {
+    requireSessionToolLogProof: params.state.requires_session_tool_log_proof,
+  });
+  if (!result.ok) {
+    return undefined;
+  }
+  return {
+    schemaVersion: 1,
+    recordId: buildTrbRecoveryRecordId({
+      state: params.state,
+      contract: params.contract,
+    }),
+    createdAt: params.createdAt ?? Date.now(),
+    classification: params.contract.classification as TrbRecoveryClassification,
+    whatWasHappeningBeforeMisfire: params.contract.what_was_happening_before_misfire!,
+    proofChecked: params.contract.proof_checked!,
+    actualIssueIdentified: params.contract.actual_issue_identified!,
+    ...(params.contract.root_cause ? { rootCause: params.contract.root_cause } : {}),
+    ...(params.contract.missing_proof
+      ? {
+          missingProof: {
+            whatWasChecked: params.contract.missing_proof.what_was_checked,
+            proofMissing: params.contract.missing_proof.proof_missing,
+            whereProofShouldExist: params.contract.missing_proof.where_proof_should_exist,
+            missingProofIsBlocker: params.contract.missing_proof.missing_proof_is_blocker,
+            exactNextRecoveryStep: params.contract.missing_proof.exact_next_recovery_step,
+          },
+        }
+      : {}),
+    activeMissionImpact: params.contract.active_mission_impact!,
+    ...(typeof params.contract.active_mission_blocked === "boolean"
+      ? { activeMissionBlocked: params.contract.active_mission_blocked }
+      : {}),
+    ...(params.contract.issue_list_action
+      ? { issueListAction: params.contract.issue_list_action }
+      : {}),
+    ...(params.contract.lawful_no_update_reason
+      ? { lawfulNoUpdateReason: params.contract.lawful_no_update_reason }
+      : {}),
+    recoveryArtifactPath: params.contract.recovery_artifact_path!,
+    exactNextAction: params.contract.exact_next_action!,
+    ...(params.contract.session_tool_log_proof
+      ? { sessionToolLogProof: params.contract.session_tool_log_proof }
+      : {}),
+    ...(params.contract.oversized_output
+      ? {
+          oversizedOutput: {
+            observed: params.contract.oversized_output.observed,
+            summarizedOrCheckpointed: params.contract.oversized_output.summarized_or_checkpointed,
+            finalRecoveryReportDelivered:
+              params.contract.oversized_output.final_recovery_report_delivered,
+          },
+        }
+      : {}),
+  };
+}
+
 export function validateTrbRecoveryRecord(
   record: TrbRecoveryRecordV1,
   opts: { requireSessionToolLogProof?: boolean } = {},
@@ -632,6 +715,39 @@ export function validateTrbFinalReplyPayloads(params: {
   return validateTrbRecoveryContract(parseTrbRecoveryContractFromText(text), {
     requireSessionToolLogProof: params.state.requires_session_tool_log_proof,
   });
+}
+
+function replyPayloadsToText(payloads: ReplyPayload | ReplyPayload[] | undefined): string {
+  return (Array.isArray(payloads) ? payloads : payloads ? [payloads] : [])
+    .map((payload) => payload.text)
+    .filter((value): value is string => typeof value === "string")
+    .join("\n");
+}
+
+export function captureTrbRecoveryRecordFromFinalReplyPayloads(params: {
+  sessionEntry?: SessionEntry;
+  payloads: ReplyPayload | ReplyPayload[] | undefined;
+  createdAt?: number;
+}): boolean {
+  const state = params.sessionEntry?.trbRecovery;
+  if (!state?.trb_recovery_required || state.recovery_record) {
+    return false;
+  }
+  const candidateReplyText = replyPayloadsToText(params.payloads);
+  if (!candidateReplyText.trim()) {
+    return false;
+  }
+  const parsedContract = parseTrbRecoveryContractFromText(candidateReplyText);
+  const record = createTrbRecoveryRecordFromContract({
+    state,
+    contract: parsedContract,
+    createdAt: params.createdAt,
+  });
+  if (!record) {
+    return false;
+  }
+  state.recovery_record = record;
+  return true;
 }
 
 export function evaluateTrbPostTurnWatchdog(params: {

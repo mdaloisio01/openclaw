@@ -14,6 +14,7 @@ import { resolveConfiguredTtsMode, shouldCleanTtsDirectiveText } from "../../tts
 import { getReplyPayloadProgressHeartbeat, isReplyPayloadStatusNotice } from "../reply-payload.js";
 import type { FinalizedMsgContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
+import { allowTerminalCloseout } from "./active-run-continuation-guard.js";
 import { waitForReplyDispatcherIdle } from "./reply-dispatcher.js";
 import type { ReplyDispatchKind, ReplyDispatcher } from "./reply-dispatcher.types.js";
 import { readDispatcherFailedCounts } from "./reply-dispatcher.types.js";
@@ -423,6 +424,15 @@ export function createAcpDispatchDeliveryCoordinator(params: {
         text: ttsPayload.text,
         routed: true,
       });
+      if (
+        effectiveKind === "final" &&
+        !allowTerminalCloseout(params.dispatcher, "sendFinalReply", ttsPayload).allowed
+      ) {
+        if (tracksVisibleText) {
+          state.failedVisibleTextDelivery = true;
+        }
+        return false;
+      }
       const { routeReply } = await loadRouteReplyRuntime();
       const threadId =
         params.originatingThreadId ??

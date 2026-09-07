@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import type { SessionEntry, TrbRecoveryRecordV1 } from "../config/sessions/types.js";
 import {
   buildTrbRecoverySystemPrompt,
+  captureTrbRecoveryRecordFromFinalReplyPayloads,
+  createTrbRecoveryRecordFromContract,
   createTrbRecoveryState,
   evaluateTrbPostTurnWatchdog,
   inboundTrbRecoveryRequired,
@@ -206,6 +208,115 @@ describe("TRB recovery runtime contract", () => {
 
   it("passes a complete structured TRB recovery record", () => {
     expect(validateTrbRecoveryRecord(completeRecord).ok).toBe(true);
+  });
+
+  it("captures a valid visible TRB contract as a structured recovery record", () => {
+    const state = createTrbRecoveryState({
+      ctx: { Body: "TRB", MessageSid: "msg-capture" },
+      sessionKey: "agent:orchestrator:main",
+      sessionId: "session-capture",
+      now: 123,
+    });
+
+    const record = createTrbRecoveryRecordFromContract({
+      state,
+      contract: completeContract,
+      createdAt: 456,
+    });
+
+    expect(record).toMatchObject({
+      schemaVersion: 1,
+      createdAt: 456,
+      classification: "current_blocker",
+      whatWasHappeningBeforeMisfire: completeContract.what_was_happening_before_misfire,
+      proofChecked: completeContract.proof_checked,
+      actualIssueIdentified: completeContract.actual_issue_identified,
+      rootCause: completeContract.root_cause,
+      activeMissionImpact: completeContract.active_mission_impact,
+      lawfulNoUpdateReason: completeContract.lawful_no_update_reason,
+      recoveryArtifactPath: completeContract.recovery_artifact_path,
+      exactNextAction: completeContract.exact_next_action,
+    });
+    expect(record?.recordId).toMatch(/^trb-recovery:[a-f0-9]{32}$/);
+    expect(validateTrbRecoveryRecord(record!).ok).toBe(true);
+  });
+
+  it("does not capture an invalid visible TRB contract as a structured record", () => {
+    const state = createTrbRecoveryState({
+      ctx: { Body: "TRB", MessageSid: "msg-invalid-capture" },
+      sessionKey: "agent:orchestrator:main",
+      sessionId: "session-invalid-capture",
+      now: 123,
+    });
+
+    const record = createTrbRecoveryRecordFromContract({
+      state,
+      contract: {
+        ...completeContract,
+        recovery_artifact_path: undefined,
+      },
+      createdAt: 456,
+    });
+
+    expect(record).toBeUndefined();
+  });
+
+  it("captures a valid final payload on the session before storing the gate decision", () => {
+    const sessionEntry: SessionEntry = {
+      sessionId: "session-finalizer-capture",
+      updatedAt: 1,
+      trbRecovery: createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-finalizer-capture" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-finalizer-capture",
+        now: 123,
+      }),
+    };
+    const payload = {
+      text: [
+        "classification: current_blocker",
+        "what_was_happening_before_misfire: final response gate blocked recovery",
+        "proof_checked: session state; issue register; source diff",
+        "actual_issue_identified: visible contract needed structured persistence",
+        "root_cause: finalizer did not capture the validated contract as a record",
+        "active_mission_impact: recovery remains open until record is persisted",
+        "issue_list_action: appended OPEN_TRB_RECORD_CAPTURE",
+        "recovery_artifact_path: /tmp/trb-record-capture.md",
+        "exact_next_action: persist record before gate decision",
+      ].join("\n"),
+    };
+
+    expect(
+      captureTrbRecoveryRecordFromFinalReplyPayloads({
+        sessionEntry,
+        payloads: payload,
+        createdAt: 456,
+      }),
+    ).toBe(true);
+
+    const result = validateTrbFinalReplyPayloads({
+      state: sessionEntry.trbRecovery,
+      payloads: { text: "Plain prose after structured record exists." },
+    });
+    markTrbGateResultOnSessionEntry({
+      sessionEntry,
+      result,
+      checkedAt: 789,
+      candidateReplyText: payload.text,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(sessionEntry.trbRecovery?.recovery_record).toMatchObject({
+      createdAt: 456,
+      recoveryArtifactPath: "/tmp/trb-record-capture.md",
+      issueListAction: "appended OPEN_TRB_RECORD_CAPTURE",
+    });
+    expect(sessionEntry.trbRecovery?.final_response_gate?.decisionRecord).toMatchObject({
+      status: "passed",
+      recoveryRecordId: sessionEntry.trbRecovery?.recovery_record?.recordId,
+      recoveryArtifactPath: "/tmp/trb-record-capture.md",
+      issueActionPresent: true,
+    });
   });
 
   it("prefers structured recovery records over plain visible prose", () => {

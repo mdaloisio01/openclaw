@@ -18,6 +18,7 @@ import { type OpenClawConfig, getRuntimeConfig } from "../../config/config.js";
 import { logVerbose } from "../../globals.js";
 import {
   buildTrbRecoveryBlockedPayload,
+  captureTrbRecoveryRecordFromFinalReplyPayloads,
   createTrbRecoveryState,
   inboundTrbRecoveryRequired,
   markTrbGateResultOnSessionEntry,
@@ -582,6 +583,7 @@ export async function getReplyFromConfig(
       .map((payload) => payload.text)
       .filter((value): value is string => typeof value === "string")
       .join("\n");
+    captureTrbRecoveryRecordFromFinalReplyPayloads({ sessionEntry, payloads: reply });
     markTrbGateResultOnSessionEntry({ sessionEntry, result, candidateReplyText });
     if (sessionKey && sessionStore) {
       sessionStore[sessionKey] = sessionEntry;
