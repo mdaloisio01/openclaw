@@ -15,6 +15,10 @@ import { resolveAgentDir, resolveAgentWorkspaceDir } from "../../agents/agent-sc
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { TtsAutoMode } from "../../config/types.tts.js";
 import { logVerbose } from "../../globals.js";
+import {
+  buildSystemwideDepartmentFlowBlockedAcknowledgementText,
+  isSystemwideDepartmentFlowAcknowledgementRequestText,
+} from "../../governance/systemwide-department-flow-acknowledgement.js";
 import { emitAgentEvent } from "../../infra/agent-events.js";
 import { isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { formatErrorMessage } from "../../infra/errors.js";
@@ -499,6 +503,7 @@ export async function tryDispatchAcpReply(params: {
       recordProcessed: params.recordProcessed,
       markIdle: params.markIdle,
     });
+  let attemptedTurnPromptText: string | undefined;
   try {
     const dispatchPolicyError = resolveAcpDispatchPolicyError(params.cfg);
     if (dispatchPolicyError) {
@@ -561,6 +566,7 @@ export async function tryDispatchAcpReply(params: {
             images: resolvedTurnAttachments.recentHistoryImages,
           })
         : promptText;
+    attemptedTurnPromptText = turnPromptText;
     if (!turnPromptText && attachments.length === 0) {
       const counts = params.dispatcher.getQueuedCounts();
       delivery.applyRoutedCounts(counts);
@@ -643,8 +649,17 @@ export async function tryDispatchAcpReply(params: {
       targetSessionKey: canonicalSessionKey,
       error: acpError,
     });
+    const errorText = formatAcpRuntimeErrorText(acpError);
+    const deliveredText = isSystemwideDepartmentFlowAcknowledgementRequestText(
+      attemptedTurnPromptText,
+    )
+      ? buildSystemwideDepartmentFlowBlockedAcknowledgementText({
+          blocker: errorText,
+          sessionKey: canonicalSessionKey,
+        })
+      : errorText;
     const delivered = await delivery.deliver("final", {
-      text: formatAcpRuntimeErrorText(acpError),
+      text: deliveredText,
       isError: true,
     });
     queuedFinal = queuedFinal || delivered;

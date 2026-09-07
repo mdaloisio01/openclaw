@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AcpRuntimeError } from "../../acp/runtime/errors.js";
 import type { AcpSessionStoreEntry } from "../../acp/runtime/session-meta.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { isSystemwideDepartmentFlowAcknowledgementText } from "../../governance/systemwide-department-flow-acknowledgement.js";
 import type { SessionBindingRecord } from "../../infra/outbound/session-binding-service.js";
 import type { MediaUnderstandingSkipError } from "../../media-understanding/errors.js";
 import { withFetchPreconnect } from "../../test-utils/fetch-mock.js";
@@ -1469,6 +1470,46 @@ describe("tryDispatchAcpReply", () => {
     expect(dispatcherCall(dispatcher.sendFinalReply).text).toContain(
       "Could not initialize ACP session runtime.",
     );
+  });
+
+  it("shapes bounded Phase 5 ACP runtime blockers as blocked acknowledgement schema", async () => {
+    setReadyAcpResolution();
+    managerMocks.runTurn.mockRejectedValueOnce(
+      new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP metadata is missing."),
+    );
+    const { dispatcher } = createDispatcher();
+
+    await runDispatch({
+      bodyForAgent:
+        "Bounded Phase 5 ACP/session acknowledgement schema only. Return the systemwide drill acknowledgement schema.",
+      dispatcher,
+    });
+
+    const final = dispatcherCall(dispatcher.sendFinalReply);
+    expect(final.isError).toBe(true);
+    expect(isSystemwideDepartmentFlowAcknowledgementText(String(final.text))).toBe(true);
+    const parsed = JSON.parse(String(final.text)) as Record<string, unknown>;
+    expect(parsed.result).toBe("blocked");
+    expect(parsed.what_is_still_not_real_yet).toContain("No valid Phase 5 pass schema");
+    expect(parsed.exact_next_action).toContain("Repair ACP session metadata/rebind");
+  });
+
+  it("keeps non-drill ACP runtime blockers on the generic error path", async () => {
+    setReadyAcpResolution();
+    managerMocks.runTurn.mockRejectedValueOnce(
+      new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP metadata is missing."),
+    );
+    const { dispatcher } = createDispatcher();
+
+    await runDispatch({
+      bodyForAgent: "Run ordinary ACP prompt",
+      dispatcher,
+    });
+
+    const final = dispatcherCall(dispatcher.sendFinalReply);
+    expect(final.isError).toBe(true);
+    expect(String(final.text)).toContain("ACP error (ACP_SESSION_INIT_FAILED)");
+    expect(isSystemwideDepartmentFlowAcknowledgementText(String(final.text))).toBe(false);
   });
 
   it("unbinds stale bindings on ACP runTurn missing-metadata failures", async () => {

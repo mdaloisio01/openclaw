@@ -16,6 +16,10 @@ function baseRun(overrides: Partial<SubagentRunRecord>): SubagentRunRecord {
 }
 
 function validAcknowledgementText(): string {
+  return acknowledgementText({ result: "pass" });
+}
+
+function acknowledgementText(overrides: Record<string, unknown>): string {
   return JSON.stringify({
     schema: "openclaw.systemwide_department_flow_durability_drill.acknowledgement.v1",
     run_label: "systemwide_department_flow_durability_validation_drill_2026-09-04T1352PDT",
@@ -32,6 +36,7 @@ function validAcknowledgementText(): string {
     who_lawfully_owns_the_next_step: "Will / OpenClaw controller",
     open_closed_truth_for_section: "Phase 5 ACP/session section closed; full drill open.",
     exact_next_action: "Append the Phase 5 acknowledgement result to the drill ledger.",
+    ...overrides,
   });
 }
 
@@ -43,6 +48,28 @@ describe("subagent session metrics", () => {
         completion: {
           required: true,
           resultText: validAcknowledgementText(),
+          capturedAt: 2,
+        },
+      }),
+    );
+
+    expect(state).toBe("acknowledgement_schema_returned");
+  });
+
+  it("classifies a blocked bounded drill acknowledgement as schema returned", () => {
+    const state = resolveSubagentMaterialProgressState(
+      baseRun({
+        endedAt: 2,
+        completion: {
+          required: true,
+          resultText: acknowledgementText({
+            result: "blocked",
+            proof_path_or_durable_response_receipt:
+              "runtime ACP blocker for agent:main:acp:blocked",
+            open_closed_truth_for_section:
+              "Phase 5 ACP/session acknowledgement section remains blocked/open.",
+            exact_next_action: "Repair ACP session metadata/rebind before retry.",
+          }),
           capturedAt: 2,
         },
       }),
