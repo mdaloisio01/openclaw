@@ -585,6 +585,13 @@ function normalizeOptionalAgentId(value: string | undefined | null): string | un
   return normalizeAgentId(trimmed);
 }
 
+function resolveGatewayAgentIdForAcpDispatch(params: {
+  cfg: OpenClawConfig;
+  targetAgentId: string;
+}): string | undefined {
+  return listAgentIds(params.cfg).includes(params.targetAgentId) ? params.targetAgentId : undefined;
+}
+
 function summarizeError(err: unknown): string {
   return formatErrorMessage(err);
 }
@@ -1459,6 +1466,10 @@ export async function spawnAcpDirect(
   });
 
   const sessionKey = `agent:${targetAgentId}:acp:${crypto.randomUUID()}`;
+  const gatewayAgentId = resolveGatewayAgentIdForAcpDispatch({
+    cfg,
+    targetAgentId,
+  });
   const runtimeMode = resolveAcpSessionMode(spawnMode);
   const resolvedCwd = resolveSpawnedWorkspaceInheritance({
     config: cfg,
@@ -1608,6 +1619,7 @@ export async function spawnAcpDirect(
       params: {
         message: params.task,
         sessionKey,
+        ...(gatewayAgentId ? { agentId: gatewayAgentId } : {}),
         channel: deliveryPlan.channel,
         to: deliveryPlan.to,
         accountId: deliveryPlan.accountId,

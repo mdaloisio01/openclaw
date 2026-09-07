@@ -837,6 +837,71 @@ describe("spawnAcpDirect", () => {
     expect(transcriptCalls[1]?.threadId).toBe("child-thread");
   });
 
+  it("passes configured ACP agent id into gateway dispatch to preserve ACP metadata namespace", async () => {
+    replaceSpawnConfig({
+      ...createDefaultSpawnConfig(),
+      acp: {
+        enabled: true,
+        backend: "acpx",
+        allowedAgents: ["openclaw"],
+      },
+      agents: {
+        list: [
+          {
+            id: "main",
+            default: true,
+          },
+          {
+            id: "openclaw",
+          },
+        ],
+        defaults: {
+          subagents: {
+            allowAgents: ["openclaw"],
+            maxSpawnDepth: 2,
+          },
+        },
+      },
+    });
+
+    const result = await spawnAcpDirect(
+      {
+        task: "Return the bounded acknowledgement schema",
+        agentId: "openclaw",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+      },
+    );
+
+    const accepted = expectAcceptedSpawn(result);
+    expect(accepted.childSessionKey).toMatch(/^agent:openclaw:acp:/);
+    const agentCall = gatewayRequest("agent");
+    expect(agentCall.params?.sessionKey).toBe(accepted.childSessionKey);
+    expect(agentCall.params?.agentId).toBe("openclaw");
+    expectInitializeSessionFields({
+      sessionKey: accepted.childSessionKey,
+      agent: "openclaw",
+    });
+  });
+
+  it("does not pass external-only ACP harness ids as gateway agent ids", async () => {
+    const result = await spawnAcpDirect(
+      {
+        task: "Investigate flaky tests",
+        agentId: "codex",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+      },
+    );
+
+    expectAcceptedSpawn(result);
+    const agentCall = gatewayRequest("agent");
+    expect(agentCall.params?.sessionKey).toMatch(/^agent:codex:acp:/);
+    expect(agentCall.params).not.toHaveProperty("agentId");
+  });
+
   it("allows ACP resume IDs recorded for the requester session", async () => {
     const resumeSessionId = "codex-inner-resume";
     const ownedSessionKey = "agent:codex:acp:owned";
