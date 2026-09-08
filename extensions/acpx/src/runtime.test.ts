@@ -1741,19 +1741,25 @@ describe("AcpxRuntime fresh reset wrapper", () => {
     ).toBe("env OPENCLAW_HIDE_BANNER=1 node openclaw.mjs acp --session agent:openclaw:acp:test");
   });
 
-  it("keeps explicit OpenClaw ACP bridge sessions unchanged", () => {
+  it("replaces explicit OpenClaw ACP bridge sessions with the managed session key", () => {
     expect(
       testing.appendOpenClawBridgeSessionArg({
         command: "openclaw acp --session agent:main:main",
         sessionKey: "agent:openclaw:acp:test",
       }),
-    ).toBe("openclaw acp --session agent:main:main");
+    ).toBe("openclaw acp --session agent:openclaw:acp:test");
     expect(
       testing.appendOpenClawBridgeSessionArg({
         command: "openclaw acp --session=agent:main:main",
         sessionKey: "agent:openclaw:acp:test",
       }),
-    ).toBe("openclaw acp --session=agent:main:main");
+    ).toBe("openclaw acp --session agent:openclaw:acp:test");
+    expect(
+      testing.appendOpenClawBridgeSessionArg({
+        command: "openclaw acp --session 'agent:main:main'",
+        sessionKey: "agent:openclaw:acp:test",
+      }),
+    ).toBe("openclaw acp --session agent:openclaw:acp:test");
   });
 
   it("uses the bridge-safe delegate for local node openclaw entrypoints", async () => {

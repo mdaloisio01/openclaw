@@ -454,8 +454,14 @@ function appendOpenClawBridgeSessionArg(params: {
   sessionKey: string;
 }): string | undefined {
   const command = params.command?.trim();
-  if (!command || !isOpenClawBridgeCommand(command) || hasOpenClawBridgeSessionArg(command)) {
+  if (!command || !isOpenClawBridgeCommand(command)) {
     return command;
+  }
+  if (hasOpenClawBridgeSessionArg(command)) {
+    return command.replace(
+      /(^|\s)--session(?:=(?:"[^"]*"|'[^']*'|\S+)|\s+(?:"[^"]*"|'[^']*'|\S+))/,
+      `$1--session ${quoteShellArg(params.sessionKey)}`,
+    );
   }
   return `${command} --session ${quoteShellArg(params.sessionKey)}`;
 }
