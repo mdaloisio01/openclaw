@@ -1452,6 +1452,32 @@ describe("tryDispatchAcpReply", () => {
     expect(dispatcherCall(dispatcher.sendFinalReply).text).toContain("ACP metadata is missing.");
   });
 
+  it("shapes bounded Phase 5 stale ACP resolution errors as blocked acknowledgement schema", async () => {
+    const staleSessionKey = "agent:main:acp:missing-meta";
+    managerMocks.resolveSession.mockReturnValue({
+      kind: "stale",
+      sessionKey: staleSessionKey,
+      error: new AcpRuntimeError("ACP_SESSION_INIT_FAILED", "ACP metadata is missing."),
+    });
+    const { dispatcher } = createDispatcher();
+
+    await runDispatch({
+      bodyForAgent:
+        "Bounded Phase 5 ACP/session acknowledgement schema only. Return the systemwide drill acknowledgement schema.",
+      dispatcher,
+      sessionKeyOverride: staleSessionKey,
+    });
+
+    expect(managerMocks.runTurn).not.toHaveBeenCalled();
+    const final = dispatcherCall(dispatcher.sendFinalReply);
+    expect(final.isError).toBe(true);
+    expect(isSystemwideDepartmentFlowAcknowledgementText(String(final.text))).toBe(true);
+    const parsed = JSON.parse(String(final.text)) as Record<string, unknown>;
+    expect(parsed.result).toBe("blocked");
+    expect(parsed.proof_path_or_durable_response_receipt).toContain(staleSessionKey);
+    expect(parsed.exact_next_action).toContain("Repair ACP session metadata/rebind");
+  });
+
   it("does not unbind valid bindings on generic ACP runTurn init failure", async () => {
     setReadyAcpResolution();
     // Match the post-reset module instance so dispatch-acp preserves the ACP error code.

@@ -514,8 +514,15 @@ export async function tryDispatchAcpReply(params: {
         targetSessionKey: canonicalSessionKey,
         error: acpResolution.error,
       });
+      const stalePromptText = resolveAcpPromptText(params.ctx);
+      const deliveredText = isSystemwideDepartmentFlowAcknowledgementRequestText(stalePromptText)
+        ? buildSystemwideDepartmentFlowBlockedAcknowledgementText({
+            blocker: formatAcpRuntimeErrorText(acpResolution.error),
+            sessionKey: canonicalSessionKey,
+          })
+        : formatAcpRuntimeErrorText(acpResolution.error);
       const delivered = await delivery.deliver("final", {
-        text: formatAcpRuntimeErrorText(acpResolution.error),
+        text: deliveredText,
         isError: true,
       });
       return finishAttempt({
