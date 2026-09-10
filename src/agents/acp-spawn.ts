@@ -1142,6 +1142,11 @@ async function initializeAcpSpawnRuntime(params: {
     cwd: params.cwd,
     backendId: params.cfg.acp?.backend,
   });
+  readReadyAcpSpawnSessionMeta({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+    initializedMeta: initialized.meta,
+  });
 
   return {
     initialized,
@@ -1154,6 +1159,33 @@ async function initializeAcpSpawnRuntime(params: {
     sessionStore,
     storePath,
   };
+}
+
+function readReadyAcpSpawnSessionMeta(params: {
+  cfg: OpenClawConfig;
+  sessionKey: string;
+  initializedMeta: SessionAcpMeta;
+}): SessionAcpMeta {
+  const readableMeta = readAcpSessionMeta({
+    cfg: params.cfg,
+    sessionKey: params.sessionKey,
+  });
+  if (!readableMeta) {
+    throw new Error(`ACP metadata is not readable for ${params.sessionKey} after initialization.`);
+  }
+  if (
+    readableMeta.backend !== params.initializedMeta.backend ||
+    readableMeta.agent !== params.initializedMeta.agent ||
+    readableMeta.runtimeSessionName !== params.initializedMeta.runtimeSessionName ||
+    readableMeta.mode !== params.initializedMeta.mode
+  ) {
+    throw new Error(
+      `ACP metadata readback mismatch for ${params.sessionKey}: initialized ` +
+        `${params.initializedMeta.backend}/${params.initializedMeta.agent}/${params.initializedMeta.runtimeSessionName}/${params.initializedMeta.mode}, ` +
+        `read ${readableMeta.backend}/${readableMeta.agent}/${readableMeta.runtimeSessionName}/${readableMeta.mode}.`,
+    );
+  }
+  return readableMeta;
 }
 
 async function bindPreparedAcpThread(params: {

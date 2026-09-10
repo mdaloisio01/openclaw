@@ -735,7 +735,36 @@ describe("spawnAcpDirect", () => {
       .mockReset()
       .mockReturnValue("/tmp/sess-main.acp-stream.jsonl");
     hoisted.resolveStorePathMock.mockReset().mockReturnValue("/tmp/codex-sessions.json");
-    hoisted.readAcpSessionMetaMock.mockReset().mockReturnValue(undefined);
+    hoisted.readAcpSessionMetaMock.mockReset().mockImplementation((paramsUnknown: unknown) => {
+      const params = paramsUnknown as { sessionKey?: string };
+      const sessionKey = params.sessionKey;
+      const initCall = hoisted.initializeSessionMock.mock.calls.find((call: unknown[]) => {
+        const input = call[0] as AcpInitializeSessionInput | undefined;
+        return Boolean(sessionKey && input?.sessionKey === sessionKey);
+      });
+      const initInput = initCall?.[0] as AcpInitializeSessionInput | undefined;
+      if (!sessionKey || !initInput) {
+        return undefined;
+      }
+      const runtimeSessionName = `${sessionKey}:runtime`;
+      const cwd = typeof initInput.cwd === "string" ? initInput.cwd : undefined;
+      return {
+        backend: "acpx",
+        agent: initInput.agent,
+        runtimeSessionName,
+        ...(cwd ? { runtimeOptions: { cwd }, cwd } : {}),
+        identity: {
+          state: "pending",
+          source: "ensure",
+          acpxSessionId: "acpx-1",
+          agentSessionId: "codex-inner-1",
+          lastUpdatedAt: Date.now(),
+        },
+        mode: initInput.mode,
+        state: "idle",
+        lastActivityAt: Date.now(),
+      };
+    });
     hoisted.loadSessionStoreMock.mockReset().mockImplementation(() => {
       const store: Record<string, { sessionId: string; updatedAt: number }> = {};
       return new Proxy(store, {
@@ -902,6 +931,64 @@ describe("spawnAcpDirect", () => {
     expect(agentCall.params).not.toHaveProperty("agentId");
   });
 
+  it("fails before gateway dispatch when initialized ACP metadata is not readable", async () => {
+    hoisted.readAcpSessionMetaMock.mockReturnValue(undefined);
+
+    const result = await spawnAcpDirect(
+      {
+        task: "Investigate flaky tests",
+        agentId: "codex",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+      },
+    );
+
+    expectRecordFields(result, {
+      status: "error",
+      errorCode: "spawn_failed",
+    });
+    expect(String("error" in result ? result.error : "")).toContain("ACP metadata is not readable");
+    expect(hoisted.initializeSessionMock).toHaveBeenCalledOnce();
+    expect(hoisted.cleanupFailedAcpSpawnMock).toHaveBeenCalledOnce();
+    expectGatewayMethodNotCalled("agent");
+  });
+
+  it("fails before gateway dispatch when initialized ACP metadata readback points at another runtime identity", async () => {
+    hoisted.readAcpSessionMetaMock.mockImplementation((paramsUnknown: unknown) => {
+      const params = paramsUnknown as { sessionKey?: string };
+      return {
+        backend: "acpx",
+        agent: "codex",
+        runtimeSessionName: `${params.sessionKey ?? "missing"}:other-runtime`,
+        mode: "oneshot",
+        state: "idle",
+        lastActivityAt: Date.now(),
+      };
+    });
+
+    const result = await spawnAcpDirect(
+      {
+        task: "Investigate flaky tests",
+        agentId: "codex",
+      },
+      {
+        agentSessionKey: "agent:main:main",
+      },
+    );
+
+    expectRecordFields(result, {
+      status: "error",
+      errorCode: "spawn_failed",
+    });
+    expect(String("error" in result ? result.error : "")).toContain(
+      "ACP metadata readback mismatch",
+    );
+    expect(hoisted.initializeSessionMock).toHaveBeenCalledOnce();
+    expect(hoisted.cleanupFailedAcpSpawnMock).toHaveBeenCalledOnce();
+    expectGatewayMethodNotCalled("agent");
+  });
+
   it("allows ACP resume IDs recorded for the requester session", async () => {
     const resumeSessionId = "codex-inner-resume";
     const ownedSessionKey = "agent:codex:acp:owned";
@@ -914,23 +1001,46 @@ describe("spawnAcpDirect", () => {
     });
     hoisted.readAcpSessionMetaMock.mockImplementation((paramsUnknown: unknown) => {
       const params = paramsUnknown as { sessionKey?: string };
-      return params.sessionKey === ownedSessionKey
-        ? {
-            backend: "acpx",
-            agent: "codex",
-            runtimeSessionName: "codex",
-            identity: {
-              state: "resolved",
-              source: "ensure",
-              agentSessionId: resumeSessionId,
-              acpxSessionId: "acpx-owned",
-              lastUpdatedAt: Date.now(),
-            },
-            mode: "oneshot",
-            state: "idle",
-            lastActivityAt: Date.now(),
-          }
-        : undefined;
+      if (params.sessionKey === ownedSessionKey) {
+        return {
+          backend: "acpx",
+          agent: "codex",
+          runtimeSessionName: "codex",
+          identity: {
+            state: "resolved",
+            source: "ensure",
+            agentSessionId: resumeSessionId,
+            acpxSessionId: "acpx-owned",
+            lastUpdatedAt: Date.now(),
+          },
+          mode: "oneshot",
+          state: "idle",
+          lastActivityAt: Date.now(),
+        };
+      }
+      const initCall = hoisted.initializeSessionMock.mock.calls.find((call: unknown[]) => {
+        const input = call[0] as AcpInitializeSessionInput | undefined;
+        return Boolean(params.sessionKey && input?.sessionKey === params.sessionKey);
+      });
+      const initInput = initCall?.[0] as AcpInitializeSessionInput | undefined;
+      if (!params.sessionKey || !initInput) {
+        return undefined;
+      }
+      return {
+        backend: "acpx",
+        agent: initInput.agent,
+        runtimeSessionName: `${params.sessionKey}:runtime`,
+        identity: {
+          state: "pending",
+          source: "ensure",
+          acpxSessionId: "acpx-1",
+          agentSessionId: "codex-inner-1",
+          lastUpdatedAt: Date.now(),
+        },
+        mode: initInput.mode,
+        state: "idle",
+        lastActivityAt: Date.now(),
+      };
     });
 
     const result = await spawnAcpDirect(
