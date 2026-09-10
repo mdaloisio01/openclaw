@@ -124,6 +124,12 @@ export type MsgContext = {
   MessageSid?: string;
   /** Provider-specific full message id when MessageSid is a shortened alias. */
   MessageSidFull?: string;
+  /**
+   * Owner-request intake ledger row for this inbound turn. Cleanup Crew and
+   * other durability hooks use this to settle the original gateway ack row
+   * instead of creating a sibling record that leaves the ack looking orphaned.
+   */
+  OwnerRequestIntakeRequestId?: string;
   MessageSids?: string[];
   MessageSidFirst?: string;
   MessageSidLast?: string;

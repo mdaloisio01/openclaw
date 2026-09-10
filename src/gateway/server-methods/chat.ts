@@ -3536,6 +3536,9 @@ export const chatHandlers: GatewayRequestHandlers = {
               body: commandBody,
             },
         MessageSid: clientRunId,
+        ...(ownerRequestIntake?.requestId
+          ? { OwnerRequestIntakeRequestId: ownerRequestIntake.requestId }
+          : {}),
         ...(!isOperatorUiClient(clientInfo)
           ? {
               SenderId: clientInfo?.id,

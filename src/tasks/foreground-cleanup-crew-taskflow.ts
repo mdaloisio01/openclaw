@@ -668,6 +668,7 @@ export function supersedeForegroundCleanupCrewExecutor(params: {
 export function ensureForegroundCleanupCrewTaskFlow(params: {
   sessionKey?: string | null;
   currentTurnText?: string | null;
+  existingIntakeRequestId?: string | null;
   authorityPath?: string | null;
   authorityBasis?: string | null;
   ownerLane?: string | null;
@@ -694,22 +695,29 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   if (checkpointRequiresNextAction(tracking) && !tracking.nextExecutableAction) {
     return { status: "blocked", reason: "checkpoint_next_executable_action_missing" };
   }
-  const intakeRecord = createOwnerRequestIntakeRecord({
-    message: currentTurnText,
-    sourceSessionKey: sessionKey,
-    sourceChannel: "webchat",
-    sourceProvider: "openclaw",
-    classification: "cleanup_crew_production",
-    expectedDurability: "taskflow_required",
-    governed: true,
-    status: "server_acknowledged",
-    lastExecutableAction: "owner request accepted",
-    nextExecutableAction: "persist foreground Cleanup Crew TaskFlow",
-    stateDir: params.intakeStateDir,
-    nowMs: now,
-  });
+  const existingIntakeRequestId = normalizeOptionalString(params.existingIntakeRequestId);
+  const intakeRecord = existingIntakeRequestId
+    ? undefined
+    : createOwnerRequestIntakeRecord({
+        message: currentTurnText,
+        sourceSessionKey: sessionKey,
+        sourceChannel: "webchat",
+        sourceProvider: "openclaw",
+        classification: "cleanup_crew_production",
+        expectedDurability: "taskflow_required",
+        governed: true,
+        status: "server_acknowledged",
+        lastExecutableAction: "owner request accepted",
+        nextExecutableAction: "persist foreground Cleanup Crew TaskFlow",
+        stateDir: params.intakeStateDir,
+        nowMs: now,
+      });
+  const intakeRequestId = existingIntakeRequestId ?? intakeRecord?.requestId;
+  if (!intakeRequestId) {
+    return { status: "blocked", reason: "owner_request_intake_identity_missing" };
+  }
   markOwnerRequestPromptPersisted({
-    requestId: intakeRecord.requestId,
+    requestId: intakeRequestId,
     stateDir: params.intakeStateDir,
     nowMs: now,
   });
@@ -722,20 +730,29 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       };
     }
     if (!hasForegroundCleanupCrewTracking(tracking)) {
+      const refreshed = resumeFlow({
+        flowId: existing.flowId,
+        expectedRevision: existing.revision,
+        status: "running",
+        currentStep: existing.currentStep,
+        stateJson: existing.stateJson,
+        updatedAt: now,
+      });
+      const flow = refreshed.applied ? refreshed.flow : existing;
       return {
         status: "attached",
-        flow: existing,
+        flow,
         taskId: (() => {
           const taskId = ensureForegroundExecutionTask({
-            flow: existing,
+            flow,
             ownerKey,
             sessionKey,
             now,
             tracking,
           });
           markOwnerRequestMissionRegistered({
-            requestId: intakeRecord.requestId,
-            taskFlowId: existing.flowId,
+            requestId: intakeRequestId,
+            taskFlowId: flow.flowId,
             taskId,
             lastExecutableAction: "attached to existing foreground Cleanup Crew TaskFlow",
             nextExecutableAction: "continue active production run",
@@ -786,7 +803,7 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       taskId: (() => {
         const taskId = ensureForegroundExecutionTask({ flow, ownerKey, sessionKey, now, tracking });
         markOwnerRequestMissionRegistered({
-          requestId: intakeRecord.requestId,
+          requestId: intakeRequestId,
           taskFlowId: flow.flowId,
           taskId,
           lastExecutableAction: "attached to existing foreground Cleanup Crew TaskFlow",
@@ -859,7 +876,7 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
     tracking,
   });
   markOwnerRequestMissionRegistered({
-    requestId: intakeRecord.requestId,
+    requestId: intakeRequestId,
     taskFlowId: dispatchedFlow.flowId,
     taskId,
     lastExecutableAction: "registered foreground Cleanup Crew TaskFlow",

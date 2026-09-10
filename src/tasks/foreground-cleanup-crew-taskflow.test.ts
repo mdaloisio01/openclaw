@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { listOwnerRequestIntakeRecords } from "../agents/owner-request-intake-ledger.js";
+import {
+  createOwnerRequestIntakeRecord,
+  listOwnerRequestIntakeRecords,
+} from "../agents/owner-request-intake-ledger.js";
 import {
   addSubagentRunForTests,
   resetSubagentRegistryForTests,
@@ -242,6 +245,46 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     fs.rmSync(intakeStateDir, { recursive: true, force: true });
   });
 
+  it("settles the existing gateway intake row instead of creating a sibling record", () => {
+    const intakeStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-foreground-intake-"));
+    const existing = createOwnerRequestIntakeRecord({
+      message: "Cleanup Crew production repair build. Execute Packet C.",
+      sourceSessionKey: "webchat:direct:mark",
+      sourceChannel: "webchat",
+      sourceProvider: "openclaw-control-ui",
+      classification: "cleanup_crew_production",
+      expectedDurability: "taskflow_required",
+      status: "server_acknowledged",
+      stateDir: intakeStateDir,
+      nowMs: 900,
+    });
+
+    const result = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build. Execute Packet C.",
+      existingIntakeRequestId: existing.requestId,
+      intakeStateDir,
+      now: 1000,
+    });
+
+    expect(result.status).toBe("registered");
+    if (result.status !== "registered") {
+      throw new Error("expected registered result");
+    }
+    expect(listOwnerRequestIntakeRecords({ stateDir: intakeStateDir })).toMatchObject([
+      {
+        requestId: existing.requestId,
+        status: "mission_registered",
+        sourceProvider: "openclaw-control-ui",
+        taskFlowId: result.flow.flowId,
+        taskId: result.taskId,
+        promptPersistedAtMs: 1000,
+        missionRegisteredAtMs: 1000,
+      },
+    ]);
+    fs.rmSync(intakeStateDir, { recursive: true, force: true });
+  });
+
   it("creates a fresh foreground executor when the previous fixed-run child is lost", () => {
     const first = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: "webchat:direct:mark",
@@ -472,7 +515,8 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     if (laterAttach.status !== "attached") {
       throw new Error("expected attached result");
     }
-    expect(laterAttach.flow.revision).toBe(checkpoint.flow.revision);
+    expect(laterAttach.flow.updatedAt).toBe(2000);
+    expect(laterAttach.flow.revision).toBeGreaterThan(checkpoint.flow.revision);
     expect(getTaskFlowProductionContinuation(laterAttach.flow)).toMatchObject({
       nextExecutableUnitLaunched: true,
     });

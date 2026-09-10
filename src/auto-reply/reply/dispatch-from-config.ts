@@ -1658,6 +1658,7 @@ export async function dispatchReplyFromConfig(
   const cleanupCrewTaskFlowRegistration = ensureForegroundCleanupCrewTaskFlow({
     sessionKey: acpDispatchSessionKey,
     currentTurnText: currentTurnTextForCleanupCrewGuard,
+    existingIntakeRequestId: ctx.OwnerRequestIntakeRequestId,
     authorityPath: "foreground_cleanup_crew_user_instruction",
     authorityBasis: "Foreground Cleanup Crew production mission received through reply dispatch.",
     ownerLane: "Will",
@@ -1952,6 +1953,7 @@ export async function dispatchReplyFromConfig(
         .map((part) => normalizeOptionalString(part))
         .filter(Boolean)
         .join("\n"),
+      existingIntakeRequestId: ctx.OwnerRequestIntakeRequestId,
       authorityPath: "foreground_cleanup_crew_post_report_continuation",
       authorityBasis:
         "Delivered Cleanup Crew report names an open broader build and requires continuation.",
