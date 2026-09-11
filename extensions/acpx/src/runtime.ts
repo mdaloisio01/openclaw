@@ -603,6 +603,10 @@ function appendCodexAcpConfigOverrides(command: string, override: CodexAcpModelO
   return `${command} ${configArgs.map((arg) => `-c ${quoteShellArg(arg)}`).join(" ")}`;
 }
 
+function resolveLaunchLeaseCommand(params: { command: string; stableCommand?: string }): string {
+  return params.stableCommand?.trim() || params.command;
+}
+
 function createModelScopedAgentRegistry(params: {
   agentRegistry: AcpAgentRegistry;
   scope: AsyncLocalStorage<CodexAcpModelOverride | undefined>;
@@ -761,9 +765,13 @@ export class AcpxRuntime implements AcpRuntime {
     if (!launch) {
       return command;
     }
-    launch.stableCommand = command;
-    return withAcpxLeaseEnvironment({
+    const launchCommand = resolveLaunchLeaseCommand({
       command,
+      stableCommand: launch.stableCommand,
+    });
+    launch.stableCommand = launchCommand;
+    return withAcpxLeaseEnvironment({
+      command: launchCommand,
       leaseId: launch.leaseId,
       gatewayInstanceId: launch.gatewayInstanceId,
     });
@@ -1273,6 +1281,7 @@ export const testing = {
   isClaudeAcpCommand,
   isCodexAcpCommand,
   normalizeCodexAcpModelOverride,
+  resolveLaunchLeaseCommand,
 };
 
 export type { AcpAgentRegistry, AcpRuntimeOptions, AcpSessionRecord, AcpSessionStore };

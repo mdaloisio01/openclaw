@@ -1741,6 +1741,20 @@ describe("AcpxRuntime fresh reset wrapper", () => {
     ).toBe("env OPENCLAW_HIDE_BANNER=1 node openclaw.mjs acp --session agent:openclaw:acp:test");
   });
 
+  it("preserves the managed bridge session command when adding launch lease metadata", () => {
+    expect(
+      testing.resolveLaunchLeaseCommand({
+        command: "openclaw acp",
+        stableCommand: "openclaw acp --session agent:openclaw:acp:test",
+      }),
+    ).toBe("openclaw acp --session agent:openclaw:acp:test");
+    expect(
+      testing.resolveLaunchLeaseCommand({
+        command: "openclaw acp",
+      }),
+    ).toBe("openclaw acp");
+  });
+
   it("replaces explicit OpenClaw ACP bridge sessions with the managed session key", () => {
     expect(
       testing.appendOpenClawBridgeSessionArg({
