@@ -252,6 +252,15 @@ function extractInheritedCodexRuntimeConfig(configToml: string): string {
     if (!INHERITED_TOP_LEVEL_CODEX_CONFIG_KEYS.has(key)) {
       continue;
     }
+    if (
+      key === "model_reasoning_effort" &&
+      parseTomlString(semanticLine.slice(semanticLine.indexOf("=") + 1)) === "max"
+    ) {
+      // The pinned Codex ACP adapter embeds Codex 0.133, whose highest effort is xhigh.
+      // A newer user CLI's preference must not make the shared ACP startup probe fail.
+      inheritedLines.push('model_reasoning_effort = "xhigh"');
+      continue;
+    }
     inheritedLines.push(rawLine.trimEnd());
   }
 

@@ -2,8 +2,12 @@
   "base": "4936149d58debdd94ffac123415903830d28a1ee",
   "branch": "phase5-core-test-proof-20260914",
   "repository": "mdaloisio01/openclaw",
-  "diffSha256": "0a3af85549480cf8e732863b30c213305f105174f27d8fe1fa03ef19ae968ed6",
+  "diffSha256": "22aa4fe6f86c7f925fa01fd0e0c1acb1ef3bf99cdb46eb1dcce814b9620a57d0",
   "files": {
+    "extensions/acpx/src/codex-auth-bridge.test.ts": "30eaf2b377f47a43f5f81dd203f5f4f6c6976e11583e6c1cca7d10bcc27a6a87",
+    "extensions/acpx/src/codex-trust-config.ts": "7213bb9aa6b601bb8a26aa85ce40acf1a66779bc431bdf56d92f301618c4f815",
+    "extensions/acpx/src/runtime.test.ts": "1437255b2a777af360c3df58acf744e248597b156f667b8a7782d7533e6871d1",
+    "extensions/acpx/src/service.test.ts": "cdc7209577903bab8036bb12db321ee28033ccef9a13802b9e9709bdb612bd46",
     "scripts/crabbox-wrapper.mjs": "ce27e6e3c31c0116797226ca16943bbacba7dddd19572fb1944a204a45809ab8",
     "scripts/run-tsgo.mjs": "7d816a3e85778947cc1eb0ccd751a7b424d245e3614399b5cc39ffd7b54148b8",
     "src/acp/control-plane/manager.runtime-config.test.ts": "0feb8c88b6f090b43fcba56f1dfd06775d9559084dfafb4884a912834f842a08",
@@ -40,7 +44,7 @@
     ".github/phase5-validation/supervisor_test.py",
     ".github/workflows/phase5-core-test-proof.yml"
   ],
-  "sourceTree": "0e9250a2df00c949760597c22724050f9bb094b2",
+  "sourceTree": "c1b1e3c4cdd1f5790d6955ea7bde29bea08e9358",
   "publication": "History-free source snapshot; original base is provenance only, never fetched remotely.",
   "originalNineFileDiffSha256": "b827f0f6b9d35c3584052fe94fd824f4a3d8dac5567b20b03fd03d2510e264da",
   "testFiles": [
@@ -58,6 +62,9 @@
     "src/governance/sop-enforcement-adversarial-validation.test.ts",
     "src/infra/activation-continuation.test.ts",
     "src/tasks/task-delivery-remediation.test.ts",
-    "src/tasks/task-flow-registry.test.ts"
+    "src/tasks/task-flow-registry.test.ts",
+    "extensions/acpx/src/codex-auth-bridge.test.ts",
+    "extensions/acpx/src/service.test.ts",
+    "extensions/acpx/src/runtime.test.ts"
   ]
 }

@@ -459,6 +459,33 @@ describe("prepareAcpxCodexAuthConfig", () => {
     expect(launched.codexHome).toBeNull();
   });
 
+  it.each([
+    ['model_reasoning_effort = "max"', "xhigh"],
+    ["model_reasoning_effort = 'max' # newer CLI preference", "xhigh"],
+    ['model_reasoning_effort = "high"', "high"],
+  ])("renders a supported isolated ACP effort from %s", async (sourceEffort, expectedEffort) => {
+    const root = await makeTempDir();
+    const sourceCodexHome = path.join(root, "source-codex");
+    const sourceConfigPath = path.join(sourceCodexHome, "config.toml");
+    const sourceConfig = `${sourceEffort}\nsandbox_mode = "read-only"\n`;
+    await fs.mkdir(sourceCodexHome, { recursive: true });
+    await fs.writeFile(sourceConfigPath, sourceConfig);
+    process.env.CODEX_HOME = sourceCodexHome;
+    const stateDir = path.join(root, "state");
+
+    await prepareAcpxCodexAuthConfig({
+      pluginConfig: resolveAcpxPluginConfig({ rawConfig: {}, workspaceDir: root }),
+      stateDir,
+      resolveInstalledCodexAcpBinPath: async () => undefined,
+      resolveInstalledClaudeAcpBinPath: async () => undefined,
+    });
+
+    const isolatedConfig = await fs.readFile(generatedCodexPaths(stateDir).configPath, "utf8");
+    expect(isolatedConfig).toContain(`model_reasoning_effort = "${expectedEffort}"`);
+    expect(isolatedConfig).toContain('sandbox_mode = "read-only"');
+    expect(await fs.readFile(sourceConfigPath, "utf8")).toBe(sourceConfig);
+  });
+
   it("does not copy source Codex auth", async () => {
     const root = await makeTempDir();
     const sourceCodexHome = path.join(root, "source-codex");

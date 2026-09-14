@@ -271,7 +271,7 @@ def child(out):
 
 
 def run(mode, out):
-    require(mode in ("preflight", "core", "core-test", "tests"), "Unsupported mode")
+    require(mode in ("preflight", "core", "core-test", "extensions", "tests"), "Unsupported mode")
     full = mode != "preflight"
     prefix = "test" if mode == "tests" else "compiler"
     manifest = json.loads(Path(__file__).with_name("candidate.json").read_text())
@@ -307,7 +307,10 @@ def run(mode, out):
         environment.update({"CI": "true" if remote else "false", "GITHUB_ACTIONS": "true" if remote else "false"})
         node = shutil.which("node")
         require(node is not None, "Node executable missing")
-        project = "tsconfig.core.json" if mode == "core" else "test/tsconfig/tsconfig.core.test.json"
+        project = {
+            "core": "tsconfig.core.json",
+            "extensions": "tsconfig.extensions.json",
+        }.get(mode, "test/tsconfig/tsconfig.core.test.json")
         args = ["-p", project, "--incremental", "--tsBuildInfoFile", str(out / (mode + ".tsbuildinfo"))]
         # The inspected helper only defines functions at import. Never import
         # run-tsgo.mjs here: it launches compilation at module top level.
@@ -436,7 +439,7 @@ process.stdout.write(JSON.stringify(applyLocalTsgoPolicy(JSON.parse(process.argv
 
 
 if __name__ == "__main__":
-    require(len(sys.argv) == 3, "Usage: supervisor.py preflight|core|core-test|tests|child OUTPUT")
+    require(len(sys.argv) == 3, "Usage: supervisor.py preflight|core|core-test|extensions|tests|child OUTPUT")
     output = Path(sys.argv[2]).resolve()
     if sys.argv[1] == "child":
         child(output)
