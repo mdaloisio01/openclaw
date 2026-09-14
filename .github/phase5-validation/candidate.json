@@ -2,7 +2,7 @@
   "base": "4936149d58debdd94ffac123415903830d28a1ee",
   "branch": "phase5-core-test-proof-20260914",
   "repository": "mdaloisio01/openclaw",
-  "diffSha256": "22aa4fe6f86c7f925fa01fd0e0c1acb1ef3bf99cdb46eb1dcce814b9620a57d0",
+  "diffSha256": "6b18b95baf9b0cfc1f65394d911e72cb76e5d82b5fae6844b7329407e13e2dd9",
   "files": {
     "extensions/acpx/src/codex-auth-bridge.test.ts": "30eaf2b377f47a43f5f81dd203f5f4f6c6976e11583e6c1cca7d10bcc27a6a87",
     "extensions/acpx/src/codex-trust-config.ts": "7213bb9aa6b601bb8a26aa85ce40acf1a66779bc431bdf56d92f301618c4f815",
@@ -15,7 +15,12 @@
     "src/acp/translator.session-setup.test.ts": "287bdc050ad53b66ad80ae749226b2e942d7f63ae74fbdb31e7bd699807cda5c",
     "src/acp/translator.ts": "0f40d6c8e67ba4231ed89c0efa88606e17ae6a8550c7dbc08be5b78d699415f4",
     "src/agents/embedded-agent-subscribe.handlers.tools.test.ts": "01f0074a6f94037db4925b3ef50b9f9efbbdbdb7db23e0d44f9a7107521b3753",
+    "src/agents/source-turn-delivery-state.test.ts": "c8c52bf8c39c6fac6b227ad7a0cc3e0d371afa13226be297243a7f5cb339e631",
+    "src/agents/source-turn-delivery-store.test.ts": "db93853b641ba47ee96b5af7b21e662f119a8479aa718b2f9e1a635c19c20726",
+    "src/agents/source-turn-delivery-store.ts": "16907872b0f9ff90ef1018231f5c8f3ebd53caac64524cb96062d584ccb1ba5d",
+    "src/agents/subagent-announce-delivery.test.ts": "cfa0e7a9d025870695c7d7888e661f2be10fc5040517087d995c0bc4eefb74bd",
     "src/agents/tools/sessions-spawn-tool.test.ts": "3878604ce02b9582482d73c8bba9c656876f7ed251a57b3126c708988ff938a0",
+    "src/auto-reply/reply/dispatch-from-config.reply-dispatch.test.ts": "fbdfc4a8c10055852480dcab8901246cbdeced93add435c738cf9b160aefddcb",
     "src/commands/sessions.acp-model-display.test.ts": "61b38cc079fd017bd289e20472edde71b2db7c69813322c85f8cac6e425200bf",
     "src/commands/sessions.ts": "553f69d1b772287059e224519733b2a9abeb645d44d8ad199bf54a5f974574ac",
     "src/crestodian/operations.test.ts": "c4272b8ee81f5e6348e7f298e8746498e4643f90203a595d7fb72a8b4be1a90c",
@@ -44,7 +49,7 @@
     ".github/phase5-validation/supervisor_test.py",
     ".github/workflows/phase5-core-test-proof.yml"
   ],
-  "sourceTree": "c1b1e3c4cdd1f5790d6955ea7bde29bea08e9358",
+  "sourceTree": "ed9070397e37993890ed941d5d9c600eef5da727",
   "publication": "History-free source snapshot; original base is provenance only, never fetched remotely.",
   "originalNineFileDiffSha256": "b827f0f6b9d35c3584052fe94fd824f4a3d8dac5567b20b03fd03d2510e264da",
   "testFiles": [
@@ -65,6 +70,10 @@
     "src/tasks/task-flow-registry.test.ts",
     "extensions/acpx/src/codex-auth-bridge.test.ts",
     "extensions/acpx/src/service.test.ts",
-    "extensions/acpx/src/runtime.test.ts"
+    "extensions/acpx/src/runtime.test.ts",
+    "src/agents/source-turn-delivery-store.test.ts",
+    "src/agents/source-turn-delivery-state.test.ts",
+    "src/agents/subagent-announce-delivery.test.ts",
+    "src/auto-reply/reply/dispatch-from-config.reply-dispatch.test.ts"
   ]
 }

@@ -1,7 +1,10 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import fs, { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { setTimeout } from "node:timers/promises";
+import { acquireFileLock } from "@openclaw/fs-safe/file-lock";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildSourceTurnDeliveryObligationKey,
   classifySourceTurnDeliveryWatchdogStatus,
@@ -78,6 +81,99 @@ describe("source turn delivery storage adapter", () => {
         threadId: "42",
       },
     });
+  });
+
+  it("preserves every obligation when deliveries update the registry concurrently", async () => {
+    const ids = Array.from({ length: 8 }, (_, index) => `source:main:concurrent-${index}`);
+    const written = await Promise.all(
+      ids.map((id) => persistSourceTurnDeliveryState({ registryPath, id, facts: {} })),
+    );
+
+    const registry = await loadSourceTurnDeliveryRegistry(registryPath);
+    expect(registry.rows.map((row) => row.id).toSorted()).toEqual(ids.toSorted());
+    expect(registry.rows).toEqual(expect.arrayContaining(written));
+  });
+
+  it.each(["EPERM", "EEXIST"])(
+    "preserves the existing registry when rename fails with %s",
+    async (code) => {
+      const original = await persistSourceTurnDeliveryState({
+        registryPath,
+        id: "existing-obligation",
+        facts: {},
+      });
+      const originalBytes = await readFile(registryPath, "utf8");
+      const failure = Object.assign(new Error("rename denied"), { code });
+      const rename = vi.spyOn(fs, "rename").mockRejectedValue(failure);
+      try {
+        await expect(
+          persistSourceTurnDeliveryState({ registryPath, id: "new-obligation", facts: {} }),
+        ).rejects.toBe(failure);
+      } finally {
+        rename.mockRestore();
+      }
+      expect(await readFile(registryPath, "utf8")).toBe(originalBytes);
+      expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [original] });
+    },
+  );
+
+  it("keeps abandoned locks intact when concurrent writers request recovery", async () => {
+    const owner = spawnSync(process.execPath, ["-e", ""], { timeout: 5_000 });
+    expect(owner.status).toBe(0);
+    expect(owner.pid).toBeGreaterThan(0);
+    const abandonedLock = JSON.stringify({ pid: owner.pid, createdAt: new Date().toISOString() });
+    await writeFile(`${registryPath}.lock`, abandonedLock);
+    const attempts = await Promise.allSettled(
+      Array.from({ length: 8 }, (_, index) =>
+        persistSourceTurnDeliveryState({ registryPath, id: `after-crash-${index}`, facts: {} }),
+      ),
+    );
+
+    expect(attempts).toEqual(
+      Array.from({ length: 8 }, () => ({
+        status: "rejected",
+        reason: expect.objectContaining({ code: "file_lock_stale" }),
+      })),
+    );
+    expect(await readFile(`${registryPath}.lock`, "utf8")).toBe(abandonedLock);
+    expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [] });
+  });
+
+  it.skipIf(process.platform === "win32").each([0o700, 0o1777, 0o2770])(
+    "preserves directory mode %o during atomic replacement",
+    async (mode) => {
+      await chmod(tempDir, mode);
+      expect((await stat(tempDir)).mode & 0o7777).toBe(mode);
+      const backupPath = join(tempDir, "previous-registry.json");
+      await writeFile(backupPath, "private delivery history", { mode: 0o664 });
+      await persistSourceTurnDeliveryState({ registryPath, id: "private-delivery", facts: {} });
+      expect((await stat(tempDir)).mode & 0o7777).toBe(mode);
+      expect(await readFile(backupPath, "utf8")).toBe("private delivery history");
+    },
+  );
+
+  it("waits for a live writer even when its lock timestamp is old", async () => {
+    const holder = await acquireFileLock(registryPath, {
+      managerKey: "source-delivery-test-holder",
+      payload: () => ({ pid: process.pid, createdAt: new Date(0).toISOString() }),
+    });
+    const update = persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:after-live-writer",
+      facts: {},
+    }).then(
+      (row) => ({ row }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await setTimeout(25);
+      expect(JSON.parse(await readFile(holder.lockPath, "utf8"))).toMatchObject({
+        pid: process.pid,
+      });
+    } finally {
+      await holder.release();
+    }
+    expect(await update).toMatchObject({ row: { id: "source:main:after-live-writer" } });
   });
 
   it("keys governed report delivery obligations by mission, run, report, delivery, and generation", async () => {
