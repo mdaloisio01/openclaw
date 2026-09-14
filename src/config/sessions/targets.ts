@@ -435,8 +435,8 @@ export function resolveSessionStoreTargets(
   }
 
   if (hasAgent) {
-    const knownAgents = listAgentIds(cfg);
     const requested = normalizeAgentId(opts.agent ?? "");
+    const knownAgents = listConfiguredSessionStoreAgentIds(cfg);
     if (!knownAgents.includes(requested)) {
       throw new Error(
         `Unknown agent id "${opts.agent}". Use "openclaw agents list" to see configured agents.`,

@@ -308,6 +308,64 @@ describe("gateway server agent", () => {
     expect(call.sessionId).toBe("sess-ops");
   });
 
+  test("agent preserves ACP session key owner when agentId is omitted", async () => {
+    const sessionKey = "agent:openclaw:acp:phase5";
+    await setTestSessionStore({
+      agentId: "openclaw",
+      entries: {
+        [sessionKey]: {
+          sessionId: "sess-openclaw-acp",
+          updatedAt: Date.now(),
+        },
+      },
+    });
+    testState.agentsConfig = {
+      list: [{ id: "main", default: true }, { id: "openclaw" }],
+    };
+
+    const res = await rpcReq(ws, "agent", {
+      message: "Return the bounded acknowledgement schema",
+      sessionKey,
+      acpTurnSource: "manual_spawn",
+      idempotencyKey: "idem-openclaw-acp-owner",
+    });
+    expect(res.ok).toBe(true);
+
+    const call = await waitForAgentCommandCall("idem-openclaw-acp-owner");
+    expect(call.sessionKey).toBe(sessionKey);
+    expect(call.sessionId).toBe("sess-openclaw-acp");
+    expect(call.agentId).toBe("openclaw");
+  });
+
+  test("agent accepts ACP harness owner even when it is not a configured chat agent", async () => {
+    const sessionKey = "agent:openclaw:acp:phase5";
+    await setTestSessionStore({
+      agentId: "openclaw",
+      entries: {
+        [sessionKey]: {
+          sessionId: "sess-openclaw-acp",
+          updatedAt: Date.now(),
+        },
+      },
+    });
+    testState.agentsConfig = {
+      list: [{ id: "main", default: true }],
+    };
+
+    const res = await rpcReq(ws, "agent", {
+      message: "Return the bounded acknowledgement schema",
+      sessionKey,
+      acpTurnSource: "manual_spawn",
+      idempotencyKey: "idem-openclaw-acp-harness-owner",
+    });
+    expect(res.ok).toBe(true);
+
+    const call = await waitForAgentCommandCall("idem-openclaw-acp-harness-owner");
+    expect(call.sessionKey).toBe(sessionKey);
+    expect(call.sessionId).toBe("sess-openclaw-acp");
+    expect(call.agentId).toBe("openclaw");
+  });
+
   test("agent rejects unknown reply channel", async () => {
     const res = await rpcReq(ws, "agent", {
       message: "hi",

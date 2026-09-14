@@ -181,6 +181,27 @@ describe("resolveSessionStoreTargets", () => {
     expect(() => resolveSessionStoreTargets(cfg, { agent: "ghost" })).toThrow(/Unknown agent id/);
   });
 
+  it("resolves explicitly allowed ACP harness ids even when they are not chat agents", () => {
+    const cfg: OpenClawConfig = {
+      acp: {
+        allowedAgents: ["openclaw"],
+      },
+      session: {
+        store: "/tmp/openclaw-test/agents/{agentId}/sessions/sessions.json",
+      },
+      agents: {
+        list: [{ id: "main", default: true }],
+      },
+    };
+
+    expect(resolveSessionStoreTargets(cfg, { agent: "openclaw" })).toEqual([
+      {
+        agentId: "openclaw",
+        storePath: path.resolve("/tmp/openclaw-test/agents/openclaw/sessions/sessions.json"),
+      },
+    ]);
+  });
+
   it("rejects conflicting selectors", () => {
     expect(() => resolveSessionStoreTargets({}, { agent: "main", allAgents: true })).toThrow(
       /cannot be used together/i,
