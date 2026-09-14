@@ -776,7 +776,7 @@ describe("handleToolExecutionEnd timeout metadata", () => {
     const stateDir = await useTempStateDir();
     const { ctx } = createTestContext();
     ctx.state.toolMetaById.set("tool-exec-erofs", {
-      toolName: "exec",
+      mutatingAction: true,
       meta: "build",
     });
 
@@ -822,7 +822,7 @@ describe("handleToolExecutionEnd timeout metadata", () => {
     const stateDir = await useTempStateDir();
     const { ctx } = createTestContext();
     ctx.state.toolMetaById.set("tool-exec-search", {
-      toolName: "exec",
+      mutatingAction: false,
       meta: "search source",
     });
 

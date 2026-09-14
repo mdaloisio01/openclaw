@@ -1156,7 +1156,10 @@ describe("AcpSessionManager", () => {
     hoisted.readAcpSessionEntryMock.mockImplementation(() => entry);
     hoisted.upsertAcpSessionMetaMock.mockImplementation(async (paramsUnknown: unknown) => {
       const params = paramsUnknown as {
-        mutate: (current: unknown, entry: { acp?: unknown } | undefined) => unknown;
+        mutate: (
+          current: unknown,
+          entry: { acp?: unknown } | undefined,
+        ) => SessionAcpMeta | null | undefined;
       };
       const next = params.mutate(entry.acp, entry);
       if (next === null) {
@@ -1283,7 +1286,10 @@ describe("AcpSessionManager", () => {
     hoisted.readAcpSessionEntryMock.mockImplementation(() => entry);
     hoisted.upsertAcpSessionMetaMock.mockImplementation(async (paramsUnknown: unknown) => {
       const params = paramsUnknown as {
-        mutate: (current: unknown, entry: { acp?: unknown } | undefined) => unknown;
+        mutate: (
+          current: unknown,
+          entry: { acp?: unknown } | undefined,
+        ) => SessionAcpMeta | null | undefined;
       };
       const next = params.mutate(entry.acp, entry);
       if (next === null) {

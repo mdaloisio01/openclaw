@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Temporary, single-check supervisor. Full compilation is GitHub-only."""
+"""Temporary, single-check supervisor. Compilation and test runs are GitHub-only."""
 from pathlib import Path
 from datetime import datetime, timezone
 import hashlib
@@ -34,7 +34,7 @@ ENV_KEYS = tuple(SETTINGS) + (
     "GODEBUG", "GOTRACEBACK", "OPENCLAW_TSGO_PPROF_DIR", "OPENCLAW_TSGO_HEAVY_CHECK_LOCK_HELD",
     "OPENCLAW_HEAVY_CHECK_LOCK_TIMEOUT_MS", "OPENCLAW_HEAVY_CHECK_LOCK_POLL_MS",
     "OPENCLAW_HEAVY_CHECK_LOCK_PROGRESS_MS", "OPENCLAW_HEAVY_CHECK_STALE_LOCK_MS",
-    "OPENCLAW_HEAVY_CHECK_LOCK_SCOPE", "CI", "GITHUB_ACTIONS",
+    "OPENCLAW_HEAVY_CHECK_LOCK_SCOPE", "OPENCLAW_VITEST_MAX_WORKERS", "CI", "GITHUB_ACTIONS",
 )
 
 
@@ -164,7 +164,7 @@ def guard(current, previous, streak, elapsed):
     elif streak >= 5:
         reason = "New full-memory stalls exceeded 1% in five consecutive intervals"
     elif elapsed > 900:
-        reason = "15-minute compiler deadline"
+        reason = "15-minute check deadline"
     return reason, streak, {"intervalSeconds": interval, "fullStallDeltaUs": delta, "fullStallPercent": percent}
 
 
@@ -235,8 +235,20 @@ def classify_compiler(code, log):
     return result
 
 
+def classify_tests(code):
+    result = {"wrapperExitCode": code}
+    if code < 0 or code >= 128:
+        result.update(result="INTERRUPTED", reason="Test runner terminated abnormally")
+    elif code == 0:
+        result.update(result="PASS", reason="All selected tests completed successfully")
+    else:
+        result.update(result="TEST_FAILURE", reason="Test command failed; inspect test.log for the cause")
+    return result
+
+
 def child(out):
     contract = json.loads((out / "launch.json").read_text())
+    prefix = "test" if contract["mode"] == "tests" else "compiler"
     os.environ.clear()
     os.environ.update(contract["environment"])
     signal.alarm(925 if contract["mode"] != "preflight" else 23)
@@ -248,10 +260,10 @@ def child(out):
     while not (out / "release.json").exists():
         time.sleep(0.02)
     if contract["mode"] != "preflight":
-        save(out, "compiler-started.json", {"at": now(), "command": contract["command"]})
-        with (out / "compiler.log").open("w") as log:
+        save(out, prefix + "-started.json", {"at": now(), "command": contract["command"]})
+        with (out / (prefix + ".log")).open("w") as log:
             result = subprocess.run(contract["command"], stdout=log, stderr=subprocess.STDOUT)
-        save(out, "compiler-result.json", {"at": now(), "wrapperExitCode": result.returncode})
+        save(out, prefix + "-result.json", {"at": now(), "wrapperExitCode": result.returncode})
     # Keep the unit alive so the independent supervisor can capture terminal
     # memory/events before systemd removes the cgroup, even after normal exit.
     while True:
@@ -259,14 +271,15 @@ def child(out):
 
 
 def run(mode, out):
-    require(mode in ("preflight", "core", "core-test"), "Unsupported mode")
+    require(mode in ("preflight", "core", "core-test", "tests"), "Unsupported mode")
     full = mode != "preflight"
+    prefix = "test" if mode == "tests" else "compiler"
     manifest = json.loads(Path(__file__).with_name("candidate.json").read_text())
     if full:
         require(os.environ.get("GITHUB_ACTIONS") == "true"
                 and os.environ.get("GITHUB_REPOSITORY") == manifest["repository"],
-                "Full compilation is restricted to the approved GitHub repository")
-        require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "Automatic compiler reruns are disabled")
+                "Checks are restricted to the approved GitHub repository")
+        require(os.environ.get("GITHUB_RUN_ATTEMPT") == "1", "Automatic workflow reruns are disabled")
     out.mkdir(mode=0o700, parents=True)
     unit = "phase5-check-" + str(os.getpid())
     remote = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -322,6 +335,13 @@ process.stdout.write(JSON.stringify(applyLocalTsgoPolicy(JSON.parse(process.argv
             "lockDefaults": {"waitMs": 600000, "pollMs": 500, "progressMs": 15000, "staleMs": 30000},
             "gatewayHealth": "not applicable to isolated compiler; no production Gateway contacted",
         }
+        if mode == "tests":
+            files = manifest["testFiles"]
+            require(files and all(p in manifest["files"] and p.endswith(".test.ts") for p in files),
+                    "Tests must be explicit candidate test files")
+            environment.update({"NODE_OPTIONS": "--max-old-space-size=4096", "OPENCLAW_VITEST_MAX_WORKERS": "1"})
+            contract["command"] = [node, "scripts/run-vitest.mjs", "run", *files, "--maxWorkers=1"]
+            contract["identity"]["actualNativeLaunch"] = "not applicable: test runner only"
         save(out, "launch.json", contract)
         properties = [
             "WorkingDirectory=" + str(Path.cwd()), "MemoryMax=7G", "MemoryHigh=7G",
@@ -348,7 +368,7 @@ process.stdout.write(JSON.stringify(applyLocalTsgoPolicy(JSON.parse(process.argv
         verify_separation(baseline)
         require(ready["nice"] >= 10, "Child priority cap differs")
         require(baseline["MemAvailable"] >= CAP + RESERVE, "Capacity changed before release")
-        require(not (out / "compiler-started.json").exists(), "Compiler started before readiness proof")
+        require(not (out / (prefix + "-started.json")).exists(), "Check started before readiness proof")
         save(out, "separation.json", {"verified": True, "monitorCgroup": str(cgroup(os.getpid())), "childCgroup": str(child_cg)})
         save(out, "release.json", {"at": now(), "separationVerified": True})
         released = time.monotonic()
@@ -368,13 +388,13 @@ process.stdout.write(JSON.stringify(applyLocalTsgoPolicy(JSON.parse(process.argv
                 if not full:
                     result = {"result": "PREFLIGHT_PASS", "reason": "Independent monitoring and gated harmless child verified"}
                     break
-                if (out / "compiler-result.json").exists():
-                    code = json.loads((out / "compiler-result.json").read_text())["wrapperExitCode"]
-                    result = classify_compiler(code, (out / "compiler.log").read_text(errors="replace"))
+                if (out / (prefix + "-result.json")).exists():
+                    code = json.loads((out / (prefix + "-result.json")).read_text())["wrapperExitCode"]
+                    result = classify_tests(code) if mode == "tests" else classify_compiler(code, (out / "compiler.log").read_text(errors="replace"))
                     verify_candidate(manifest, True)
                     break
                 if launcher.poll() is not None:
-                    result = {"result": "INTERRUPTED", "reason": "Restricted unit exited before compiler verdict", "launcherExitCode": launcher.returncode}
+                    result = {"result": "INTERRUPTED", "reason": "Restricted unit exited before check verdict", "launcherExitCode": launcher.returncode}
                     break
     except Exception as error:
         result = {"result": "INTERRUPTED", "reason": str(error), "errorType": type(error).__name__}
@@ -408,6 +428,7 @@ process.stdout.write(JSON.stringify(applyLocalTsgoPolicy(JSON.parse(process.argv
         except Exception as error:
             result = {"result": "INTERRUPTED", "reason": "Cleanup/evidence failure: " + str(error), "priorResult": result}
         result.update({"at": now(), "compilerStarted": (out / "compiler-started.json").exists(),
+                       "testsStarted": (out / "test-started.json").exists(),
                        "releasedAtMonotonic": released, "candidateDiffSha256": manifest["diffSha256"]})
         save(out, "result.json", result)
         print(json.dumps(result), flush=True)
@@ -415,7 +436,7 @@ process.stdout.write(JSON.stringify(applyLocalTsgoPolicy(JSON.parse(process.argv
 
 
 if __name__ == "__main__":
-    require(len(sys.argv) == 3, "Usage: supervisor.py preflight|core|core-test|child OUTPUT")
+    require(len(sys.argv) == 3, "Usage: supervisor.py preflight|core|core-test|tests|child OUTPUT")
     output = Path(sys.argv[2]).resolve()
     if sys.argv[1] == "child":
         child(output)

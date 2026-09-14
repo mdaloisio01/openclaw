@@ -228,10 +228,12 @@ describe("AcpSessionManager runtime config", () => {
       mode: "oneshot",
     });
 
-    expectRecordFields(currentMeta?.identity, {
-      state: "pending",
-      acpxSessionId: "acpx-oneshot",
-      source: "ensure",
+    expect(currentMeta).toMatchObject({
+      identity: {
+        state: "pending",
+        acpxSessionId: "acpx-oneshot",
+        source: "ensure",
+      },
     });
 
     await manager.runTurn({
@@ -251,11 +253,13 @@ describe("AcpSessionManager runtime config", () => {
       backendSessionId: "acpx-oneshot",
       agentSessionId: "agent-oneshot",
     });
-    expectRecordFields(currentMeta?.identity, {
-      state: "resolved",
-      acpxSessionId: "acpx-oneshot",
-      agentSessionId: "agent-oneshot",
-      source: "status",
+    expect(currentMeta).toMatchObject({
+      identity: {
+        state: "resolved",
+        acpxSessionId: "acpx-oneshot",
+        agentSessionId: "agent-oneshot",
+        source: "status",
+      },
     });
   });
 
@@ -660,7 +664,10 @@ describe("AcpSessionManager runtime config", () => {
     hoisted.readAcpSessionEntryMock.mockImplementation(() => currentEntry);
     hoisted.upsertAcpSessionMetaMock.mockImplementation((paramsUnknown: unknown) => {
       const params = paramsUnknown as {
-        mutate: (current: unknown, entry: { acp?: unknown } | undefined) => unknown;
+        mutate: (
+          current: unknown,
+          entry: { acp?: unknown } | undefined,
+        ) => SessionAcpMeta | null | undefined;
       };
       const nextMeta = params.mutate(currentEntry.acp, currentEntry);
       if (nextMeta === null) {

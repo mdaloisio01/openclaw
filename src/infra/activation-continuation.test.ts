@@ -169,6 +169,8 @@ describe("activation restart continuations", () => {
   });
 
   it("keeps visible delivery proof separate from delivery route proof", async () => {
+    // Exercise the existing normalizer with an untyped delivery label from an external caller.
+    const rawRequiredChecks: unknown = ["visible_delivery", "delivery route is configured"];
     const record = await persistActivationContinuationBeforeRestart(
       {
         id: "activation-visible-proof",
@@ -176,7 +178,7 @@ describe("activation restart continuations", () => {
         route: { sessionKey: "main" },
         objective: "activate patched gateway",
         expectedRuntime: { commit: "abc" },
-        requiredChecks: ["visible_delivery", "delivery route is configured"],
+        requiredChecks: rawRequiredChecks as ActivationContinuationCheckName[],
       },
       { stateDir },
     );

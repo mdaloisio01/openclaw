@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { describe, expect, it } from "vitest";
 import {
   GOVERNED_REQUIRED_RECEIPT_KINDS,
@@ -94,10 +95,12 @@ describe("governed operator override workflow", () => {
         expectedFlowRevision: 7,
       },
     });
-    expect(decision.patch.stateJson[GOVERNED_MISSION_TASKFLOW_STATE_KEY]).toMatchObject({
-      currentGovernedState: "GOVERNED_MISSION_PENDING_OVERRIDE",
-      currentStep: "operator_override_pending",
-      overrideRef: { overrideId: "override-19-1", status: "pending" },
+    expect(decision.patch.stateJson).toMatchObject({
+      [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
+        currentGovernedState: "GOVERNED_MISSION_PENDING_OVERRIDE",
+        currentStep: "operator_override_pending",
+        overrideRef: { overrideId: "override-19-1", status: "pending" },
+      },
     });
   });
 
@@ -128,6 +131,7 @@ describe("governed operator override workflow", () => {
         },
       },
     });
+    assert(decision.decision === "approved");
     expect(decision.override.prohibitedClasses).toEqual(
       expect.arrayContaining([
         "expand_os_authority",
@@ -138,14 +142,16 @@ describe("governed operator override workflow", () => {
         "bypass_release_gate",
       ]),
     );
-    expect(decision.patch.stateJson[GOVERNED_MISSION_TASKFLOW_STATE_KEY]).toMatchObject({
-      currentGovernedState: "GOVERNED_MISSION_ACTIVE",
-      currentStep: "operator_override_approved",
-      overrideRef: { overrideId: "override-19-1", status: "approved" },
-    });
-    expect(decision.patch.stateJson.governedOperatorOverrideWorkflow).toMatchObject({
-      decision: "approved",
-      receiptRef: decision.receipt.receiptId,
+    expect(decision.patch.stateJson).toMatchObject({
+      [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
+        currentGovernedState: "GOVERNED_MISSION_ACTIVE",
+        currentStep: "operator_override_approved",
+        overrideRef: { overrideId: "override-19-1", status: "approved" },
+      },
+      governedOperatorOverrideWorkflow: {
+        decision: "approved",
+        receiptRef: decision.receipt.receiptId,
+      },
     });
   });
 
@@ -168,10 +174,12 @@ describe("governed operator override workflow", () => {
         overrideId: "override-19-1",
       },
     });
-    expect(decision.patch.stateJson[GOVERNED_MISSION_TASKFLOW_STATE_KEY]).toMatchObject({
-      currentGovernedState: "GOVERNED_MISSION_ACTIVE",
-      currentStep: "operator_override_denied",
-      overrideRef: { overrideId: "override-19-1", status: "denied" },
+    expect(decision.patch.stateJson).toMatchObject({
+      [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
+        currentGovernedState: "GOVERNED_MISSION_ACTIVE",
+        currentStep: "operator_override_denied",
+        overrideRef: { overrideId: "override-19-1", status: "denied" },
+      },
     });
   });
 

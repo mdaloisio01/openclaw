@@ -33,7 +33,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "source-revision-1",
   runtimeBuildSha256: "runtime-build-sha",
   policyVersion: "policy-v1",
-  mode: "production",
+  mode: "enforce",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_RECEIPT_KINDS],
   createdAt: "2026-08-22T04:50:00Z",

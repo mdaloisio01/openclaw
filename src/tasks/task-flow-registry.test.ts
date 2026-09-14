@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveMissionSettlementTail } from "../agents/mission-settlement-tail.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -787,7 +788,7 @@ describe("task-flow-registry", () => {
         currentStep: "attempted_close",
       });
 
-      expect(closed.applied).toBe(false);
+      assert(closed.applied === false);
       expect(closed.reason).toBe("guard_blocked");
       expect(closed.blockedSummary).toContain("Mission settlement tail is not settled");
       expect(closed.blockedSummary).toContain("DELIVERY_UNKNOWN");
@@ -851,7 +852,7 @@ describe("task-flow-registry", () => {
         reason: "whole_run_complete",
       });
 
-      expect(stopped.applied).toBe(false);
+      assert(stopped.applied === false);
       expect(stopped.reason).toBe("guard_blocked");
       expect(stopped.blockedSummary).toContain("Mission settlement tail is not settled");
       expect(stopped.blockedSummary).toContain("DELIVERY_FAILED");

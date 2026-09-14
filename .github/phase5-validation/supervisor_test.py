@@ -69,6 +69,12 @@ class GuardTests(unittest.TestCase):
             self.assertEqual(supervisor.classify_compiler(2, "error TS2322: example\n" + crash)["result"], "INTERRUPTED")
         self.assertEqual(supervisor.classify_compiler(0, "")["result"], "PASS")
 
+    def test_test_runner_results_are_separate_from_compiler_results(self):
+        self.assertEqual(supervisor.classify_tests(0)["result"], "PASS")
+        self.assertEqual(supervisor.classify_tests(1)["result"], "TEST_FAILURE")
+        for code in (-9, -15, 137, 143):
+            self.assertEqual(supervisor.classify_tests(code)["result"], "INTERRUPTED")
+
     def test_wrapper_preserves_harmless_child_outcome(self):
         wrapper = Path(__file__).resolve().parents[2] / "scripts/run-tsgo.mjs"
         # Temporary fake executable: neither the installed compiler nor a project
