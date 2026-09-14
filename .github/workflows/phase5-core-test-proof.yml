@@ -1,0 +1,81 @@
+name: Phase 5 core-test proof
+
+on:
+  push:
+    branches: [phase5-core-test-proof-20260914]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase5-core-test-proof
+  cancel-in-progress: false
+
+jobs:
+  core-test:
+    if: github.repository == 'mdaloisio01/openclaw' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - name: Check out the testing snapshot
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the pinned Node and pnpm
+        timeout-minutes: 5
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "22.22.0"
+          install-bun: "false"
+          install-deps: "false"
+          use-actions-cache: "false"
+          save-actions-cache: "false"
+
+      - name: Install the frozen dependencies
+        timeout-minutes: 12
+        shell: bash
+        env:
+          CI: "true"
+        run: pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+
+      - name: Verify the supervisor rules
+        run: python3 -I -B .github/phase5-validation/supervisor_test.py
+
+      - name: Run the full production check with independent supervision
+        timeout-minutes: 17
+        shell: bash
+        run: python3 -I -B .github/phase5-validation/supervisor.py core "$RUNNER_TEMP/phase5-core"
+
+      - name: Run the full core-test check with independent supervision
+        timeout-minutes: 17
+        shell: bash
+        run: python3 -I -B .github/phase5-validation/supervisor.py core-test "$RUNNER_TEMP/phase5-core-test"
+
+      - name: Preserve the result and measurements in job logs
+        if: always()
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os
+          for mode in ('core', 'core-test'):
+              out = Path(os.environ['RUNNER_TEMP']) / ('phase5-' + mode)
+              if not out.exists():
+                  print(mode + ': compiler not started because an earlier step failed.')
+                  continue
+              for p in sorted(out.iterdir()):
+                  if p.suffix not in ('.json', '.jsonl', '.log'):
+                      continue
+                  print('::group::' + mode + '/' + p.name, flush=True)
+                  print(p.read_text(errors='replace'), flush=True)
+                  print('::endgroup::', flush=True)
+              result = out / 'result.json'
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+                  if result.exists():
+                      summary.write(mode + ' full check result\n\n```json\n' + result.read_text() + '\n```\n')
+                  else:
+                      summary.write('INTERRUPTED: supervisor result is missing; inspect the retained measurements.\n')
+          PY

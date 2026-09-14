@@ -1,0 +1,15 @@
+[Unit]
+Description=OpenClaw Production Outage Monitor
+Documentation=https://docs.openclaw.ai/
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env node %h/openclaw-source/scripts/openclaw-production-monitor.mjs
+Environment=OPENCLAW_MONITOR_PREVIOUS_BACKUP_MAX=5
+Environment=OPENCLAW_MONITOR_DISK_WARN_PERCENT=85
+Environment=OPENCLAW_MONITOR_DISK_CRITICAL_PERCENT=95
+Environment=OPENCLAW_MONITOR_INODE_WARN_PERCENT=85
+Environment=OPENCLAW_MONITOR_INODE_CRITICAL_PERCENT=95
+
+[Install]
+WantedBy=default.target

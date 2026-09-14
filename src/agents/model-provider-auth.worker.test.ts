@@ -1,0 +1,111 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { clearRuntimeAuthProfileStoreSnapshots } from "./auth-profiles.js";
+import { clearCurrentProviderAuthState } from "./model-provider-auth.js";
+import { runProviderAuthWarmWorkerInput } from "./model-provider-auth.worker.js";
+
+const tempDirs: string[] = [];
+const envKeys = ["OPENCLAW_DISABLE_PERSISTED_PLUGIN_REGISTRY", "OPENCLAW_STATE_DIR"] as const;
+
+function restoreEnv(previous: Record<(typeof envKeys)[number], string | undefined>): void {
+  for (const key of envKeys) {
+    if (previous[key] === undefined) {
+      delete process.env[key];
+      continue;
+    }
+    process.env[key] = previous[key];
+  }
+}
+
+describe("provider auth warm worker", () => {
+  afterEach(() => {
+    clearCurrentProviderAuthState();
+    clearRuntimeAuthProfileStoreSnapshots();
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves runtime-only auth profile snapshots in the worker warm input", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "openclaw-provider-auth-worker-"));
+    tempDirs.push(root);
+    const previousEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]])) as Record<
+      (typeof envKeys)[number],
+      string | undefined
+    >;
+    process.env.OPENCLAW_DISABLE_PERSISTED_PLUGIN_REGISTRY = "1";
+    process.env.OPENCLAW_STATE_DIR = path.join(root, "state");
+
+    try {
+      const agentDir = path.join(root, "agent");
+      const cfg = {
+        agents: { list: [{ id: "main", agentDir }] },
+        models: {
+          providers: {
+            "runtime-only": {
+              baseUrl: "https://example.com/v1",
+              api: "openai",
+              models: [{ id: "runtime-model", name: "Runtime Model" }],
+            },
+          },
+        },
+      } as unknown as OpenClawConfig;
+      const result = await runProviderAuthWarmWorkerInput({
+        cfg,
+        parentStartedAtEpochMs: Date.now(),
+        runtimeAuthStores: [
+          {
+            agentDir,
+            store: {
+              version: 1,
+              profiles: {
+                "runtime-only:default": {
+                  type: "api_key",
+                  provider: "runtime-only",
+                },
+              },
+            },
+          },
+        ],
+      });
+
+      expect(result.status).toBe("ok");
+      if (result.status !== "ok") {
+        return;
+      }
+      expect(result.snapshot.agents[0]?.providers).toContainEqual(["runtime-only", true]);
+      expect(result.snapshot.timing?.providerCheckCount).toBeGreaterThan(0);
+      expect(result.snapshot.timing?.duplicateProviderCheckCount).toBe(0);
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("catalog_load=");
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_startup_process_module_load=",
+      );
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_auth_snapshot_start=",
+      );
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_auth_snapshot_end=",
+      );
+      expect(result.snapshot.timing?.workerStartupTimings.join(" ")).toContain(
+        "worker_result_ready=",
+      );
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("auth_snapshot_start=");
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("agent_list_build=");
+      expect(result.snapshot.timing?.stages.join(" ")).toContain("result_aggregation=");
+      expect(result.snapshot.timing?.catalogTimings.join(" ")).toMatch(
+        /catalog_(persisted_models_json_read|static_configured_model_catalog_build)=/,
+      );
+      expect(result.snapshot.timing?.providerTimings.join(" ")).toContain(
+        "provider_auth_check_main_runtime-only=",
+      );
+      expect(result.snapshot.timing?.providerTimings.join(" ")).toContain(
+        "provider_auth_check_phase_main_runtime-only_runtime_auth=",
+      );
+    } finally {
+      restoreEnv(previousEnv);
+    }
+  }, 30_000);
+});

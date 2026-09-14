@@ -1,0 +1,31 @@
+{
+  "base": "4936149d58debdd94ffac123415903830d28a1ee",
+  "branch": "phase5-core-test-proof-20260914",
+  "repository": "mdaloisio01/openclaw",
+  "diffSha256": "c5e6da5c5b23f7f5cbe6cd73b8d4aaad39c63ae8c64e4b355457a44e8242026f",
+  "files": {
+    "scripts/crabbox-wrapper.mjs": "ce27e6e3c31c0116797226ca16943bbacba7dddd19572fb1944a204a45809ab8",
+    "scripts/run-tsgo.mjs": "7d816a3e85778947cc1eb0ccd751a7b424d245e3614399b5cc39ffd7b54148b8",
+    "src/acp/translator.session-setup.test.ts": "287bdc050ad53b66ad80ae749226b2e942d7f63ae74fbdb31e7bd699807cda5c",
+    "src/acp/translator.ts": "0f40d6c8e67ba4231ed89c0efa88606e17ae6a8550c7dbc08be5b78d699415f4",
+    "src/agents/tools/sessions-spawn-tool.test.ts": "3878604ce02b9582482d73c8bba9c656876f7ed251a57b3126c708988ff938a0",
+    "src/commands/sessions.acp-model-display.test.ts": "61b38cc079fd017bd289e20472edde71b2db7c69813322c85f8cac6e425200bf",
+    "src/commands/sessions.ts": "553f69d1b772287059e224519733b2a9abeb645d44d8ad199bf54a5f974574ac",
+    "src/gateway/server-methods/agent.test.ts": "de140e711a21ddcc7abd41886bd1ca61b6d2ebc4947337a2e63e70f45889f796",
+    "src/gateway/server-methods/agent.ts": "950444887f7a0fac3193611765c9b9bf4c9abf5230db86a6047fba942ca5a2a1",
+    "test/scripts/crabbox-wrapper.test.ts": "060867b44c638a584a938e047782ba6c7af1238023f72f839b246ad865373844"
+  },
+  "nodeVersion": "22.22.0",
+  "compilerVersion": "7.0.0-dev.20260527.2",
+  "pnpmVersion": "11.2.2",
+  "compilerSha256": "6c80ab7b7521846626309e5a8aa54b584eaa8e06da66509664f8fbacf9fb2922",
+  "automation": [
+    ".github/phase5-validation/candidate.json",
+    ".github/phase5-validation/supervisor.py",
+    ".github/phase5-validation/supervisor_test.py",
+    ".github/workflows/phase5-core-test-proof.yml"
+  ],
+  "sourceTree": "95a07f587ac1b53d84a12a87606d1b69f908052b",
+  "publication": "History-free source snapshot; original base is provenance only, never fetched remotely.",
+  "originalNineFileDiffSha256": "b827f0f6b9d35c3584052fe94fd824f4a3d8dac5567b20b03fd03d2510e264da"
+}

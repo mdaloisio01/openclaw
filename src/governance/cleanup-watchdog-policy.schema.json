@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openclaw.local/schemas/cleanup-watchdog-policy.schema.json",
+  "title": "Cleanup Crew Watchdog Governance Policy",
+  "type": "object",
+  "required": [
+    "policyVersion",
+    "acceptedReadVersions",
+    "missionStates",
+    "phaseStates",
+    "actionStates",
+    "workerStates",
+    "continuationStates",
+    "watchdogFindingStates",
+    "deliveryStates",
+    "decisionStates",
+    "priorityOrder",
+    "cleanDimensions",
+    "coverageKinds",
+    "activationGates"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "policyVersion": {
+      "const": "cleanup-watchdog-governance-20260715T1442Z"
+    },
+    "acceptedReadVersions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "contains": { "const": "cleanup-watchdog-governance-20260715T1442Z" }
+    },
+    "missionStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "created",
+          "authorized",
+          "running",
+          "recovering",
+          "deferred",
+          "external_wait",
+          "owner_wait",
+          "blocked_verified",
+          "complete",
+          "aborted_verified",
+          "superseded"
+        ]
+      }
+    },
+    "phaseStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "not_started",
+          "ready",
+          "running",
+          "reporting",
+          "dispatching_next",
+          "recovering",
+          "blocked_verified",
+          "complete",
+          "skipped_by_policy",
+          "superseded"
+        ]
+      }
+    },
+    "actionStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "queued",
+          "leased",
+          "running",
+          "succeeded",
+          "failed_retryable",
+          "failed_recovering",
+          "blocked_verified",
+          "cancelled",
+          "superseded"
+        ]
+      }
+    },
+    "workerStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "candidate",
+          "assigned",
+          "leased",
+          "heartbeat_current",
+          "heartbeat_stale",
+          "lost",
+          "superseding",
+          "superseded",
+          "terminated",
+          "unknown_invalid"
+        ]
+      }
+    },
+    "continuationStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "none_invalid",
+          "dispatch_pending",
+          "dispatch_receipted",
+          "resume_ready",
+          "deferred_until_drain",
+          "external_wait",
+          "owner_wait",
+          "blocked_verified",
+          "completed",
+          "superseded",
+          "lost"
+        ]
+      }
+    },
+    "watchdogFindingStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "detected",
+          "delivered",
+          "acknowledged",
+          "owned",
+          "repair_task_created",
+          "repairing",
+          "validation_pending",
+          "closed_clean",
+          "closed_verified_blocked",
+          "superseded",
+          "stale_obsolete"
+        ]
+      }
+    },
+    "deliveryStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "not_required",
+          "pending_report_delivery",
+          "pending_milestone_report",
+          "retrying",
+          "delivered",
+          "failed_blocking",
+          "superseded_by_later_delivery"
+        ]
+      }
+    },
+    "decisionStates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "not_required",
+          "owner_decision_required",
+          "owner_decision_answered",
+          "external_dependency",
+          "external_dependency_resolved",
+          "external_dependency_expired",
+          "invalid_as_owner_decision"
+        ]
+      }
+    },
+    "priorityOrder": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "P1_SAFETY_OR_DUPLICATE_EXECUTION",
+          "P2_ACTIVE_NO_WORKER",
+          "P3_CORRUPTED_STATE",
+          "P4_RESTART_OR_RUNTIME_RECOVERY",
+          "P5_MISSING_PROOF_OR_POLICY_MIGRATION",
+          "P6_REVIEW_REQUIRED_FOR_SAFE_WORK",
+          "P7_PENDING_REPORT_DELIVERY",
+          "P8_STALE_ARTIFACT_DEBT"
+        ]
+      }
+    },
+    "cleanDimensions": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "record_integrity",
+          "worker_coverage",
+          "continuation_readiness",
+          "delivery_completeness",
+          "runtime_health",
+          "repair_closure",
+          "policy_version"
+        ]
+      }
+    },
+    "coverageKinds": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "valid_executor",
+          "durable_defer",
+          "external_wait",
+          "owner_wait",
+          "verified_blocker"
+        ]
+      }
+    },
+    "activationGates": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "policy_schema_generated",
+          "sop_parity_validated",
+          "source_built_runtime_match",
+          "watchdog_clean",
+          "worker_coverage_proven",
+          "shadow_decisions_stable",
+          "repair_tasks_drained",
+          "grant_review_passed",
+          "rollback_plan_verified",
+          "production_paused",
+          "trinity_unstarted",
+          "control_plane_phase2_paused"
+        ]
+      }
+    }
+  }
+}
