@@ -28,7 +28,7 @@ const log = createSubsystemLogger("channels/message/send");
 
 export type DurableMessageBatchSendParams = Omit<
   DeliverOutboundPayloadsParams,
-  "abortSignal" | "onDeliveryIntent" | "payloads" | "queuePolicy"
+  "abortSignal" | "onDeliveryOwnerCommit" | "payloads" | "queuePolicy"
 > & {
   payloads: ReplyPayload[];
   attempt?: number;
@@ -36,6 +36,11 @@ export type DurableMessageBatchSendParams = Omit<
   /** @deprecated Use `signal`. */
   abortSignal?: AbortSignal;
   previousReceipt?: MessageReceipt;
+  onDeliveryOwnerCommit?: (commit: {
+    deliveryIntent: OutboundDeliveryIntent;
+    receipt: MessageReceipt;
+    payloadOutcomes: readonly OutboundPayloadDeliveryOutcome[];
+  }) => Promise<void> | void;
 };
 
 export type DurableMessageSuppressionReason =
@@ -161,8 +166,10 @@ export async function withDurableMessageSendContext<T>(
     onDeleteReceipt,
     onEditReceipt,
     onCommitReceipt,
+    onDeliveryOwnerCommit,
     onPreviewUpdate,
     onSendFailure,
+    onDeliveryIntent,
     onPayloadDeliveryOutcome,
     payloads,
     preview,
@@ -195,6 +202,7 @@ export async function withDurableMessageSendContext<T>(
     },
     send: async (rendered): Promise<DurableMessageBatchSendResult> => {
       const payloadOutcomes: OutboundPayloadDeliveryOutcome[] = [];
+      let ownerCommittedReceipt: MessageReceipt | undefined;
       const durablePayloadOutcomes = (): DurableMessagePayloadDeliveryOutcome[] =>
         toDurablePayloadOutcomes(payloadOutcomes);
       try {
@@ -208,16 +216,37 @@ export async function withDurableMessageSendContext<T>(
             payloadOutcomes.push(outcome);
             onPayloadDeliveryOutcome?.(outcome);
           },
-          onDeliveryIntent: (intent) => {
+          onDeliveryIntent: async (intent) => {
             deliveryIntent = intent;
             ctx.intent = toDurableMessageIntent(intent, rendered);
+            await onDeliveryIntent?.(intent);
           },
+          ...(onDeliveryOwnerCommit
+            ? {
+                onDeliveryOwnerCommit: async (commit) => {
+                  const { results: committedResults, ...committedIntent } = commit;
+                  const receipt = createMessageReceiptFromOutboundResults({
+                    results: committedResults,
+                    threadId: params.threadId == null ? undefined : String(params.threadId),
+                    replyToId: params.replyToId ?? undefined,
+                  });
+                  await onDeliveryOwnerCommit({
+                    deliveryIntent: committedIntent,
+                    receipt,
+                    payloadOutcomes: [...payloadOutcomes],
+                  });
+                  ownerCommittedReceipt = receipt;
+                },
+              }
+            : {}),
         });
-        const receipt = createMessageReceiptFromOutboundResults({
-          results,
-          threadId: params.threadId == null ? undefined : String(params.threadId),
-          replyToId: params.replyToId ?? undefined,
-        });
+        const receipt =
+          ownerCommittedReceipt ??
+          createMessageReceiptFromOutboundResults({
+            results,
+            threadId: params.threadId == null ? undefined : String(params.threadId),
+            replyToId: params.replyToId ?? undefined,
+          });
         const failedOutcome = payloadOutcomes.find((outcome) => outcome.status === "failed");
         if (failedOutcome) {
           if (results.length > 0) {

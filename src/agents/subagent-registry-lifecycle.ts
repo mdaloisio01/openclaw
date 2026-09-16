@@ -55,6 +55,7 @@ import {
   ensureDeliveryState,
   getDeliveryLastError,
   isDeliverySuspended,
+  shouldRetainParentYieldCloseout,
 } from "./subagent-delivery-state.js";
 import {
   SUBAGENT_ENDED_REASON_COMPLETE,
@@ -76,7 +77,10 @@ import {
   resolveAnnounceRetryDelayMs,
   safeRemoveAttachmentsDir,
 } from "./subagent-registry-helpers.js";
-import { replaceSubagentRunAfterSteer as replaceSubagentRunAfterSteerDefault } from "./subagent-registry-steer-runtime.js";
+import {
+  assertParentYieldWaitAllowsRestart as assertParentYieldWaitAllowsRestartDefault,
+  replaceSubagentRunAfterSteer as replaceSubagentRunAfterSteerDefault,
+} from "./subagent-registry-steer-runtime.js";
 import type { PendingFinalDeliveryPayload, SubagentRunRecord } from "./subagent-registry.types.js";
 import { resolveSubagentRunDeadlineMs } from "./subagent-run-timeout.js";
 import { deleteSubagentSessionForCleanup } from "./subagent-session-cleanup.js";
@@ -439,6 +443,7 @@ export function createSubagentRegistryLifecycleController(params: {
     workspaceDir?: string;
   }): Promise<void>;
   resumeSubagentRun(runId: string): void;
+  assertParentYieldWaitAllowsRestart?: (runId: string) => Promise<void>;
   replaceSubagentRunAfterSteer?(params: {
     previousRunId: string;
     nextRunId: string;
@@ -446,7 +451,7 @@ export function createSubagentRegistryLifecycleController(params: {
     runTimeoutSeconds?: number;
     preserveFrozenResultFallback?: boolean;
     transcriptFile?: string;
-  }): boolean;
+  }): Promise<boolean>;
   callGateway: typeof defaultCallGateway;
   captureSubagentCompletionReply: CaptureSubagentCompletionReply;
   cleanupBrowserSessionsForLifecycleEnd?: typeof cleanupBrowserSessionsForLifecycleEnd;
@@ -1349,6 +1354,9 @@ export function createSubagentRegistryLifecycleController(params: {
     }
     let launchResponse: { runId?: string } | undefined;
     try {
+      await (
+        params.assertParentYieldWaitAllowsRestart ?? assertParentYieldWaitAllowsRestartDefault
+      )(args.entry.runId);
       launchResponse = await params.callGateway<{ runId?: string }>({
         method: "agent",
         params: {
@@ -1383,11 +1391,12 @@ export function createSubagentRegistryLifecycleController(params: {
         ? params.replaceSubagentRunAfterSteer(replaceArgs)
         : replaceSubagentRunAfterSteerDefault(replaceArgs);
     if (
-      !replaceAfterSteer({
+      !(await replaceAfterSteer({
         previousRunId: args.entry.runId,
         nextRunId,
+        fallback: args.entry,
         preserveFrozenResultFallback: true,
-      })
+      }))
     ) {
       return {
         launched: false,
@@ -2059,7 +2068,8 @@ export function createSubagentRegistryLifecycleController(params: {
     completion.fallbackResultText = undefined;
     completion.fallbackCapturedAt = undefined;
     const shouldDeleteAttachments =
-      giveUpParams.entry.cleanup === "delete" || !giveUpParams.entry.retainAttachmentsOnKeep;
+      !shouldRetainParentYieldCloseout(giveUpParams.entry) &&
+      (giveUpParams.entry.cleanup === "delete" || !giveUpParams.entry.retainAttachmentsOnKeep);
     if (shouldDeleteAttachments) {
       await safeRemoveAttachmentsDir(giveUpParams.entry);
     }
@@ -2155,7 +2165,12 @@ export function createSubagentRegistryLifecycleController(params: {
         },
       });
     }
-    if (cleanupParams.cleanup === "delete") {
+    // Parent closeout must retain child identity and frozen output through fan-in.
+    // The registry sweeper releases delete-mode records after the durable receipt.
+    if (
+      cleanupParams.cleanup === "delete" &&
+      !shouldRetainParentYieldCloseout(cleanupParams.entry)
+    ) {
       params.clearPendingLifecycleError(cleanupParams.runId);
       void params.notifyContextEngineSubagentEnded({
         childSessionKey: cleanupParams.entry.childSessionKey,
@@ -2217,7 +2232,9 @@ export function createSubagentRegistryLifecycleController(params: {
     if (entry.expectsCompletionMessage === false) {
       clearPendingFinalDelivery(entry);
       entry.wakeOnDescendantSettle = undefined;
-      const shouldDeleteAttachments = cleanup === "delete" || !entry.retainAttachmentsOnKeep;
+      const shouldDeleteAttachments =
+        !shouldRetainParentYieldCloseout(entry) &&
+        (cleanup === "delete" || !entry.retainAttachmentsOnKeep);
       if (shouldDeleteAttachments) {
         await safeRemoveAttachmentsDir(entry);
       }
@@ -2267,11 +2284,13 @@ export function createSubagentRegistryLifecycleController(params: {
       completion.fallbackCapturedAt = undefined;
       const completionReason = resolveCleanupCompletionReason(entry);
       await emitCompletionEndedHookIfNeeded(entry, completionReason);
-      const shouldDeleteAttachments = cleanup === "delete" || !entry.retainAttachmentsOnKeep;
+      const shouldDeleteAttachments =
+        !shouldRetainParentYieldCloseout(entry) &&
+        (cleanup === "delete" || !entry.retainAttachmentsOnKeep);
       if (shouldDeleteAttachments) {
         await safeRemoveAttachmentsDir(entry);
       }
-      if (cleanup === "delete") {
+      if (cleanup === "delete" && !shouldRetainParentYieldCloseout(entry)) {
         completion.resultText = undefined;
         completion.capturedAt = undefined;
       }
@@ -2339,7 +2358,9 @@ export function createSubagentRegistryLifecycleController(params: {
       const completion = ensureCompletionState(entry);
       completion.fallbackResultText = undefined;
       completion.fallbackCapturedAt = undefined;
-      const shouldDeleteAttachments = cleanup === "delete" || !entry.retainAttachmentsOnKeep;
+      const shouldDeleteAttachments =
+        !shouldRetainParentYieldCloseout(entry) &&
+        (cleanup === "delete" || !entry.retainAttachmentsOnKeep);
       if (shouldDeleteAttachments) {
         await safeRemoveAttachmentsDir(entry);
       }
@@ -2393,7 +2414,7 @@ export function createSubagentRegistryLifecycleController(params: {
     }
     if (entry.expectsCompletionMessage === false) {
       void (async () => {
-        if (entry.cleanup === "delete") {
+        if (entry.cleanup === "delete" && !shouldRetainParentYieldCloseout(entry)) {
           await deleteSubagentSessionForCleanup({
             callGateway: params.callGateway,
             childSessionKey: entry.childSessionKey,
@@ -2457,7 +2478,7 @@ export function createSubagentRegistryLifecycleController(params: {
         requesterDisplayKey: pendingPayload.requesterDisplayKey,
         task: pendingPayload.task,
         timeoutMs: params.subagentAnnounceTimeoutMs,
-        cleanup: entry.cleanup,
+        cleanup: shouldRetainParentYieldCloseout(entry) ? "keep" : entry.cleanup,
         roundOneReply: pendingPayload.frozenResultText ?? undefined,
         fallbackReply: pendingPayload.fallbackFrozenResultText ?? undefined,
         waitForCompletion: false,

@@ -15,14 +15,27 @@ import {
 } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 
+export type ParentYieldWaitRef = {
+  waitId: string;
+  parentRunId: string;
+};
+
+export type ActivationContinuationRef = {
+  id: string;
+  createdAt: number;
+  reportId: string;
+};
+
 export type SystemEvent = {
   text: string;
   ts: number;
   contextKey?: string | null;
   deliveryContext?: DeliveryContext;
+  parentYieldWait?: ParentYieldWaitRef;
+  activationContinuation?: ActivationContinuationRef;
 };
 
-const MAX_EVENTS = 20;
+const MAX_ORDINARY_EVENTS = 20;
 
 type SessionQueue = {
   queue: SystemEvent[];
@@ -37,6 +50,8 @@ type SystemEventOptions = {
   sessionKey: string;
   contextKey?: string | null;
   deliveryContext?: DeliveryContext;
+  parentYieldWait?: ParentYieldWaitRef;
+  activationContinuation?: ActivationContinuationRef;
 };
 
 function requireSessionKey(key?: string | null): string {
@@ -73,6 +88,10 @@ function cloneSystemEvent(event: SystemEvent): SystemEvent {
   return {
     ...event,
     ...(event.deliveryContext ? { deliveryContext: { ...event.deliveryContext } } : {}),
+    ...(event.parentYieldWait ? { parentYieldWait: { ...event.parentYieldWait } } : {}),
+    ...(event.activationContinuation
+      ? { activationContinuation: { ...event.activationContinuation } }
+      : {}),
   };
 }
 
@@ -90,8 +109,10 @@ function findDuplicateInQueue(
   text: string,
   contextKey: string | null,
   deliveryContext: DeliveryContext | undefined,
+  parentYieldWait: ParentYieldWaitRef | undefined,
+  activationContinuation: ActivationContinuationRef | undefined,
 ): boolean {
-  const incoming = { text, contextKey, deliveryContext };
+  const incoming = { text, contextKey, deliveryContext, parentYieldWait, activationContinuation };
   if (contextKey === null) {
     const last = queue[queue.length - 1];
     return last ? isDuplicateSystemEvent(last, incoming) : false;
@@ -110,7 +131,16 @@ export function enqueueSystemEvent(text: string, options: SystemEventOptions) {
   }
   const normalizedContextKey = normalizeContextKey(options.contextKey);
   const normalizedDeliveryContext = normalizeDeliveryContext(options.deliveryContext);
-  if (findDuplicateInQueue(entry.queue, cleaned, normalizedContextKey, normalizedDeliveryContext)) {
+  if (
+    findDuplicateInQueue(
+      entry.queue,
+      cleaned,
+      normalizedContextKey,
+      normalizedDeliveryContext,
+      options.parentYieldWait,
+      options.activationContinuation,
+    )
+  ) {
     return false;
   }
   if (normalizedContextKey !== null) {
@@ -121,9 +151,17 @@ export function enqueueSystemEvent(text: string, options: SystemEventOptions) {
     ts: Date.now(),
     contextKey: normalizedContextKey,
     deliveryContext: normalizedDeliveryContext,
+    ...(options.parentYieldWait ? { parentYieldWait: { ...options.parentYieldWait } } : {}),
+    ...(options.activationContinuation
+      ? { activationContinuation: { ...options.activationContinuation } }
+      : {}),
   });
-  if (entry.queue.length > MAX_EVENTS) {
-    entry.queue.shift();
+  // Required continuations remain until the delivery owner consumes them. Notice
+  // pressure must not discard their only wake while continuation is scheduled.
+  const isOrdinary = (event: SystemEvent) =>
+    !event.parentYieldWait && !event.activationContinuation;
+  if (entry.queue.filter(isOrdinary).length > MAX_ORDINARY_EVENTS) {
+    entry.queue.splice(entry.queue.findIndex(isOrdinary), 1);
   }
   return true;
 }
@@ -153,12 +191,21 @@ function areDeliveryContextsEqual(left?: DeliveryContext, right?: DeliveryContex
 
 function isDuplicateSystemEvent(
   existing: SystemEvent,
-  incoming: Pick<SystemEvent, "text" | "contextKey" | "deliveryContext">,
+  incoming: Pick<
+    SystemEvent,
+    "text" | "contextKey" | "deliveryContext" | "parentYieldWait" | "activationContinuation"
+  >,
 ): boolean {
   return (
     existing.text === incoming.text &&
     (existing.contextKey ?? null) === (incoming.contextKey ?? null) &&
-    areDeliveryContextsEqual(existing.deliveryContext, incoming.deliveryContext)
+    areDeliveryContextsEqual(existing.deliveryContext, incoming.deliveryContext) &&
+    existing.parentYieldWait?.waitId === incoming.parentYieldWait?.waitId &&
+    existing.parentYieldWait?.parentRunId === incoming.parentYieldWait?.parentRunId &&
+    areActivationContinuationRefsEqual(
+      existing.activationContinuation,
+      incoming.activationContinuation,
+    )
   );
 }
 
@@ -167,7 +214,21 @@ function areSystemEventsEqual(left: SystemEvent, right: SystemEvent): boolean {
     left.text === right.text &&
     left.ts === right.ts &&
     (left.contextKey ?? null) === (right.contextKey ?? null) &&
-    areDeliveryContextsEqual(left.deliveryContext, right.deliveryContext)
+    areDeliveryContextsEqual(left.deliveryContext, right.deliveryContext) &&
+    left.parentYieldWait?.waitId === right.parentYieldWait?.waitId &&
+    left.parentYieldWait?.parentRunId === right.parentYieldWait?.parentRunId &&
+    areActivationContinuationRefsEqual(left.activationContinuation, right.activationContinuation)
+  );
+}
+
+function areActivationContinuationRefsEqual(
+  left?: ActivationContinuationRef,
+  right?: ActivationContinuationRef,
+): boolean {
+  return (
+    left?.id === right?.id &&
+    left?.createdAt === right?.createdAt &&
+    left?.reportId === right?.reportId
   );
 }
 

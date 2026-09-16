@@ -1,6 +1,4 @@
 import crypto from "node:crypto";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { isParentOwnedBackgroundAcpSession } from "@openclaw/acp-core/session-interaction-mode";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -43,6 +41,8 @@ import {
 import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
 import {
   persistSourceTurnDeliveryState,
+  resolveSourceTurnDeliveryRegistryPath,
+  type PersistSourceTurnDeliveryParams,
   type SourceTurnDeliveryContext,
   type SourceTurnDeliveryRow,
 } from "../../agents/source-turn-delivery-store.js";
@@ -50,6 +50,7 @@ import {
   isSubagentEnvelopeSession,
   resolveSubagentCapabilityStore,
 } from "../../agents/subagent-capabilities.js";
+import { completeParentYieldWaitFromDelivery } from "../../agents/subagent-registry.js";
 import { mergeAlsoAllowPolicy, resolveToolProfilePolicy } from "../../agents/tool-policy.js";
 import {
   resolveConversationBindingRecord,
@@ -78,6 +79,7 @@ import { isDiagnosticsEnabled } from "../../infra/diagnostic-events.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { getSessionBindingService } from "../../infra/outbound/session-binding-service.js";
+import type { ActivationContinuationRef, ParentYieldWaitRef } from "../../infra/system-events.js";
 import { isAbortError } from "../../infra/unhandled-rejections.js";
 import {
   logMessageDispatchCompleted,
@@ -102,7 +104,10 @@ import { isAcpSessionKey } from "../../routing/session-key.js";
 import { resolveSendPolicy } from "../../sessions/send-policy.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveSilentReplyPolicyFromPolicies } from "../../shared/silent-reply-policy.js";
-import { ensureForegroundCleanupCrewTaskFlow } from "../../tasks/foreground-cleanup-crew-taskflow.js";
+import {
+  ensureForegroundCleanupCrewTaskFlow,
+  recordForegroundCleanupCrewExecutionStarted,
+} from "../../tasks/foreground-cleanup-crew-taskflow.js";
 import {
   attachMissionSettlementToTaskFlowStateJson,
   recordFlowLawfulStop,
@@ -139,14 +144,15 @@ import {
   isReplyPayloadStatusNotice,
   markReplyPayloadAsProgressHeartbeat,
   markReplyPayloadAsTtsSupplement,
+  setReplyPayloadMetadata,
   type ReplyPayload,
 } from "../reply-payload.js";
 import type { FinalizedMsgContext } from "../templating.js";
 import { normalizeVerboseLevel } from "../thinking.js";
 import {
   allowTerminalCloseout,
+  beginActiveRunContinuationGuard,
   installActiveRunContinuationGuard,
-  recordActiveRunStarted,
   recordLawfulBlocker,
   recordNextExecutableStepStarted,
   recordNonTerminalBuildUpdateEmitted,
@@ -370,13 +376,6 @@ function inferActiveRunContinuationFromPayload(payload: ReplyPayload):
       openTruth: "build still open; waiting on approval.",
     };
   }
-  if (normalized.includes("paperwork/setup done, build still open")) {
-    return {
-      stopAllowed: true,
-      stopReason: "paperwork_only_setup",
-      openTruth: "paperwork/setup done, build still open.",
-    };
-  }
   if (normalized.includes("local slice complete; broader mission still open")) {
     return {
       stopAllowed: false,
@@ -489,28 +488,6 @@ const replyMediaPathsRuntimeLoader = createLazyImportLoader(
   () => import("./reply-media-paths.runtime.js"),
 );
 
-const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
-const WORKSPACE_ORCHESTRATOR_DIR_ENV = "OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR";
-
-function resolveDefaultSourceTurnDeliveryRegistryPath(): string {
-  const workspaceDir =
-    normalizeOptionalString(process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV]) ??
-    join(homedir(), ".openclaw", "workspace-orchestrator");
-  return join(
-    workspaceDir,
-    "var",
-    "source_delivery_obligations",
-    "source_delivery_obligations.json",
-  );
-}
-
-function resolveSourceTurnDeliveryRegistryPath(): string {
-  return (
-    normalizeOptionalString(process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV]) ??
-    resolveDefaultSourceTurnDeliveryRegistryPath()
-  );
-}
-
 function buildSourceTurnDeliveryRecordId(params: {
   ctx: FinalizedMsgContext;
   runId?: string;
@@ -605,6 +582,10 @@ async function persistDispatchSourceTurnDeliveryState(params: {
     sourceChannel?: string;
     deliveryContext?: SourceTurnDeliveryContext;
   };
+  runId?: string;
+  parentYieldWaits?: ParentYieldWaitRef[];
+  activationContinuation?: ActivationContinuationRef;
+  preparedSourceFinal?: PersistSourceTurnDeliveryParams["preparedSourceFinal"];
   facts: SourceTurnDeliveryFacts;
   currentStage: string;
 }): Promise<SourceTurnDeliveryRow | undefined> {
@@ -612,15 +593,39 @@ async function persistDispatchSourceTurnDeliveryState(params: {
     return undefined;
   }
   try {
-    return await persistSourceTurnDeliveryState({
+    const row = await persistSourceTurnDeliveryState({
       registryPath: params.registryPath,
       id: params.recordId,
       sourceTurnId: params.recordId,
       ...params.metadata,
+      runId: params.runId,
+      parentYieldWaits: params.parentYieldWaits,
+      preparedSourceFinal: params.preparedSourceFinal,
+      ...(params.activationContinuation
+        ? {
+            deliveryId: params.activationContinuation.id,
+            generation: params.activationContinuation.createdAt,
+            reportId: params.activationContinuation.reportId,
+          }
+        : {}),
       facts: params.facts,
       currentStage: params.currentStage,
     });
+    if (row.sourceSessionKey && row.finalDeliveryDelivered) {
+      for (const wait of row.parentYieldWaits ?? []) {
+        await completeParentYieldWaitFromDelivery({
+          controllerSessionKey: row.sourceSessionKey,
+          ...wait,
+          registryPath: params.registryPath,
+          deliveryRecordId: row.id,
+        });
+      }
+    }
+    return row;
   } catch (error) {
+    if (params.parentYieldWaits?.length || params.activationContinuation) {
+      throw error;
+    }
     logVerbose(
       `dispatch-from-config: source-turn delivery state write failed: ${formatErrorMessage(error)}`,
     );
@@ -1126,9 +1131,10 @@ function shouldBypassPluginOwnedBindingForCommand(
   );
 }
 
-async function clearPendingFinalDeliveryAfterSuccess(params: {
+export async function clearPendingFinalDeliveryAfterSuccess(params: {
   storePath?: string;
   sessionKey?: string;
+  expectedCreatedAt?: number;
 }): Promise<void> {
   if (!params.storePath || !params.sessionKey) {
     return;
@@ -1139,6 +1145,13 @@ async function clearPendingFinalDeliveryAfterSuccess(params: {
     skipMaintenance: true,
     takeCacheOwnership: true,
     update: async (entry) => {
+      // A recovered old receipt cannot clear a later turn's pending final.
+      if (
+        params.expectedCreatedAt !== undefined &&
+        entry.pendingFinalDeliveryCreatedAt !== params.expectedCreatedAt
+      ) {
+        return null;
+      }
       if (!entry.pendingFinalDelivery && !entry.pendingFinalDeliveryText) {
         return null;
       }
@@ -1272,47 +1285,50 @@ function runWithDispatchAbortSignal<T>(
   });
 }
 
+function primeContinuationGuardFromPayload(
+  dispatcher: ReplyDispatcher,
+  payload: ReplyPayload,
+): void {
+  const continuation = inferActiveRunContinuationFromPayload(payload);
+  if (!continuation) {
+    return;
+  }
+  if (continuation.stopAllowed === false) {
+    const detail =
+      normalizeOptionalString(continuation.openTruth) ??
+      normalizeOptionalString(continuation.stopReason) ??
+      "runtime_open_build_state";
+    recordNonTerminalBuildUpdateEmitted(dispatcher, `stop_contract:${detail}`);
+    return;
+  }
+  if (
+    continuation.stopAllowed === true &&
+    (continuation.stopReason === "blocker" ||
+      continuation.stopReason === "whole_run_complete" ||
+      continuation.stopReason === "owner_boundary_stop" ||
+      continuation.stopReason === "approval_blocked" ||
+      continuation.stopReason === "approval_unavailable" ||
+      continuation.stopReason === "restart_or_reload" ||
+      continuation.stopReason === "hard_stop" ||
+      continuation.stopReason === "safety_stop" ||
+      continuation.stopReason === "terminal_completion_proof")
+  ) {
+    if (continuation.stopReason === "owner_boundary_stop") {
+      recordOwnerBoundaryHandoff(dispatcher, continuation.openTruth);
+      return;
+    }
+    if (continuation.stopReason === "terminal_completion_proof") {
+      recordTerminalCompletionProof(dispatcher, continuation.openTruth);
+      return;
+    }
+    recordLawfulBlocker(dispatcher, continuation.stopReason);
+  }
+}
+
 function createAbortAwareDispatcher(params: {
   dispatcher: ReplyDispatcher;
   isAborted: () => boolean;
 }): ReplyDispatcher {
-  const primeContinuationGuardFromPayload = (payload: ReplyPayload): void => {
-    const continuation = inferActiveRunContinuationFromPayload(payload);
-    if (!continuation) {
-      return;
-    }
-    if (continuation.stopAllowed === false) {
-      const detail =
-        normalizeOptionalString(continuation.openTruth) ??
-        normalizeOptionalString(continuation.stopReason) ??
-        "runtime_open_build_state";
-      recordNonTerminalBuildUpdateEmitted(params.dispatcher, `stop_contract:${detail}`);
-      return;
-    }
-    if (
-      continuation.stopAllowed === true &&
-      (continuation.stopReason === "blocker" ||
-        continuation.stopReason === "whole_run_complete" ||
-        continuation.stopReason === "owner_boundary_stop" ||
-        continuation.stopReason === "approval_blocked" ||
-        continuation.stopReason === "approval_unavailable" ||
-        continuation.stopReason === "restart_or_reload" ||
-        continuation.stopReason === "hard_stop" ||
-        continuation.stopReason === "safety_stop" ||
-        continuation.stopReason === "terminal_completion_proof" ||
-        continuation.stopReason === "paperwork_only_setup")
-    ) {
-      if (continuation.stopReason === "owner_boundary_stop") {
-        recordOwnerBoundaryHandoff(params.dispatcher, continuation.openTruth);
-        return;
-      }
-      if (continuation.stopReason === "terminal_completion_proof") {
-        recordTerminalCompletionProof(params.dispatcher, continuation.openTruth);
-        return;
-      }
-      recordLawfulBlocker(params.dispatcher, continuation.stopReason);
-    }
-  };
   const sendIfActive =
     (
       send: (payload: ReplyPayload) => boolean,
@@ -1322,7 +1338,7 @@ function createAbortAwareDispatcher(params: {
       params.isAborted()
         ? false
         : options?.terminalKind
-          ? (primeContinuationGuardFromPayload(payload),
+          ? (primeContinuationGuardFromPayload(params.dispatcher, payload),
             allowTerminalCloseout(params.dispatcher, options.terminalKind, payload).allowed &&
               send(payload))
           : send(payload);
@@ -1459,8 +1475,7 @@ export async function dispatchReplyFromConfig(
       counts: dispatcher.getQueuedCounts(),
     };
   }
-  installActiveRunContinuationGuard(dispatcher);
-  recordActiveRunStarted(dispatcher);
+  beginActiveRunContinuationGuard(dispatcher);
   const diagnosticsEnabled = isDiagnosticsEnabled(cfg);
   const channel = normalizeLowercaseStringOrEmpty(ctx.Surface ?? ctx.Provider ?? "unknown");
   const chatId = ctx.To ?? ctx.From;
@@ -1642,9 +1657,11 @@ export async function dispatchReplyFromConfig(
   const inboundAudio = isInboundAudioContext(ctx);
   const sessionTtsAuto = normalizeTtsAutoMode(sessionStoreEntry.entry?.ttsAuto);
   const workspaceDir = resolveAgentWorkspaceDir(cfg, sessionAgentId);
-  const currentTurnTextForCleanupCrewGuard = normalizeOptionalString(
-    ctx.BodyForCommands ?? ctx.CommandBody ?? ctx.RawBody ?? ctx.Body,
-  );
+  const currentTurnTextForCleanupCrewGuard =
+    normalizeOptionalString(ctx.BodyForCommands) ??
+    normalizeOptionalString(ctx.CommandBody) ??
+    normalizeOptionalString(ctx.RawBody) ??
+    normalizeOptionalString(ctx.Body);
   installActiveRunContinuationGuard(dispatcher, {
     persistence: resolveActiveRunContinuityGatePersistence({
       workspaceDir,
@@ -1682,6 +1699,24 @@ export async function dispatchReplyFromConfig(
     cleanupCrewTaskFlowRegistration.status === "attached"
       ? cleanupCrewTaskFlowRegistration.flow
       : undefined;
+  let cleanupCrewPostReportExecutionStarted = false;
+  const recordExecutedStep = (proofRef: string) => {
+    recordNextExecutableStepStarted(dispatcher, proofRef);
+    if (cleanupCrewPostReportContinuationRecorded) {
+      cleanupCrewPostReportExecutionStarted = true;
+    }
+    if (!cleanupCrewMissionSettlementFlow || !acpDispatchSessionKey) {
+      return;
+    }
+    const flow = recordForegroundCleanupCrewExecutionStarted({
+      flowId: cleanupCrewMissionSettlementFlow.flowId,
+      sessionKey: acpDispatchSessionKey,
+      proofRef,
+    });
+    if (flow) {
+      cleanupCrewMissionSettlementFlow = flow;
+    }
+  };
   const extractCleanupCrewReportField = (reportText: string, label: string): string => {
     const lowerLabel = label.toLowerCase();
     for (const line of reportText.split(/\r?\n/)) {
@@ -1807,9 +1842,6 @@ export async function dispatchReplyFromConfig(
       decision.broaderBuildOpen ||
       decision.state === "continuation_dispatch_required" ||
       decision.state === "pending_continuation_action";
-    const continuationRecorded =
-      cleanupCrewPostReportContinuationRecorded &&
-      decision.state === "continuation_dispatch_required";
     return {
       activeMissionScope,
       closeoutScope: closeout.scopeHandled,
@@ -1830,7 +1862,7 @@ export async function dispatchReplyFromConfig(
                 evidence: string[];
                 exhaustedPaths: string[];
               })
-            : continuationRecorded
+            : cleanupCrewPostReportExecutionStarted
               ? ({ kind: "next_executable_parent_step_started" } as const)
               : parentOpen
                 ? ({ kind: "missing" } as const)
@@ -1949,10 +1981,7 @@ export async function dispatchReplyFromConfig(
     }
     const postReportRegistration = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: sessionKeyForContinuation,
-      currentTurnText: [currentTurnTextForCleanupCrewGuard, reportText]
-        .map((part) => normalizeOptionalString(part))
-        .filter(Boolean)
-        .join("\n"),
+      currentTurnText: currentTurnTextForCleanupCrewGuard,
       existingIntakeRequestId: ctx.OwnerRequestIntakeRequestId,
       authorityPath: "foreground_cleanup_crew_post_report_continuation",
       authorityBasis:
@@ -1972,9 +2001,9 @@ export async function dispatchReplyFromConfig(
     ) {
       cleanupCrewMissionSettlementFlow = postReportRegistration.flow;
       cleanupCrewPostReportContinuationRecorded = true;
-      recordNextExecutableStepStarted(
+      recordNonTerminalBuildUpdateEmitted(
         dispatcher,
-        `cleanup_crew_post_report_continuation:${nextExecutableAction}`,
+        `cleanup_crew_post_report_continuation_required:${nextExecutableAction}`,
       );
     } else if (postReportRegistration.status === "blocked") {
       recordNonTerminalBuildUpdateEmitted(
@@ -2008,31 +2037,6 @@ export async function dispatchReplyFromConfig(
     recordNonTerminalBuildUpdateEmitted(
       dispatcher,
       "cleanup_crew_final_delivery_pending_settlement",
-    );
-  };
-  const primeCleanupCrewContinuationGuardBeforeFinalDelivery = (payload: ReplyPayload): void => {
-    if (cleanupCrewPostReportContinuationRecorded) {
-      return;
-    }
-    const reportText = normalizeOptionalString(payload.text);
-    if (!reportText) {
-      return;
-    }
-    const decision = resolveCleanupCrewPostReportContinuation({
-      currentTurnText: currentTurnTextForCleanupCrewGuard,
-      reportText,
-      finalDeliveryDelivered: true,
-    });
-    if (decision.state !== "continuation_dispatch_required") {
-      return;
-    }
-    const nextExecutableAction = normalizeOptionalString(decision.nextExecutableAction);
-    if (!nextExecutableAction) {
-      return;
-    }
-    recordNextExecutableStepStarted(
-      dispatcher,
-      `cleanup_crew_report_delivery_pending_continuation:${nextExecutableAction}`,
     );
   };
   let dispatchReplyOperation: ReplyOperation | undefined;
@@ -2587,11 +2591,22 @@ export async function dispatchReplyFromConfig(
     },
     deliveryChannel,
   });
-  const recordSourceTurnDeliveryState = (facts: SourceTurnDeliveryFacts, currentStage: string) =>
+  const requiredSourceContinuation = Boolean(
+    ctx.ParentYieldWaits?.length || ctx.ActivationContinuation,
+  );
+  const recordSourceTurnDeliveryState = (
+    facts: SourceTurnDeliveryFacts,
+    currentStage: string,
+    preparedSourceFinal?: PersistSourceTurnDeliveryParams["preparedSourceFinal"],
+  ) =>
     persistDispatchSourceTurnDeliveryState({
       registryPath: sourceTurnDeliveryRegistryPath,
       recordId: sourceTurnDeliveryRecordId,
       metadata: sourceTurnDeliveryMetadata,
+      runId: params.replyOptions?.runId,
+      parentYieldWaits: ctx.ParentYieldWaits,
+      activationContinuation: ctx.ActivationContinuation,
+      preparedSourceFinal,
       facts,
       currentStage,
     });
@@ -2971,6 +2986,9 @@ export async function dispatchReplyFromConfig(
       finalDeliveryDelivered: boolean;
       finalDeliveryUnknown: boolean;
     }> => {
+      if (requiredSourceContinuation) {
+        return sendRequiredSourceFinalBatch([payload], options.abortSignal);
+      }
       const abortSignal = options.abortSignal ?? getDispatchAbortSignal();
       const throwIfFinalDeliveryAborted = () => {
         if (abortSignal?.aborted) {
@@ -2999,8 +3017,19 @@ export async function dispatchReplyFromConfig(
       const normalizedPayload = await normalizeReplyMediaPayload(ttsPayload);
       throwIfFinalDeliveryAborted();
       recordCleanupCrewTerminalStopBeforeFinalDelivery(normalizedPayload);
-      primeCleanupCrewContinuationGuardBeforeFinalDelivery(normalizedPayload);
       recordCleanupCrewMissionSettlement(normalizedPayload, "intent_durable");
+      if (shouldRouteToOriginating) {
+        primeContinuationGuardFromPayload(dispatcher, normalizedPayload);
+        if (!allowTerminalCloseout(dispatcher, "sendFinalReply", normalizedPayload).allowed) {
+          recordCleanupCrewMissionSettlement(normalizedPayload, "failed");
+          return {
+            queuedFinal: false,
+            routedFinalCount: 0,
+            finalDeliveryDelivered: false,
+            finalDeliveryUnknown: false,
+          };
+        }
+      }
       const result = await routeReplyToOriginating(normalizedPayload, {
         abortSignal,
         kind: "final",
@@ -3043,7 +3072,6 @@ export async function dispatchReplyFromConfig(
         metadata: sourceReplyTranscriptMirror,
       });
       recordCleanupCrewTerminalStopBeforeFinalDelivery(normalizedPayload);
-      primeCleanupCrewContinuationGuardBeforeFinalDelivery(normalizedPayload);
       recordCleanupCrewMissionSettlement(normalizedPayload, "intent_durable");
       const queuedFinal = runtimeDispatcher.sendFinalReply(normalizedPayload);
       let finalDeliveryDelivered = false;
@@ -3083,6 +3111,196 @@ export async function dispatchReplyFromConfig(
         finalDeliveryDelivered,
         finalDeliveryUnknown,
       };
+    };
+    const sendRequiredSourceFinalBatch = async (
+      payloads: readonly ReplyPayload[],
+      abortSignal = getDispatchAbortSignal(),
+    ) => {
+      const unproven = {
+        queuedFinal: false,
+        routedFinalCount: 0,
+        finalDeliveryDelivered: false,
+        finalDeliveryUnknown: false,
+      };
+      // Diagnostics are separate from the substantive final. They cannot prove
+      // delivery, and must not prevent a valid final in the same result batch.
+      const finalPayloads = payloads.filter(
+        (payload) => !isReplyPayloadStatusNotice(payload) && !payload.isError,
+      );
+      if (finalPayloads.length === 0) {
+        return unproven;
+      }
+      if (!dispatcher.sendFinalReplyBatch || shouldRouteToOriginating) {
+        throw new Error("required source final needs its source dispatcher");
+      }
+      const transcriptSource = sourceTurnDeliveryMetadata.sourceChannel === "webchat";
+      const preparedPayloads: ReplyPayload[] = [];
+      for (const payload of finalPayloads) {
+        if (abortSignal?.aborted) {
+          throw new DispatchReplyOperationAbortedError();
+        }
+        const ttsPayload = await maybeApplyTtsToReplyPayload({
+          payload,
+          cfg,
+          channel: deliveryChannel,
+          kind: "final",
+          inboundAudio,
+          ttsAuto: sessionTtsAuto,
+          agentId: sessionAgentId,
+          accountId: replyRoute.accountId,
+        });
+        // WebChat owns its data URLs, trusted audio, and live-only media policy.
+        // Its post-hook preparation must run before any generic staging can copy
+        // sensitive media or replace an attachment with a warning-only caption.
+        const normalized = transcriptSource
+          ? ttsPayload
+          : await normalizeReplyMediaPayload(ttsPayload);
+        if (
+          resolveSendableOutboundReplyParts(normalized).mediaUrls.length !==
+          resolveSendableOutboundReplyParts(ttsPayload).mediaUrls.length
+        ) {
+          throw new Error("required source final media normalization removed an attachment");
+        }
+        preparedPayloads.push(normalized);
+      }
+      const before = getDispatcherFinalOutcomeCounts(dispatcher);
+      const queuedFinal = dispatcher.sendFinalReplyBatch(preparedPayloads, async (finals) => {
+        if (abortSignal?.aborted) {
+          throw new DispatchReplyOperationAbortedError();
+        }
+        // Preparation follows every policy/hook transformation and precedes the
+        // first publication. A cancelled or failed part cannot close this wait.
+        if (
+          finals.length !== preparedPayloads.length ||
+          finals.some(
+            (payload) =>
+              isReplyPayloadStatusNotice(payload) ||
+              payload.isError ||
+              !hasOutboundReplyContent(payload, { trimText: true }),
+          )
+        ) {
+          throw new Error("required source final batch is incomplete");
+        }
+        for (const payload of finals) {
+          primeContinuationGuardFromPayload(dispatcher, payload);
+          if (!allowTerminalCloseout(dispatcher, "sendFinalReply", payload).allowed) {
+            throw new Error("required source final was refused by closeout admission");
+          }
+        }
+        const sourceEntry = sessionStoreEntry.storePath
+          ? readSessionEntry(
+              sessionStoreEntry.storePath,
+              sourceTurnDeliveryMetadata.sourceSessionKey!,
+            )
+          : undefined;
+        if (!sourceEntry?.sessionId) {
+          throw new Error("required source final session is missing");
+        }
+        const { prepareWebchatSourceContent } = transcriptSource
+          ? await import("../../gateway/webchat-source-publication.js")
+          : { prepareWebchatSourceContent: undefined };
+        const parts = await Promise.all(
+          finals.map(async (payload) => {
+            const sendable = resolveSendableOutboundReplyParts(payload);
+            const reference = getReplyPayloadMetadata(payload)?.canonicalAssistantTranscript;
+            const unchangedNativeFinal =
+              transcriptSource &&
+              reference &&
+              reference.sessionId === sourceEntry?.sessionId &&
+              reference.text === sendable.text &&
+              sendable.mediaUrls.length === 0;
+            return {
+              text: sendable.text,
+              mediaUrls: sendable.mediaUrls,
+              payload: structuredClone(payload),
+              ...(unchangedNativeFinal ? { canonicalAssistantTranscript: reference } : {}),
+              ...(prepareWebchatSourceContent &&
+              (sendable.mediaUrls.length > 0 || !sendable.text.trim())
+                ? {
+                    webchatContent: await prepareWebchatSourceContent({
+                      sessionKey: sourceTurnDeliveryMetadata.sourceSessionKey!,
+                      agentId: sessionAgentId,
+                      payload,
+                      config: cfg,
+                    }),
+                  }
+                : {}),
+            };
+          }),
+        );
+        if (
+          ctx.ActivationContinuation &&
+          (parts.length !== 1 ||
+            parts[0].mediaUrls.length > 0 ||
+            crypto.createHash("sha256").update(parts[0].text).digest("hex") !==
+              ctx.ActivationContinuation.reportId)
+        ) {
+          throw new Error("activation report content changed before delivery");
+        }
+        const row = await recordSourceTurnDeliveryState(
+          { finalDeliveryRequired: true, evidenceKinds: ["internal_evidence_record"] },
+          "final_dispatch_prepared_pending_delivery",
+          transcriptSource
+            ? {
+                kind: "source_session_transcript",
+                sessionId: sourceEntry.sessionId,
+                pendingFinalDeliveryCreatedAt: sourceEntry.pendingFinalDeliveryCreatedAt,
+                expectedPartCount: parts.length,
+                parts,
+              }
+            : {
+                kind: "external_channel",
+                sessionId: sourceEntry.sessionId,
+                pendingFinalDeliveryCreatedAt: sourceEntry.pendingFinalDeliveryCreatedAt,
+                expectedPartCount: parts.length,
+                parts: parts.map((part, index) =>
+                  Object.assign({}, part, { payload: finals[index] }),
+                ),
+                outboundDelivery: { status: "prepared" },
+              },
+        );
+        if (!row?.preparedSourceFinal) {
+          throw new Error("required source final preparation was not persisted");
+        }
+        markInboundDedupeReplayUnsafe();
+        finalReplyDeliveryStarted = true;
+        return finals.map((payload, index) => {
+          recordCleanupCrewTerminalStopBeforeFinalDelivery(payload);
+          recordCleanupCrewMissionSettlement(payload, "intent_durable");
+          const part =
+            row.preparedSourceFinal?.kind === "source_session_transcript"
+              ? row.preparedSourceFinal.parts[index]
+              : undefined;
+          return part
+            ? setReplyPayloadMetadata(payload, {
+                ...getReplyPayloadMetadata(payload),
+                canonicalAssistantTranscript: part.canonicalAssistantTranscript,
+                sourceReplyTranscriptMirror: {
+                  sessionKey: row.sourceSessionKey!,
+                  sessionId: row.preparedSourceFinal!.sessionId,
+                  agentId: sessionAgentId,
+                  text: part.text,
+                  mediaUrls: part.mediaUrls,
+                  idempotencyKey: part.idempotencyKey,
+                  webchatContent: part.webchatContent,
+                },
+              })
+            : payload;
+        });
+      });
+      if (!queuedFinal) {
+        return unproven;
+      }
+      await dispatcher.waitForIdle();
+      const after = getDispatcherFinalOutcomeCounts(dispatcher);
+      const delivered = after.failed === before.failed && after.cancelled === before.cancelled;
+      for (const payload of preparedPayloads) {
+        recordCleanupCrewMissionSettlement(payload, delivered ? "proven" : "failed");
+        if (delivered) {
+          recordCleanupCrewPostReportContinuation(payload, { finalDeliveryDelivered: true });
+        }
+      }
+      return { ...unproven, queuedFinal, finalDeliveryDelivered: delivered };
     };
     // Run before_dispatch hook — let plugins inspect or handle before model dispatch.
     if (hookRunner?.hasHooks("before_dispatch")) {
@@ -3126,33 +3344,35 @@ export async function dispatchReplyFromConfig(
           queuedFinal = handledReply.queuedFinal;
           routedFinalCount += handledReply.routedFinalCount;
           const handledFinalDelivered = handledReply.finalDeliveryDelivered;
-          await recordSourceTurnDeliveryState(
-            handledFinalDelivered
-              ? {
-                  finalDeliveryRequired: true,
-                  finalDeliveryDelivered: true,
-                  evidenceKinds:
-                    handledReply.routedFinalCount > 0
-                      ? ["direct_source_final"]
-                      : ["source_chat_final"],
-                }
-              : handledReply.finalDeliveryUnknown
+          if (!requiredSourceContinuation) {
+            await recordSourceTurnDeliveryState(
+              handledFinalDelivered
                 ? {
                     finalDeliveryRequired: true,
-                    deliveryOutcomeUnknown: true,
-                    evidenceKinds: ["delivery_unknown_after_send"],
+                    finalDeliveryDelivered: true,
+                    evidenceKinds:
+                      handledReply.routedFinalCount > 0
+                        ? ["direct_source_final"]
+                        : ["source_chat_final"],
                   }
-                : {
-                    finalDeliveryRequired: true,
-                    deliveryToolFailed: true,
-                    evidenceKinds: ["delivery_tool_failure"],
-                  },
-            handledFinalDelivered
-              ? "before_dispatch_final_delivered"
-              : handledReply.finalDeliveryUnknown
-                ? "before_dispatch_final_delivery_unknown"
-                : "before_dispatch_final_delivery_failed",
-          );
+                : handledReply.finalDeliveryUnknown
+                  ? {
+                      finalDeliveryRequired: true,
+                      deliveryOutcomeUnknown: true,
+                      evidenceKinds: ["delivery_unknown_after_send"],
+                    }
+                  : {
+                      finalDeliveryRequired: true,
+                      deliveryToolFailed: true,
+                      evidenceKinds: ["delivery_tool_failure"],
+                    },
+              handledFinalDelivered
+                ? "before_dispatch_final_delivered"
+                : handledReply.finalDeliveryUnknown
+                  ? "before_dispatch_final_delivery_unknown"
+                  : "before_dispatch_final_delivery_failed",
+            );
+          }
         } else if (text && suppressDelivery) {
           await recordSourceTurnDeliveryState(
             {
@@ -3199,6 +3419,12 @@ export async function dispatchReplyFromConfig(
             {
               cfg,
               dispatcher: dispatchHookDispatcher,
+              ...(requiredSourceContinuation
+                ? {
+                    deliverFinalBatch: (payloads: readonly ReplyPayload[]) =>
+                      sendRequiredSourceFinalBatch(payloads, getPreDispatchAbortSignal()),
+                  }
+                : {}),
               abortSignal: getPreDispatchAbortSignal() ?? params.replyOptions?.abortSignal,
               onReplyStart: params.replyOptions?.onReplyStart,
               recordProcessed,
@@ -3546,6 +3772,25 @@ export async function dispatchReplyFromConfig(
             shouldSuppressToolErrorWarnings,
             typingPolicy: typing.typingPolicy,
             suppressTyping: typing.suppressTyping,
+            onExecutionProgress: async (event) => {
+              if (isDispatchOperationAborted()) {
+                return;
+              }
+              await waitForPendingDirectBlockReplyDelivery(dispatchAbortOperation?.abortSignal);
+              if (isDispatchOperationAborted()) {
+                return;
+              }
+              const proofRef = [
+                `run:${event.runId}`,
+                `${event.source}:${event.phase}`,
+                event.toolCallId ?? event.itemId,
+                event.name,
+              ]
+                .filter(Boolean)
+                .join(":");
+              recordExecutedStep(proofRef);
+              await params.replyOptions?.onExecutionProgress?.(event);
+            },
             onPartialReply: wrapProgressCallback(params.replyOptions?.onPartialReply),
             onReasoningStream: wrapProgressCallback(params.replyOptions?.onReasoningStream),
             onReasoningEnd: wrapProgressCallback(params.replyOptions?.onReasoningEnd),
@@ -3557,22 +3802,12 @@ export async function dispatchReplyFromConfig(
               forwardWhenSourceDeliverySuppressed: true,
               requiresToolSummaryVisibility: true,
               waitForDirectBlockReplyDelivery: true,
-              onForward: (payload) => {
-                recordNextExecutableStepStarted(
-                  dispatcher,
-                  `tool_start:${normalizeOptionalString(payload?.name) ?? "unknown"}`,
-                );
-              },
             }),
             onItemEvent: wrapProgressCallback(params.replyOptions?.onItemEvent, {
               forwardWhenSourceDeliverySuppressed: true,
               requiresToolSummaryVisibility: true,
               waitForDirectBlockReplyDelivery: true,
               onForward: (payload) => {
-                recordNextExecutableStepStarted(
-                  dispatcher,
-                  `item_event:${normalizeOptionalString(payload?.phase) ?? "unknown"}`,
-                );
                 if (hasFailedProgressStatus(payload)) {
                   markVisibleToolErrorProgress();
                 }
@@ -3583,10 +3818,6 @@ export async function dispatchReplyFromConfig(
               requiresToolSummaryVisibility: true,
               waitForDirectBlockReplyDelivery: true,
               onForward: (payload) => {
-                recordNextExecutableStepStarted(
-                  dispatcher,
-                  `command_output:${normalizeOptionalString(payload?.phase) ?? "unknown"}`,
-                );
                 if (hasFailedProgressStatus(payload)) {
                   markVisibleToolErrorProgress();
                 }
@@ -3596,24 +3827,15 @@ export async function dispatchReplyFromConfig(
               forwardWhenSourceDeliverySuppressed: true,
               requiresToolSummaryVisibility: true,
               waitForDirectBlockReplyDelivery: true,
-              onForward: () => {
-                recordNextExecutableStepStarted(dispatcher, "compaction_start");
-              },
             }),
             onCompactionEnd: wrapProgressCallback(params.replyOptions?.onCompactionEnd, {
               forwardWhenSourceDeliverySuppressed: true,
               requiresToolSummaryVisibility: true,
               waitForDirectBlockReplyDelivery: true,
-              onForward: () => {
-                recordNextExecutableStepStarted(dispatcher, "compaction_end");
-              },
             }),
             onToolResult: (payload: ReplyPayload) => {
               markProgress();
-              recordNextExecutableStepStarted(
-                dispatcher,
-                `tool_result:${normalizeOptionalString(payload.text) ?? "tool_result"}`,
-              );
+              recordExecutedStep("tool_result");
               const run = async () => {
                 if (isDispatchOperationAborted()) {
                   return;
@@ -3749,10 +3971,6 @@ export async function dispatchReplyFromConfig(
                 return;
               }
               markProgress();
-              recordNextExecutableStepStarted(
-                dispatcher,
-                `patch_summary:${normalizeOptionalString(payload.summary ?? payload.title) ?? "patch"}`,
-              );
               await waitForPendingDirectBlockReplyDelivery(dispatchAbortOperation?.abortSignal);
               if (isDispatchOperationAborted()) {
                 return;
@@ -3908,6 +4126,12 @@ export async function dispatchReplyFromConfig(
             {
               cfg,
               dispatcher: dispatchHookDispatcher,
+              ...(requiredSourceContinuation
+                ? {
+                    deliverFinalBatch: (payloads: readonly ReplyPayload[]) =>
+                      sendRequiredSourceFinalBatch(payloads, getDispatchAbortSignal()),
+                  }
+                : {}),
               abortSignal: getPreDispatchAbortSignal() ?? params.replyOptions?.abortSignal,
               onReplyStart: params.replyOptions?.onReplyStart,
               recordProcessed,
@@ -3939,6 +4163,7 @@ export async function dispatchReplyFromConfig(
     let attemptedFinalDelivery = false;
     let finalDeliveryUnknown = false;
     let finalDeliveryProven = false;
+    const requiredFinalPayloads: ReplyPayload[] = [];
     let privateOnlyFinalSuppressed = false;
     // Explicit command turns (native or authorized text-slash like /compact) are
     // user-initiated, so a marked terminal reply for the command bypasses
@@ -3988,6 +4213,10 @@ export async function dispatchReplyFromConfig(
         continue;
       }
       attemptedFinalDelivery = true;
+      if (requiredSourceContinuation) {
+        requiredFinalPayloads.push(reply);
+        continue;
+      }
       const finalReply = await sendFinalPayload(reply);
       queuedFinal = finalReply.queuedFinal || queuedFinal;
       routedFinalCount += finalReply.routedFinalCount;
@@ -3995,7 +4224,14 @@ export async function dispatchReplyFromConfig(
       finalDeliveryUnknown = finalReply.finalDeliveryUnknown || finalDeliveryUnknown;
     }
 
-    if (attemptedFinalDelivery) {
+    if (requiredFinalPayloads.length > 0) {
+      const finalBatch = await sendRequiredSourceFinalBatch(requiredFinalPayloads);
+      queuedFinal = finalBatch.queuedFinal;
+      finalDeliveryProven = finalBatch.finalDeliveryDelivered;
+      finalDeliveryUnknown = finalBatch.finalDeliveryUnknown;
+    }
+
+    if (attemptedFinalDelivery && !requiredSourceContinuation) {
       await recordSourceTurnDeliveryState(
         finalDeliveryProven
           ? {
@@ -4119,7 +4355,17 @@ export async function dispatchReplyFromConfig(
     await waitForPendingDirectBlockReplyDelivery(getDispatchAbortSignal());
     const counts = dispatcher.getQueuedCounts();
     counts.final += routedFinalCount;
-    commitInboundDedupeIfClaimed();
+    if (
+      ctx.ActivationContinuation &&
+      !inboundDedupeReplayUnsafe &&
+      inboundDedupeClaim.status === "claimed"
+    ) {
+      // The activation owner supplies its checked immutable report. A failed
+      // preparation must permit that same publication to retry before any effect.
+      releaseInboundDedupe(inboundDedupeClaim.key);
+    } else {
+      commitInboundDedupeIfClaimed();
+    }
     recordAgentDispatchCompleted("completed");
     recordProcessed(
       "completed",

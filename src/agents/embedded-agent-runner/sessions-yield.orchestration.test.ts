@@ -3,7 +3,16 @@
  * with no pending tool calls, so the parent session is idle when subagent
  * results arrive.
  */
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockInstance,
+} from "vitest";
 import { makeAttemptResult } from "./run.overflow-compaction.fixture.js";
 import {
   loadRunOverflowCompactionHarness,
@@ -14,16 +23,53 @@ import {
 import { isEmbeddedAgentRunActive, queueEmbeddedAgentMessageWithOutcome } from "./runs.js";
 
 let runEmbeddedAgent: typeof import("./run.js").runEmbeddedAgent;
+let confirmYield: MockInstance<
+  typeof import("../subagent-registry.js").completeParentYieldWaitContinuationYield
+>;
 
 describe("sessions_yield orchestration", () => {
   beforeAll(async () => {
     ({ runEmbeddedAgent } = await loadRunOverflowCompactionHarness());
+    const registry = await import("../subagent-registry.js");
+    confirmYield = vi.spyOn(registry, "completeParentYieldWaitContinuationYield");
   });
+
+  afterAll(() => confirmYield.mockRestore());
 
   beforeEach(() => {
     mockedRunEmbeddedAttempt.mockReset();
     mockedGlobalHookRunner.hasHooks.mockImplementation(() => false);
+    confirmYield.mockClear();
   });
+
+  it.each([true, false])(
+    "confirms a parent handoff only after a yielded backend return (%s)",
+    async (yielded) => {
+      let releaseAttempt!: (result: ReturnType<typeof makeAttemptResult>) => void;
+      mockedRunEmbeddedAttempt.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseAttempt = resolve;
+          }),
+      );
+      const run = runEmbeddedAgent({
+        ...overflowBaseRunParams,
+        runId: "parent-handoff-run",
+      });
+      await vi.waitFor(() => expect(mockedRunEmbeddedAttempt).toHaveBeenCalledOnce());
+      expect(confirmYield).not.toHaveBeenCalled();
+      releaseAttempt(makeAttemptResult({ yieldDetected: yielded }));
+      await run;
+      if (yielded) {
+        expect(confirmYield).toHaveBeenCalledExactlyOnceWith({
+          controllerSessionKey: overflowBaseRunParams.sessionKey,
+          runId: "parent-handoff-run",
+        });
+      } else {
+        expect(confirmYield).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it("parent session is idle after yield — end_turn, no pendingToolCalls", async () => {
     const sessionId = "yield-parent-session";
@@ -80,6 +126,7 @@ describe("sessions_yield orchestration", () => {
     expect(result.meta.stopReason).toBe("tool_calls");
     expect(result.meta.pendingToolCalls).toHaveLength(1);
     expect(result.meta.pendingToolCalls![0].name).toBe("hosted_tool");
+    expect(confirmYield).not.toHaveBeenCalled();
   });
 
   it("preserves order across multiple client tool calls in one attempt (#52288)", async () => {

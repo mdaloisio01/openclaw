@@ -27,6 +27,7 @@ import {
 import { scheduleGatewaySigusr1Restart } from "../../infra/restart.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { collectEnabledInsecureOrDangerousFlags } from "../../security/dangerous-config-flags.js";
+import type { DeliveryContext } from "../../utils/delivery-context.types.js";
 import { optionalNonNegativeIntegerSchema, stringEnum } from "../schema/typebox.js";
 import {
   type AnyAgentTool,
@@ -505,6 +506,7 @@ const GatewayToolSchema = Type.Object({
 
 export function createGatewayTool(opts?: {
   agentSessionKey?: string;
+  currentDeliveryContext?: DeliveryContext;
   config?: OpenClawConfig;
 }): AnyAgentTool {
   return {
@@ -527,9 +529,15 @@ export function createGatewayTool(opts?: {
         const reason = normalizeOptionalString(params.reason)?.slice(0, 200);
         const note = normalizeOptionalString(params.note);
         const continuationMessage = normalizeOptionalString(params.continuationMessage);
-        // Extract channel + threadId for routing after restart.
-        // Uses generic :thread: parsing plus plugin-owned session grammars.
-        const { deliveryContext, threadId } = extractDeliveryInfo(sessionKey);
+        const currentDeliveryContext =
+          sessionKey === normalizeOptionalString(opts?.agentSessionKey)
+            ? opts?.currentDeliveryContext
+            : undefined;
+        // Current-turn source facts outrank an older stored route. A separately
+        // selected target must never inherit this conversation's destination.
+        const { deliveryContext, threadId } = currentDeliveryContext?.channel
+          ? { deliveryContext: currentDeliveryContext, threadId: currentDeliveryContext.threadId }
+          : extractDeliveryInfo(sessionKey);
         const activationContinuation = buildGatewayToolActivationContinuation({
           deliveryContext,
           note,
@@ -550,7 +558,7 @@ export function createGatewayTool(opts?: {
           ts: Date.now(),
           sessionKey,
           deliveryContext,
-          threadId,
+          threadId: threadId === undefined ? undefined : String(threadId),
           message: note ?? reason ?? null,
           continuation: buildRestartSuccessContinuation({
             sessionKey,

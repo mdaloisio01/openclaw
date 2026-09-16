@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -31,6 +32,12 @@ const TURN_ID = "turn-1";
 const tempDirs = new Set<string>();
 const tinyPngBase64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+function commandProjectionFingerprint(command: string, cwd?: string): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ command, ...(cwd ? { cwd } : {}) }))
+    .digest("hex");
+}
 
 type ProjectorNotification = Parameters<CodexAppServerEventProjector["handleNotification"]>[0];
 
@@ -1662,7 +1669,14 @@ describe("CodexAppServerEventProjector", () => {
       itemId: "cmd-snapshot",
       toolCallId: "cmd-snapshot",
       name: "bash",
-      arguments: { command: "pnpm test extensions/codex", cwd: "/workspace" },
+      arguments: {
+        command: "pnpm test extensions/codex",
+        cwd: "/workspace",
+        ownerProjectionFingerprint: commandProjectionFingerprint(
+          "pnpm test extensions/codex",
+          "/workspace",
+        ),
+      },
     });
     expect(trajectoryRecorder.recordEvent).toHaveBeenCalledWith("tool.result", {
       threadId: THREAD_ID,
@@ -1677,6 +1691,47 @@ describe("CodexAppServerEventProjector", () => {
     });
   });
 
+  it("fingerprints native command projections before trajectory redaction", async () => {
+    const trajectoryRecorder = {
+      filePath: "trajectory.jsonl",
+      recordEvent: vi.fn(),
+      flush: vi.fn(async () => undefined),
+    };
+    const projector = await createProjector(await createParams(), { trajectoryRecorder });
+    const command = "echo token=abcdefghijklmnop";
+
+    await projector.handleNotification(
+      turnCompleted([
+        {
+          type: "commandExecution",
+          id: "cmd-sensitive",
+          command,
+          cwd: "/workspace",
+          processId: null,
+          source: "agent",
+          status: "completed",
+          commandActions: [],
+          aggregatedOutput: "ok",
+          exitCode: 0,
+          durationMs: 1,
+        },
+      ]),
+    );
+
+    expect(trajectoryRecorder.recordEvent).toHaveBeenCalledWith("tool.call", {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      itemId: "cmd-sensitive",
+      toolCallId: "cmd-sensitive",
+      name: "bash",
+      arguments: {
+        command: "echo token=***",
+        cwd: "/workspace",
+        ownerProjectionFingerprint: commandProjectionFingerprint(command, "/workspace"),
+      },
+    });
+  });
+
   it("fails closed when a native tool call finishes without a matching result", async () => {
     const trajectoryRecorder = {
       filePath: "trajectory.jsonl",
@@ -1687,12 +1742,13 @@ describe("CodexAppServerEventProjector", () => {
 
     await projector.handleNotification(
       forCurrentTurn("item/started", {
+        startedAtMs: 1_789_000_000_123,
         item: {
           type: "commandExecution",
           id: "cmd-denied",
           command: "node scripts/report.js --publish",
           cwd: "/workspace",
-          processId: null,
+          processId: "99124",
           source: "agent",
           status: "inProgress",
           commandActions: [],
@@ -1741,6 +1797,12 @@ describe("CodexAppServerEventProjector", () => {
       arguments: {
         command: "node scripts/report.js --publish",
         cwd: "/workspace",
+        ownerProjectionFingerprint: commandProjectionFingerprint(
+          "node scripts/report.js --publish",
+          "/workspace",
+        ),
+        ownerExecutionStartedAtMs: 1_789_000_000_123,
+        ownerExecutionProcessId: "99124",
       },
     });
     expect(trajectoryRecorder.recordEvent).toHaveBeenCalledWith("tool.result", {
@@ -1754,6 +1816,194 @@ describe("CodexAppServerEventProjector", () => {
       result: { status: "failed", reason: "missing_tool_result" },
       output: expect.stringContaining("without a matching tool.result"),
     });
+  });
+
+  it("records an approval start boundary without inventing a process identity", async () => {
+    const trajectoryRecorder = {
+      filePath: "trajectory.jsonl",
+      recordEvent: vi.fn(),
+      flush: vi.fn(async () => undefined),
+    };
+    const projector = await createProjector(await createParams(), { trajectoryRecorder });
+
+    await projector.handleNotification(
+      forCurrentTurn("item/started", {
+        startedAtMs: 1_789_000_000_456,
+        item: {
+          type: "commandExecution",
+          id: "cmd-approval",
+          command: "/bin/bash -lc 'echo approved'",
+          cwd: "/workspace",
+          processId: null,
+          source: "agent",
+          status: "inProgress",
+          commandActions: [],
+          aggregatedOutput: null,
+          exitCode: null,
+          durationMs: null,
+        },
+      }),
+    );
+
+    expect(trajectoryRecorder.recordEvent).toHaveBeenCalledWith("tool.call", {
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      itemId: "cmd-approval",
+      toolCallId: "cmd-approval",
+      name: "bash",
+      arguments: {
+        command: "/bin/bash -lc 'echo approved'",
+        cwd: "/workspace",
+        ownerProjectionFingerprint: commandProjectionFingerprint(
+          "/bin/bash -lc 'echo approved'",
+          "/workspace",
+        ),
+        ownerExecutionStartedAtMs: 1_789_000_000_456,
+      },
+    });
+  });
+
+  it.each([
+    { line: "Process running with session ID 86753", status: "running", processId: "86753" },
+    { line: "Process exited with code 0", status: "completed", exitCode: 0 },
+    { line: "Process exited with code 17", status: "failed", exitCode: 17 },
+  ])("preserves the actual raw native command result: $status", async (testCase) => {
+    const trajectoryRecorder = {
+      filePath: "trajectory.jsonl",
+      recordEvent: vi.fn(),
+      flush: vi.fn(async () => undefined),
+    };
+    const projector = await createProjector(await createParams(), { trajectoryRecorder });
+    await projector.handleNotification(
+      forCurrentTurn("item/started", {
+        item: {
+          type: "commandExecution",
+          id: "cmd-yielded",
+          command: "node worker.js",
+          cwd: "/workspace",
+          status: "inProgress",
+          processId: "86753",
+        },
+      }),
+    );
+    const output = `Chunk ID: chunk-1\nWall time: 1.0000 seconds\n${testCase.line}\nOriginal token count: 1\nOutput:\nready\n`;
+    await projector.handleNotification(
+      forCurrentTurn("rawResponseItem/completed", {
+        item: { type: "function_call_output", call_id: "cmd-yielded", output },
+      }),
+    );
+    await projector.handleNotification(
+      turnCompleted([
+        { type: "agentMessage", id: "msg-1", text: "I received the command result." },
+      ]),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+    expect(result.promptError).toBeNull();
+    expect(result.itemLifecycle.activeCount).toBe(testCase.processId ? 1 : 0);
+    expect(result.toolMetas).toEqual([
+      expect.objectContaining({
+        toolName: "bash",
+        ...(testCase.processId ? { asyncStarted: true } : {}),
+      }),
+    ]);
+    const toolResult = result.messagesSnapshot.find((message) => message.role === "toolResult");
+    expect(toolResult).toMatchObject({
+      toolCallId: "cmd-yielded",
+      isError: testCase.status === "failed",
+      content: [{ type: "toolResult", text: output.trim() }],
+    });
+    expect(trajectoryRecorder.recordEvent).toHaveBeenCalledWith(
+      "tool.result",
+      expect.objectContaining({
+        toolCallId: "cmd-yielded",
+        status: testCase.status,
+        isError: testCase.status === "failed",
+        result: expect.objectContaining({
+          status: testCase.status,
+          ...(testCase.processId ? { processId: testCase.processId } : {}),
+          ...(testCase.exitCode !== undefined ? { exitCode: testCase.exitCode } : {}),
+        }),
+        output: output.trim(),
+      }),
+    );
+  });
+
+  it("keeps process exit proof when a yielded command completes before the turn", async () => {
+    const trajectoryRecorder = {
+      filePath: "trajectory.jsonl",
+      recordEvent: vi.fn(),
+      flush: vi.fn(async () => undefined),
+    };
+    const projector = await createProjector(await createParams(), { trajectoryRecorder });
+    const item = {
+      type: "commandExecution",
+      id: "cmd-yielded",
+      command: "node worker.js",
+      cwd: "/workspace",
+      status: "inProgress",
+      processId: "86753",
+    };
+    await projector.handleNotification(forCurrentTurn("item/started", { item }));
+    await projector.handleNotification(
+      forCurrentTurn("rawResponseItem/completed", {
+        item: {
+          type: "function_call_output",
+          call_id: item.id,
+          output: "Wall time: 1.0000 seconds\nProcess running with session ID 86753\nOutput:\n",
+        },
+      }),
+    );
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: { ...item, status: "completed", exitCode: 0, aggregatedOutput: "finished" },
+      }),
+    );
+    await projector.handleNotification(turnCompleted([]));
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+    expect(result.promptError).toBeNull();
+    expect(result.itemLifecycle.activeCount).toBe(0);
+    const results = trajectoryRecorder.recordEvent.mock.calls.filter(
+      ([type]) => type === "tool.result",
+    );
+    expect(results).toHaveLength(1);
+    expect(results[0]?.[1]).toMatchObject({ status: "completed", output: "finished" });
+    expect(JSON.stringify(result.messagesSnapshot)).toContain("finished");
+    expect(JSON.stringify(result.messagesSnapshot)).not.toContain("Process running");
+  });
+
+  it("does not accept another call's output or a session handle printed in stdout", async () => {
+    const projector = await createProjector();
+    await projector.handleNotification(
+      forCurrentTurn("item/started", {
+        item: {
+          type: "commandExecution",
+          id: "cmd-missing",
+          command: "node worker.js",
+          status: "inProgress",
+        },
+      }),
+    );
+    for (const item of [
+      {
+        type: "function_call_output",
+        call_id: "other-call",
+        output: "Wall time: 1.0000 seconds\nProcess running with session ID 86753\nOutput:\n",
+      },
+      {
+        type: "function_call_output",
+        call_id: "cmd-missing",
+        output: "Wall time: 1.0000 seconds\nOutput:\nProcess running with session ID 86753\n",
+      },
+    ]) {
+      await projector.handleNotification(forCurrentTurn("rawResponseItem/completed", { item }));
+    }
+    await projector.handleNotification(
+      turnCompleted([{ type: "agentMessage", id: "msg-1", text: "Done." }]),
+    );
+    expect(String(projector.buildResult(buildEmptyToolTelemetry()).promptError)).toContain(
+      "without a matching tool.result",
+    );
   });
 
   it("uses streamed command output when final command snapshots omit aggregated output", async () => {

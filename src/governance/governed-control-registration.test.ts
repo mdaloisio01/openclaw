@@ -131,13 +131,13 @@ describe("governed control registration", () => {
     const activeRegistry = getActivePluginRegistry();
 
     expect(activeRegistry?.plugins).toContainEqual(record);
-    expect(activeRegistry?.trustedToolPolicies.map((entry) => entry.policy.id)).toContain(
+    expect(activeRegistry?.trustedToolPolicies?.map((entry) => entry.policy.id)).toContain(
       proof.trustedToolPolicyId,
     );
-    expect(activeRegistry?.runtimeLifecycles.map((entry) => entry.lifecycle.id)).toContain(
+    expect(activeRegistry?.runtimeLifecycles?.map((entry) => entry.lifecycle.id)).toContain(
       proof.lifecycleId,
     );
-    expect(activeRegistry?.controlUiDescriptors.map((entry) => entry.descriptor.id)).toContain(
+    expect(activeRegistry?.controlUiDescriptors?.map((entry) => entry.descriptor.id)).toContain(
       proof.controlUiDescriptorId,
     );
     expect(buildGovernedControlRegistrationHealth(proof)).toMatchObject({

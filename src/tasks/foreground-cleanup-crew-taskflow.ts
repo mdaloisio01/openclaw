@@ -2,9 +2,9 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import {
   createOwnerRequestIntakeRecord,
   markOwnerRequestMissionRegistered,
-  markOwnerRequestPromptPersisted,
 } from "../agents/owner-request-intake-ledger.js";
 import { getLatestSubagentRunByChildSessionKey } from "../agents/subagent-registry.js";
+import { classifyCurrentInboundInstruction } from "../governance/current-inbound-instruction.js";
 import {
   bindActiveSessionTaskToManagedFlowById,
   getTaskById,
@@ -77,27 +77,12 @@ function normalizeText(value: string | undefined): string {
   return (value ?? "").toLowerCase();
 }
 
-function isExplicitReportOnlyOrStop(text: string): boolean {
-  return [
-    "report only",
-    "report-only",
-    "status only",
-    "status-only",
-    "only report",
-    "just report",
-    "stop after this",
-    "stop now",
-    "do not continue",
-    "don't continue",
-  ].some((phrase) => text.includes(phrase));
-}
-
 export function isForegroundCleanupCrewProductionMission(text: string | undefined): boolean {
   const normalized = normalizeText(text);
   if (!normalized.includes("cleanup crew") && !normalized.includes("cleanup-crew")) {
     return false;
   }
-  if (isExplicitReportOnlyOrStop(normalized)) {
+  if (classifyCurrentInboundInstruction(text) !== "unrestricted") {
     return false;
   }
   return [
@@ -237,66 +222,6 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function settleObsoleteRestartBoundaryStateJson(params: {
-  flow: TaskFlowRecord;
-  stateJson: TaskFlowRecord["stateJson"];
-  tracking: ForegroundCleanupCrewTracking;
-  currentStep: string;
-  now: number;
-}): TaskFlowRecord["stateJson"] {
-  if (!params.tracking.checkpointKind || !params.tracking.nextExecutableAction) {
-    return params.stateJson;
-  }
-  const continuation = getTaskFlowProductionContinuation(params.flow);
-  if (
-    !continuation?.activeProductionRun ||
-    continuation.lawfulStopReason !== "restart_or_reload" ||
-    !continuation.restartOrReloadRequired
-  ) {
-    return params.stateJson;
-  }
-  const { lawfulStopReason: _obsoleteStopReason, ...continuationWithoutStopReason } = continuation;
-  const detail = `Obsolete restart/reload boundary settled by ${params.tracking.checkpointKind}: ${params.tracking.nextExecutableAction}`;
-  const settledContinuation = {
-    ...continuationWithoutStopReason,
-    currentUnitStatus: "started" as const,
-    blockerPresent: false,
-    ownerDecisionRequired: false,
-    restartOrReloadRequired: false,
-    hardStopPresent: false,
-    safetyStopPresent: false,
-    lawfulWholeRunCompletion: false,
-    continuationRequiredAfterLocalSuccess: false,
-    nextExecutableUnitIdentified: true,
-    nextExecutableUnitLaunched: false,
-    continuationViolation: false,
-    events: [
-      ...continuation.events,
-      {
-        type: "NEXT_EXECUTABLE_UNIT_IDENTIFIED" as const,
-        at: params.now,
-        detail,
-      },
-    ],
-  };
-  const baseState = isPlainRecord(params.stateJson) ? { ...params.stateJson } : {};
-  const flowForProjection: TaskFlowRecord = {
-    ...params.flow,
-    currentStep: params.currentStep,
-    stateJson: {
-      ...baseState,
-      productionContinuation: settledContinuation,
-    },
-  };
-  const activeProductionContinuation =
-    getTaskFlowActiveProductionContinuation(flowForProjection) ?? undefined;
-  return {
-    ...baseState,
-    productionContinuation: settledContinuation,
-    ...(activeProductionContinuation ? { activeProductionContinuation } : {}),
-  };
-}
-
 function refreshCheckpointNextActionProjectionStateJson(params: {
   flow: TaskFlowRecord;
   stateJson: TaskFlowRecord["stateJson"];
@@ -402,27 +327,30 @@ function ensureForegroundExecutionTask(params: {
   return task?.taskId;
 }
 
-function recordForegroundCheckpointDispatch(params: {
-  flow: TaskFlowRecord;
-  tracking: ForegroundCleanupCrewTracking;
-  currentStep: string;
-  now: number;
-}): TaskFlowRecord {
-  if (!params.tracking.checkpointKind || !params.tracking.nextExecutableAction) {
-    return params.flow;
+export function recordForegroundCleanupCrewExecutionStarted(params: {
+  flowId: string;
+  sessionKey: string;
+  proofRef: string;
+  now?: number;
+}): TaskFlowRecord | undefined {
+  const flow = getTaskFlowById(params.flowId);
+  if (!flow || flow.ownerKey !== params.sessionKey || !isOpenProductionFlow(flow)) {
+    return undefined;
   }
-  const activeProductionContinuation = getTaskFlowActiveProductionContinuation(params.flow);
+  const activeProductionContinuation = getTaskFlowActiveProductionContinuation(flow);
   if (activeProductionContinuation?.status !== "dispatch_required") {
-    return params.flow;
+    return flow;
   }
+  // A checkpoint identifies work. Only the executor's real activity callback
+  // may turn it into a launch receipt; registration itself cannot prove execution.
   const launched = recordFlowNextExecutableLaunch({
-    flowId: params.flow.flowId,
-    expectedRevision: params.flow.revision,
-    detail: params.tracking.nextExecutableAction,
-    currentStep: params.currentStep,
-    updatedAt: params.now,
+    flowId: flow.flowId,
+    expectedRevision: flow.revision,
+    detail: params.proofRef,
+    currentStep: flow.currentStep,
+    updatedAt: params.now ?? Date.now(),
   });
-  return launched.applied ? launched.flow : params.flow;
+  return launched.applied ? launched.flow : undefined;
 }
 
 function findExistingForegroundSupersessionTask(params: {
@@ -716,11 +644,6 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   if (!intakeRequestId) {
     return { status: "blocked", reason: "owner_request_intake_identity_missing" };
   }
-  markOwnerRequestPromptPersisted({
-    requestId: intakeRequestId,
-    stateDir: params.intakeStateDir,
-    nowMs: now,
-  });
   const existing = findForegroundCleanupCrewFlow(ownerKey);
   if (existing) {
     if (isLawfullyBlockedWithoutLaunch(existing)) {
@@ -766,16 +689,9 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
     const trackedStateJson = applyTrackingToStateJson(existing.stateJson, tracking);
     const currentStep =
       tracking.stageId ?? existing.currentStep ?? "foreground_cleanup_crew_resumed";
-    const settledStateJson = settleObsoleteRestartBoundaryStateJson({
-      flow: existing,
-      stateJson: trackedStateJson,
-      tracking,
-      currentStep,
-      now,
-    });
     const nextActionStateJson = refreshCheckpointNextActionProjectionStateJson({
       flow: existing,
-      stateJson: settledStateJson,
+      stateJson: trackedStateJson,
       tracking,
       currentStep,
       now,
@@ -788,15 +704,9 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
       stateJson: nextActionStateJson,
       updatedAt: now,
     });
-    const resumedFlow = resumed.applied
+    const flow = resumed.applied
       ? (findForegroundCleanupCrewFlow(ownerKey) ?? resumed.flow)
       : existing;
-    const flow = recordForegroundCheckpointDispatch({
-      flow: resumedFlow,
-      tracking,
-      currentStep,
-      now,
-    });
     return {
       status: "attached",
       flow,
@@ -858,18 +768,8 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   if (!flow) {
     return { status: "blocked", reason: "taskflow_persistence_failed" };
   }
-  const currentStep =
-    tracking.checkpointKind && tracking.nextExecutableAction
-      ? (tracking.stageId ?? flow.currentStep ?? "foreground_cleanup_crew_checkpoint")
-      : (flow.currentStep ?? "foreground_cleanup_crew_checkpoint");
-  const dispatchedFlow = recordForegroundCheckpointDispatch({
-    flow,
-    tracking,
-    currentStep,
-    now,
-  });
   const taskId = ensureForegroundExecutionTask({
-    flow: dispatchedFlow,
+    flow,
     ownerKey,
     sessionKey,
     now,
@@ -877,7 +777,7 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   });
   markOwnerRequestMissionRegistered({
     requestId: intakeRequestId,
-    taskFlowId: dispatchedFlow.flowId,
+    taskFlowId: flow.flowId,
     taskId,
     lastExecutableAction: "registered foreground Cleanup Crew TaskFlow",
     nextExecutableAction: "execute Cleanup Crew production mission",
@@ -886,7 +786,7 @@ export function ensureForegroundCleanupCrewTaskFlow(params: {
   });
   return {
     status: "registered",
-    flow: dispatchedFlow,
+    flow,
     taskId,
   };
 }

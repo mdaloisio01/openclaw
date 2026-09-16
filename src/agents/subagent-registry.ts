@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { markReplyPayloadAsProgressHeartbeat } from "../auto-reply/reply-payload.js";
 import { routeReply } from "../auto-reply/reply/route-reply.js";
@@ -11,7 +12,12 @@ import type { ContextEngine, SubagentEndReason } from "../context-engine/types.j
 import { callGateway } from "../gateway/call.js";
 import { getAgentRunContext, onAgentEvent } from "../infra/agent-events.js";
 import { requestHeartbeat } from "../infra/heartbeat-wake.js";
-import { enqueueSystemEvent } from "../infra/system-events.js";
+import {
+  consumeSelectedSystemEventEntries,
+  enqueueSystemEvent,
+  peekSystemEventEntries,
+  type ParentYieldWaitRef,
+} from "../infra/system-events.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { formatBlockedLivenessError, isBlockedLivenessState } from "../shared/agent-liveness.js";
 import { normalizeAssistantPhase } from "../shared/chat-message-content.js";
@@ -30,6 +36,12 @@ import { removeInternalSessionEffectsTranscript } from "./internal-session-effec
 import { isAbortedAgentStopReason } from "./run-termination.js";
 import { waitForAgentRun, type AgentWaitResult } from "./run-wait.js";
 import type { ensureRuntimePluginsLoaded as ensureRuntimePluginsLoadedFn } from "./runtime-plugins.js";
+import {
+  loadSourceTurnDeliveryRegistry,
+  persistSourceTurnDeliveryState,
+  resolveSourceTurnDeliveryRegistryPath,
+  type SourceTurnDeliveryRow,
+} from "./source-turn-delivery-store.js";
 import type { SubagentRunOutcome } from "./subagent-announce-output.js";
 import {
   ensureCompletionState,
@@ -38,6 +50,8 @@ import {
   getDeliveryLastAttemptAt,
   getDeliveryLastError,
   isDeliverySuspended,
+  isParentYieldCloseoutPending,
+  shouldRetainParentYieldCloseout,
 } from "./subagent-delivery-state.js";
 import {
   SUBAGENT_ENDED_REASON_COMPLETE,
@@ -204,11 +218,15 @@ const runtimePluginsLoader = createLazyPromiseLoader(() =>
 
 let sweeper: NodeJS.Timeout | null = null;
 const resumeRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+// Only the control caller owns an admitted steer until its handoff finishes.
+// A warm Gateway restart must not abandon that still-running transaction.
+const activeSteerRestarts = new Set<string>();
 let sweepInProgress = false;
 let listenerStarted = false;
 let listenerStop: (() => void) | null = null;
 // Use var to avoid TDZ when init runs across circular imports during bootstrap.
 let restoreAttempted = false;
+let parentYieldWaitRecovery: Promise<void> | undefined;
 const ORPHAN_RECOVERY_DEBOUNCE_MS = 1_000;
 let lastOrphanRecoveryScheduleAt = 0;
 const SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
@@ -286,8 +304,8 @@ function persistSubagentRuns() {
   subagentRegistryDeps.persistSubagentRunsToDisk(subagentRuns);
 }
 
-function persistSubagentRunsOrThrow() {
-  subagentRegistryDeps.persistSubagentRunsToDiskOrThrow(subagentRuns);
+function persistSubagentRunsOrThrow(runs = subagentRuns) {
+  subagentRegistryDeps.persistSubagentRunsToDiskOrThrow(runs);
 }
 
 export function scheduleSubagentOrphanRecovery(params?: { delayMs?: number; maxRetries?: number }) {
@@ -395,18 +413,24 @@ function emitSubagentRequesterSystemEvent(
   entry: SubagentRunRecord,
   text: string,
   contextSuffix: string,
+  parentYieldWait?: ParentYieldWaitRef,
 ): void {
-  const sessionKey = normalizeOptionalString(entry.requesterSessionKey);
+  const sessionKey = normalizeOptionalString(
+    parentYieldWait ? entry.parentYieldWait?.parentSessionKey : entry.requesterSessionKey,
+  );
   const trimmed = text.trim();
   if (!sessionKey || !trimmed) {
     return;
   }
-  const contextKey = `subagent:${entry.runId}:${contextSuffix}`;
+  const contextKey = parentYieldWait
+    ? `subagent:parent-yield:${parentYieldWait.parentRunId}:${parentYieldWait.waitId}`
+    : `subagent:${entry.runId}:${contextSuffix}`;
   const fallback = () => {
     enqueueSystemEvent(trimmed, {
       sessionKey,
       contextKey,
       deliveryContext: entry.requesterOrigin,
+      ...(parentYieldWait ? { parentYieldWait } : {}),
     });
     requestHeartbeat({
       source: "subagent-progress",
@@ -415,6 +439,12 @@ function emitSubagentRequesterSystemEvent(
       sessionKey,
     });
   };
+  // Continuation is work for the parent, even when a direct status route exists.
+  // Keep the typed wait identity on the wake event until its final delivery.
+  if (parentYieldWait) {
+    fallback();
+    return;
+  }
   const directOrigin = resolveRoutableDeliveryContext(entry.requesterOrigin);
   if (!directOrigin) {
     fallback();
@@ -486,6 +516,7 @@ function isRunTerminalForParentYieldWait(entry: SubagentRunRecord): boolean {
   return (
     typeof entry.endedAt === "number" &&
     entry.pauseReason !== "sessions_yield" &&
+    entry.suppressAnnounceReason !== "steer-restart" &&
     entry.outcome !== undefined
   );
 }
@@ -504,16 +535,47 @@ function uniqueSorted(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean))).toSorted();
 }
 
+function commitParentYieldWaitUpdates(
+  updates: Map<string, NonNullable<SubagentRunRecord["parentYieldWait"]>>,
+): void {
+  if (updates.size === 0) {
+    return;
+  }
+  const nextRuns = new Map(subagentRuns);
+  for (const [runId, wait] of updates) {
+    const entry = subagentRuns.get(runId);
+    if (entry) {
+      nextRuns.set(runId, { ...entry, parentYieldWait: wait });
+    }
+  }
+  // A wake may start source delivery immediately. Its exact wait must survive
+  // restart before any event or heartbeat can publish that obligation.
+  persistSubagentRunsOrThrow(nextRuns);
+  for (const [runId, wait] of updates) {
+    const entry = subagentRuns.get(runId);
+    if (entry) {
+      entry.parentYieldWait = wait;
+    }
+  }
+}
+
 function updateParentYieldWaitFanIn(
   waitId: string,
   sourceEntry: SubagentRunRecord,
   now = Date.now(),
-): boolean {
-  const members = collectParentYieldWaitMembers(waitId);
-  if (members.length === 0) {
-    return false;
+  replayScheduled = false,
+): void {
+  const members = collectParentYieldWaitMembers(waitId).filter(
+    (entry) =>
+      entry.parentYieldWait?.parentRunId === sourceEntry.parentYieldWait?.parentRunId &&
+      entry.parentYieldWait?.parentSessionKey === sourceEntry.parentYieldWait?.parentSessionKey,
+  );
+  const representative = members.find((entry) => entry.runId === sourceEntry.runId) ?? members[0];
+  const wait = representative?.parentYieldWait;
+  if (!representative || !wait) {
+    return;
   }
-  const expected = members[0]?.parentYieldWait?.expectedChildRunIds ?? [];
+  const expected = wait.expectedChildRunIds;
   const expectedSet = new Set(expected);
   const terminalChildRunIds = uniqueSorted(
     members
@@ -521,37 +583,40 @@ function updateParentYieldWaitFanIn(
       .map((entry) => entry.runId),
   );
   const allTerminal = expected.length > 0 && terminalChildRunIds.length === expectedSet.size;
-  let mutated = false;
-
+  const scheduleContinuation =
+    allTerminal &&
+    wait.status !== "closeout_delivered" &&
+    wait.continuation?.phase !== "yield_requested" &&
+    (wait.continuationScheduledAt === undefined || replayScheduled);
+  const updates = new Map<string, NonNullable<SubagentRunRecord["parentYieldWait"]>>();
   for (const entry of members) {
-    const wait = entry.parentYieldWait;
-    if (!wait) {
+    const current = entry.parentYieldWait;
+    if (!current || current.status === "closeout_delivered") {
       continue;
     }
-    const nextStatus = allTerminal && wait.status === "waiting" ? "ready_to_resume" : wait.status;
-    const currentTerminal = JSON.stringify(wait.terminalChildRunIds ?? []);
-    const nextTerminal = JSON.stringify(terminalChildRunIds);
-    if (wait.status !== nextStatus || currentTerminal !== nextTerminal) {
-      entry.parentYieldWait = {
-        ...wait,
+    const newlyScheduled = scheduleContinuation && current.continuationScheduledAt === undefined;
+    const nextStatus = newlyScheduled
+      ? "continuation_scheduled"
+      : allTerminal && current.status === "waiting"
+        ? "ready_to_resume"
+        : current.status;
+    if (
+      current.status !== nextStatus ||
+      JSON.stringify(current.terminalChildRunIds ?? []) !== JSON.stringify(terminalChildRunIds)
+    ) {
+      updates.set(entry.runId, {
+        ...current,
         status: nextStatus,
         terminalChildRunIds,
+        ...(newlyScheduled ? { continuationScheduledAt: now } : {}),
         lastUpdatedAt: now,
-      };
-      mutated = true;
+      });
     }
   }
-
-  if (!allTerminal) {
-    return mutated;
+  commitParentYieldWaitUpdates(updates);
+  if (!scheduleContinuation) {
+    return;
   }
-
-  const representative = members.find((entry) => entry.runId === sourceEntry.runId) ?? members[0];
-  const wait = representative?.parentYieldWait;
-  if (!representative || !wait || wait.continuationScheduledAt) {
-    return mutated;
-  }
-
   emitSubagentRequesterSystemEvent(
     representative,
     [
@@ -561,24 +626,452 @@ function updateParentYieldWaitFanIn(
       "Resume the parent task now and produce the required user-facing closeout; do not reply NO_REPLY.",
     ].join(" "),
     `yield-wait-ready:${wait.waitId}`,
+    wait.parentRunId ? { waitId: wait.waitId, parentRunId: wait.parentRunId } : undefined,
   );
+}
 
-  for (const entry of members) {
-    const current = entry.parentYieldWait;
-    if (!current) {
-      continue;
-    }
-    entry.parentYieldWait = {
-      ...current,
-      status: "continuation_scheduled",
-      terminalChildRunIds,
-      continuationScheduledAt: now,
-      lastUpdatedAt: now,
-    };
-    mutated = true;
+type ParentYieldWaitDeliveryIdentity = {
+  controllerSessionKey: string;
+  waitId: string;
+  parentRunId: string;
+};
+
+function consumeParentYieldWaitEvents(identity: ParentYieldWaitDeliveryIdentity): void {
+  consumeSelectedSystemEventEntries(
+    identity.controllerSessionKey,
+    peekSystemEventEntries(identity.controllerSessionKey).filter(
+      (event) =>
+        event.parentYieldWait?.waitId === identity.waitId &&
+        event.parentYieldWait.parentRunId === identity.parentRunId,
+    ),
+  );
+}
+
+function readParentYieldWaitMembers(identity: ParentYieldWaitDeliveryIdentity) {
+  const snapshot = subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns);
+  const members = [...snapshot.values()].filter(
+    (entry) =>
+      entry.parentYieldWait?.waitId === identity.waitId &&
+      entry.parentYieldWait.parentRunId === identity.parentRunId &&
+      entry.parentYieldWait.parentSessionKey === identity.controllerSessionKey,
+  );
+  const wait = members[0]?.parentYieldWait;
+  if (
+    !wait?.requiredCloseout ||
+    wait.expectedChildRunIds.length === 0 ||
+    members.length !== new Set(wait.expectedChildRunIds).size ||
+    !wait.expectedChildRunIds.every((runId) => members.some((entry) => entry.runId === runId)) ||
+    !members.every((entry) => isDeepStrictEqual(entry.parentYieldWait, wait))
+  ) {
+    return undefined;
+  }
+  return { members, wait };
+}
+
+export function getParentYieldWaitContinuation(
+  identity: ParentYieldWaitDeliveryIdentity,
+): { status: "ready" | "waiting"; yieldedRunIds: string[] } | undefined {
+  const state = readParentYieldWaitMembers(identity);
+  if (!state || state.wait.status === "closeout_delivered") {
+    return undefined;
+  }
+  return {
+    status:
+      state.wait.status === "continuation_scheduled" &&
+      state.wait.continuation?.phase !== "yield_requested" &&
+      state.members.every(isRunTerminalForParentYieldWait)
+        ? "ready"
+        : "waiting",
+    yieldedRunIds: (state.wait.yieldedContinuations ?? []).map((entry) => entry.runId),
+  };
+}
+
+/** Claim the exact execution before dispatch can create its accepted source row. */
+export function prepareParentYieldWaitContinuation(
+  identity: ParentYieldWaitDeliveryIdentity & { runId: string },
+): string {
+  const state = readParentYieldWaitMembers(identity);
+  if (
+    !state ||
+    state.wait.status !== "continuation_scheduled" ||
+    state.wait.continuation?.phase === "yield_requested" ||
+    !state.members.every(isRunTerminalForParentYieldWait)
+  ) {
+    throw new Error("Parent continuation is still waiting for its owned work");
+  }
+  // A pre-dispatch interruption can leave the claim without an accepted row.
+  // Reuse that exact identity; an existing accepted row is checked by heartbeat first.
+  const runId = state.wait.continuation?.runId ?? identity.runId;
+  const next = { ...state.wait, continuation: { runId, phase: "running" as const } };
+  commitParentYieldWaitUpdates(new Map(state.members.map((entry) => [entry.runId, next])));
+  return runId;
+}
+
+/** Called only by the common run owner after the backend returns a confirmed yield. */
+export function completeParentYieldWaitContinuationYield(params: {
+  controllerSessionKey: string;
+  runId: string;
+}): void {
+  const snapshot = subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns);
+  const requested = [...snapshot.values()].find(
+    (entry) =>
+      entry.parentYieldWait?.parentSessionKey === params.controllerSessionKey &&
+      entry.parentYieldWait.continuation?.runId === params.runId &&
+      entry.parentYieldWait.continuation.phase === "yield_requested",
+  )?.parentYieldWait;
+  if (!requested?.parentRunId) {
+    return;
+  }
+  const identity = {
+    controllerSessionKey: params.controllerSessionKey,
+    waitId: requested.waitId,
+    parentRunId: requested.parentRunId,
+  };
+  const state = readParentYieldWaitMembers(identity);
+  if (!state || state.wait.status === "closeout_delivered") {
+    throw new Error("Parent yield handoff is missing its complete child ownership");
+  }
+  const now = Date.now();
+  const next = {
+    ...state.wait,
+    status: "waiting" as const,
+    continuation: undefined,
+    continuationScheduledAt: undefined,
+    yieldedContinuations: [
+      ...(state.wait.yieldedContinuations ?? []),
+      { runId: params.runId, endedAt: now },
+    ],
+    lastUpdatedAt: now,
+  };
+  commitParentYieldWaitUpdates(new Map(state.members.map((entry) => [entry.runId, next])));
+  // Retire the old wake only after the handoff commits, then let canonical
+  // child fan-in schedule the next round under the same original obligation.
+  consumeParentYieldWaitEvents(identity);
+  updateParentYieldWaitFanIn(identity.waitId, state.members[0], now);
+}
+
+function isParentYieldWaitDeliveryReceipt(
+  row: SourceTurnDeliveryRow,
+  identity: ParentYieldWaitDeliveryIdentity,
+): boolean {
+  return Boolean(
+    row.sourceSessionKey === identity.controllerSessionKey &&
+    row.parentYieldWaits?.some(
+      (wait) => wait.waitId === identity.waitId && wait.parentRunId === identity.parentRunId,
+    ) &&
+    row.sourceTurnState === "final_delivered" &&
+    row.obligationStage === "delivered" &&
+    row.finalDeliveryDelivered &&
+    row.deliveryDecision.finalDeliveryDelivered &&
+    !row.deliveryDecision.refused &&
+    row.durabilityDecision.allowedToSettle &&
+    normalizeOptionalString(row.obligationIdentity?.runId) &&
+    row.idempotencyKey,
+  );
+}
+
+/** Settle a yielded parent's closeout only from the delivery owner's durable receipt. */
+export async function completeParentYieldWaitFromDelivery(
+  params: ParentYieldWaitDeliveryIdentity & { registryPath: string; deliveryRecordId: string },
+): Promise<number> {
+  const registry = await loadSourceTurnDeliveryRegistry(params.registryPath);
+  const receipt = registry.rows.find(
+    (row) => row.id === params.deliveryRecordId && isParentYieldWaitDeliveryReceipt(row, params),
+  );
+  const deliveredAt = receipt ? Date.parse(receipt.updatedAt) : Number.NaN;
+  if (!receipt || !Number.isFinite(deliveredAt)) {
+    return 0;
   }
 
-  return mutated;
+  const snapshot = subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns);
+  const updated = new Map<string, SubagentRunRecord>();
+  for (const entry of snapshot.values()) {
+    const wait = entry.parentYieldWait;
+    if (
+      !wait ||
+      wait.status !== "continuation_scheduled" ||
+      wait.waitId !== params.waitId ||
+      wait.parentSessionKey !== params.controllerSessionKey ||
+      wait.parentRunId !== params.parentRunId ||
+      !wait.requiredCloseout ||
+      wait.continuationScheduledAt === undefined ||
+      deliveredAt < wait.continuationScheduledAt ||
+      wait.yieldedContinuations?.some(
+        (yielded) => yielded.runId === receipt.obligationIdentity.runId,
+      ) ||
+      (wait.continuation &&
+        (wait.continuation.phase !== "running" ||
+          wait.continuation.runId !== receipt.obligationIdentity.runId)) ||
+      wait.expectedChildRunIds.length === 0
+    ) {
+      continue;
+    }
+    // A later reply cannot settle missing children or another yield generation.
+    const childrenTerminal = wait.expectedChildRunIds.every((runId) => {
+      const child = snapshot.get(runId);
+      return (
+        child?.parentYieldWait?.waitId === wait.waitId &&
+        child.parentYieldWait.parentRunId === wait.parentRunId &&
+        child.parentYieldWait.parentSessionKey === wait.parentSessionKey &&
+        isDeepStrictEqual(child.parentYieldWait.continuation, wait.continuation) &&
+        isDeepStrictEqual(child.parentYieldWait.yieldedContinuations, wait.yieldedContinuations) &&
+        isRunTerminalForParentYieldWait(child) &&
+        child.endedAt! <= deliveredAt
+      );
+    });
+    if (!childrenTerminal) {
+      continue;
+    }
+    updated.set(entry.runId, {
+      ...entry,
+      ...(entry.cleanup === "delete" ? { archiveAtMs: deliveredAt } : {}),
+      parentYieldWait: {
+        ...wait,
+        status: "closeout_delivered",
+        terminalChildRunIds: uniqueSorted(wait.expectedChildRunIds),
+        lastUpdatedAt: deliveredAt,
+        closeout: {
+          parentRunId: params.parentRunId,
+          deliveryRecordId: receipt.id,
+          deliveryIdempotencyKey: receipt.idempotencyKey,
+          deliveryRegistryPath: params.registryPath,
+          deliveredAt,
+        },
+      },
+    });
+  }
+  if (updated.size === 0) {
+    return 0;
+  }
+
+  // Publish memory only after SQLite commits; failed persistence must leave the
+  // required closeout visible to the next recovery attempt.
+  const next = new Map([...snapshot, ...updated]);
+  subagentRegistryDeps.persistSubagentRunsToDiskOrThrow(next);
+  for (const [runId, entry] of updated) {
+    subagentRuns.set(runId, entry);
+  }
+  return updated.size;
+}
+
+/** Reconcile an existing receipt before any parent continuation can be redelivered. */
+export async function reconcileParentYieldWaitDelivery(
+  params: ParentYieldWaitDeliveryIdentity & { registryPath: string },
+): Promise<"settled" | "pending" | "missing_receipt"> {
+  try {
+    const registry = await loadSourceTurnDeliveryRegistry(params.registryPath);
+    const receipts = registry.rows.filter((row) => isParentYieldWaitDeliveryReceipt(row, params));
+    if (receipts.length === 0) {
+      return "missing_receipt";
+    }
+    for (const receipt of receipts) {
+      await completeParentYieldWaitFromDelivery({ ...params, deliveryRecordId: receipt.id });
+    }
+    const snapshot = subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns);
+    const members = [...snapshot.values()].filter(
+      (child) =>
+        child.parentYieldWait?.waitId === params.waitId &&
+        child.parentYieldWait.parentRunId === params.parentRunId &&
+        child.parentYieldWait.parentSessionKey === params.controllerSessionKey,
+    );
+    const isClosed = (child: SubagentRunRecord | undefined) => {
+      const wait = child?.parentYieldWait;
+      const expected = uniqueSorted(wait?.expectedChildRunIds ?? []);
+      const terminal = uniqueSorted(wait?.terminalChildRunIds ?? []);
+      return (
+        child !== undefined &&
+        wait?.waitId === params.waitId &&
+        wait.parentRunId === params.parentRunId &&
+        wait.parentSessionKey === params.controllerSessionKey &&
+        wait.status === "closeout_delivered" &&
+        wait.requiredCloseout &&
+        wait.closeout.parentRunId === params.parentRunId &&
+        wait.closeout.deliveryRegistryPath === params.registryPath &&
+        expected.length > 0 &&
+        expected.includes(child.runId) &&
+        expected.length === terminal.length &&
+        expected.every((id, index) => terminal[index] === id) &&
+        isRunTerminalForParentYieldWait(child) &&
+        receipts.some(
+          (receipt) =>
+            wait.closeout.deliveryRecordId === receipt.id &&
+            wait.closeout.deliveryIdempotencyKey === receipt.idempotencyKey &&
+            wait.closeout.deliveredAt === Date.parse(receipt.updatedAt) &&
+            child.endedAt! <= wait.closeout.deliveredAt,
+        )
+      );
+    };
+    const settled =
+      members.length > 0 &&
+      members.every((child) => {
+        const expected = child.parentYieldWait?.expectedChildRunIds ?? [];
+        // Completion already verified every child before committing the full
+        // terminal set. Normal cleanup may sweep siblings after that commit.
+        return (
+          isClosed(child) && expected.every((id) => !snapshot.has(id) || isClosed(snapshot.get(id)))
+        );
+      });
+    if (settled) {
+      const closedWait = members[0].parentYieldWait;
+      if (closedWait?.status !== "closeout_delivered") {
+        return "pending";
+      }
+      const receipt = receipts.find((row) => row.id === closedWait.closeout.deliveryRecordId)!;
+      for (const yielded of closedWait.yieldedContinuations ?? []) {
+        // A confirmed yield transfers the still-owed final, never claims that
+        // this older execution delivered it. Only this exact later receipt settles it.
+        const yieldedRows = registry.rows.filter(
+          (row) =>
+            row.obligationIdentity.runId === yielded.runId &&
+            row.sourceSessionKey === params.controllerSessionKey &&
+            row.parentYieldWaits?.some(
+              (wait) => wait.waitId === params.waitId && wait.parentRunId === params.parentRunId,
+            ),
+        );
+        for (const row of yieldedRows) {
+          if (
+            row.sourceChannel !== receipt.sourceChannel ||
+            !isDeepStrictEqual(row.deliveryContext, receipt.deliveryContext) ||
+            row.preparedSourceFinal ||
+            row.finalDeliveryDelivered ||
+            !(Date.parse(row.acceptedAt) <= yielded.endedAt) ||
+            !(yielded.endedAt <= closedWait.closeout.deliveredAt)
+          ) {
+            return "pending";
+          }
+          if (row.sourceTurnState === "settled_resolved_later") {
+            continue;
+          }
+          await persistSourceTurnDeliveryState({
+            registryPath: params.registryPath,
+            id: row.id,
+            sourceTurnId: row.sourceTurnId,
+            ...row.obligationIdentity,
+            facts: {
+              finalDeliveryRequired: true,
+              historicalSettlement: true,
+              evidenceKinds: ["settled_resolved_later"],
+            },
+            currentStage: "parent_yield_settled_by_later_final",
+            watchdogReconciliation: {
+              status: "settled_resolved_later",
+              action: "settle-source-resolved-later",
+              reason: `Confirmed yielded run ${yielded.runId}; exact parent final ${receipt.id} (${receipt.idempotencyKey}) delivered.`,
+              proofPath: params.registryPath,
+              originalFinalDeliveryDelivered: false,
+              originalVisibleDeliveryCount: row.visibleDeliveryCount,
+            },
+          });
+        }
+      }
+      consumeParentYieldWaitEvents(params);
+    }
+    return settled ? "settled" : "pending";
+  } catch (error) {
+    // The receipt may already be durable. Keep the wait visible and let the
+    // existing wake owner retry settlement without another model run or delivery.
+    log.warn(`failed to reconcile parent yield wait ${params.waitId}: ${String(error)}`);
+    return "pending";
+  }
+}
+
+async function recoverRestoredParentYieldWaits(): Promise<void> {
+  const waits = new Map<
+    string,
+    ParentYieldWaitRef & {
+      parentSessionKey: string;
+      childRunId: string;
+      replayScheduled: boolean;
+    }
+  >();
+  for (const entry of subagentRuns.values()) {
+    const wait = entry.parentYieldWait;
+    if (!wait?.parentRunId) {
+      continue;
+    }
+    // Warm restart can preserve the event after closeout committed. Include it
+    // so receipt reconciliation removes that wake before another parent turn.
+    const hasQueuedWait = peekSystemEventEntries(wait.parentSessionKey).some(
+      (event) =>
+        event.parentYieldWait?.waitId === wait.waitId &&
+        event.parentYieldWait.parentRunId === wait.parentRunId,
+    );
+    if (!isParentYieldCloseoutPending(entry) && !hasQueuedWait) {
+      continue;
+    }
+    const identity = JSON.stringify([wait.parentSessionKey, wait.parentRunId, wait.waitId]);
+    if (!waits.has(identity)) {
+      waits.set(identity, {
+        waitId: wait.waitId,
+        parentRunId: wait.parentRunId,
+        parentSessionKey: wait.parentSessionKey,
+        childRunId: entry.runId,
+        replayScheduled: wait.continuationScheduledAt !== undefined,
+      });
+    }
+  }
+  if (waits.size === 0) {
+    return;
+  }
+
+  const registryPath = resolveSourceTurnDeliveryRegistryPath();
+  for (const wait of waits.values()) {
+    try {
+      // A crash can follow the sink's durable receipt but precede wait settlement.
+      // Recover that acknowledgment before replaying an ephemeral system event.
+      const reconciled = await reconcileParentYieldWaitDelivery({
+        controllerSessionKey: wait.parentSessionKey,
+        waitId: wait.waitId,
+        parentRunId: wait.parentRunId,
+        registryPath,
+      });
+      if (reconciled === "settled") {
+        continue;
+      }
+      const current = subagentRuns.get(wait.childRunId);
+      if (
+        current?.parentYieldWait?.waitId !== wait.waitId ||
+        current.parentYieldWait.parentRunId !== wait.parentRunId ||
+        current.parentYieldWait.parentSessionKey !== wait.parentSessionKey
+      ) {
+        continue;
+      }
+      if (
+        current.parentYieldWait.yieldedContinuations?.length &&
+        !current.parentYieldWait.continuation &&
+        current.parentYieldWait.continuationScheduledAt === undefined
+      ) {
+        // A warm crash can follow the yielded handoff commit but precede old
+        // event retirement. Remove that wake before canonical fan-in replays it.
+        consumeParentYieldWaitEvents({
+          controllerSessionKey: wait.parentSessionKey,
+          waitId: wait.waitId,
+          parentRunId: wait.parentRunId,
+        });
+      }
+      updateParentYieldWaitFanIn(wait.waitId, current, Date.now(), wait.replayScheduled);
+    } catch (error) {
+      log.warn(`failed to recover parent yield wait ${wait.waitId}: ${String(error)}`);
+    }
+  }
+}
+
+function recoverAbandonedSteerRestarts(): void {
+  // Only explicit Gateway startup owns abandoned handoffs. Other processes can
+  // import this shared registry while its actual control caller is still alive.
+  for (const entry of subagentRuns.values()) {
+    if (entry.suppressAnnounceReason !== "steer-restart" || activeSteerRestarts.has(entry.runId)) {
+      continue;
+    }
+    // The Gateway may have committed the replacement before its caller received
+    // the reply. Never close the old wait over that newer canonical child run.
+    const latest = getLatestSubagentRunByChildSessionKey(entry.childSessionKey);
+    if (latest?.runId === entry.runId) {
+      // Clearing intent does not finish a still-running child; fan-in continues
+      // to require its actual terminal outcome after the old caller is gone.
+      clearSubagentRunSteerRestart(entry.runId);
+    }
+  }
 }
 
 export function markParentYieldWaitForController(params: {
@@ -599,10 +1092,38 @@ export function markParentYieldWaitForController(params: {
     return { marked: 0, expectedChildRunIds: [], terminalChildRunIds: [] };
   }
   const now = params.now ?? Date.now();
-  const candidates = listRunsForControllerFromRuns(
+  const controllerRuns = listRunsForControllerFromRuns(
     subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns),
     controllerSessionKey,
-  ).filter((entry) => {
+  );
+  const continuedWait = controllerRuns.find(
+    (entry) =>
+      params.parentRunId &&
+      (entry.parentYieldWait?.continuation?.runId === params.parentRunId ||
+        (entry.parentYieldWait?.parentRunId === params.parentRunId &&
+          !entry.parentYieldWait.continuation)) &&
+      entry.parentYieldWait?.status !== "closeout_delivered",
+  )?.parentYieldWait;
+  const continuedState = continuedWait?.parentRunId
+    ? readParentYieldWaitMembers({
+        controllerSessionKey,
+        waitId: continuedWait.waitId,
+        parentRunId: continuedWait.parentRunId,
+      })
+    : undefined;
+  if (continuedWait && !continuedState) {
+    throw new Error("Parent yield cannot replace an incomplete owned wait");
+  }
+  const candidates = controllerRuns.filter((entry) => {
+    const wait = entry.parentYieldWait;
+    if (continuedWait && wait?.waitId === continuedWait.waitId) {
+      return true;
+    }
+    // Another required wait retains its own receipt and children. A new turn
+    // cannot overwrite it merely because it shares the controller session.
+    if (wait?.requiredCloseout && wait.status !== "closeout_delivered") {
+      return false;
+    }
     if (entry.expectsCompletionMessage === false) {
       return false;
     }
@@ -624,31 +1145,42 @@ export function markParentYieldWaitForController(params: {
 
   const expectedChildRunIds = uniqueSorted(candidates.map((entry) => entry.runId));
   const childSessionKeys = uniqueSorted(candidates.map((entry) => entry.childSessionKey));
-  const waitId = `${controllerSessionKey}:${params.parentRunId ?? "run"}:${now}`;
+  const waitId =
+    continuedWait?.waitId ?? `${controllerSessionKey}:${params.parentRunId ?? "run"}:${now}`;
   const staleAt = now + Math.max(1, params.staleAfterMs ?? PARENT_YIELD_WAIT_STALE_MS);
   const terminalChildRunIds = uniqueSorted(
     candidates.filter(isRunTerminalForParentYieldWait).map((entry) => entry.runId),
   );
 
+  const updates = new Map<string, NonNullable<SubagentRunRecord["parentYieldWait"]>>();
   for (const entry of candidates) {
-    entry.parentYieldWait = {
+    updates.set(entry.runId, {
+      ...(continuedWait?.status !== "closeout_delivered" ? continuedWait : {}),
       waitId,
       parentSessionKey: controllerSessionKey,
-      ...(params.parentRunId ? { parentRunId: params.parentRunId } : {}),
+      ...((continuedWait?.parentRunId ?? params.parentRunId)
+        ? { parentRunId: continuedWait?.parentRunId ?? params.parentRunId }
+        : {}),
       ...(params.reason ? { reason: params.reason } : {}),
       expectedChildRunIds,
       childSessionKeys,
-      waitStartedAt: now,
+      waitStartedAt: continuedWait?.waitStartedAt ?? now,
       staleAt,
       requiredCloseout: params.requiredCloseout ?? true,
       status: "waiting",
+      ...(continuedWait && params.parentRunId
+        ? {
+            continuation: { runId: params.parentRunId, phase: "yield_requested" as const },
+            continuationScheduledAt: undefined,
+          }
+        : {}),
       terminalChildRunIds,
       lastUpdatedAt: now,
-    };
+    });
   }
 
+  commitParentYieldWaitUpdates(updates);
   updateParentYieldWaitFanIn(waitId, candidates[0], now);
-  persistSubagentRuns();
   return {
     marked: candidates.length,
     waitId,
@@ -808,16 +1340,6 @@ async function completeSubagentRunWithRecovery(params: CompleteSubagentRunParams
   const entryBeforeCompletion = subagentRuns.get(params.runId);
   try {
     await completeSubagentRun(params);
-    if (entryBeforeCompletion?.parentYieldWait?.waitId) {
-      if (
-        updateParentYieldWaitFanIn(
-          entryBeforeCompletion.parentYieldWait.waitId,
-          entryBeforeCompletion,
-        )
-      ) {
-        persistSubagentRuns();
-      }
-    }
     if (entryBeforeCompletion) {
       if (params.outcome.status === "ok") {
         clearSubagentFailureStreak(entryBeforeCompletion);
@@ -1098,11 +1620,20 @@ const subagentLifecycleController = createSubagentRegistryLifecycleController({
 const {
   clearScheduledResumeTimers,
   completeCleanupBookkeeping,
-  completeSubagentRun,
   finalizeResumedAnnounceGiveUp,
   refreshFrozenResultFromSession,
   startSubagentAnnounceCleanupFlow,
 } = subagentLifecycleController;
+
+async function completeSubagentRun(params: CompleteSubagentRunParams): Promise<void> {
+  const entry = subagentRuns.get(params.runId);
+  await subagentLifecycleController.completeSubagentRun(params);
+  // Polling, lifecycle events, and successful completion retries share this
+  // owner so every terminal observation can release its parent's durable wait.
+  if (entry?.parentYieldWait?.waitId) {
+    updateParentYieldWaitFanIn(entry.parentYieldWait.waitId, entry);
+  }
+}
 
 function resumeSubagentRun(runId: string) {
   if (!runId || resumedRuns.has(runId)) {
@@ -1204,7 +1735,7 @@ function resumeSubagentRun(runId: string) {
 
 function restoreSubagentRunsOnce() {
   if (restoreAttempted) {
-    return;
+    return parentYieldWaitRecovery;
   }
   restoreAttempted = true;
   try {
@@ -1213,7 +1744,7 @@ function restoreSubagentRunsOnce() {
       mergeOnly: true,
     });
     if (restoredCount === 0) {
-      return;
+      return parentYieldWaitRecovery;
     }
     if (
       reconcileOrphanedRestoredRuns({
@@ -1224,10 +1755,15 @@ function restoreSubagentRunsOnce() {
       persistSubagentRuns();
     }
     if (subagentRuns.size === 0) {
-      return;
+      return parentYieldWaitRecovery;
     }
     // Resume pending work.
     ensureListener();
+    // System events do not survive restart. The once-only restore guard bounds
+    // replay while the persisted wait preserves its original schedule and age.
+    parentYieldWaitRecovery = recoverRestoredParentYieldWaits().catch((error: unknown) => {
+      log.warn(`failed to recover parent yield waits: ${String(error)}`);
+    });
     // Always start sweeper — session-mode runs (no archiveAtMs) also need TTL cleanup.
     startSweeper();
     for (const runId of subagentRuns.keys()) {
@@ -1242,6 +1778,7 @@ function restoreSubagentRunsOnce() {
       `failed to restore subagent runs from disk: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  return parentYieldWaitRecovery;
 }
 
 function resolveSubagentWaitTimeoutMs(cfg: OpenClawConfig, runTimeoutSeconds?: number) {
@@ -1403,6 +1940,7 @@ async function sweepSubagentRuns() {
   try {
     const now = Date.now();
     const storeCache: SubagentSessionStoreCache = new Map();
+    const retriedParentWaits = new Set<string>();
     let mutated = false;
     const suspendedEntries = [...subagentRuns.entries()].filter(([, entry]) =>
       isSuspendedPendingFinalDelivery(entry),
@@ -1427,6 +1965,29 @@ async function sweepSubagentRuns() {
       });
     }
     for (const [runId, entry] of subagentRuns.entries()) {
+      // The parent receipt validator needs the complete child set after restart.
+      // Resume cleanup after its durable closeout and exact wake retirement.
+      if (typeof entry.endedAt === "number" && shouldRetainParentYieldCloseout(entry)) {
+        const wait = entry.parentYieldWait;
+        if (
+          wait &&
+          isParentYieldCloseoutPending(entry) &&
+          wait.continuationScheduledAt === undefined
+        ) {
+          const identity = JSON.stringify([wait.parentSessionKey, wait.parentRunId, wait.waitId]);
+          if (!retriedParentWaits.has(identity)) {
+            retriedParentWaits.add(identity);
+            try {
+              // Immediate terminal callbacks can exhaust their storage retries.
+              // The existing sweep owns a later attempt without deleting proof.
+              updateParentYieldWaitFanIn(wait.waitId, entry, now);
+            } catch (error) {
+              log.warn(`failed to retry parent yield wait ${wait.waitId}: ${String(error)}`);
+            }
+          }
+        }
+        continue;
+      }
       if (isSuspendedPendingFinalDelivery(entry)) {
         const suspendedAgeMs = now - (entry.delivery?.suspendedAt ?? now);
         const expired = suspendedAgeMs >= resolveSuspendedDeliveryExpiryMs(entry);
@@ -1807,19 +2368,41 @@ const subagentRunManager = createSubagentRunManager({
 });
 
 configureSubagentRegistrySteerRuntime({
-  replaceSubagentRunAfterSteer: (params) => subagentRunManager.replaceSubagentRunAfterSteer(params),
+  assertParentYieldWaitAllowsRestart,
+  replaceSubagentRunAfterSteer,
   finalizeInterruptedSubagentRun: async (params) => await finalizeInterruptedSubagentRun(params),
 });
 
 export function markSubagentRunForSteerRestart(runId: string) {
-  return subagentRunManager.markSubagentRunForSteerRestart(runId);
+  const key = runId.trim();
+  if (activeSteerRestarts.has(key)) {
+    return false;
+  }
+  const marked = subagentRunManager.markSubagentRunForSteerRestart(key);
+  if (marked) {
+    activeSteerRestarts.add(key);
+  }
+  return marked;
 }
 
 export function clearSubagentRunSteerRestart(runId: string) {
-  return subagentRunManager.clearSubagentRunSteerRestart(runId);
+  const key = runId.trim();
+  activeSteerRestarts.delete(key);
+  const cleared = subagentRunManager.clearSubagentRunSteerRestart(key);
+  const entry = subagentRuns.get(key);
+  if (cleared && entry?.parentYieldWait) {
+    try {
+      updateParentYieldWaitFanIn(entry.parentYieldWait.waitId, entry);
+    } catch (error) {
+      // The terminal child stays retained. The existing sweep retries the exact
+      // scheduling commit after storage recovers, without inventing a new wait.
+      log.warn(`failed to resume parent after steer ${key}: ${String(error)}`);
+    }
+  }
+  return cleared;
 }
 
-export function replaceSubagentRunAfterSteer(params: {
+export async function replaceSubagentRunAfterSteer(params: {
   previousRunId: string;
   nextRunId: string;
   fallback?: SubagentRunRecord;
@@ -1827,7 +2410,56 @@ export function replaceSubagentRunAfterSteer(params: {
   preserveFrozenResultFallback?: boolean;
   transcriptFile?: string;
 }) {
-  return subagentRunManager.replaceSubagentRunAfterSteer(params);
+  const previous = subagentRuns.get(params.previousRunId.trim());
+  if (previous && !(await settleParentYieldWaitBeforeRestart(previous))) {
+    return false;
+  }
+  const replaced = subagentRunManager.replaceSubagentRunAfterSteer(params);
+  if (replaced) {
+    activeSteerRestarts.delete(params.previousRunId.trim());
+  }
+  return replaced;
+}
+
+export async function assertParentYieldWaitAllowsRestart(runId: string): Promise<void> {
+  const entry = subagentRegistryDeps.getSubagentRunsSnapshotForRead(subagentRuns).get(runId);
+  if (entry && !(await settleParentYieldWaitBeforeRestart(entry))) {
+    throw new Error(
+      "Parent closeout is pending; retry this child after its parent final is delivered.",
+    );
+  }
+}
+
+async function settleParentYieldWaitBeforeRestart(entry: SubagentRunRecord): Promise<boolean> {
+  const wait = entry.parentYieldWait;
+  if (!wait?.requiredCloseout) {
+    return true;
+  }
+  if (wait.status !== "closeout_delivered" && wait.continuationScheduledAt === undefined) {
+    return true;
+  }
+  if (!wait.parentRunId) {
+    return false;
+  }
+  // Replacement can reuse the child session. Retire its exact delivered wake
+  // before removing the old proof, and never carry that wait into the new run.
+  const reconciled = await reconcileParentYieldWaitDelivery({
+    controllerSessionKey: wait.parentSessionKey,
+    waitId: wait.waitId,
+    parentRunId: wait.parentRunId,
+    registryPath:
+      wait.status === "closeout_delivered"
+        ? wait.closeout.deliveryRegistryPath
+        : resolveSourceTurnDeliveryRegistryPath(),
+  });
+  const current = subagentRuns.get(entry.runId)?.parentYieldWait;
+  return (
+    reconciled === "settled" &&
+    current?.status === "closeout_delivered" &&
+    current.waitId === wait.waitId &&
+    current.parentRunId === wait.parentRunId &&
+    current.parentSessionKey === wait.parentSessionKey
+  );
 }
 
 export function registerSubagentRun(params: RegisterSubagentRunParams) {
@@ -1844,6 +2476,7 @@ export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
     clearTimeout(timer);
   }
   resumeRetryTimers.clear();
+  activeSteerRestarts.clear();
   subagentRuns.clear();
   resumedRuns.clear();
   endedHookInFlightRunIds.clear();
@@ -1859,6 +2492,7 @@ export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {
   stopSweeper();
   sweepInProgress = false;
   restoreAttempted = false;
+  parentYieldWaitRecovery = undefined;
   if (listenerStop) {
     listenerStop();
     listenerStop = null;
@@ -1890,7 +2524,14 @@ export function addSubagentRunForTests(entry: SubagentRunRecord) {
   subagentRuns.set(entry.runId, entry);
 }
 
-export function releaseSubagentRun(runId: string) {
+export async function releaseSubagentRun(runId: string) {
+  const entry = subagentRuns.get(runId);
+  if (
+    entry &&
+    (isParentYieldCloseoutPending(entry) || !(await settleParentYieldWaitBeforeRestart(entry)))
+  ) {
+    return;
+  }
   subagentRunManager.releaseSubagentRun(runId);
 }
 
@@ -1995,7 +2636,7 @@ export function leasePendingAgentSteeringItems(params: {
   leaseId: string;
   now?: number;
 }) {
-  restoreSubagentRunsOnce();
+  void restoreSubagentRunsOnce();
   const leased = leasePendingAgentSteeringItemsFromSubagentRuns({
     runs: subagentRuns,
     requesterSessionKey: params.requesterSessionKey,
@@ -2126,8 +2767,25 @@ export function getLatestSubagentRunByChildSessionKey(
   return latest;
 }
 
-export function initSubagentRegistry() {
-  restoreSubagentRunsOnce();
+export function initSubagentRegistry(opts?: { gatewayStartup?: boolean }) {
+  const alreadyRestored = restoreAttempted;
+  const recovery = restoreSubagentRunsOnce();
+  if (!opts?.gatewayStartup) {
+    return recovery;
+  }
+  // In-process restarts preserve events but can lose an in-flight wake request.
+  // Each Gateway lifecycle refreshes that wake after checking durable receipts.
+  parentYieldWaitRecovery = Promise.resolve(recovery)
+    .then(async () => {
+      if (alreadyRestored) {
+        await recoverRestoredParentYieldWaits();
+      }
+      recoverAbandonedSteerRestarts();
+    })
+    .catch((error: unknown) => {
+      log.warn(`failed to recover parent yield waits at Gateway startup: ${String(error)}`);
+    });
+  return parentYieldWaitRecovery;
 }
 
 // Importing this module also registers the subagent maintenance preserve-key

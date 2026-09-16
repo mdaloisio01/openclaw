@@ -7,10 +7,19 @@ export type ReplyDispatchBeforeDeliver = (
   info: { kind: ReplyDispatchKind },
 ) => Promise<ReplyPayload | null> | ReplyPayload | null;
 
+export type ReplyDispatchPrepareFinalBatch = (
+  payloads: readonly ReplyPayload[],
+) => Promise<readonly ReplyPayload[]> | readonly ReplyPayload[];
+
 export type ReplyDispatcher = {
   sendToolResult: (payload: ReplyPayload) => boolean;
   sendBlockReply: (payload: ReplyPayload) => boolean;
   sendFinalReply: (payload: ReplyPayload) => boolean;
+  /** Prepare every surviving post-hook final before sending any part. Return true on admission. */
+  sendFinalReplyBatch?: (
+    payloads: readonly ReplyPayload[],
+    prepare: ReplyDispatchPrepareFinalBatch,
+  ) => boolean;
   appendBeforeDeliver?: (hook: ReplyDispatchBeforeDeliver) => void;
   waitForIdle: () => Promise<void>;
   getQueuedCounts: () => Record<ReplyDispatchKind, number>;

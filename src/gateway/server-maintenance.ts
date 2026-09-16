@@ -4,6 +4,7 @@ import { sweepStaleRunContexts } from "../infra/agent-events.js";
 import { cleanOldMedia } from "../media/store.js";
 import { abortTrackedChatRunById, type ChatAbortControllerEntry } from "./chat-abort.js";
 import { pruneStaleControlPlaneBuckets } from "./control-plane-rate-limit.js";
+import { cleanupManagedOutgoingImageRecords } from "./managed-image-attachments.js";
 import type { ChatRunState } from "./server-chat-state.js";
 import type { ChatRunEntry } from "./server-chat.js";
 import {
@@ -251,19 +252,22 @@ export function startGatewayMaintenanceTimers(params: {
     sweepStaleRunContexts();
   }, 60_000);
 
-  if (typeof params.mediaCleanupTtlMs !== "number") {
-    return { tickInterval, healthInterval, dedupeCleanup, mediaCleanup: null };
-  }
-
   let mediaCleanupInFlight: Promise<void> | null = null;
   const runMediaCleanup = () => {
     if (mediaCleanupInFlight) {
       return mediaCleanupInFlight;
     }
-    mediaCleanupInFlight = cleanOldMedia(params.mediaCleanupTtlMs, {
-      recursive: true,
-      pruneEmptyDirs: true,
-    })
+    mediaCleanupInFlight = (async () => {
+      if (typeof params.mediaCleanupTtlMs === "number") {
+        await cleanOldMedia(params.mediaCleanupTtlMs, {
+          recursive: true,
+          pruneEmptyDirs: true,
+        });
+      }
+      // Generic cleanup excludes this tree because transcript and pending-source
+      // ownership, rather than mtime alone, determines when its bytes are stale.
+      await cleanupManagedOutgoingImageRecords();
+    })()
       .catch((err: unknown) => {
         params.logHealth.error(`media cleanup failed: ${formatError(err)}`);
       })

@@ -65,6 +65,16 @@ type GatewayCaller = typeof callGateway;
 const SESSIONS_SEND_REPLY_HISTORY_LIMIT = 50;
 const SESSIONS_SEND_MESSAGE_ALIASES = ["SendMessage", "content", "text"] as const;
 
+function rejectBeforeDispatch(details: {
+  status: "error" | "forbidden";
+  error: string;
+  sessionKey?: string;
+}) {
+  // Rejection IDs correlate tool responses; no executor owns these UUIDs.
+  // Controllers must not poll them as admitted agent runs.
+  return jsonResult({ runId: crypto.randomUUID(), dispatchState: "not_dispatched", ...details });
+}
+
 type SessionsSendFollowupExecutionTruth = {
   runningNow: boolean;
   liveExecutionState: "active_confirmed" | "accepted_not_yet_proven_active" | "delivery_failed";
@@ -355,8 +365,7 @@ export function createSessionsSendTool(opts?: {
       const labelParam = normalizeOptionalString(readStringParam(params, "label"));
       const labelAgentIdParam = normalizeOptionalString(readStringParam(params, "agentId"));
       if (sessionKeyParam && labelParam) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: "error",
           error: "Provide either sessionKey or label (not both).",
         });
@@ -370,8 +379,7 @@ export function createSessionsSendTool(opts?: {
           mainKey,
         });
         if (!agentMainKey) {
-          return jsonResult({
-            runId: crypto.randomUUID(),
+          return rejectBeforeDispatch({
             status: "error",
             error: `agent not found: ${labelAgentIdParam}`,
           });
@@ -385,8 +393,7 @@ export function createSessionsSendTool(opts?: {
           : undefined;
 
         if (restrictToSpawned && requestedAgentId && requestedAgentId !== requesterAgentId) {
-          return jsonResult({
-            runId: crypto.randomUUID(),
+          return rejectBeforeDispatch({
             status: "forbidden",
             error: "Sandboxed sessions_send label lookup is limited to this agent",
           });
@@ -394,16 +401,14 @@ export function createSessionsSendTool(opts?: {
 
         if (requesterAgentId && requestedAgentId && requestedAgentId !== requesterAgentId) {
           if (!a2aPolicy.enabled) {
-            return jsonResult({
-              runId: crypto.randomUUID(),
+            return rejectBeforeDispatch({
               status: "forbidden",
               error:
                 "Agent-to-agent messaging is disabled. Set tools.agentToAgent.enabled=true to allow cross-agent sends.",
             });
           }
           if (!a2aPolicy.isAllowed(requesterAgentId, requestedAgentId)) {
-            return jsonResult({
-              runId: crypto.randomUUID(),
+            return rejectBeforeDispatch({
               status: "forbidden",
               error: "Agent-to-agent messaging denied by tools.agentToAgent.allow.",
             });
@@ -426,14 +431,12 @@ export function createSessionsSendTool(opts?: {
         } catch (err) {
           const msg = formatErrorMessage(err);
           if (restrictToSpawned) {
-            return jsonResult({
-              runId: crypto.randomUUID(),
+            return rejectBeforeDispatch({
               status: "forbidden",
               error: "Session not visible from this sandboxed agent session.",
             });
           }
-          return jsonResult({
-            runId: crypto.randomUUID(),
+          return rejectBeforeDispatch({
             status: "error",
             error: msg || `No session found with label: ${labelParam}`,
           });
@@ -441,14 +444,12 @@ export function createSessionsSendTool(opts?: {
 
         if (!resolvedKey) {
           if (restrictToSpawned) {
-            return jsonResult({
-              runId: crypto.randomUUID(),
+            return rejectBeforeDispatch({
               status: "forbidden",
               error: "Session not visible from this sandboxed agent session.",
             });
           }
-          return jsonResult({
-            runId: crypto.randomUUID(),
+          return rejectBeforeDispatch({
             status: "error",
             error: `No session found with label: ${labelParam}`,
           });
@@ -457,8 +458,7 @@ export function createSessionsSendTool(opts?: {
       }
 
       if (!sessionKey) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: "error",
           error: "Either sessionKey or label is required",
         });
@@ -471,8 +471,7 @@ export function createSessionsSendTool(opts?: {
         restrictToSpawned,
       });
       if (!resolvedSession.ok) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: resolvedSession.status,
           error: resolvedSession.error,
         });
@@ -484,8 +483,7 @@ export function createSessionsSendTool(opts?: {
         visibilitySessionKey: sessionKey,
       });
       if (!visibleSession.ok) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: visibleSession.status,
           error: visibleSession.error,
           sessionKey: visibleSession.displayKey,
@@ -502,8 +500,7 @@ export function createSessionsSendTool(opts?: {
       const idempotencyKey = crypto.randomUUID();
       let runId: string = idempotencyKey;
       if (parseSessionThreadInfoFast(resolvedKey).threadId) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: "error",
           error:
             "sessions_send cannot target a thread session for inter-agent coordination. Use the parent channel session key instead.",
@@ -518,8 +515,7 @@ export function createSessionsSendTool(opts?: {
       });
       const access = visibilityGuard.check(resolvedKey);
       if (!access.allowed) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: access.status,
           error: access.error,
           sessionKey: displayKey,
@@ -533,8 +529,7 @@ export function createSessionsSendTool(opts?: {
         mainKey,
       });
       if (!ensuredSession.ok) {
-        return jsonResult({
-          runId: crypto.randomUUID(),
+        return rejectBeforeDispatch({
           status: "error",
           error: ensuredSession.error,
           sessionKey: displayKey,

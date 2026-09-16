@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RuntimeEnv } from "../runtime.js";
+import type { CommonChangeRegistryClient } from "./common-change-config-set-adapter.js";
 import { createCrestodianTestRuntime } from "./crestodian.test-helpers.js";
 import { executeCrestodianOperation, parseCrestodianOperation } from "./operations.js";
 
@@ -364,7 +365,9 @@ describe("parseCrestodianOperation", () => {
     const registry = {
       integrity_status: vi.fn(async () => ({ valid: true })),
       create_operation: vi.fn(async () => ({ operation_id: "op-config-set", revision: 1 })),
-      transition_operation: vi.fn(async () => ({ revision: 2 })),
+      transition_operation: vi
+        .fn<CommonChangeRegistryClient["transition_operation"]>()
+        .mockResolvedValue({ revision: 2 }),
     };
 
     const result = await executeCrestodianOperation(

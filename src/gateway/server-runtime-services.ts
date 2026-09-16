@@ -148,11 +148,14 @@ function recoverPendingOutboundDeliveries(params: {
   void (async () => {
     const { recoverPendingDeliveries } = await import("../infra/outbound/delivery-queue.js");
     const { deliverOutboundPayloadsInternal } = await import("../infra/outbound/deliver.js");
+    const { createSourceTurnDeliveryRecoveryCallbacks } =
+      await import("../agents/source-turn-delivery-recovery.js");
     const logRecovery = params.log.child("delivery-recovery");
     await recoverPendingDeliveries({
       deliver: deliverOutboundPayloadsInternal,
       log: logRecovery,
       cfg: params.cfg,
+      ...createSourceTurnDeliveryRecoveryCallbacks(),
     });
   })().catch((err: unknown) => params.log.error(`Delivery recovery failed: ${String(err)}`));
 }

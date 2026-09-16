@@ -852,6 +852,7 @@ describe("sessions_send gating", () => {
     const details = requireDetails(result);
     expect(details.status).toBe("error");
     expect(details.sessionKey).toBe(threadSessionKey);
+    expect(details.dispatchState).toBe("not_dispatched");
     expect((result.details as { error?: string } | undefined)?.error ?? "").toContain(
       "cannot target a thread session",
     );
@@ -879,6 +880,7 @@ describe("sessions_send gating", () => {
     const details = requireDetails(result);
     expect(details.status).toBe("error");
     expect(details.sessionKey).toBe(threadSessionKey);
+    expect(details.dispatchState).toBe("not_dispatched");
     expect((result.details as { error?: string } | undefined)?.error ?? "").toContain(
       "cannot target a thread session",
     );

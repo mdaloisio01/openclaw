@@ -1,5 +1,6 @@
 import type { HeartbeatToolResponse } from "../../../auto-reply/heartbeat-tool-response.js";
 import type { ThinkLevel } from "../../../auto-reply/thinking.js";
+import type { CanonicalAssistantTranscript } from "../../../config/sessions/transcript.js";
 import type {
   SessionContextBudgetStatus,
   SessionSystemPromptReport,
@@ -142,6 +143,7 @@ export type EmbeddedRunAttemptResult = {
   finalPromptText?: string;
   messagesSnapshot: AgentMessage[];
   assistantTexts: string[];
+  canonicalAssistantTranscript?: CanonicalAssistantTranscript;
   toolMetas: Array<{
     toolName: string;
     meta?: string;

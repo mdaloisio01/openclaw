@@ -13,6 +13,7 @@ import { normalizeReplyPayload, type NormalizeReplySkipReason } from "./normaliz
 import type {
   ReplyDispatchBeforeDeliver,
   ReplyDispatchKind,
+  ReplyDispatchPrepareFinalBatch,
   ReplyDispatcher,
 } from "./reply-dispatcher.types.js";
 import type { ResponsePrefixContext } from "./response-prefix-template.js";
@@ -35,7 +36,7 @@ type ReplyDispatchDeliverer = (
   info: { kind: ReplyDispatchKind },
 ) => Promise<unknown>;
 
-export type { ReplyDispatchBeforeDeliver };
+export type { ReplyDispatchBeforeDeliver, ReplyDispatchPrepareFinalBatch };
 
 const DEFAULT_HUMAN_DELAY_MIN_MS = 800;
 const DEFAULT_HUMAN_DELAY_MAX_MS = 2500;
@@ -59,6 +60,8 @@ function getHumanDelay(config: HumanDelayConfig | undefined): number {
 
 export type ReplyDispatcherOptions = {
   deliver: ReplyDispatchDeliverer;
+  /** Keep a required final in one durable transport batch after preparation. */
+  deliverFinalBatch?: (payloads: readonly ReplyPayload[]) => Promise<void>;
   silentReplyContext?: {
     cfg?: OpenClawConfig;
     sessionKey?: string;
@@ -174,7 +177,7 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
     waitForIdle: () => sendChain,
   });
 
-  const enqueue = (kind: ReplyDispatchKind, payload: ReplyPayload) => {
+  const normalizePayload = (kind: ReplyDispatchKind, payload: ReplyPayload) => {
     const originalWasExactSilent = isSilentReplyText(payload.text, SILENT_REPLY_TOKEN);
     const normalized = normalizeReplyPayloadInternal(payload, {
       responsePrefix: options.responsePrefix,
@@ -184,14 +187,39 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
       onHeartbeatStrip: options.onHeartbeatStrip,
       onSkip: (reason) => options.onSkip?.(payload, { kind, reason }),
     });
+    if (!normalized && kind === "final" && originalWasExactSilent) {
+      silentReplyLogger.debug("exact NO_REPLY final payload was skipped before delivery", {
+        hasSessionKey: Boolean(options.silentReplyContext?.sessionKey),
+        surface: options.silentReplyContext?.surface,
+        conversationType: options.silentReplyContext?.conversationType,
+      });
+    }
+    return normalized;
+  };
+
+  const applyBeforeDeliver = async (payload: ReplyPayload, kind: ReplyDispatchKind) => {
+    const prepared = beforeDeliver ? await beforeDeliver(payload, { kind }) : payload;
+    if (!prepared) {
+      cancelledCounts[kind] += 1;
+    }
+    return prepared;
+  };
+
+  const releasePending = (count: number) => {
+    pending -= count;
+    // Keep the restart reservation until both the producer and all queued sends finish.
+    if (pending === 1 && completeCalled) {
+      pending -= 1;
+    }
+    if (pending === 0) {
+      unregister();
+      void options.onIdle?.();
+    }
+  };
+
+  const enqueue = (kind: ReplyDispatchKind, payload: ReplyPayload) => {
+    const normalized = normalizePayload(kind, payload);
     if (!normalized) {
-      if (kind === "final" && originalWasExactSilent) {
-        silentReplyLogger.debug("exact NO_REPLY final payload was skipped before delivery", {
-          hasSessionKey: Boolean(options.silentReplyContext?.sessionKey),
-          surface: options.silentReplyContext?.surface,
-          conversationType: options.silentReplyContext?.conversationType,
-        });
-      }
       return false;
     }
     queuedCounts[kind] += 1;
@@ -212,13 +240,11 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
             await sleep(delayMs);
           }
         }
-        let deliverPayload: ReplyPayload | null = normalized;
-        if (beforeDeliver) {
-          deliverPayload = await beforeDeliver(normalized, { kind });
-          if (!deliverPayload) {
-            cancelledCounts[kind] += 1;
-            return;
-          }
+        const deliverPayload = beforeDeliver
+          ? await applyBeforeDeliver(normalized, kind)
+          : normalized;
+        if (!deliverPayload) {
+          return;
         }
         const effectiveKind = resolveEffectiveDeliveryKind(kind, deliverPayload);
         await options.deliver(deliverPayload, { kind: effectiveKind });
@@ -227,21 +253,58 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
         failedCounts[kind] += 1;
         void options.onError?.(err, { kind });
       })
-      .finally(() => {
-        pending -= 1;
-        // Clear reservation if:
-        // 1. pending is now 1 (just the reservation left)
-        // 2. markComplete has been called
-        // 3. No more replies will be enqueued
-        if (pending === 1 && completeCalled) {
-          pending -= 1; // Clear the reservation
+      .finally(() => releasePending(1));
+    return true;
+  };
+
+  const enqueueFinalBatch = (
+    payloads: readonly ReplyPayload[],
+    prepare: ReplyDispatchPrepareFinalBatch,
+  ) => {
+    const normalized = payloads.flatMap((payload) => normalizePayload("final", payload) ?? []);
+    if (normalized.length === 0) {
+      return false;
+    }
+    queuedCounts.final += normalized.length;
+    pending += normalized.length;
+    let unresolved = normalized.length;
+    sendChain = sendChain
+      .then(async () => {
+        const postHook: ReplyPayload[] = [];
+        for (const payload of normalized) {
+          const prepared = await applyBeforeDeliver(payload, "final");
+          if (prepared) {
+            postHook.push(prepared);
+          } else {
+            unresolved -= 1;
+          }
         }
-        if (pending === 0) {
-          // Unregister from global tracking when idle.
-          unregister();
-          void options.onIdle?.();
+        if (postHook.length === 0) {
+          return;
         }
-      });
+        // Persist the complete post-hook batch before any transport side effect.
+        // Per-part identities may change here; rerunning hooks would invalidate that proof.
+        const prepared = await prepare(postHook);
+        if (prepared.length !== postHook.length) {
+          throw new Error("Final batch preparation must preserve payload count");
+        }
+        if (options.deliverFinalBatch) {
+          await options.deliverFinalBatch(prepared);
+          unresolved = 0;
+          return;
+        }
+        for (const payload of prepared) {
+          await options.deliver(payload, { kind: "final" });
+          unresolved -= 1;
+        }
+      })
+      .catch((err: unknown) => {
+        // A failed part stops this batch. Neither prior successes nor cancelled parts
+        // can hide the failed part and its unsent remainder from closeout accounting.
+        failedCounts.final += unresolved;
+        void options.onError?.(err, { kind: "final" });
+      })
+      .finally(() => releasePending(normalized.length));
     return true;
   };
 
@@ -269,6 +332,7 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
     sendToolResult: (payload) => enqueue("tool", payload),
     sendBlockReply: (payload) => enqueue("block", payload),
     sendFinalReply: (payload) => enqueue("final", payload),
+    sendFinalReplyBatch: enqueueFinalBatch,
     appendBeforeDeliver: (hook) => {
       const previousBeforeDeliver = beforeDeliver;
       beforeDeliver = previousBeforeDeliver

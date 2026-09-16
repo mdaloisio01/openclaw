@@ -11,6 +11,7 @@ import {
 import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
 import { CHAT_SEND_SESSION_KEY_MAX_LENGTH } from "../../../packages/gateway-protocol/src/schema.js";
 import type { ModelCatalogEntry } from "../../agents/model-catalog.types.js";
+import { listOwnerRequestIntakeRecords } from "../../agents/owner-request-intake-ledger.js";
 import { setReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
 import type { MsgContext } from "../../auto-reply/templating.js";
 import { appendSessionTranscriptMessage } from "../../config/sessions/transcript-append.js";
@@ -4978,6 +4979,41 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
       expect(message?.role).toBe("user");
       expect(message?.content).toBe("hello before agent error payload");
     });
+  });
+
+  it("marks governed intake when the runtime persists without a gateway append result", async () => {
+    const fixtureDir = createTranscriptFixture("openclaw-chat-runtime-intake-");
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    process.env.OPENCLAW_STATE_DIR = fixtureDir;
+    try {
+      mockState.triggerAgentRunStart = true;
+      mockState.triggerUserMessagePersisted = true;
+      mockState.finalPayload = { text: "bounded acknowledgement" };
+      const context = createChatContext();
+      await runNonStreamingChatSend({
+        context,
+        respond: vi.fn(),
+        idempotencyKey: "runtime-intake-proof",
+        message: "Review the build plan and return an acknowledgement.",
+        expectBroadcast: false,
+      });
+      const requestId = mockState.lastDispatchCtx?.OwnerRequestIntakeRequestId;
+      expect(requestId).toEqual(expect.any(String));
+      expect(
+        listOwnerRequestIntakeRecords({ stateDir: fixtureDir }).find(
+          (row) => row.requestId === requestId,
+        ),
+      ).toMatchObject({
+        status: "prompt_persisted",
+        promptPersistedAtMs: expect.any(Number),
+      });
+    } finally {
+      if (previousStateDir === undefined) {
+        delete process.env.OPENCLAW_STATE_DIR;
+      } else {
+        process.env.OPENCLAW_STATE_DIR = previousStateDir;
+      }
+    }
   });
 
   it("falls back to gateway user persistence when successful runtime persistence fails", async () => {

@@ -13,6 +13,7 @@ import {
   type CleanupWatchdogFindingCategory,
   type CleanupWatchdogPriorityCode,
 } from "../governance/cleanup-watchdog-policy.js";
+import { classifyCurrentInboundInstruction } from "../governance/current-inbound-instruction.js";
 
 export const REPORT_DELIVERY_GUARD_STATES = [
   "not_required",
@@ -558,21 +559,6 @@ function isCleanupCrewReportText(text: string): boolean {
   return reportTextIncludesAny(text, ["cleanup crew", "cleanup-crew"]);
 }
 
-function isOperatorStopText(text: string): boolean {
-  return reportTextIncludesAny(text, [
-    "report only",
-    "report-only",
-    "status only",
-    "status-only",
-    "only report",
-    "just report",
-    "stop after this",
-    "stop now",
-    "do not continue",
-    "don't continue",
-  ]);
-}
-
 function reportNamesBroaderBuildOpen(text: string): boolean {
   const namesBroaderOpenFamily =
     /\bbroader\b.{0,96}\b(remains|is|still)\s+open\b/.test(text) ||
@@ -799,8 +785,10 @@ export function resolveCleanupCrewPostReportContinuation(input: {
   const currentTurnText = normalizeReportText(input.currentTurnText);
   const reportText = normalizeReportText(input.reportText);
   const combinedText = `${currentTurnText}\n${reportText}`;
+  const instruction = classifyCurrentInboundInstruction(input.currentTurnText);
   const activeCleanupCrewMission =
-    input.activeCleanupCrewMission === true || isCleanupCrewReportText(combinedText);
+    instruction !== "planning_only" &&
+    (input.activeCleanupCrewMission === true || isCleanupCrewReportText(combinedText));
   const finalDeliveryDelivered = input.finalDeliveryDelivered === true;
   const broaderBuildOpen = reportNamesBroaderBuildOpen(reportText);
 
@@ -830,12 +818,12 @@ export function resolveCleanupCrewPostReportContinuation(input: {
     };
   }
 
-  if (isOperatorStopText(currentTurnText)) {
+  if (instruction === "report_only" || instruction === "no_work") {
     return {
       schema: "openclaw.cleanup_crew_post_report_continuation_decision.v1",
       state: "terminal_stop_allowed_operator_stop",
       activeCleanupCrewMission,
-      broaderBuildOpen,
+      broaderBuildOpen: true,
       finalDeliveryDelivered,
       stopAllowed: true,
       pendingContinuationVisible: false,
@@ -941,8 +929,10 @@ export function resolveCleanupCrewReportCloseoutAcceptance(input: {
   const currentTurnText = normalizeReportText(input.currentTurnText);
   const reportText = normalizeReportText(input.reportText);
   const combinedText = `${currentTurnText}\n${reportText}`;
+  const instruction = classifyCurrentInboundInstruction(input.currentTurnText);
   const activeCleanupCrewMission =
-    input.activeCleanupCrewMission === true || isCleanupCrewReportText(combinedText);
+    instruction !== "planning_only" &&
+    (input.activeCleanupCrewMission === true || isCleanupCrewReportText(combinedText));
   const reportGenerated =
     input.reportGenerated ??
     (activeCleanupCrewMission && isCleanupCrewCloseoutOrStatusReportText(reportText));
@@ -951,7 +941,7 @@ export function resolveCleanupCrewReportCloseoutAcceptance(input: {
   const explicitArtifactOnlyAllowed =
     input.explicitArtifactOnlyAllowed === true ||
     reportNamesArtifactOnlyPermission(currentTurnText);
-  const operatorStopRequested = isOperatorStopText(currentTurnText);
+  const operatorStopRequested = instruction === "report_only" || instruction === "no_work";
   const markFacingExportRequired =
     input.markFacingExportRequired ??
     (closeoutRequiresTruthFields &&
@@ -1051,14 +1041,14 @@ export function resolveCleanupCrewReportCloseoutAcceptance(input: {
     };
   }
 
-  if (isOperatorStopText(currentTurnText)) {
+  if (operatorStopRequested) {
     return {
       schema: "openclaw.cleanup_crew_report_closeout_acceptance_decision.v1",
       state: "stop_after_report_only_request",
       policyVersion: CLEANUP_WATCHDOG_POLICY_VERSION,
       activeCleanupCrewMission,
       allowedToAcceptReport: true,
-      allowedToCloseMission: true,
+      allowedToCloseMission: false,
       reportDelivery,
       postReportContinuation,
       missingTruthFields,

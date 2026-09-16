@@ -98,6 +98,7 @@ export const CORE_GATEWAY_METHOD_SPECS: readonly CoreGatewayMethodSpec[] = [
   { name: "tasks.cancel", scope: "operator.write" },
   { name: "tasks.startProductionFlow", scope: "operator.write" },
   { name: "tasks.resumeProductionFlow", scope: "operator.write" },
+  { name: "tasks.handleBuildIssue", scope: "operator.write" },
   { name: "tasks.runTaskInFlow", scope: "operator.write" },
   { name: "tasks.recordTaskInFlowProgress", scope: "operator.write" },
   { name: "tasks.completeTaskInFlow", scope: "operator.write" },

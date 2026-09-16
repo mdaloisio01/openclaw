@@ -7,7 +7,7 @@ import {
 } from "openclaw/plugin-sdk/hook-runtime";
 import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { castAgentMessage } from "openclaw/plugin-sdk/test-fixtures";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { runAgentHarnessBeforeMessageWriteHook } from "../agents/harness/hook-helpers.js";
 import {
   appendUserTurnTranscriptMessage,
@@ -562,7 +562,9 @@ describe("user turn transcript persistence", () => {
     it("does not fallback-persist after runtime persistence is marked", async () => {
       const dir = createTempDir("openclaw-user-turn-recorder-runtime-");
       const transcriptPath = path.join(dir, "session.jsonl");
+      const onPersisted = vi.fn();
       const recorder = createUserTurnTranscriptRecorder({
+        onPersisted,
         input: {
           text: "runtime-owned turn",
           timestamp: 123,
@@ -583,6 +585,8 @@ describe("user turn transcript persistence", () => {
       });
 
       await expect(recorder.persistFallback()).resolves.toBeUndefined();
+      recorder.markRuntimePersisted();
+      expect(onPersisted).toHaveBeenCalledTimes(1);
       expect(fs.existsSync(transcriptPath)).toBe(false);
     });
 

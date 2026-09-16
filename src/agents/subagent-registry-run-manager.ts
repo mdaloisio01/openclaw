@@ -209,7 +209,7 @@ export function createSubagentRunManager(params: {
   resumedRuns: Set<string>;
   endedHookInFlightRunIds: Set<string>;
   persist(): void;
-  persistOrThrow(): void;
+  persistOrThrow(runs?: Map<string, SubagentRunRecord>): void;
   callGateway: typeof callGateway;
   getRuntimeConfig: typeof getRuntimeConfig;
   ensureRuntimePluginsLoaded:
@@ -552,8 +552,17 @@ export function createSubagentRunManager(params: {
     if (entry.suppressAnnounceReason === "steer-restart") {
       return true;
     }
+    const nextRuns = new Map(params.runs);
+    nextRuns.set(key, { ...entry, suppressAnnounceReason: "steer-restart" });
+    try {
+      // Abort can immediately finish the last child. Persist its intentional
+      // handoff before that completion can schedule a premature parent reply.
+      params.persistOrThrow(nextRuns);
+    } catch (error) {
+      log.warn("failed to admit subagent steer restart", { runId: key, error });
+      return false;
+    }
     entry.suppressAnnounceReason = "steer-restart";
-    params.persist();
     return true;
   };
 
@@ -599,20 +608,40 @@ export function createSubagentRunManager(params: {
     if (!source) {
       return false;
     }
-
-    if (previousRunId !== nextRunId) {
-      params.clearPendingLifecycleError(previousRunId);
-      if (shouldDeleteAttachments(source)) {
-        void safeRemoveAttachmentsDir(source);
-      }
-      if (
-        source.execution?.transcriptFile &&
-        source.execution.transcriptFile !== replaceParams.transcriptFile
-      ) {
-        void removeInternalSessionEffectsTranscript(source.execution.transcriptFile);
-      }
-      params.runs.delete(previousRunId);
-      params.resumedRuns.delete(previousRunId);
+    const existingNext = params.runs.get(nextRunId);
+    if (!previous && existingNext) {
+      // Gateway can bind the accepted run before its caller receives the reply.
+      // Preserve that committed record when the caller acknowledges the same handoff.
+      const priorWait = source.parentYieldWait;
+      const currentWait = existingNext.parentYieldWait;
+      const sameParentWait =
+        !priorWait?.requiredCloseout ||
+        (priorWait.status === "closeout_delivered"
+          ? currentWait?.waitId !== priorWait.waitId
+          : currentWait?.waitId === priorWait.waitId &&
+            currentWait.parentRunId === priorWait.parentRunId &&
+            currentWait.parentSessionKey === priorWait.parentSessionKey &&
+            currentWait.expectedChildRunIds.includes(nextRunId) &&
+            !currentWait.expectedChildRunIds.includes(previousRunId));
+      return (
+        existingNext.childSessionKey === source.childSessionKey &&
+        existingNext.requesterSessionKey === source.requesterSessionKey &&
+        existingNext.controllerSessionKey === source.controllerSessionKey &&
+        sameParentWait
+      );
+    }
+    if (!previous && source.parentYieldWait?.requiredCloseout) {
+      return false;
+    }
+    const parentWait = source.parentYieldWait;
+    const remapParentWait =
+      parentWait?.requiredCloseout && parentWait.status !== "closeout_delivered";
+    if (
+      remapParentWait &&
+      (parentWait.continuationScheduledAt !== undefined ||
+        !parentWait.expectedChildRunIds.includes(previousRunId))
+    ) {
+      return false;
     }
 
     const now = Date.now();
@@ -635,10 +664,14 @@ export function createSubagentRunManager(params: {
         typeof source.endedAt === "number" ? source.endedAt : now,
       ) ?? 0;
 
-    const sourceCompletion = ensureCompletionState(source);
+    const sourceCompletion = source.completion;
     const next: SubagentRunRecord = normalizeSubagentRunState({
       ...source,
       runId: nextRunId,
+      parentYieldWait:
+        source.parentYieldWait?.status === "closeout_delivered"
+          ? undefined
+          : source.parentYieldWait,
       createdAt: now,
       startedAt: now,
       sessionStartedAt,
@@ -657,8 +690,8 @@ export function createSubagentRunManager(params: {
       },
       completion: {
         required: source.expectsCompletionMessage === true,
-        fallbackResultText: preserveFrozenResultFallback ? sourceCompletion.resultText : undefined,
-        fallbackCapturedAt: preserveFrozenResultFallback ? sourceCompletion.capturedAt : undefined,
+        fallbackResultText: preserveFrozenResultFallback ? sourceCompletion?.resultText : undefined,
+        fallbackCapturedAt: preserveFrozenResultFallback ? sourceCompletion?.capturedAt : undefined,
       },
       cleanupCompletedAt: undefined,
       cleanupHandled: false,
@@ -672,12 +705,85 @@ export function createSubagentRunManager(params: {
     });
     clearDeliveryState(next);
 
-    params.runs.set(nextRunId, next);
+    const nextRuns = new Map(params.runs);
+    nextRuns.delete(previousRunId);
+    nextRuns.set(nextRunId, next);
+    if (remapParentWait) {
+      const expected = [...new Set(parentWait.expectedChildRunIds)].toSorted();
+      const replacementExpected = [
+        ...new Set(expected.map((id) => (id === previousRunId ? nextRunId : id))),
+      ].toSorted();
+      for (const [runId, member] of nextRuns) {
+        const wait = member.parentYieldWait;
+        if (
+          wait?.waitId !== parentWait.waitId ||
+          wait.parentRunId !== parentWait.parentRunId ||
+          wait.parentSessionKey !== parentWait.parentSessionKey
+        ) {
+          continue;
+        }
+        if (
+          wait.status === "closeout_delivered" ||
+          wait.continuationScheduledAt !== undefined ||
+          JSON.stringify([...new Set(wait.expectedChildRunIds)].toSorted()) !==
+            JSON.stringify(expected)
+        ) {
+          return false;
+        }
+        nextRuns.set(runId, {
+          ...member,
+          parentYieldWait: {
+            ...wait,
+            status: "waiting",
+            expectedChildRunIds: replacementExpected,
+            terminalChildRunIds: wait.terminalChildRunIds?.filter((id) => id !== previousRunId),
+            lastUpdatedAt: now,
+          },
+        });
+      }
+    }
+    try {
+      // Commit replacement before deleting the prior proof or its artifacts.
+      // Failed persistence leaves the original in-memory owner unchanged.
+      params.persistOrThrow(nextRuns);
+    } catch (error) {
+      log.warn("failed to persist steered subagent replacement", {
+        error,
+        previousRunId,
+        nextRunId,
+      });
+      return false;
+    }
+    // Existing sibling completion observers hold their row identity. Publish
+    // only the committed wait change so their active callbacks remain valid.
+    for (const [runId, entry] of nextRuns) {
+      const current = params.runs.get(runId);
+      if (current && runId !== nextRunId && current !== entry) {
+        current.parentYieldWait = entry.parentYieldWait;
+        nextRuns.set(runId, current);
+      }
+    }
+    params.runs.clear();
+    for (const [runId, entry] of nextRuns) {
+      params.runs.set(runId, entry);
+    }
+    if (previousRunId !== nextRunId) {
+      params.clearPendingLifecycleError(previousRunId);
+      params.resumedRuns.delete(previousRunId);
+      if (shouldDeleteAttachments(source)) {
+        void safeRemoveAttachmentsDir(source);
+      }
+      if (
+        source.execution?.transcriptFile &&
+        source.execution.transcriptFile !== replaceParams.transcriptFile
+      ) {
+        void removeInternalSessionEffectsTranscript(source.execution.transcriptFile);
+      }
+    }
     params.ensureListener();
-    params.persist();
     // Always start sweeper — session-mode runs (no archiveAtMs) also need TTL cleanup.
     params.startSweeper();
-    void waitForSubagentCompletion(nextRunId, waitTimeoutMs, next);
+    void waitForSubagentCompletion(nextRunId, waitTimeoutMs, params.runs.get(nextRunId));
     return true;
   };
 

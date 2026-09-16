@@ -471,7 +471,7 @@ describe("CronService", () => {
       reason: "disabled",
     }));
 
-    const { store, cron } = await createWakeModeNowMainHarness({
+    const { store, cron, enqueueSystemEvent } = await createWakeModeNowMainHarness({
       runHeartbeatOnce,
     });
 
@@ -491,6 +491,12 @@ describe("CronService", () => {
       reason: `cron:${job.id}`,
       allowDuringCron: true,
     });
+    const scheduledText = enqueueSystemEvent.mock.calls[0]?.[0];
+    expect(scheduledText).toMatch(
+      new RegExp(
+        `--cron-run-id cron:${job.id}:\\d+:proof:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}`,
+      ),
+    );
 
     await cron.list({ includeDisabled: true });
     await stopCronAndCleanup(cron, store);

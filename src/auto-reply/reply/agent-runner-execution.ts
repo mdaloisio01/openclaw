@@ -2107,6 +2107,7 @@ export async function runAgentTurnWithFallback(params: {
                   provider: cliExecutionProvider,
                   onAgentRunStart: notifyAgentRunStart,
                   suppressAssistantBridge: params.followupRun.run.silentExpected,
+                  onExecutionProgress: params.opts?.onExecutionProgress,
                   onAssistantText: async (text) => {
                     const textForTyping = await handlePartialForTyping({ text } as ReplyPayload);
                     if (textForTyping === undefined || !params.opts?.onPartialReply) {
@@ -2360,6 +2361,25 @@ export async function runAgentTurnWithFallback(params: {
                     onReasoningEnd: params.opts?.onReasoningEnd,
                     onAgentEvent: async (evt) => {
                       lifecycleBackstop.note(evt);
+                      // Execution evidence belongs to the run owner. UI suppression and
+                      // callback availability must not erase real work or fabricate it.
+                      if (
+                        evt.stream === "tool" ||
+                        evt.stream === "command_output" ||
+                        evt.stream === "patch"
+                      ) {
+                        const phase = readStringValue(evt.data.phase);
+                        if (phase) {
+                          await params.opts?.onExecutionProgress?.({
+                            runId,
+                            source: evt.stream,
+                            phase,
+                            itemId: readStringValue(evt.data.itemId),
+                            toolCallId: readStringValue(evt.data.toolCallId),
+                            name: readStringValue(evt.data.name),
+                          });
+                        }
+                      }
                       // Signal run start only after the embedded agent emits real activity.
                       const hasLifecyclePhase =
                         evt.stream === "lifecycle" && typeof evt.data.phase === "string";

@@ -10,4 +10,7 @@ export {
   resolveRequesterForChildSession,
   shouldIgnorePostCompletionAnnounceForSession,
 } from "./subagent-registry-announce-read.js";
-export { replaceSubagentRunAfterSteer } from "./subagent-registry-steer-runtime.js";
+export {
+  assertParentYieldWaitAllowsRestart,
+  replaceSubagentRunAfterSteer,
+} from "./subagent-registry-steer-runtime.js";

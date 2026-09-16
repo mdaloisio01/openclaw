@@ -59,6 +59,7 @@ import {
   runOutboundDeliveryCommitHooks,
   type OutboundDeliveryCommitHook,
 } from "./delivery-commit-hooks.js";
+import { prepareDeliveryQueuePayload } from "./delivery-queue-payload.js";
 import {
   ackDelivery,
   enqueueDelivery,
@@ -67,6 +68,7 @@ import {
   markDeliveryPlatformSendAttemptStarted,
   type QueuedReplyPayloadSendingHook,
   type QueuedRenderedMessageBatchPlan,
+  type DeliveryQueueOwnerReference,
   withActiveDeliveryClaim,
 } from "./delivery-queue.js";
 import type { OutboundDeliveryFormattingOptions } from "./formatting.js";
@@ -84,7 +86,6 @@ import {
   type OutboundPayloadPlan,
 } from "./payloads.js";
 import { createReplyToDeliveryPolicy } from "./reply-policy.js";
-import { stripInternalRuntimeScaffolding } from "./sanitize-text.js";
 import type { OutboundSendDeps } from "./send-deps.js";
 import type { OutboundSessionContext } from "./session-context.js";
 import type { OutboundChannel } from "./targets.js";
@@ -102,6 +103,10 @@ export type OutboundDeliveryIntent = {
   to: string;
   accountId?: string;
   queuePolicy: OutboundDeliveryQueuePolicy;
+};
+
+export type OutboundDeliveryOwnerCommit = OutboundDeliveryIntent & {
+  results: readonly OutboundDeliveryResult[];
 };
 
 export type DurableFinalDeliveryRequirement = keyof NonNullable<
@@ -654,6 +659,10 @@ type DeliverOutboundPayloadsCoreParams = {
   mirror?: DeliveryMirror;
   silent?: boolean;
   gatewayClientScopes?: readonly string[];
+  /** Durable correlation used by queue recovery to settle an owning workflow. */
+  deliveryQueueOwner?: DeliveryQueueOwnerReference;
+  /** Commits a durable owner after platform success but before queue acknowledgement. */
+  onDeliveryOwnerCommit?: (commit: OutboundDeliveryOwnerCommit) => Promise<void> | void;
 };
 
 type DeliverOutboundPayloadsCoreRuntimeParams = DeliverOutboundPayloadsCoreParams & {
@@ -674,7 +683,7 @@ export type DeliverOutboundPayloadsParams = DeliverOutboundPayloadsCoreParams & 
   deferCommitHooks?: boolean;
   queuePolicy?: OutboundDeliveryQueuePolicy;
   renderedBatchPlan?: QueuedRenderedMessageBatchPlan;
-  onDeliveryIntent?: (intent: OutboundDeliveryIntent) => void;
+  onDeliveryIntent?: (intent: OutboundDeliveryIntent) => Promise<void> | void;
 };
 
 type MessageSentEvent = {
@@ -787,7 +796,7 @@ function normalizePayloadsForChannelDelivery(
 ): NormalizedPayloadForChannelDelivery[] {
   const normalizedPayloads: NormalizedPayloadForChannelDelivery[] = [];
   for (const entry of plan) {
-    let sanitizedPayload = stripInternalRuntimeScaffoldingFromPayload(entry.payload);
+    let sanitizedPayload = prepareDeliveryQueuePayload(entry.payload);
     if (handler.sanitizeText && sanitizedPayload.text) {
       if (!handler.shouldSkipPlainTextSanitization?.(sanitizedPayload)) {
         sanitizedPayload = {
@@ -800,52 +809,13 @@ function normalizePayloadsForChannelDelivery(
       ? handler.normalizePayload(sanitizedPayload)
       : sanitizedPayload;
     const normalized = normalizedPayload
-      ? normalizeEmptyPayloadForDelivery(
-          stripInternalRuntimeScaffoldingFromPayload(normalizedPayload),
-        )
+      ? normalizeEmptyPayloadForDelivery(prepareDeliveryQueuePayload(normalizedPayload))
       : null;
     if (normalized) {
       normalizedPayloads.push({ index: entry.sourceIndex, payload: normalized });
     }
   }
   return normalizedPayloads;
-}
-
-function stripInternalRuntimeScaffoldingFromValue(value: unknown): unknown {
-  if (typeof value === "string") {
-    return stripInternalRuntimeScaffolding(value);
-  }
-  if (Array.isArray(value)) {
-    let changed = false;
-    const next = value.map((entry) => {
-      const stripped = stripInternalRuntimeScaffoldingFromValue(entry);
-      changed ||= stripped !== entry;
-      return stripped;
-    });
-    return changed ? next : value;
-  }
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) {
-    return value;
-  }
-  let changed = false;
-  const next: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value)) {
-    const stripped = stripInternalRuntimeScaffoldingFromValue(entry);
-    changed ||= stripped !== entry;
-    next[key] = stripped;
-  }
-  return changed ? next : value;
-}
-
-function stripInternalRuntimeScaffoldingFromPayload(payload: ReplyPayload): ReplyPayload {
-  const stripped = stripInternalRuntimeScaffoldingFromValue(payload);
-  return stripped && typeof stripped === "object" && !Array.isArray(stripped)
-    ? (stripped as ReplyPayload)
-    : payload;
 }
 
 function buildPayloadSummary(payload: ReplyPayload): NormalizedOutboundPayload {
@@ -1242,7 +1212,7 @@ export async function deliverOutboundPayloadsInternal(
 ): Promise<OutboundDeliveryResult[]> {
   const { channel, to, payloads } = params;
   const queuePolicy = params.queuePolicy ?? "best_effort";
-  const queuePayloads = payloads.map(stripInternalRuntimeScaffoldingFromPayload);
+  const queuePayloads = payloads.map(prepareDeliveryQueuePayload);
   const queuePayloadsChanged = queuePayloads.some((payload, index) => payload !== payloads[index]);
   const renderedBatchPlan =
     params.renderedBatchPlan ?? createRenderedMessageBatchPlan(params.payloads);
@@ -1272,6 +1242,7 @@ export async function deliverOutboundPayloadsInternal(
         mirror: params.mirror,
         session: params.session,
         gatewayClientScopes: params.gatewayClientScopes,
+        owner: params.deliveryQueueOwner,
       }).catch((err: unknown) => {
         if (queuePolicy === "required") {
           throw err;
@@ -1279,25 +1250,24 @@ export async function deliverOutboundPayloadsInternal(
         return null;
       }); // Best-effort delivery falls back to direct send if the queue write fails.
 
-  if (queueId) {
-    params.onDeliveryIntent?.({
-      id: queueId,
-      channel,
-      to,
-      ...(params.accountId ? { accountId: params.accountId } : {}),
-      queuePolicy,
-    });
-  }
-
   if (!queueId) {
     return await deliverOutboundPayloadsWithQueueCleanup(params, null);
   }
 
   // Hold the same in-process claim used by recovery/drain while the live send
   // owns this queue entry.
-  const claimResult = await withActiveDeliveryClaim(queueId, () =>
-    deliverOutboundPayloadsWithQueueCleanup(params, queueId),
-  );
+  const claimResult = await withActiveDeliveryClaim(queueId, async () => {
+    // A caller may durably bind this intent before any platform send. Keep the
+    // recovery claim while it waits so a drain cannot publish ahead of that owner.
+    await params.onDeliveryIntent?.({
+      id: queueId,
+      channel,
+      to,
+      ...(params.accountId ? { accountId: params.accountId } : {}),
+      queuePolicy,
+    });
+    return await deliverOutboundPayloadsWithQueueCleanup(params, queueId);
+  });
   if (claimResult.status === "claimed-by-other-owner") {
     return [];
   }
@@ -1364,6 +1334,14 @@ async function deliverOutboundPayloadsWithQueueCleanup(
             queuePolicy,
           });
         }
+        await params.onDeliveryOwnerCommit?.({
+          id: queueId,
+          channel: params.channel,
+          to: params.to,
+          ...(params.accountId ? { accountId: params.accountId } : {}),
+          queuePolicy,
+          results,
+        });
         const acked = await ackDelivery(queueId)
           .then(() => true)
           .catch((err: unknown) => {
@@ -1661,7 +1639,7 @@ async function deliverOutboundPayloadsCore(
       const presentationHandler = await getDeliveryHandler(
         buildPayloadSummary(deliveryPayload).mediaUrls,
       );
-      const renderedPayload = stripInternalRuntimeScaffoldingFromPayload(
+      const renderedPayload = prepareDeliveryQueuePayload(
         await renderPresentationForDelivery(presentationHandler, deliveryPayload),
       );
       const renderedHandler = await getDeliveryHandler(
@@ -1671,9 +1649,7 @@ async function deliverOutboundPayloadsCore(
         ? renderedHandler.normalizePayload(renderedPayload)
         : renderedPayload;
       const effectivePayload = normalizedEffectivePayload
-        ? normalizeEmptyPayloadForDelivery(
-            stripInternalRuntimeScaffoldingFromPayload(normalizedEffectivePayload),
-          )
+        ? normalizeEmptyPayloadForDelivery(prepareDeliveryQueuePayload(normalizedEffectivePayload))
         : null;
       if (!effectivePayload) {
         recordPayloadOutcome(

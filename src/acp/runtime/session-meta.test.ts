@@ -7,12 +7,49 @@ import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db
 import { withTempDir } from "../../test-helpers/temp-dir.js";
 import {
   listAcpSessionEntries,
+  findAcpSessionEntryByBackendSessionId,
   readAcpSessionEntry,
   upsertAcpSessionMeta,
   writeAcpSessionMetaForMigration,
 } from "./session-meta.js";
 
 describe("ACP session metadata SQLite store", () => {
+  it("resolves a unique backend session and rejects missing or competing owners", async () => {
+    await withTempDir({ prefix: "openclaw-acp-intake-" }, async (dir) => {
+      const cfg = { session: { store: path.join(dir, "sessions.json") } } as OpenClawConfig;
+      const databasePath = path.join(dir, "state", "openclaw.sqlite");
+      const sessionKey = "agent:worker:acp:outer";
+      const options = { cfg, databasePath, backendSessionId: "bridge-session" };
+      const writeOwner = (key: string) =>
+        upsertAcpSessionMeta({
+          cfg,
+          databasePath,
+          sessionKey: key,
+          mutate: () => ({
+            backend: "acpx",
+            agent: "worker",
+            runtimeSessionName: key,
+            mode: "oneshot",
+            state: "running",
+            lastActivityAt: 100,
+            identity: {
+              state: "resolved",
+              source: "ensure",
+              acpxSessionId: "bridge-session",
+              lastUpdatedAt: 100,
+            },
+          }),
+        });
+      await writeOwner(sessionKey);
+      expect(findAcpSessionEntryByBackendSessionId(options)?.sessionKey).toBe(sessionKey);
+      expect(
+        findAcpSessionEntryByBackendSessionId({ ...options, backendSessionId: "other-session" }),
+      ).toBeUndefined();
+      await writeOwner("agent:other:acp:competing");
+      expect(findAcpSessionEntryByBackendSessionId(options)).toBeUndefined();
+    });
+  });
+
   afterEach(() => {
     closeOpenClawStateDatabaseForTest();
   });

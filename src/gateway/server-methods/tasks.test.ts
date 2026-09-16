@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { CronServiceContract } from "../../cron/service-contract.js";
 import type { CronJob } from "../../cron/types.js";
 import {
@@ -10,9 +11,11 @@ import {
   installProductionWatchdogLifecycleGate,
   resetProductionWatchdogLifecycleGateForTests,
 } from "../../tasks/active-production-watchdog-lifecycle.js";
+import { recordProductionExecutorAssignment } from "../../tasks/production-executor-assignment.js";
 import {
   createTaskRecord as createTaskRecordOrNull,
   getTaskById,
+  listTasksForFlowId,
   markTaskTerminalById,
   recordTaskProgressByRunId,
   resetTaskRegistryForTests,
@@ -132,9 +135,12 @@ function createCronHarness(enabled: boolean): CronServiceContract & {
   } as unknown as CronServiceContract & { job: CronJob; update: ReturnType<typeof vi.fn> };
 }
 
-function createContext(cron: CronServiceContract = createCronHarness(false)) {
+function createContext(
+  cron: CronServiceContract = createCronHarness(false),
+  cfg: OpenClawConfig = {},
+) {
   return {
-    getRuntimeConfig: () => ({}),
+    getRuntimeConfig: () => cfg,
     cron,
   } as never;
 }
@@ -159,20 +165,21 @@ async function runTaskHandler(
     | "tasks.cancel"
     | "tasks.startProductionFlow"
     | "tasks.resumeProductionFlow"
+    | "tasks.handleBuildIssue"
     | "tasks.runTaskInFlow"
     | "tasks.recordTaskInFlowProgress"
     | "tasks.completeTaskInFlow"
     | "tasks.recordProductionFlowLawfulStop"
     | "tasks.probeProductionWatchdogLifecycle",
   params: Record<string, unknown>,
-  options?: { cron?: CronServiceContract },
+  options?: { cron?: CronServiceContract; cfg?: OpenClawConfig },
 ) {
   const { calls, respond } = captureRespond();
   await tasksHandlers[method]({
     req: { type: "req", id: `req-${method}`, method },
     params,
     respond,
-    context: createContext(options?.cron),
+    context: createContext(options?.cron, options?.cfg),
     client: null,
     isWebchatConnect: () => false,
   });
@@ -196,6 +203,88 @@ async function getTaskPayload(taskId: string) {
 }
 
 describe("tasks gateway handlers", () => {
+  it("persists build issue triage through the RPC while preserving an explicit session-send denial", async () => {
+    const authorityPath = await writeTestBuildPlan();
+    const started = await runTaskHandler("tasks.startProductionFlow", {
+      ownerKey: "agent:main:main",
+      controllerId: "build-issue-test",
+      goal: "Finish repair",
+      sliceId: "repair",
+      sliceOwner: "Coding Agent",
+      authorityPath,
+      authorityBasis: "owner instruction",
+      buildItem: "repair",
+      requiredOwnerLane: "Coding Agent",
+      attemptedOwnerLane: "Coding Agent",
+      attemptedExecutor: "Coding Agent",
+      executorRole: "Coding Agent",
+      lawfulRouteRequired: "assigned coding lane",
+    });
+    const flowId = String(started.payload?.flow?.flowId);
+    const task = createTaskRecord({
+      runtime: "subagent",
+      ownerKey: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+      parentFlowId: flowId,
+      scopeKind: "session",
+      childSessionKey: "agent:main:subagent:worker",
+      runId: "worker-run",
+      task: "Assigned repair",
+      status: "running",
+      deliveryStatus: "pending",
+      notifyPolicy: "silent",
+    });
+    const assignment = recordProductionExecutorAssignment({
+      flowId,
+      taskId: task.taskId,
+      expectedRunId: "worker-run",
+      executorId: "Coding Agent",
+      ownerLane: "Coding Agent",
+      role: "Coding Agent",
+      permitted: ["production_dispatch"],
+      prohibited: [],
+      evidenceRefs: ["proof:capability"],
+    });
+    expect(assignment.applied).toBe(true);
+    const result = await runTaskHandler(
+      "tasks.handleBuildIssue",
+      {
+        kind: "triage",
+        flowId,
+        ownerKey: "agent:main:main",
+        actionId: "action-1",
+        occurrenceId: "occurrence-1",
+        issueId: "issue-1",
+        summary: "Incidental failure",
+        evidenceRefs: ["proof:incidental"],
+        impact: "non_blocking",
+        resume: {
+          executor: {
+            taskId: task.taskId,
+            expectedRunId: "worker-run",
+            ownerLane: "Coding Agent",
+            role: "Coding Agent",
+            permitted: ["production_dispatch"],
+            prohibited: [],
+            evidenceRefs: ["proof:capability"],
+          },
+          message: "Continue the assigned repair.",
+        },
+      },
+      { cfg: { gateway: { tools: { deny: ["sessions_send"] } } } },
+    );
+    expect(result.calls[0]?.[0]).toBe(true);
+    expect(result.calls[0]?.[1]).toMatchObject({
+      receipt: {
+        decision: "log_deferred_issue_and_resume",
+        execution: { state: "dispatch_failed", reason: "Tool not available: sessions_send" },
+      },
+    });
+    expect(getTaskFlowById(flowId)?.stateJson).toMatchObject({
+      buildIssueActions: [{ input: { issueId: "issue-1" } }],
+    });
+    expect(getTaskFlowById(flowId)?.endedAt).toBeUndefined();
+  });
   it("lists task summaries with SDK-facing statuses and filters", async () => {
     const running = createTaskRecord({
       runtime: "subagent",
@@ -335,13 +424,13 @@ describe("tasks gateway handlers", () => {
       ok: true,
       initialEnabled: false,
       afterOpenEnabled: true,
-      afterCloseEnabled: true,
+      afterCloseEnabled: false,
       flowStatus: "succeeded",
     });
     expect(cron.update).toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
       enabled: true,
     });
-    expect(cron.update).not.toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
+    expect(cron.update).toHaveBeenCalledWith(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID, {
       enabled: false,
     });
     const flowId = payload?.flowId;
@@ -946,7 +1035,7 @@ describe("tasks gateway handlers", () => {
       requiredOwnerLane: "sadb_decomposition_review",
       attemptedOwnerLane: "sadb_decomposition_review",
       attemptedExecutor: "sadb_decomposition_review",
-      executorRole: "sadb_lane_execution",
+      executorRole: "SADB",
       lawfulRouteRequired: "SADB executes through governed lane path",
       handoffRef: "handoff:sadb",
       handoffAcceptedBy: "sadb_decomposition_review",
@@ -955,6 +1044,8 @@ describe("tasks gateway handlers", () => {
       runId: "gie-phase1-sadb-child-run",
       label: "Phase 1 SADB runtime implementation",
       status: "running",
+      permitted: ["repo_read", "repo_write", "production_dispatch"],
+      prohibited: [],
     });
 
     expect(child.calls[0]?.[0]).toBe(true);
@@ -972,7 +1063,7 @@ describe("tasks gateway handlers", () => {
       requiredOwnerLane: "sadb_decomposition_review",
       attemptedOwnerLane: "sadb_decomposition_review",
       attemptedExecutor: "sadb_decomposition_review",
-      executorRole: "sadb_lane_execution",
+      executorRole: "SADB",
       handoffRef: "handoff:sadb",
       handoffAcceptedBy: "sadb_decomposition_review",
       parentFlowId: flowId,
@@ -980,6 +1071,78 @@ describe("tasks gateway handlers", () => {
       deliveryStatus: "pending",
     });
     expect(child.payload?.executorIdentityProof?.childTaskId).toBe(child.payload?.task?.taskId);
+    expect(getTaskFlowById(flowId)?.stateJson).toMatchObject({
+      productionExecutorAssignments: [
+        {
+          taskId: child.payload?.task?.taskId,
+          expectedRunId: "gie-phase1-sadb-child-run",
+          executorId: "sadb_decomposition_review",
+          ownerLane: "sadb_decomposition_review",
+          role: "SADB",
+          permitted: ["production_dispatch", "repo_read", "repo_write"],
+          prohibited: [],
+        },
+      ],
+    });
+    resetTaskFlowRegistryForTests({ persist: false });
+    expect(getTaskFlowById(flowId)?.stateJson).toMatchObject({
+      productionExecutorAssignments: [
+        {
+          taskId: child.payload?.task?.taskId,
+          expectedRunId: "gie-phase1-sadb-child-run",
+          role: "SADB",
+          permitted: ["production_dispatch", "repo_read", "repo_write"],
+        },
+      ],
+    });
+  });
+
+  it("removes the exact child when executor assignment persistence is rejected", async () => {
+    const authorityPath = await writeTestBuildPlan("assignment-compensation-plan.md");
+    const started = await runTaskHandler("tasks.startProductionFlow", {
+      ownerKey: "assignment-compensation-owner",
+      controllerId: "assignment-compensation-controller",
+      goal: "Prove assignment compensation",
+      sliceId: "assignment-compensation-slice",
+      sliceOwner: "Coding Agent",
+      authorityPath,
+      authorityBasis: "test authority",
+      buildItem: "Assignment compensation",
+      requiredOwnerLane: "Coding Agent",
+      attemptedOwnerLane: "Coding Agent",
+      attemptedExecutor: "Coding Agent",
+      executorRole: "Coding Agent",
+      lawfulRouteRequired: "assigned coding lane",
+    });
+    const flowId = String(started.payload?.flow?.flowId);
+
+    const child = await runTaskHandler("tasks.runTaskInFlow", {
+      lookup: flowId,
+      runtime: "cli",
+      workPacketRef: "x".repeat(4_097),
+      buildPlanRef: authorityPath,
+      buildItem: "Assignment compensation",
+      requiredOwnerLane: "Coding Agent",
+      attemptedOwnerLane: "Coding Agent",
+      attemptedExecutor: "Coding Agent",
+      executorRole: "Coding Agent",
+      lawfulRouteRequired: "assigned coding lane",
+      handoffRef: "handoff:assignment-compensation",
+      handoffAcceptedBy: "Coding Agent",
+      childSessionKey: "agent:main:subagent:assignment-compensation",
+      task: "Exercise assignment compensation",
+      status: "running",
+      permitted: ["repo_read", "production_dispatch"],
+      prohibited: [],
+    });
+
+    expect(child.calls[0]?.[0]).toBe(false);
+    expect(child.calls[0]?.[2]?.message).toContain(
+      "child_task_assignment_persist_failed: production_executor_assignment_invalid",
+    );
+    expect(listTasksForFlowId(flowId)).toEqual([]);
+    resetTaskRegistryForTests({ persist: false });
+    expect(listTasksForFlowId(flowId)).toEqual([]);
   });
 
   it("allows a scoped explicit operator override for a production flow", async () => {

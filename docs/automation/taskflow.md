@@ -120,6 +120,111 @@ The flow registry uses SQLite with bounded write-ahead-log maintenance, includin
 periodic and shutdown checkpoints, so long-running gateways do not retain
 unbounded `registry.sqlite-wal` sidecar files.
 
+### Authoritative child executor assignments
+
+`tasks.runTaskInFlow` is the owner boundary for a production child's executor
+assignment. Along with the existing plan, owner-lane, handoff, and backing-session
+proof, the request supplies `executorRole`, `permitted`, and `prohibited`.
+`executorRole` must be `Coding Agent`, `Grant`, `SADB`, `TaskFlow`, `Watchdog`, or
+`Will`; the capability values are listed under [Build issue actions](#build-issue-actions).
+
+After creating the child task, Task Flow stores its task and run identities,
+executor identity, owner lane, role, capability sets, and handoff evidence in the
+flow's SQLite-backed state. Later build-issue routing uses this persisted assignment
+as authority. Executor fields repeated in a `tasks.handleBuildIssue` request must
+match it exactly; they cannot add a lane, role, or capability. A child without a
+valid persisted assignment is not eligible for routing.
+
+## Build issue actions
+
+For an active managed production flow, an authorized controller can call the
+`tasks.handleBuildIssue` Gateway RPC to record an issue and dispatch the next
+authorized action. The method requires `operator.write` and stores its receipts
+in the flow's SQLite state. Inspect them with `openclaw tasks flow show <flow-id>`.
+
+This method uses the existing `sessions_send` tool with the same runtime policies
+as native MCP, including tool profiles, explicit denies, session visibility, and
+agent-to-agent permissions. A tool denial is recorded as a failed dispatch; the
+controller does not select another executor to evade that denial. The separate
+[HTTP tool restrictions](/gateway/tools-invoke-http-api) remain on generic tool
+invocation and are not changed by this method.
+
+Every request supplies these fields:
+
+| Field                     | Meaning                                                                 |
+| ------------------------- | ----------------------------------------------------------------------- |
+| `flowId`, `ownerKey`      | Existing flow and its exact owner session key.                          |
+| `actionId`                | Stable identity for this action and its side effects.                   |
+| `occurrenceId`            | Stable identity for this observed occurrence.                           |
+| `issueId`                 | Issue identity used to link repeated occurrences within the same owner. |
+| `summary`, `evidenceRefs` | Bounded description and references to the observed evidence.            |
+| `kind`                    | `triage` or `recover_execution_surface`.                                |
+
+Identity fields contain 1–256 characters. Summaries, dispatch messages, and each
+evidence reference contain 1–4,096 characters; evidence arrays contain 1–32 entries.
+Unknown fields are rejected.
+
+### Record an incidental issue
+
+Use `kind: "triage"` with an explicit `impact`: `non_blocking`, `current_blocker`,
+`unsafe`, `dishonest`, `impossible`, or `operator_decision`. For `non_blocking`,
+provide `resume: { executor, message }` to continue the assigned work. The issue
+is persisted and read back before the tool is invoked. A current blocker or owner
+decision records a continuation boundary and does not dispatch dependent work.
+
+Each executor supplies `taskId`, `expectedRunId`, `ownerLane`, `role`, `permitted`,
+`prohibited`, and `evidenceRefs`. The task must belong to this flow and owner, retain
+the expected run identity, and have a backing child session. Its lane, role, and
+capability sets must exactly match the authoritative assignment recorded by
+`tasks.runTaskInFlow`; request fields do not grant authority. Its current status
+must be `queued` or `running`, and its owner lane must satisfy the controlling plan.
+The controller derives the target session from that task.
+
+Roles are `Coding Agent`, `Grant`, `SADB`, `TaskFlow`, `Watchdog`, or `Will`.
+Capability lists use `grant_review`, `production_dispatch`, `repo_read`,
+`repo_write`, `report_delivery`, `runtime_restart`, `taskflow_reconciliation`, or
+`watchdog_repair`. `permitted` must contain at least one capability. A triage resume
+requires `production_dispatch` to be permitted and absent from `prohibited`.
+
+### Recover an unavailable execution surface
+
+Use `kind: "recover_execution_surface"` with `primaryFailure: { taskId, kind,
+evidenceRefs }`, `requiredCapability`, an `executors` array, and `message`.
+The failure kind is `execution_unavailable` or `policy_denied`. Candidates must
+refer to different tasks from the failed primary; at most 32 candidates are accepted.
+Selection checks the required capability, owner lane, and current task identity
+before invoking the selected session. Stale identities require reconciliation.
+
+If no route is available, an optional `exhaustion` receipt must use the canonical
+mission-abort receipt schema, match `flowId` as its `mission_id`, and include evidence
+for all 14 continuation classes. Recording that receipt leaves the parent mission
+open. Existing owner decisions, safety stops, hard stops, and restart boundaries
+must be resolved through their owners before further dispatch.
+
+### Read results and retry
+
+The response contains `receipt`, including the original input, its hash, timestamps,
+the decision, and `execution.state`:
+
+| State                      | Meaning                                                         |
+| -------------------------- | --------------------------------------------------------------- |
+| `not_dispatched`           | A recorded boundary prevents dispatch.                          |
+| `dispatch_pending`         | Dispatch intent is durable; its outcome has not been recorded.  |
+| `dispatch_unknown`         | The call was interrupted or returned no usable execution proof. |
+| `dispatch_failed`          | Admission or policy rejected the dispatch.                      |
+| `awaiting_result`          | A run identity is known; its terminal outcome remains unproven. |
+| `terminal_result_observed` | The tool or a later wait returned terminal run evidence.        |
+
+Repeat the identical request to read its retained receipt. If it has a known run
+in `awaiting_result`, the controller waits briefly for that run and updates the
+receipt when terminal proof is available. This includes `sessions_send` errors
+that retain a run identity: a lost RPC response does not prove dispatch failed.
+Changed input under the same action or
+occurrence identity is rejected. Pending or unknown dispatches are never resent
+automatically; recover their original execution evidence before authorizing another
+action. A terminal child result does not complete the parent flow or prove visible
+report delivery.
+
 ## Cancel behavior
 
 `openclaw tasks flow cancel` sets a sticky cancel intent on the flow. Active tasks within the flow are cancelled, and no new steps are started. The cancel intent persists across restarts, so a cancelled flow stays cancelled even if the gateway restarts before all child tasks have terminated.

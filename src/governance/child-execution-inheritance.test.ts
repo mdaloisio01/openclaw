@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { evaluateChildExecutionInheritance } from "./child-execution-inheritance.js";
+import {
+  evaluateChildExecutionInheritance,
+  type ChildExecutionInheritanceInput,
+} from "./child-execution-inheritance.js";
 
 const now = "2026-08-23T03:56:00Z";
 
@@ -31,7 +34,7 @@ const baseInput = {
     },
   },
   now,
-};
+} satisfies ChildExecutionInheritanceInput;
 
 describe("child execution inheritance", () => {
   it("allows child delegation when authority and actions are equal-or-narrower", () => {

@@ -173,6 +173,7 @@ describe("subagent registry lifecycle error grace", () => {
         getLatestSubagentRunByChildSessionKey: mod.getLatestSubagentRunByChildSessionKey,
         isSubagentSessionRunActive: mod.isSubagentSessionRunActive,
         listSubagentRunsForRequester: mod.listSubagentRunsForRequester,
+        assertParentYieldWaitAllowsRestart: mod.assertParentYieldWaitAllowsRestart,
         replaceSubagentRunAfterSteer: mod.replaceSubagentRunAfterSteer,
         resolveRequesterForChildSession: mod.resolveRequesterForChildSession,
         shouldIgnorePostCompletionAnnounceForSession:

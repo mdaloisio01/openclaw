@@ -212,6 +212,23 @@ export function createOpenClawTools(
     toolDenylist: options?.pluginToolDenylist,
   });
   const trimmedRunSessionKey = options?.runSessionKey?.trim();
+  const onYield = options?.onYield
+    ? async (message: string) => {
+        const controllerSessionKey = trimmedRunSessionKey || options.agentSessionKey?.trim();
+        if (controllerSessionKey) {
+          // Every harness uses this tool owner. Persist the same parent wait
+          // before its runtime-specific callback ends the current execution.
+          const { markParentYieldWaitForController } = await import("./subagent-registry.js");
+          markParentYieldWaitForController({
+            controllerSessionKey,
+            parentRunId: options.runId,
+            reason: message,
+            requiredCloseout: true,
+          });
+        }
+        await options.onYield?.(message);
+      }
+    : undefined;
   const mediaGenerationAgentSessionKey =
     trimmedRunSessionKey && isCronRunSessionKey(trimmedRunSessionKey)
       ? trimmedRunSessionKey
@@ -430,6 +447,7 @@ export function createOpenClawTools(
       : [
           createGatewayTool({
             agentSessionKey: options?.agentSessionKey,
+            currentDeliveryContext: deliveryContext,
             config: options?.config,
           }),
         ]),
@@ -518,7 +536,7 @@ export function createOpenClawTools(
       : []),
     createSessionsYieldTool({
       sessionId: options?.sessionId,
-      onYield: options?.onYield,
+      onYield,
     }),
     createSubagentsTool({
       agentSessionKey: options?.agentSessionKey,

@@ -275,13 +275,13 @@ describe("subagent registry steer restarts", () => {
     });
   };
 
-  const replaceRunAfterSteer = (params: {
+  const replaceRunAfterSteer = async (params: {
     previousRunId: string;
     nextRunId: string;
     fallback?: ReturnType<typeof listMainRuns>[number];
     transcriptFile?: string;
   }) => {
-    const replaced = mod.replaceSubagentRunAfterSteer({
+    const replaced = await mod.replaceSubagentRunAfterSteer({
       previousRunId: params.previousRunId,
       nextRunId: params.nextRunId,
       fallback: params.fallback,
@@ -329,7 +329,7 @@ describe("subagent registry steer restarts", () => {
       expect(runSubagentEndedHookMock).not.toHaveBeenCalled();
       expect(emitSessionLifecycleEventMock).not.toHaveBeenCalled();
 
-      replaceRunAfterSteer({
+      await replaceRunAfterSteer({
         previousRunId: "run-old",
         nextRunId: "run-new",
         fallback: previous,
@@ -375,7 +375,7 @@ describe("subagent registry steer restarts", () => {
         transcriptFile: "/tmp/openclaw-state/internal-agent-runs/run-old.jsonl",
       };
 
-      replaceRunAfterSteer({
+      await replaceRunAfterSteer({
         previousRunId: "run-old",
         nextRunId: "run-new",
         fallback: previous,
@@ -442,7 +442,7 @@ describe("subagent registry steer restarts", () => {
     }
   });
 
-  it("clears announce retry state when replacing after steer restart", () => {
+  it("clears announce retry state when replacing after steer restart", async () => {
     {
       registerRun({
         runId: "run-retry-reset-old",
@@ -456,7 +456,7 @@ describe("subagent registry steer restarts", () => {
         previous.delivery = { status: "pending", attemptCount: 2, lastAttemptAt: Date.now() };
       }
 
-      const run = replaceRunAfterSteer({
+      const run = await replaceRunAfterSteer({
         previousRunId: "run-retry-reset-old",
         nextRunId: "run-retry-reset-new",
         fallback: previous,
@@ -483,7 +483,7 @@ describe("subagent registry steer restarts", () => {
         previous.outcome = { status: "ok" };
       }
 
-      const run = replaceRunAfterSteer({
+      const run = await replaceRunAfterSteer({
         previousRunId: "run-terminal-state-old",
         nextRunId: "run-terminal-state-new",
         fallback: previous,
@@ -504,7 +504,7 @@ describe("subagent registry steer restarts", () => {
     }
   });
 
-  it("clears frozen completion fields when replacing after steer restart", () => {
+  it("clears frozen completion fields when replacing after steer restart", async () => {
     registerRun({
       runId: "run-frozen-old",
       childSessionKey: "agent:main:subagent:frozen",
@@ -523,7 +523,7 @@ describe("subagent registry steer restarts", () => {
       previous.cleanupHandled = true;
     }
 
-    const run = replaceRunAfterSteer({
+    const run = await replaceRunAfterSteer({
       previousRunId: "run-frozen-old",
       nextRunId: "run-frozen-new",
       fallback: previous,
@@ -535,7 +535,7 @@ describe("subagent registry steer restarts", () => {
     expect(run.cleanupHandled).toBe(false);
   });
 
-  it("preserves cumulative session timing across steer replacement runs", () => {
+  it("preserves cumulative session timing across steer replacement runs", async () => {
     registerRun({
       runId: "run-runtime-old",
       childSessionKey: "agent:main:subagent:runtime",
@@ -554,7 +554,7 @@ describe("subagent registry steer restarts", () => {
     previous.accumulatedRuntimeMs = 0;
     previous.outcome = { status: "ok" };
 
-    const replaced = mod.replaceSubagentRunAfterSteer({
+    const replaced = await mod.replaceSubagentRunAfterSteer({
       previousRunId: "run-runtime-old",
       nextRunId: "run-runtime-new",
       fallback: previous,
@@ -575,7 +575,7 @@ describe("subagent registry steer restarts", () => {
     expect(mod.getSubagentSessionRuntimeMs(next, next.endedAt)).toBe(150_000);
   });
 
-  it("clears completion delivery metadata when replacing for steer restart", () => {
+  it("clears completion delivery metadata when replacing for steer restart", async () => {
     registerRun({
       runId: "run-delivery-old",
       childSessionKey: "agent:main:subagent:delivery-clear",
@@ -595,7 +595,7 @@ describe("subagent registry steer restarts", () => {
       lastDropReason: "sink_unavailable",
     };
 
-    const replaced = mod.replaceSubagentRunAfterSteer({
+    const replaced = await mod.replaceSubagentRunAfterSteer({
       previousRunId: "run-delivery-old",
       nextRunId: "run-delivery-new",
       fallback: previous,
@@ -612,7 +612,7 @@ describe("subagent registry steer restarts", () => {
     expect(next.delivery?.lastDropReason).toBeUndefined();
   });
 
-  it("preserves frozen completion as fallback when replacing for wake continuation", () => {
+  it("preserves frozen completion as fallback when replacing for wake continuation", async () => {
     registerRun({
       runId: "run-wake-old",
       childSessionKey: "agent:main:subagent:wake",
@@ -629,7 +629,7 @@ describe("subagent registry steer restarts", () => {
       };
     }
 
-    const replaced = mod.replaceSubagentRunAfterSteer({
+    const replaced = await mod.replaceSubagentRunAfterSteer({
       previousRunId: "run-wake-old",
       nextRunId: "run-wake-new",
       fallback: previous,

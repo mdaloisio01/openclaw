@@ -3003,6 +3003,101 @@ describe("dispatchReplyFromConfig", () => {
     );
   });
 
+  it("observes real execution when channel progress callbacks are absent", async () => {
+    setNoAbort();
+    const dispatcher = createDispatcher();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    await dispatchReplyFromConfig({
+      ctx: buildTestCtx({ Provider: "telegram", ChatType: "direct" }),
+      cfg,
+      dispatcher,
+      replyResolver: async (_ctx, opts) => {
+        await opts?.onPlanUpdate?.({ phase: "update", steps: ["Inspect the source"] });
+        expect(opts?.onToolStart).toBeUndefined();
+        await opts?.onExecutionProgress?.({
+          runId: "execution-without-preview",
+          source: "tool",
+          phase: "start",
+          toolCallId: "read-1",
+          name: "read",
+        });
+        return { text: "Source inspection finished." };
+      },
+    });
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({ text: "Source inspection finished." });
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toContainEqual({
+      type: "NEXT_EXECUTABLE_STEP_STARTED",
+      detail: "run:execution-without-preview:tool:start:read-1:read",
+    });
+  });
+
+  it.each(["compaction", "item narration"] as const)(
+    "does not count %s as execution after a production update",
+    async (kind) => {
+      setNoAbort();
+      const dispatcher = createDispatcher();
+      await dispatchReplyFromConfig({
+        ctx: buildTestCtx({ Provider: "telegram", ChatType: "direct" }),
+        cfg: {
+          ...emptyConfig,
+          agents: { defaults: { verboseDefault: "on" } },
+        },
+        dispatcher,
+        replyOptions: { onCompactionStart: vi.fn(), onItemEvent: vi.fn() },
+        replyResolver: async (_ctx, opts) => {
+          await opts?.onPlanUpdate?.({ phase: "update", steps: ["Apply the repair"] });
+          if (kind === "compaction") {
+            await opts?.onCompactionStart?.();
+          } else {
+            await opts?.onItemEvent?.({ kind: "assistant", phase: "start", title: "Preparing" });
+          }
+          return { text: "done" };
+        },
+      });
+      expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+      expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "NEXT_EXECUTABLE_STEP_STARTED" })]),
+      );
+    },
+  );
+
+  it("starts a fresh guard for a nonproduction turn after stale continuation state", async () => {
+    setNoAbort();
+    const dispatcher = createDispatcher();
+    const cfg = {
+      ...emptyConfig,
+      agents: { defaults: { verboseDefault: "on" } },
+    } satisfies OpenClawConfig;
+    const ctx = buildTestCtx({ Provider: "telegram", ChatType: "direct" });
+    await dispatchReplyFromConfig({
+      ctx,
+      cfg,
+      dispatcher,
+      replyResolver: async (_ctx, opts) => {
+        await opts?.onPlanUpdate?.({ phase: "update", steps: ["Repair the prior issue"] });
+        return { text: "done" };
+      },
+    });
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+    await dispatchReplyFromConfig({
+      ctx: { ...ctx, Body: "The previous issue is closed. Explain what a task is." },
+      cfg,
+      dispatcher,
+      replyResolver: async () => ({ text: "A task records a unit of work." }),
+    });
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "A task records a unit of work.",
+    });
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+  });
+
   it("allows terminal delivery after a non-terminal update when final text is a drill acknowledgement", async () => {
     setNoAbort();
     const cfg = {
@@ -3163,7 +3258,7 @@ describe("dispatchReplyFromConfig", () => {
     );
   });
 
-  it("allows planning-only setup closeout text without triggering BLOCKED_CLOSEOUT", async () => {
+  it("allows setup output because the current request authorizes only planning", async () => {
     setNoAbort();
     const cfg = {
       ...emptyConfig,
@@ -3174,6 +3269,7 @@ describe("dispatchReplyFromConfig", () => {
       Provider: "webchat",
       Surface: "webchat",
       ChatType: "direct",
+      Body: "Only draft a Cleanup Crew production build plan.",
     });
 
     const replyResolver = async (
@@ -3203,9 +3299,67 @@ describe("dispatchReplyFromConfig", () => {
     expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ type: "NON_TERMINAL_BUILD_UPDATE_EMITTED" }),
-        { type: "BLOCKER_STATE", detail: "true:paperwork_only_setup" },
+        { type: "BLOCKER_STATE", detail: "true:operator_pause_hold" },
         { type: "TERMINAL_CLOSEOUT_ATTEMPTED", detail: "sendFinalReply" },
         { type: "TERMINAL_CLOSEOUT_ALLOWED", detail: "sendFinalReply" },
+      ]),
+    );
+  });
+
+  it("does not let generated setup wording authorize a production stop", async () => {
+    setNoAbort();
+    const dispatcher = createDispatcher();
+    await dispatchReplyFromConfig({
+      ctx: buildTestCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        ChatType: "direct",
+        Body: "Give me a Cleanup Crew production build plan. Execute it now.",
+      }),
+      cfg: { ...emptyConfig, agents: { defaults: { verboseDefault: "on" } } },
+      dispatcher,
+      replyResolver: async (_ctx, opts) => {
+        await opts?.onPlanUpdate?.({
+          phase: "update",
+          steps: ["Write build plan", "Execute build"],
+        });
+        return { text: "paperwork/setup done, build still open." };
+      },
+    });
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalledWith({
+      text: "paperwork/setup done, build still open.",
+    });
+    const events = dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
+      ]),
+    );
+    expect(events.map((event) => event.type)).not.toContain("OPERATOR_PAUSE_HOLD_RECORDED");
+    expect(events.map((event) => event.type)).not.toContain("TERMINAL_COMPLETION_PROOF_RECORDED");
+  });
+
+  it.each([
+    "Cleanup Crew build planning-only: prepare the repair prompt.",
+    "Only draft a prompt for the Cleanup Crew production repair plan.",
+  ])("classifies current planning intent without a special final phrase: %s", async (body) => {
+    setNoAbort();
+    const dispatcher = createDispatcher();
+    await dispatchReplyFromConfig({
+      ctx: buildTestCtx({ Provider: "telegram", ChatType: "direct", Body: body }),
+      cfg: { ...emptyConfig, agents: { defaults: { verboseDefault: "on" } } },
+      dispatcher,
+      replyResolver: async (_ctx, opts) => {
+        await opts?.onPlanUpdate?.({ phase: "update", steps: ["Draft the requested prompt"] });
+        return { text: "Use this prompt to carry out the repair when execution is requested." };
+      },
+    });
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith({
+      text: "Use this prompt to carry out the repair when execution is requested.",
+    });
+    expect(dispatchFromConfigTesting.activeRunContinuation.getEvents(dispatcher)).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "ACTIVE_RUN_CONTINUITY_VIOLATION" }),
       ]),
     );
   });
@@ -3421,6 +3575,12 @@ describe("dispatchReplyFromConfig", () => {
         phase: "update",
         explanation: "Inspect code, patch it, run tests.",
         steps: ["Inspect code", "Patch code", "Run tests"],
+      });
+      await opts?.onExecutionProgress?.({
+        runId: "slack-patch-run",
+        source: "patch",
+        phase: "end",
+        itemId: "patch-1",
       });
       await opts?.onPatchSummary?.({
         phase: "end",

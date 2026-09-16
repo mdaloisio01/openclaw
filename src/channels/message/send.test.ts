@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { OutboundDeliveryError } from "../../infra/outbound/deliver-types.js";
 import type { OutboundPayloadDeliveryOutcome } from "../../infra/outbound/deliver-types.js";
-import type { OutboundDeliveryIntent } from "../../infra/outbound/deliver.js";
+import type {
+  OutboundDeliveryIntent,
+  OutboundDeliveryOwnerCommit,
+} from "../../infra/outbound/deliver.js";
 
 const deliverOutboundPayloads = vi.hoisted(() => vi.fn());
 
@@ -20,6 +23,7 @@ import type { DurableMessageSendIntent } from "./types.js";
 
 type DeliveryIntentCallbackParams = {
   onDeliveryIntent?: (intent: OutboundDeliveryIntent) => void;
+  onDeliveryOwnerCommit?: (commit: OutboundDeliveryOwnerCommit) => Promise<void> | void;
   onPayloadDeliveryOutcome?: (outcome: OutboundPayloadDeliveryOutcome) => void;
 };
 
@@ -207,6 +211,46 @@ describe("withDurableMessageSendContext", () => {
     const request = latestDeliveryRequest();
     expect(request.abortSignal).toBe(abortController.signal);
     expect(request.queuePolicy).toBe("required");
+  });
+
+  it("normalizes the exact pre-ack owner receipt with collected payload outcomes", async () => {
+    deliverOutboundPayloads.mockImplementationOnce(async (params: DeliveryIntentCallbackParams) => {
+      const deliveryIntent = {
+        id: "intent-owner-commit",
+        channel: "telegram" as const,
+        to: "chat-1",
+        queuePolicy: "required" as const,
+      };
+      const results = [{ channel: "telegram" as const, messageId: "msg-1" }];
+      params.onDeliveryIntent?.(deliveryIntent);
+      params.onPayloadDeliveryOutcome?.({ index: 0, status: "sent", results });
+      await params.onDeliveryOwnerCommit?.({ ...deliveryIntent, results });
+      return results;
+    });
+    const onDeliveryOwnerCommit = vi.fn();
+
+    const result = await sendDurableMessageBatch({
+      cfg,
+      channel: "telegram",
+      to: "chat-1",
+      payloads: [{ text: "hello" }],
+      threadId: 42,
+      onDeliveryOwnerCommit,
+    });
+
+    expectBatchStatus(result, "sent");
+    expect(onDeliveryOwnerCommit).toHaveBeenCalledWith({
+      deliveryIntent: expect.objectContaining({ id: "intent-owner-commit" }),
+      receipt: expect.objectContaining({
+        platformMessageIds: ["msg-1"],
+        threadId: "42",
+      }),
+      payloadOutcomes: [{ index: 0, status: "sent", results: result.results }],
+    });
+    const [ownerCommit] = requireMockCall(onDeliveryOwnerCommit, 0, "owner commit") as [
+      { receipt: unknown },
+    ];
+    expect(result.receipt).toBe(ownerCommit.receipt);
   });
 
   it("maps best-effort durability to best-effort queue policy", async () => {

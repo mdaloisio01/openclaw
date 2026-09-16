@@ -186,7 +186,6 @@ import {
 import {
   ackPendingAgentSteeringItems,
   leasePendingAgentSteeringItems,
-  markParentYieldWaitForController,
   prependAgentSteeringPrompt,
   releasePendingAgentSteeringItems,
 } from "../../subagent-registry.js";
@@ -1244,19 +1243,6 @@ export async function runEmbeddedAttempt(
             onToolOutcome: params.onToolOutcome,
             skillsSnapshot: skillsSnapshotForRun,
             onYield: (message) => {
-              const controllerSessionKey = params.sessionKey?.trim();
-              if (controllerSessionKey) {
-                markParentYieldWaitForController({
-                  controllerSessionKey,
-                  parentRunId: params.runId,
-                  reason: message,
-                  requiredCloseout: true,
-                });
-              } else {
-                log.warn(
-                  `sessions_yield parent wait not recorded: missing controller session key runId=${params.runId ?? "unknown"}`,
-                );
-              }
               yieldDetected = true;
               yieldMessage = message;
               queueYieldInterruptForSession?.();

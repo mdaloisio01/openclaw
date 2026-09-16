@@ -1,1 +1,4 @@
-export { replaceSubagentRunAfterSteer } from "../agents/subagent-registry.js";
+export {
+  assertParentYieldWaitAllowsRestart,
+  replaceSubagentRunAfterSteer,
+} from "../agents/subagent-registry.js";

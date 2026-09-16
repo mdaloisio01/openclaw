@@ -332,6 +332,36 @@ export function readAcpSessionEntry(params: {
   };
 }
 
+export function findAcpSessionEntryByBackendSessionId(params: {
+  backendSessionId: string;
+  cfg?: OpenClawConfig;
+  env?: NodeJS.ProcessEnv;
+  databasePath?: string;
+}): AcpSessionStoreEntry | undefined {
+  const database = openOpenClawStateDatabase({ env: params.env, path: params.databasePath });
+  // The backend's session/new result identifies the bridge, independently of
+  // the outer routing key. Never infer that ownership from prompt text.
+  const { rows } = executeSqliteQuerySync(
+    database.db,
+    getAcpSessionKysely(database.db)
+      .selectFrom("acp_sessions")
+      .select("session_key")
+      .where((eb) =>
+        eb(
+          eb.fn<string>("json_extract", [eb.ref("identity_json"), eb.val("$.acpxSessionId")]),
+          "=",
+          params.backendSessionId,
+        ),
+      )
+      .limit(2),
+  );
+  if (rows.length !== 1) {
+    return undefined;
+  }
+  const entry = readAcpSessionEntry({ ...params, sessionKey: rows[0].session_key });
+  return entry?.acp?.identity?.acpxSessionId === params.backendSessionId ? entry : undefined;
+}
+
 export async function listAcpSessionEntries(params: {
   cfg?: OpenClawConfig;
   env?: NodeJS.ProcessEnv;

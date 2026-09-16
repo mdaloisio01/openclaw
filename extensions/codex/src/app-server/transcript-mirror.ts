@@ -17,9 +17,13 @@ import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runti
 
 type MirroredAgentMessage = Extract<AgentMessage, { role: "user" | "assistant" | "toolResult" }>;
 type MirroredUserMessage = Extract<AgentMessage, { role: "user" }>;
+type CanonicalAssistantTranscript = NonNullable<
+  EmbeddedRunAttemptResult["canonicalAssistantTranscript"]
+>;
 
 export type CodexAppServerTranscriptMirrorResult = {
   userMessagesPresent: MirroredUserMessage[];
+  canonicalAssistantTranscript?: CanonicalAssistantTranscript;
 };
 
 const MIRROR_IDENTITY_META_KEY = "mirrorIdentity" as const;
@@ -106,7 +110,7 @@ export async function mirrorTranscriptBestEffort(params: {
   cwd: string;
   threadId: string;
   turnId: string;
-}): Promise<void> {
+}): Promise<CanonicalAssistantTranscript | undefined> {
   try {
     const messages = await resolveFinalCodexMirrorMessages({
       params: params.params,
@@ -126,13 +130,18 @@ export async function mirrorTranscriptBestEffort(params: {
       // identity (not via the scope). Dropping `turnId` from the scope here is
       // what lets a re-emitted prior-turn entry collide with its existing key.
       idempotencyScope: `codex-app-server:${params.threadId}`,
+      ...(params.result.lastAssistant
+        ? { canonicalAssistantIdentity: `${params.turnId}:assistant` }
+        : {}),
       config: params.params.config,
     });
     for (const message of mirrorResult.userMessagesPresent) {
       params.notifyUserMessagePersisted(message);
     }
+    return mirrorResult.canonicalAssistantTranscript;
   } catch (error) {
     embeddedAgentLog.warn("failed to mirror codex app-server transcript", { error });
+    return undefined;
   }
 }
 
@@ -270,6 +279,38 @@ function buildMirrorDedupeIdentity(message: MirroredAgentMessage): string {
   return `${message.role}:${fingerprintMirrorMessageContent(message)}`;
 }
 
+function resolveCanonicalAssistantTranscript(params: {
+  message: AgentMessage;
+  messageId: string;
+  sessionId?: string;
+  sessionFile: string;
+  idempotencyKey: string;
+}): CanonicalAssistantTranscript | undefined {
+  const message = params.message;
+  // Native terminal mirrors are one plain text block. A write hook may hide or
+  // replace that message; only the actual visible persisted form can be reused.
+  if (
+    !params.sessionId ||
+    message.role !== "assistant" ||
+    message.stopReason !== "stop" ||
+    (message as { display?: unknown }).display === false ||
+    message.content.length !== 1
+  ) {
+    return undefined;
+  }
+  const content = message.content[0];
+  if (content?.type !== "text" || !content.text.trim() || content.textSignature) {
+    return undefined;
+  }
+  return {
+    sessionId: params.sessionId,
+    sessionFile: params.sessionFile,
+    messageId: params.messageId,
+    idempotencyKey: params.idempotencyKey,
+    text: content.text,
+  };
+}
+
 export async function mirrorCodexAppServerTranscript(params: {
   sessionFile: string;
   sessionId?: string;
@@ -278,6 +319,7 @@ export async function mirrorCodexAppServerTranscript(params: {
   agentId?: string;
   messages: AgentMessage[];
   idempotencyScope?: string;
+  canonicalAssistantIdentity?: string;
   config?: SessionWriteLockAcquireTimeoutConfig;
 }): Promise<CodexAppServerTranscriptMirrorResult> {
   const messages = params.messages.filter(
@@ -295,8 +337,13 @@ export async function mirrorCodexAppServerTranscript(params: {
   const appendedUpdates: Array<{ messageId: string; message: AgentMessage; messageSeq: number }> =
     [];
   const userMessagesPresent: MirroredUserMessage[] = [];
+  let canonicalAssistantTranscript: CanonicalAssistantTranscript | undefined;
+  const canonicalAssistantKey =
+    params.idempotencyScope && params.canonicalAssistantIdentity
+      ? `${params.idempotencyScope}:${params.canonicalAssistantIdentity}`
+      : undefined;
   try {
-    const mirrorState = await readTranscriptMirrorState(params.sessionFile);
+    const mirrorState = await readTranscriptMirrorState(params.sessionFile, canonicalAssistantKey);
     let nextMessageSeq = mirrorState.messageCount;
     for (const message of messages) {
       const dedupeIdentity = buildMirrorDedupeIdentity(message);
@@ -311,6 +358,14 @@ export async function mirrorCodexAppServerTranscript(params: {
         const persistedUserMessage = mirrorState.userMessagesByIdempotencyKey.get(idempotencyKey);
         if (persistedUserMessage) {
           userMessagesPresent.push(persistedUserMessage);
+        }
+        if (idempotencyKey === canonicalAssistantKey && mirrorState.canonicalAssistant) {
+          canonicalAssistantTranscript = resolveCanonicalAssistantTranscript({
+            ...mirrorState.canonicalAssistant,
+            sessionId: params.sessionId,
+            sessionFile: params.sessionFile,
+            idempotencyKey,
+          });
         }
         continue;
       }
@@ -344,6 +399,15 @@ export async function mirrorCodexAppServerTranscript(params: {
           mirrorState.userMessagesByIdempotencyKey.set(idempotencyKey, appendedMessage);
         }
       }
+      if (idempotencyKey && idempotencyKey === canonicalAssistantKey) {
+        canonicalAssistantTranscript = resolveCanonicalAssistantTranscript({
+          message: appendedMessage,
+          messageId,
+          sessionId: params.sessionId,
+          sessionFile: params.sessionFile,
+          idempotencyKey,
+        });
+      }
       nextMessageSeq += 1;
       appendedUpdates.push({ messageId, message: appendedMessage, messageSeq: nextMessageSeq });
       if (idempotencyKey) {
@@ -365,17 +429,25 @@ export async function mirrorCodexAppServerTranscript(params: {
     });
   }
 
-  return { userMessagesPresent };
+  return {
+    userMessagesPresent,
+    ...(canonicalAssistantTranscript ? { canonicalAssistantTranscript } : {}),
+  };
 }
 
-async function readTranscriptMirrorState(sessionFile: string): Promise<{
+async function readTranscriptMirrorState(
+  sessionFile: string,
+  canonicalAssistantKey?: string,
+): Promise<{
   idempotencyKeys: Set<string>;
   messageCount: number;
   userMessagesByIdempotencyKey: Map<string, MirroredUserMessage>;
+  canonicalAssistant?: { message: AgentMessage; messageId: string };
 }> {
   const idempotencyKeys = new Set<string>();
   const userMessagesByIdempotencyKey = new Map<string, MirroredUserMessage>();
   let messageCount = 0;
+  let canonicalAssistant: { message: AgentMessage; messageId: string } | undefined;
   let raw: string;
   try {
     raw = await fs.readFile(sessionFile, "utf8");
@@ -390,7 +462,10 @@ async function readTranscriptMirrorState(sessionFile: string): Promise<{
       continue;
     }
     try {
-      const parsed = JSON.parse(line) as { message?: AgentMessage & { idempotencyKey?: unknown } };
+      const parsed = JSON.parse(line) as {
+        id?: unknown;
+        message?: AgentMessage & { idempotencyKey?: unknown };
+      };
       if ((parsed as { type?: unknown }).type === "message") {
         messageCount += 1;
       }
@@ -399,10 +474,18 @@ async function readTranscriptMirrorState(sessionFile: string): Promise<{
         if (parsed.message.role === "user") {
           userMessagesByIdempotencyKey.set(parsed.message.idempotencyKey, parsed.message);
         }
+        if (
+          parsed.message.idempotencyKey === canonicalAssistantKey &&
+          parsed.message.role === "assistant" &&
+          typeof parsed.id === "string" &&
+          parsed.id
+        ) {
+          canonicalAssistant = { message: parsed.message, messageId: parsed.id };
+        }
       }
     } catch {
       continue;
     }
   }
-  return { idempotencyKeys, messageCount, userMessagesByIdempotencyKey };
+  return { idempotencyKeys, messageCount, userMessagesByIdempotencyKey, canonicalAssistant };
 }

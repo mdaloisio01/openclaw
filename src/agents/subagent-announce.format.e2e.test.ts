@@ -174,8 +174,9 @@ const { subagentRegistryMock } = vi.hoisted(() => ({
     listSubagentRunsForRequester: vi.fn(
       (_sessionKey: string, _scope?: { requesterRunId?: string }): MockSubagentRun[] => [],
     ),
+    assertParentYieldWaitAllowsRestart: vi.fn(async () => {}),
     replaceSubagentRunAfterSteer: vi.fn(
-      (_params: { previousRunId: string; nextRunId: string }) => true,
+      async (_params: { previousRunId: string; nextRunId: string }) => true,
     ),
     resolveRequesterForChildSession: vi.fn((_sessionKey: string): RequesterResolution => null),
   },
@@ -469,7 +470,7 @@ describe("subagent announce formatting", () => {
       .mockClear()
       .mockReturnValue(undefined);
     subagentRegistryMock.listSubagentRunsForRequester.mockClear().mockReturnValue([]);
-    subagentRegistryMock.replaceSubagentRunAfterSteer.mockClear().mockReturnValue(true);
+    subagentRegistryMock.replaceSubagentRunAfterSteer.mockClear().mockResolvedValue(true);
     subagentRegistryMock.resolveRequesterForChildSession.mockClear().mockReturnValue(null);
     hasSubagentDeliveryTargetHook = false;
     hookHasHooksMock.mockClear();
@@ -2806,6 +2807,7 @@ describe("subagent announce formatting", () => {
     expect(subagentRegistryMock.replaceSubagentRunAfterSteer).toHaveBeenCalledWith({
       previousRunId: "run-parent-phase-1",
       nextRunId: "run-parent-phase-2",
+      fallback: undefined,
       preserveFrozenResultFallback: true,
     });
   });

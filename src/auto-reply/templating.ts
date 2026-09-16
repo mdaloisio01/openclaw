@@ -1,4 +1,5 @@
 import type { InboundEventKind } from "../channels/inbound-event/kind.js";
+import type { ActivationContinuationRef, ParentYieldWaitRef } from "../infra/system-events.js";
 import type {
   MediaUnderstandingDecision,
   MediaUnderstandingOutput,
@@ -130,6 +131,10 @@ export type MsgContext = {
    * instead of creating a sibling record that leaves the ack looking orphaned.
    */
   OwnerRequestIntakeRequestId?: string;
+  /** Exact parent wait generations delivered by the internal continuation wake. */
+  ParentYieldWaits?: ParentYieldWaitRef[];
+  /** Exact prepared activation report owned by the internal continuation wake. */
+  ActivationContinuation?: ActivationContinuationRef;
   MessageSids?: string[];
   MessageSidFirst?: string;
   MessageSidLast?: string;

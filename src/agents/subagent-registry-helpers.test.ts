@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  drainSystemEventEntries,
+  enqueueSystemEvent,
+  resetSystemEventsForTest,
+} from "../infra/system-events.js";
 import { defaultRuntime } from "../runtime.js";
-import { logAnnounceGiveUp, reconcileOrphanedRun } from "./subagent-registry-helpers.js";
+import {
+  logAnnounceGiveUp,
+  reconcileOrphanedRun,
+  resolveSubagentRunOrphanReason,
+} from "./subagent-registry-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 function createRunEntry(overrides: Partial<SubagentRunRecord> = {}): SubagentRunRecord {
@@ -21,37 +30,108 @@ function createRunEntry(overrides: Partial<SubagentRunRecord> = {}): SubagentRun
 describe("reconcileOrphanedRun", () => {
   afterEach(() => {
     vi.useRealTimers();
+    resetSystemEventsForTest();
   });
 
-  it("preserves timing on orphaned error outcomes", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(4_000);
-    const entry = createRunEntry();
+  it("keeps terminal parent proof through orphan recovery until its delivered wake is retired", () => {
+    const entry = createRunEntry({ endedAt: 4_000, outcome: { status: "ok" } });
+    const wait = {
+      waitId: "parent-wait",
+      parentRunId: "parent-run",
+      parentSessionKey: entry.requesterSessionKey,
+      expectedChildRunIds: [entry.runId],
+      childSessionKeys: [entry.childSessionKey],
+      waitStartedAt: 1_000,
+      staleAt: 2_000,
+      continuationScheduledAt: 3_000,
+      status: "continuation_scheduled" as const,
+      requiredCloseout: true,
+    };
+    entry.parentYieldWait = wait;
     const runs = new Map([[entry.runId, entry]]);
-    const resumedRuns = new Set([entry.runId]);
-
-    expect(
-      reconcileOrphanedRun({
-        runId: entry.runId,
-        entry,
-        reason: "missing-session-id",
-        source: "resume",
-        runs,
-        resumedRuns,
-      }),
-    ).toBe(true);
-
-    expect(entry.endedAt).toBe(4_000);
-    expect(entry.outcome).toEqual({
-      status: "error",
-      error: "orphaned subagent run (missing-session-id)",
-      startedAt: 1_000,
-      endedAt: 4_000,
-      elapsedMs: 3_000,
+    const args = {
+      runId: entry.runId,
+      entry,
+      reason: "missing-session-entry" as const,
+      source: "restore" as const,
+      runs,
+      resumedRuns: new Set<string>(),
+    };
+    expect(resolveSubagentRunOrphanReason({ entry })).toBeNull();
+    expect(reconcileOrphanedRun(args)).toBe(false);
+    expect(runs.has(entry.runId)).toBe(true);
+    expect(entry.outcome).toEqual({ status: "ok" });
+    entry.parentYieldWait = {
+      ...wait,
+      status: "closeout_delivered",
+      closeout: {
+        parentRunId: "parent-run",
+        deliveryRecordId: "final",
+        deliveryIdempotencyKey: "final-key",
+        deliveryRegistryPath: "/isolated/delivery.json",
+        deliveredAt: 5_000,
+      },
+    };
+    enqueueSystemEvent("Resume parent", {
+      sessionKey: wait.parentSessionKey,
+      parentYieldWait: { waitId: wait.waitId, parentRunId: wait.parentRunId },
     });
+    expect(resolveSubagentRunOrphanReason({ entry })).toBeNull();
+    expect(reconcileOrphanedRun(args)).toBe(false);
+    expect(runs.has(entry.runId)).toBe(true);
+    expect(entry.outcome).toEqual({ status: "ok" });
+    drainSystemEventEntries(wait.parentSessionKey);
+    expect(reconcileOrphanedRun(args)).toBe(true);
     expect(runs.has(entry.runId)).toBe(false);
-    expect(resumedRuns.has(entry.runId)).toBe(false);
   });
+
+  it.each([false, true])(
+    "preserves actual orphan failure timing with parent wait %s",
+    (parentWait) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(4_000);
+      const entry = createRunEntry();
+      if (parentWait) {
+        entry.parentYieldWait = {
+          waitId: "parent-wait",
+          parentRunId: "parent-run",
+          parentSessionKey: entry.requesterSessionKey,
+          expectedChildRunIds: [entry.runId],
+          childSessionKeys: [entry.childSessionKey],
+          waitStartedAt: 1_000,
+          staleAt: 2_000,
+          status: "waiting",
+          requiredCloseout: true,
+        };
+        entry.pauseReason = "sessions_yield";
+      }
+      const runs = new Map([[entry.runId, entry]]);
+      const resumedRuns = new Set([entry.runId]);
+
+      expect(
+        reconcileOrphanedRun({
+          runId: entry.runId,
+          entry,
+          reason: "missing-session-id",
+          source: "resume",
+          runs,
+          resumedRuns,
+        }),
+      ).toBe(true);
+
+      expect(entry.endedAt).toBe(4_000);
+      expect(entry.outcome).toEqual({
+        status: "error",
+        error: "orphaned subagent run (missing-session-id)",
+        startedAt: 1_000,
+        endedAt: 4_000,
+        elapsedMs: 3_000,
+      });
+      expect(runs.has(entry.runId)).toBe(parentWait);
+      expect(entry.pauseReason).toBeUndefined();
+      expect(resumedRuns.has(entry.runId)).toBe(false);
+    },
+  );
 });
 
 describe("logAnnounceGiveUp", () => {

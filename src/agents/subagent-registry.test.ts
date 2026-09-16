@@ -15,7 +15,9 @@ import {
   findTaskByRunId,
   resetTaskRegistryForTests,
 } from "../tasks/task-registry.js";
+import { persistSourceTurnDeliveryState } from "./source-turn-delivery-store.js";
 import { SUBAGENT_ENDED_REASON_COMPLETE } from "./subagent-lifecycle-events.js";
+import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 const noop = () => {};
 const waitForFast = <T>(callback: () => T | Promise<T>) =>
@@ -118,6 +120,12 @@ const mocks = vi.hoisted(() => ({
   resolveAgentTimeoutMs: vi.fn(() => 1_000),
   scheduleOrphanRecovery: vi.fn(),
   enqueueSystemEvent: vi.fn(),
+  peekSystemEventEntries: vi.fn<typeof import("../infra/system-events.js").peekSystemEventEntries>(
+    () => [],
+  ),
+  consumeSelectedSystemEventEntries: vi.fn<
+    typeof import("../infra/system-events.js").consumeSelectedSystemEventEntries
+  >(() => []),
   requestHeartbeat: vi.fn((_: Parameters<typeof requestHeartbeatFn>[0]) => undefined),
   routeReply: vi.fn(),
 }));
@@ -137,6 +145,8 @@ vi.mock("../infra/heartbeat-wake.js", () => ({
 
 vi.mock("../infra/system-events.js", () => ({
   enqueueSystemEvent: mocks.enqueueSystemEvent,
+  peekSystemEventEntries: mocks.peekSystemEventEntries,
+  consumeSelectedSystemEventEntries: mocks.consumeSelectedSystemEventEntries,
 }));
 
 vi.mock("../auto-reply/reply/route-reply.js", () => ({
@@ -228,6 +238,8 @@ describe("subagent registry seam flow", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-24T12:00:00Z"));
     mocks.onAgentEvent.mockReturnValue(noop);
+    mocks.peekSystemEventEntries.mockReturnValue([]);
+    mocks.consumeSelectedSystemEventEntries.mockReturnValue([]);
     mocks.getAgentRunContext.mockReturnValue(undefined);
     mocks.getRuntimeConfig.mockReturnValue({
       agents: { defaults: { subagents: { archiveAfterMinutes: 0 } } },
@@ -422,7 +434,7 @@ describe("subagent registry seam flow", () => {
     }
   });
 
-  it("does not invent parent continuation linkage when no active mission-linked parent flow exists", () => {
+  it("does not invent parent continuation linkage when no active mission-linked parent flow exists", async () => {
     resetTaskRegistryForTests({ persist: false });
     resetTaskFlowRegistryForTests();
     mod.resetSubagentRegistryForTests({ persist: false });
@@ -1424,7 +1436,7 @@ describe("subagent registry seam flow", () => {
       return {};
     });
 
-    mod.initSubagentRegistry();
+    void mod.initSubagentRegistry();
 
     await waitForFast(() => {
       const completedRun = mod
@@ -1479,7 +1491,7 @@ describe("subagent registry seam flow", () => {
       return {};
     });
 
-    mod.initSubagentRegistry();
+    void mod.initSubagentRegistry();
 
     await waitForFast(() => {
       const completedRun = mod
@@ -1922,7 +1934,7 @@ describe("subagent registry seam flow", () => {
       },
     );
 
-    mod.initSubagentRegistry();
+    void mod.initSubagentRegistry();
 
     await waitForFast(() => {
       expect(waitTimeouts).toEqual([1_000]);
@@ -2185,7 +2197,7 @@ describe("subagent registry seam flow", () => {
     expect(mod.countPendingDescendantRuns("agent:main:main")).toBe(1);
 
     expect(
-      mod.replaceSubagentRunAfterSteer({
+      await mod.replaceSubagentRunAfterSteer({
         previousRunId: "run-yield-paused",
         nextRunId: "run-yield-continuation",
       }),
@@ -2263,6 +2275,7 @@ describe("subagent registry seam flow", () => {
       runId: "run-yield-child-b",
       childSessionKey: "agent:main:subagent:child-b",
       requesterSessionKey: "agent:main:main",
+      requesterOrigin: { channel: "telegram", to: "12345" },
       controllerSessionKey: "agent:main:main",
       requesterDisplayKey: "main",
       task: "second child",
@@ -2326,6 +2339,7 @@ describe("subagent registry seam flow", () => {
       expect.stringContaining("Subagent wait ready to resume"),
       expect.objectContaining({
         sessionKey: "agent:main:main",
+        parentYieldWait: { waitId: marked.waitId, parentRunId: "parent-run" },
       }),
     );
     expect(mocks.requestHeartbeat).toHaveBeenCalledWith(
@@ -2335,6 +2349,805 @@ describe("subagent registry seam flow", () => {
       }),
     );
   });
+
+  it("withholds a repeated wait wake until the backend confirms the yielding execution", async () => {
+    const controllerSessionKey = "agent:main:main";
+    const child = (runId: string): SubagentRunRecord => ({
+      runId,
+      childSessionKey: `agent:main:subagent:${runId}`,
+      controllerSessionKey,
+      requesterSessionKey: controllerSessionKey,
+      requesterDisplayKey: "main",
+      task: runId,
+      cleanup: "keep",
+      createdAt: 1_000,
+      startedAt: 1_000,
+    });
+    mod.addSubagentRunForTests({
+      ...child("round-one"),
+      endedAt: 2_000,
+      outcome: { status: "ok" },
+    });
+    const original = mod.markParentYieldWaitForController({
+      controllerSessionKey,
+      parentRunId: "original-parent",
+      now: 2_000,
+    });
+    const identity = {
+      controllerSessionKey,
+      waitId: original.waitId!,
+      parentRunId: "original-parent",
+    };
+    expect(
+      mod.prepareParentYieldWaitContinuation({ ...identity, runId: "first-continuation" }),
+    ).toBe("first-continuation");
+    mod.addSubagentRunForTests(child("round-two"));
+    mocks.enqueueSystemEvent.mockClear();
+    const repeated = mod.markParentYieldWaitForController({
+      controllerSessionKey,
+      parentRunId: "first-continuation",
+      now: 3_000,
+    });
+    expect(repeated.waitId).toBe(original.waitId);
+    await mod.testing.completeSubagentRunForTests({
+      runId: "round-two",
+      endedAt: 4_000,
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: false,
+    });
+    expect(mod.getParentYieldWaitContinuation(identity)).toEqual({
+      status: "waiting",
+      yieldedRunIds: [],
+    });
+    expect(() =>
+      mod.prepareParentYieldWaitContinuation({ ...identity, runId: "premature" }),
+    ).toThrow("still waiting");
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
+    mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+      throw new Error("yield handoff commit failed");
+    });
+    expect(() =>
+      mod.completeParentYieldWaitContinuationYield({
+        controllerSessionKey,
+        runId: "first-continuation",
+      }),
+    ).toThrow("yield handoff commit failed");
+    expect(mod.getParentYieldWaitContinuation(identity)).toEqual({
+      status: "waiting",
+      yieldedRunIds: [],
+    });
+    expect(mocks.consumeSelectedSystemEventEntries).not.toHaveBeenCalled();
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
+    mod.completeParentYieldWaitContinuationYield({
+      controllerSessionKey,
+      runId: "first-continuation",
+    });
+    expect(mod.getParentYieldWaitContinuation(identity)).toEqual({
+      status: "ready",
+      yieldedRunIds: ["first-continuation"],
+    });
+    expect(mocks.enqueueSystemEvent).toHaveBeenCalledOnce();
+    for (const entry of mod.listSubagentRunsForRequester(controllerSessionKey)) {
+      expect(entry.parentYieldWait).toMatchObject({
+        waitId: original.waitId,
+        parentRunId: "original-parent",
+        waitStartedAt: 2_000,
+        expectedChildRunIds: ["round-one", "round-two"],
+        terminalChildRunIds: ["round-one", "round-two"],
+        status: "continuation_scheduled",
+      });
+    }
+    expect(
+      mod.prepareParentYieldWaitContinuation({ ...identity, runId: "second-continuation" }),
+    ).toBe("second-continuation");
+  });
+
+  it("remaps an unscheduled parent wait atomically and waits for the actual replacement terminal", async () => {
+    const parentSessionKey = "agent:main:main";
+    for (const runId of ["child-old", "child-b"]) {
+      mod.addSubagentRunForTests({
+        runId,
+        childSessionKey: `agent:main:subagent:${runId}`,
+        requesterSessionKey: parentSessionKey,
+        controllerSessionKey: parentSessionKey,
+        requesterDisplayKey: "main",
+        task: runId,
+        cleanup: "keep",
+        expectsCompletionMessage: true,
+        createdAt: 1_000,
+        startedAt: 1_000,
+      });
+    }
+    const marked = mod.markParentYieldWaitForController({
+      controllerSessionKey: parentSessionKey,
+      parentRunId: "original-parent",
+      now: 1_000,
+      staleAfterMs: 60_000,
+    });
+    await mod.testing.completeSubagentRunForTests({
+      runId: "child-old",
+      endedAt: 2_000,
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: false,
+    });
+    const sibling = mod
+      .listSubagentRunsForRequester(parentSessionKey)
+      .find((entry) => entry.runId === "child-b")!;
+    const originals = structuredClone(mod.listSubagentRunsForRequester(parentSessionKey));
+    const previous = originals.find((entry) => entry.runId === "child-old")!;
+    const replacement = { previousRunId: "child-old", nextRunId: "child-next", fallback: previous };
+    mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+      throw new Error("replacement commit unavailable");
+    });
+    expect(await mod.replaceSubagentRunAfterSteer(replacement)).toBe(false);
+    expect(mod.listSubagentRunsForRequester(parentSessionKey)).toEqual(originals);
+
+    let finishReplacement: ((result: unknown) => void) | undefined;
+    mocks.callGateway.mockImplementation(async (request: { method?: string }) => {
+      if (request.method === "agent.wait") {
+        return new Promise((resolve) => {
+          finishReplacement = resolve;
+        });
+      }
+      return {};
+    });
+    expect(await mod.replaceSubagentRunAfterSteer(replacement)).toBe(true);
+    const committed = mod.listSubagentRunsForRequester(parentSessionKey);
+    const next = committed.find((entry) => entry.runId === "child-next")!;
+    expect(committed.find((entry) => entry.runId === "child-b")).toBe(sibling);
+    for (const entry of committed) {
+      expect(entry.parentYieldWait).toMatchObject({
+        waitId: marked.waitId,
+        parentRunId: "original-parent",
+        waitStartedAt: 1_000,
+        staleAt: 61_000,
+        status: "waiting",
+        expectedChildRunIds: ["child-b", "child-next"],
+        terminalChildRunIds: [],
+      });
+    }
+    expect(await mod.replaceSubagentRunAfterSteer(replacement)).toBe(true);
+    expect(
+      mod
+        .listSubagentRunsForRequester(parentSessionKey)
+        .find((entry) => entry.runId === "child-next"),
+    ).toBe(next);
+    await mod.testing.completeSubagentRunForTests({
+      runId: "child-b",
+      endedAt: Date.now(),
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: false,
+    });
+    expect(next.parentYieldWait?.status).toBe("waiting");
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalledWith(
+      expect.stringContaining("Subagent wait ready to resume"),
+      expect.anything(),
+    );
+    expect(finishReplacement).toBeDefined();
+    finishReplacement!({ status: "ok", startedAt: next.startedAt, endedAt: Date.now() + 1 });
+    await waitForFast(() => {
+      expect(next.parentYieldWait?.status).toBe("continuation_scheduled");
+      expect(next.parentYieldWait?.terminalChildRunIds).toEqual(["child-b", "child-next"]);
+    });
+    await expect(mod.assertParentYieldWaitAllowsRestart("child-next")).rejects.toThrow(
+      "Parent closeout is pending",
+    );
+  });
+
+  it("commits the exact parent wait before publishing a wake and retries a failed scheduling commit", async () => {
+    const child: SubagentRunRecord = {
+      runId: "commit-child",
+      childSessionKey: "agent:main:subagent:commit-child",
+      controllerSessionKey: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "durable parent wake",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt: 1_000,
+      startedAt: 1_000,
+    };
+    mod.addSubagentRunForTests(child);
+    const mark = () =>
+      mod.markParentYieldWaitForController({
+        controllerSessionKey: "agent:main:main",
+        parentRunId: "commit-parent",
+        now: 1_000,
+        staleAfterMs: 60_000,
+      });
+    mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+      throw new Error("initial wait commit unavailable");
+    });
+    expect(mark).toThrow("initial wait commit unavailable");
+    expect(child.parentYieldWait).toBeUndefined();
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
+    const marked = mark();
+    const parentWakeCalls = () =>
+      mocks.enqueueSystemEvent.mock.calls.filter((args) =>
+        String(args[0]).includes("Subagent wait ready to resume"),
+      );
+    let committedWait: SubagentRunRecord["parentYieldWait"];
+    mocks.persistSubagentRunsToDiskOrThrow
+      .mockImplementationOnce(() => {
+        expect(parentWakeCalls()).toHaveLength(0);
+        expect(child.parentYieldWait?.status).toBe("waiting");
+        throw new Error("scheduled wait commit unavailable");
+      })
+      .mockImplementationOnce((runs: Map<string, SubagentRunRecord>) => {
+        expect(parentWakeCalls()).toHaveLength(0);
+        committedWait = structuredClone(runs.get(child.runId)?.parentYieldWait);
+      });
+    await mod.testing.completeSubagentRunForTests({
+      runId: child.runId,
+      endedAt: 2_000,
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: false,
+    });
+    expect(parentWakeCalls()).toHaveLength(1);
+    expect(child.parentYieldWait).toEqual(committedWait);
+    expect(committedWait).toMatchObject({
+      waitId: marked.waitId,
+      parentRunId: "commit-parent",
+      waitStartedAt: 1_000,
+      staleAt: 61_000,
+      status: "continuation_scheduled",
+      terminalChildRunIds: [child.runId],
+      continuationScheduledAt: Date.now(),
+    });
+  });
+
+  it("retries one retained unscheduled wait per sweep after all immediate commits fail", async () => {
+    const parentSessionKey = "agent:main:main";
+    for (const runId of ["retry-child-a", "retry-child-b"]) {
+      mod.addSubagentRunForTests({
+        runId,
+        childSessionKey: `agent:main:subagent:${runId}`,
+        controllerSessionKey: parentSessionKey,
+        requesterSessionKey: parentSessionKey,
+        requesterDisplayKey: "main",
+        task: "recover parent scheduling after storage failure",
+        cleanup: "delete",
+        createdAt: 1_000,
+        startedAt: 1_000,
+      });
+    }
+    const marked = mod.markParentYieldWaitForController({
+      controllerSessionKey: parentSessionKey,
+      parentRunId: "retry-parent",
+      now: 1_000,
+      staleAfterMs: 60_000,
+    });
+    let storageAvailable = false;
+    let durable: Map<string, SubagentRunRecord> | undefined;
+    mocks.persistSubagentRunsToDiskOrThrow.mockImplementation((runs) => {
+      if (!storageAvailable) {
+        throw new Error("storage unavailable through immediate retries");
+      }
+      durable = structuredClone(runs);
+    });
+    const parentWakeCalls = () =>
+      mocks.enqueueSystemEvent.mock.calls.filter((args) =>
+        String(args[0]).includes("Subagent wait ready to resume"),
+      );
+    try {
+      for (const runId of ["retry-child-a", "retry-child-b"]) {
+        await mod.testing.completeSubagentRunForTests({
+          runId,
+          endedAt: 2_000,
+          outcome: { status: "ok" },
+          reason: SUBAGENT_ENDED_REASON_COMPLETE,
+          triggerCleanup: false,
+        });
+      }
+      expect(parentWakeCalls()).toHaveLength(0);
+      expect(mod.listSubagentRunsForRequester(parentSessionKey)).toHaveLength(2);
+      const attempts = mocks.persistSubagentRunsToDiskOrThrow.mock.calls.length;
+      await mod.testing.sweepOnceForTests();
+      expect(mocks.persistSubagentRunsToDiskOrThrow).toHaveBeenCalledTimes(attempts + 1);
+      expect(parentWakeCalls()).toHaveLength(0);
+
+      storageAvailable = true;
+      await mod.testing.sweepOnceForTests();
+      expect(parentWakeCalls()).toHaveLength(1);
+      for (const child of mod.listSubagentRunsForRequester(parentSessionKey)) {
+        expect(child.parentYieldWait).toEqual(durable?.get(child.runId)?.parentYieldWait);
+        expect(child.parentYieldWait).toMatchObject({
+          waitId: marked.waitId,
+          parentRunId: "retry-parent",
+          waitStartedAt: 1_000,
+          staleAt: 61_000,
+          status: "continuation_scheduled",
+          terminalChildRunIds: ["retry-child-a", "retry-child-b"],
+        });
+      }
+      await mod.testing.sweepOnceForTests();
+      expect(parentWakeCalls()).toHaveLength(1);
+    } finally {
+      mocks.persistSubagentRunsToDiskOrThrow.mockImplementation(() => {});
+    }
+  });
+
+  it.each(["terminal-old", "running-old", "committed-replacement"])(
+    "recovers abandoned steer intent only through Gateway ownership: %s",
+    async (scenario) => {
+      const parentSessionKey = "agent:main:main";
+      const runId = scenario === "committed-replacement" ? "recovery-new" : "recovery-old";
+      const terminal = scenario === "terminal-old";
+      const child: SubagentRunRecord = {
+        runId,
+        childSessionKey: "agent:main:subagent:recovery-child",
+        controllerSessionKey: parentSessionKey,
+        requesterSessionKey: parentSessionKey,
+        requesterDisplayKey: "main",
+        task: "recover exact original child ownership",
+        cleanup: "keep",
+        createdAt: Date.now(),
+        startedAt: Date.now(),
+        ...(terminal
+          ? { endedAt: Date.now(), outcome: { status: "error", error: "interrupted" } as const }
+          : {}),
+        suppressAnnounceReason: scenario === "committed-replacement" ? undefined : "steer-restart",
+        parentYieldWait: {
+          waitId: "recovery-wait",
+          parentRunId: "recovery-parent",
+          parentSessionKey,
+          expectedChildRunIds: [runId],
+          childSessionKeys: ["agent:main:subagent:recovery-child"],
+          waitStartedAt: 1_000,
+          staleAt: 61_000,
+          requiredCloseout: true,
+          status: "waiting",
+        },
+      };
+      mocks.restoreSubagentRunsFromDisk.mockImplementation(((params: {
+        runs: Map<string, SubagentRunRecord>;
+      }) => {
+        params.runs.set(runId, child);
+        return 1;
+      }) as never);
+      mocks.loadSessionStore.mockReturnValue({
+        [child.childSessionKey]: {
+          sessionId: "recovery-child-session",
+          updatedAt: Date.now(),
+        },
+      });
+      mocks.callGateway.mockImplementation(async () => ({ status: "pending" }));
+      const parentWakeCalls = () =>
+        mocks.enqueueSystemEvent.mock.calls.filter((args) =>
+          String(args[0]).includes("Subagent wait ready to resume"),
+        );
+      await mod.initSubagentRegistry();
+      expect(parentWakeCalls()).toHaveLength(0);
+      if (scenario !== "committed-replacement") {
+        expect(child.suppressAnnounceReason).toBe("steer-restart");
+      }
+      await mod.initSubagentRegistry({ gatewayStartup: true });
+      expect(child.suppressAnnounceReason).toBeUndefined();
+      expect(child.parentYieldWait?.expectedChildRunIds).toEqual([runId]);
+      expect(parentWakeCalls()).toHaveLength(terminal ? 1 : 0);
+      if (!terminal) {
+        expect(child.endedAt).toBeUndefined();
+        expect(child.outcome).toBeUndefined();
+        await mod.testing.completeSubagentRunForTests({
+          runId,
+          endedAt: Date.now() + 1,
+          outcome: { status: "ok" },
+          reason: SUBAGENT_ENDED_REASON_COMPLETE,
+          triggerCleanup: false,
+        });
+      }
+      expect(parentWakeCalls()).toHaveLength(1);
+      expect(child.parentYieldWait).toMatchObject({
+        waitId: "recovery-wait",
+        parentRunId: "recovery-parent",
+        waitStartedAt: 1_000,
+        staleAt: 61_000,
+        terminalChildRunIds: [runId],
+      });
+    },
+  );
+
+  it.each([
+    "matching",
+    "other-parent",
+    "other-wait",
+    "pending-delivery",
+    "missing-continuation-run",
+    "yielded-continuation-run",
+    "different-claimed-run",
+    "yield-requested",
+    "running-child",
+    "old-delivery",
+    "persist-failed",
+  ])(
+    "settles parent closeout only with correlated durable final delivery: %s",
+    async (scenario) => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "parent-closeout-delivery-"));
+      const registryPath = path.join(tempDir, "delivery.json");
+      const now = Date.now();
+      const waitId = "parent-wait";
+      const parentRunId = "parent-run";
+      try {
+        mod.addSubagentRunForTests({
+          runId: "child-run",
+          childSessionKey: "agent:main:subagent:child",
+          requesterSessionKey: "agent:main:main",
+          requesterDisplayKey: "main",
+          task: "child work",
+          cleanup: "delete",
+          cleanupCompletedAt: now - 2_000,
+          archiveAtMs: now - 500,
+          createdAt: now - 2_000,
+          ...(scenario === "running-child"
+            ? {}
+            : { endedAt: now - 1_000, outcome: { status: "ok" as const } }),
+          parentYieldWait: {
+            waitId,
+            parentRunId,
+            parentSessionKey: "agent:main:main",
+            expectedChildRunIds: ["child-run"],
+            childSessionKeys: ["agent:main:subagent:child"],
+            waitStartedAt: now - 2_000,
+            staleAt: now - 500,
+            requiredCloseout: true,
+            status: "continuation_scheduled",
+            continuationScheduledAt: now - 1_000,
+            ...(scenario === "yielded-continuation-run"
+              ? { yieldedContinuations: [{ runId: "actual-continuation-run", endedAt: now - 500 }] }
+              : {}),
+            ...(scenario === "different-claimed-run" || scenario === "yield-requested"
+              ? {
+                  continuation: {
+                    runId:
+                      scenario === "different-claimed-run"
+                        ? "newer-continuation"
+                        : "actual-continuation-run",
+                    phase:
+                      scenario === "yield-requested"
+                        ? ("yield_requested" as const)
+                        : ("running" as const),
+                  },
+                }
+              : {}),
+          },
+        });
+        await persistSourceTurnDeliveryState({
+          registryPath,
+          id: "parent-final",
+          sourceSessionKey: "agent:main:main",
+          ...(scenario === "missing-continuation-run" ? {} : { runId: "actual-continuation-run" }),
+          parentYieldWaits: [
+            {
+              waitId: scenario === "other-wait" ? "another-wait" : waitId,
+              parentRunId: scenario === "other-parent" ? "another-parent" : parentRunId,
+            },
+          ],
+          now: new Date(scenario === "old-delivery" ? now - 3_000 : now).toISOString(),
+          facts:
+            scenario === "pending-delivery"
+              ? { finalDeliveryRequired: true }
+              : { finalDeliveryRequired: true, visibleFinalProofKind: "source_chat_final" },
+        });
+        if (scenario === "matching") {
+          expect(mod.listSessionMaintenanceProtectedSubagentSessionKeys()).toContain(
+            "agent:main:subagent:child",
+          );
+          await mod.testing.sweepOnceForTests();
+          expect(mod.listSubagentRunsForRequester("agent:main:main")).toHaveLength(1);
+        }
+        const args = {
+          controllerSessionKey: "agent:main:main",
+          waitId,
+          parentRunId,
+          registryPath,
+          deliveryRecordId: "parent-final",
+        };
+        if (scenario === "persist-failed") {
+          mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+            throw new Error("store unavailable");
+          });
+          await expect(mod.completeParentYieldWaitFromDelivery(args)).rejects.toThrow(
+            "store unavailable",
+          );
+          expect(mocks.persistSubagentRunsToDiskOrThrow).toHaveBeenCalledTimes(1);
+        } else {
+          expect(await mod.completeParentYieldWaitFromDelivery(args)).toBe(
+            scenario === "matching" ? 1 : 0,
+          );
+        }
+        const child = mod.listSubagentRunsForRequester("agent:main:main")[0];
+        expect(child.parentYieldWait?.requiredCloseout).toBe(true);
+        expect(child.parentYieldWait?.staleAt).toBe(now - 500);
+        expect(child.parentYieldWait?.status).toBe(
+          scenario === "matching" ? "closeout_delivered" : "continuation_scheduled",
+        );
+        if (scenario === "persist-failed") {
+          mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+            throw new Error("store unavailable again");
+          });
+          expect(await mod.reconcileParentYieldWaitDelivery(args)).toBe("pending");
+          expect(
+            mod.listSubagentRunsForRequester("agent:main:main")[0].parentYieldWait?.status,
+          ).toBe("continuation_scheduled");
+          expect(await mod.reconcileParentYieldWaitDelivery(args)).toBe("settled");
+          expect(
+            mod.listSubagentRunsForRequester("agent:main:main")[0].parentYieldWait?.status,
+          ).toBe("closeout_delivered");
+        } else {
+          const expectedReconciliation =
+            scenario === "matching"
+              ? "settled"
+              : [
+                    "running-child",
+                    "old-delivery",
+                    "yielded-continuation-run",
+                    "different-claimed-run",
+                    "yield-requested",
+                  ].includes(scenario)
+                ? "pending"
+                : "missing_receipt";
+          expect(await mod.reconcileParentYieldWaitDelivery(args)).toBe(expectedReconciliation);
+        }
+        if (scenario === "matching") {
+          expect(child.parentYieldWait?.closeout).toMatchObject({
+            parentRunId,
+            deliveryRecordId: "parent-final",
+            deliveredAt: now,
+          });
+          expect(mocks.persistSubagentRunsToDiskOrThrow).toHaveBeenCalledTimes(1);
+          expect(await mod.completeParentYieldWaitFromDelivery(args)).toBe(0);
+          expect(mocks.persistSubagentRunsToDiskOrThrow).toHaveBeenCalledTimes(1);
+          expect(mod.listSessionMaintenanceProtectedSubagentSessionKeys()).not.toContain(
+            "agent:main:subagent:child",
+          );
+          await mod.testing.sweepOnceForTests();
+          expect(mod.listSubagentRunsForRequester("agent:main:main")).toHaveLength(0);
+          expect(mocks.callGateway).toHaveBeenCalledWith(
+            expect.objectContaining({ method: "sessions.delete" }),
+          );
+        } else if (scenario !== "persist-failed") {
+          expect(mocks.persistSubagentRunsToDiskOrThrow).not.toHaveBeenCalled();
+        }
+      } finally {
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    "absent",
+    "matching",
+    "other-wait",
+    "missing-child",
+    "persist-failed",
+    "ack-before-warm-restart",
+  ])(
+    "recovers a restored parent continuation once after checking durable receipts: %s",
+    async (scenario) => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "parent-closeout-restore-"));
+      const registryPath = path.join(tempDir, "delivery.json");
+      vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", registryPath);
+      const now = Date.now();
+      const waitId = "restored-parent-wait";
+      const parentRunId = "original-parent-run";
+      const parentSessionKey = "agent:main:controller";
+      const expectedChildRunIds = ["child-a", "child-b"];
+      const matchingEvent = {
+        text: "Resume parent",
+        ts: now - 1_000,
+        parentYieldWait: { waitId, parentRunId },
+      };
+      const unrelatedEvents = [
+        { ...matchingEvent, parentYieldWait: { waitId: "other-wait", parentRunId } },
+        { ...matchingEvent, parentYieldWait: { waitId, parentRunId: "other-parent" } },
+      ];
+      let queuedEvents = [matchingEvent, ...unrelatedEvents];
+      mocks.peekSystemEventEntries.mockImplementation((sessionKey) =>
+        sessionKey === parentSessionKey ? queuedEvents : [],
+      );
+      mocks.consumeSelectedSystemEventEntries.mockImplementation((sessionKey, selected) => {
+        expect(sessionKey).toBe(parentSessionKey);
+        const removed = queuedEvents.filter((event) => selected.includes(event));
+        queuedEvents = queuedEvents.filter((event) => !selected.includes(event));
+        return removed;
+      });
+      try {
+        if (scenario !== "absent" && scenario !== "ack-before-warm-restart") {
+          await persistSourceTurnDeliveryState({
+            registryPath,
+            id: "parent-final",
+            sourceSessionKey: parentSessionKey,
+            runId: "actual-continuation-run",
+            parentYieldWaits: [
+              { waitId: scenario === "other-wait" ? "other-wait" : waitId, parentRunId },
+            ],
+            now: new Date(now).toISOString(),
+            facts: { finalDeliveryRequired: true, visibleFinalProofKind: "source_chat_final" },
+          });
+        }
+        mocks.restoreSubagentRunsFromDisk.mockImplementation(((params: {
+          runs: Map<string, SubagentRunRecord>;
+        }) => {
+          for (const runId of expectedChildRunIds) {
+            params.runs.set(runId, {
+              runId,
+              childSessionKey: `agent:main:subagent:${runId}`,
+              requesterSessionKey: "agent:main:main",
+              requesterDisplayKey: "main",
+              task: "restored child work",
+              cleanup: scenario === "matching" && runId === "child-b" ? "keep" : "delete",
+              cleanupCompletedAt: now - 500,
+              createdAt: now - 3_000,
+              endedAt: now - 2_000,
+              outcome: { status: "ok" },
+              parentYieldWait: {
+                waitId,
+                parentRunId,
+                parentSessionKey,
+                expectedChildRunIds:
+                  scenario === "missing-child"
+                    ? [...expectedChildRunIds, "missing-child"]
+                    : expectedChildRunIds,
+                childSessionKeys: expectedChildRunIds.map((id) => `agent:main:subagent:${id}`),
+                waitStartedAt: now - 3_000,
+                staleAt: now - 500,
+                requiredCloseout: true,
+                status: "continuation_scheduled",
+                continuationScheduledAt: now - 1_000,
+                terminalChildRunIds: expectedChildRunIds,
+              },
+            });
+          }
+          return expectedChildRunIds.length;
+        }) as never);
+        if (scenario === "persist-failed") {
+          mocks.persistSubagentRunsToDiskOrThrow.mockImplementationOnce(() => {
+            throw new Error("store unavailable");
+          });
+        }
+
+        await mod.initSubagentRegistry();
+        await mod.initSubagentRegistry();
+        const expectedWakeCount = [
+          "absent",
+          "other-wait",
+          "persist-failed",
+          "ack-before-warm-restart",
+        ].includes(scenario)
+          ? 1
+          : 0;
+        expect(mocks.enqueueSystemEvent).toHaveBeenCalledTimes(expectedWakeCount);
+        expect(mocks.requestHeartbeat).toHaveBeenCalledTimes(expectedWakeCount);
+        if (expectedWakeCount) {
+          expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith(
+            expect.stringContaining("Subagent wait ready to resume"),
+            expect.objectContaining({
+              sessionKey: parentSessionKey,
+              parentYieldWait: { waitId, parentRunId },
+            }),
+          );
+        }
+        const children = mod.listSubagentRunsForRequester("agent:main:main");
+        expect(children).toHaveLength(2);
+        for (const child of children) {
+          expect(child.parentYieldWait).toMatchObject({
+            status: scenario === "matching" ? "closeout_delivered" : "continuation_scheduled",
+            continuationScheduledAt: now - 1_000,
+            staleAt: now - 500,
+          });
+        }
+        expect(mocks.restoreSubagentRunsFromDisk).toHaveBeenCalledTimes(1);
+        expect(queuedEvents).toEqual(
+          scenario === "matching" ? unrelatedEvents : [matchingEvent, ...unrelatedEvents],
+        );
+        if (scenario === "ack-before-warm-restart") {
+          await persistSourceTurnDeliveryState({
+            registryPath,
+            id: "parent-final",
+            sourceSessionKey: parentSessionKey,
+            runId: "actual-continuation-run",
+            parentYieldWaits: [{ waitId, parentRunId }],
+            now: new Date(now).toISOString(),
+            facts: { finalDeliveryRequired: true, visibleFinalProofKind: "source_chat_final" },
+          });
+          expect(
+            await mod.completeParentYieldWaitFromDelivery({
+              controllerSessionKey: parentSessionKey,
+              waitId,
+              parentRunId,
+              registryPath,
+              deliveryRecordId: "parent-final",
+            }),
+          ).toBe(2);
+          // Both delete-mode children are eligible for cleanup after the commit,
+          // but the exact queued wake still needs their settlement proof.
+          await mod.testing.sweepOnceForTests();
+          expect(mod.listSubagentRunsForRequester("agent:main:main")).toHaveLength(2);
+          expect(mod.listSessionMaintenanceProtectedSubagentSessionKeys()).toEqual(
+            expectedChildRunIds.map((id) => `agent:main:subagent:${id}`),
+          );
+          expect(queuedEvents).toContain(matchingEvent);
+        }
+        if (["absent", "matching", "ack-before-warm-restart"].includes(scenario)) {
+          if (scenario === "matching") {
+            // A warm restart can preserve the event after its wait has committed.
+            // Startup must consume that exact event without regenerating a reply.
+            queuedEvents.push(matchingEvent);
+          }
+          await mod.initSubagentRegistry({ gatewayStartup: true });
+          expect(mocks.restoreSubagentRunsFromDisk).toHaveBeenCalledTimes(1);
+          expect(mocks.requestHeartbeat).toHaveBeenCalledTimes(
+            expectedWakeCount + (scenario === "absent" ? 1 : 0),
+          );
+          if (scenario === "absent") {
+            // A different child may have scheduled the original event; the
+            // canonical parent key keeps the preserved queue entry deduplicated.
+            expect(mocks.enqueueSystemEvent.mock.calls[0]).toEqual(
+              mocks.enqueueSystemEvent.mock.calls[1],
+            );
+          } else {
+            expect(queuedEvents).toEqual(unrelatedEvents);
+            expect(
+              mod.listSubagentRunsForRequester("agent:main:main")[0].parentYieldWait?.status,
+            ).toBe("closeout_delivered");
+          }
+        }
+        if (scenario === "ack-before-warm-restart") {
+          expect(mod.listSessionMaintenanceProtectedSubagentSessionKeys()).toEqual([]);
+          await mod.testing.sweepOnceForTests();
+          expect(mod.listSubagentRunsForRequester("agent:main:main")).toHaveLength(0);
+          expect(queuedEvents).toEqual(unrelatedEvents);
+        }
+        if (scenario === "matching") {
+          await mod.testing.sweepOnceForTests();
+          const remaining = mod.listSubagentRunsForRequester("agent:main:main");
+          expect(remaining.map((child) => child.runId)).toEqual(["child-b"]);
+          const reconciliation = {
+            controllerSessionKey: parentSessionKey,
+            waitId,
+            parentRunId,
+            registryPath,
+          };
+          expect(await mod.reconcileParentYieldWaitDelivery(reconciliation)).toBe("settled");
+          const survivor = remaining[0];
+          expect(survivor.parentYieldWait?.terminalChildRunIds).toEqual(expectedChildRunIds);
+          queuedEvents.push(matchingEvent);
+          await expect(mod.assertParentYieldWaitAllowsRestart("child-b")).resolves.toBeUndefined();
+          expect(queuedEvents).toEqual(unrelatedEvents);
+          mod.addSubagentRunForTests({
+            ...survivor,
+            parentYieldWait: { ...survivor.parentYieldWait!, terminalChildRunIds: ["child-b"] },
+          });
+          queuedEvents.push(matchingEvent);
+          expect(await mod.reconcileParentYieldWaitDelivery(reconciliation)).toBe("pending");
+          await expect(mod.assertParentYieldWaitAllowsRestart("child-b")).rejects.toThrow(
+            "Parent closeout is pending",
+          );
+          expect(queuedEvents).toContain(matchingEvent);
+          const replacement = { previousRunId: "child-b", nextRunId: "child-b-next" };
+          expect(await mod.replaceSubagentRunAfterSteer(replacement)).toBe(false);
+          await mod.releaseSubagentRun("child-b");
+          expect(mod.listSubagentRunsForRequester("agent:main:main")).toHaveLength(1);
+          expect(queuedEvents).toContain(matchingEvent);
+
+          mod.addSubagentRunForTests(survivor);
+          expect(await mod.replaceSubagentRunAfterSteer(replacement)).toBe(true);
+          expect(queuedEvents).toEqual(unrelatedEvents);
+          const next = mod.listSubagentRunsForRequester("agent:main:main");
+          expect(next).toHaveLength(1);
+          expect(next[0].runId).toBe("child-b-next");
+          expect(next[0].parentYieldWait).toBeUndefined();
+        }
+      } finally {
+        vi.unstubAllEnvs();
+        await fs.rm(tempDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("schedules a parent continuation when sessions_yield has no pending children", () => {
     const marked = mod.markParentYieldWaitForController({
@@ -3212,7 +4025,7 @@ describe("subagent registry seam flow", () => {
       return 1;
     }) as never);
 
-    mod.initSubagentRegistry();
+    void mod.initSubagentRegistry();
     await Promise.resolve();
     await Promise.resolve();
 
@@ -3274,7 +4087,7 @@ describe("subagent registry seam flow", () => {
       return 1;
     }) as never);
 
-    mod.initSubagentRegistry();
+    void mod.initSubagentRegistry();
     await Promise.resolve();
     await Promise.resolve();
 
@@ -3296,7 +4109,7 @@ describe("subagent registry seam flow", () => {
     });
   });
 
-  it("clears suspended final delivery fields when reactivating a subagent run", () => {
+  it("clears suspended final delivery fields when reactivating a subagent run", async () => {
     const endedAt = Date.parse("2026-03-24T11:59:30Z");
     mod.addSubagentRunForTests({
       runId: "run-suspended-old",
@@ -3334,7 +4147,7 @@ describe("subagent registry seam flow", () => {
     });
 
     expect(
-      mod.replaceSubagentRunAfterSteer({
+      await mod.replaceSubagentRunAfterSteer({
         previousRunId: "run-suspended-old",
         nextRunId: "run-suspended-new",
       }),
@@ -3886,7 +4699,7 @@ describe("subagent registry seam flow", () => {
       cleanupHandled: false,
     });
 
-    mod.releaseSubagentRun("run-release-delete");
+    await mod.releaseSubagentRun("run-release-delete");
 
     await waitForFast(async () => {
       await expectPathMissing(attachmentsDir);
@@ -3921,7 +4734,7 @@ describe("subagent registry seam flow", () => {
       cleanupHandled: false,
     });
 
-    mod.releaseSubagentRun("run-release-context-engine");
+    await mod.releaseSubagentRun("run-release-context-engine");
 
     await waitForFast(() => {
       expect(mocks.onSubagentEnded).toHaveBeenCalledWith({

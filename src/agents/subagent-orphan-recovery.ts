@@ -30,6 +30,7 @@ import {
   markSubagentRecoveryWedged,
 } from "./subagent-recovery-state.js";
 import {
+  assertParentYieldWaitAllowsRestart,
   finalizeInterruptedSubagentRun,
   replaceSubagentRunAfterSteer,
 } from "./subagent-registry-steer-runtime.js";
@@ -128,6 +129,7 @@ async function resumeOrphanedSession(params: {
   }
 
   try {
+    await assertParentYieldWaitAllowsRestart(params.originalRunId);
     const idempotencyKey = crypto.randomUUID();
     const result = await callGateway<{ runId: string }>({
       method: "agent",
@@ -148,7 +150,7 @@ async function resumeOrphanedSession(params: {
       },
       timeoutMs: 10_000,
     });
-    const remapped = replaceSubagentRunAfterSteer({
+    const remapped = await replaceSubagentRunAfterSteer({
       previousRunId: params.originalRunId,
       nextRunId: result.runId,
       fallback: params.originalRun,

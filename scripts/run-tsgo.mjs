@@ -8,11 +8,11 @@ import {
   resolveLocalHeavyCheckEnv,
   shouldAcquireLocalHeavyCheckLockForTsgo,
 } from "./lib/local-heavy-check-runtime.mjs";
+import { createManagedCommandInvocation, signalExitCode } from "./lib/managed-child-process.mjs";
 import {
   getSparseTsgoGuardError,
   shouldSkipSparseTsgoGuardError,
 } from "./lib/tsgo-sparse-guard.mjs";
-import { createManagedCommandInvocation } from "./lib/managed-child-process.mjs";
 
 const { args: finalArgs, env } = applyLocalTsgoPolicy(
   process.argv.slice(2),
@@ -62,7 +62,12 @@ try {
       throw result.error;
     }
 
-    process.exitCode = result.status ?? 1;
+    // Keep interrupted checks distinguishable from completed diagnostic results.
+    // The native-preview launcher execs tsgo on supported POSIX Node versions.
+    if (result.signal) {
+      console.error(`[tsgo] native process terminated by ${result.signal}`);
+    }
+    process.exitCode = result.signal ? signalExitCode(result.signal) : (result.status ?? 1);
   }
 } finally {
   releaseLock();

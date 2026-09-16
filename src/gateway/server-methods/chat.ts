@@ -39,6 +39,7 @@ import {
   classifyOwnerRequestIntakeMessage,
   createOwnerRequestIntakeRecord,
   markOwnerRequestChatOnlyExempted,
+  markOwnerRequestMissionRegistered,
   markOwnerRequestPromptPersisted,
   type OwnerRequestIntakeRecord,
 } from "../../agents/owner-request-intake-ledger.js";
@@ -63,7 +64,6 @@ import {
 } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage, formatUncaughtError } from "../../infra/errors.js";
 import { jsonUtf8Bytes } from "../../infra/json-utf8-bytes.js";
-import { normalizeReplyPayloadsForDelivery } from "../../infra/outbound/payloads.js";
 import { getSessionBindingService } from "../../infra/outbound/session-binding-service.js";
 import { logLargePayload } from "../../logging/diagnostic-payload.js";
 import {
@@ -93,11 +93,9 @@ import {
   type UserTurnInput,
   type UserTurnTranscriptRecorder,
 } from "../../sessions/user-turn-transcript.js";
+import { resolveOwnerRequestIntakeBinding } from "../../tasks/owner-request-intake-binding.js";
 import { deliveryContextFromSession } from "../../utils/delivery-context.shared.js";
-import {
-  stripInlineDirectiveTagsForDisplay,
-  sanitizeReplyDirectiveId,
-} from "../../utils/directive-tags.js";
+import { sanitizeReplyDirectiveId } from "../../utils/directive-tags.js";
 import {
   INTERNAL_MESSAGE_CHANNEL,
   isGatewayCliClient,
@@ -129,13 +127,11 @@ import {
   projectRecentChatDisplayMessages,
   resolveEffectiveChatHistoryMaxChars,
 } from "../chat-display-projection.js";
-import { stripEnvelopeFromMessage } from "../chat-sanitize.js";
 import { augmentChatHistoryWithCliSessionImports } from "../cli-session-history.js";
 import { isSuppressedControlReplyText } from "../control-reply-text.js";
 import {
   attachManagedOutgoingImagesToMessage,
   cleanupManagedOutgoingImageRecords,
-  createManagedOutgoingImageBlocks,
 } from "../managed-image-attachments.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
 import { getMaxChatHistoryMessagesBytes, MAX_PAYLOAD_BYTES } from "../server-constants.js";
@@ -166,7 +162,9 @@ import {
 } from "./chat-transcript-inject.js";
 import {
   buildWebchatAssistantMessageFromReplyPayloads,
-  buildWebchatAudioContentBlocksFromReplyPayloads,
+  buildAssistantDisplayContentFromReplyPayloads,
+  extractAssistantDisplayTextFromContent,
+  replaceAssistantContentTextBlocks,
 } from "./chat-webchat-media.js";
 import { loadOptionalServerMethodModelCatalog } from "./optional-model-catalog.js";
 import {
@@ -555,138 +553,6 @@ function hasSensitiveMediaPayload(payloads: ReplyPayload[]): boolean {
 }
 
 type AssistantDisplayContentBlock = Record<string, unknown>;
-
-function sanitizeAssistantDisplayText(value?: string | null): string | undefined {
-  if (!value) {
-    return undefined;
-  }
-  const withoutEnvelope = stripEnvelopeFromMessage(value);
-  const normalized = typeof withoutEnvelope === "string" ? withoutEnvelope : value;
-  const stripped = stripInlineDirectiveTagsForDisplay(normalized).text.trim();
-  return stripped || undefined;
-}
-
-function extractAssistantDisplayTextFromContent(
-  content?: readonly AssistantDisplayContentBlock[] | null,
-): string | undefined {
-  if (!Array.isArray(content) || content.length === 0) {
-    return undefined;
-  }
-  const parts = content
-    .map((block) => {
-      if (block?.type !== "text" || typeof block.text !== "string") {
-        return "";
-      }
-      return block.text.trim();
-    })
-    .filter(Boolean);
-  return parts.length > 0 ? parts.join("\n\n") : undefined;
-}
-
-async function buildAssistantDisplayContentFromReplyPayloads(params: {
-  sessionKey: string;
-  agentId?: string;
-  payloads: ReplyPayload[];
-  managedImageLocalRoots?: Parameters<typeof createManagedOutgoingImageBlocks>[0]["localRoots"];
-  includeSensitiveMedia?: boolean;
-  onLocalAudioAccessDenied?: (message: string) => void;
-  onManagedImagePrepareError?: (message: string) => void;
-}): Promise<AssistantDisplayContentBlock[] | undefined> {
-  const rawTextPayloadCount = params.payloads.filter(
-    (payload) =>
-      payload.isReasoning !== true &&
-      typeof payload.text === "string" &&
-      payload.text.trim().length > 0,
-  ).length;
-  const normalized = normalizeReplyPayloadsForDelivery(params.payloads);
-  if (normalized.length === 0) {
-    return rawTextPayloadCount > 0 ? [{ type: "text", text: "" }] : undefined;
-  }
-
-  const content: AssistantDisplayContentBlock[] = [];
-  let strippedTextPayloadCount = 0;
-  for (const payload of normalized) {
-    const text = sanitizeAssistantDisplayText(payload.text);
-    if (text) {
-      content.push({ type: "text", text });
-    } else if (typeof payload.text === "string" && payload.text.trim().length > 0) {
-      strippedTextPayloadCount += 1;
-    }
-    if (params.includeSensitiveMedia === false && payload.sensitiveMedia === true) {
-      continue;
-    }
-    const audioBlocks = await buildWebchatAudioContentBlocksFromReplyPayloads([payload], {
-      localRoots: Array.isArray(params.managedImageLocalRoots)
-        ? params.managedImageLocalRoots
-        : undefined,
-      onLocalAudioAccessDenied: (err) => {
-        params.onLocalAudioAccessDenied?.(formatForLog(err));
-      },
-    });
-    content.push(...audioBlocks);
-
-    const mediaUrls = Array.from(
-      new Set([
-        ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls : []),
-        ...(typeof payload.mediaUrl === "string" ? [payload.mediaUrl] : []),
-      ]),
-    );
-    const imageBlocks = await createManagedOutgoingImageBlocks({
-      sessionKey: params.sessionKey,
-      ...(params.sessionKey === "global" && params.agentId ? { agentId: params.agentId } : {}),
-      mediaUrls,
-      localRoots: params.managedImageLocalRoots,
-      continueOnPrepareError: true,
-      onPrepareError: (error) => {
-        params.onManagedImagePrepareError?.(error.message);
-      },
-    });
-    if (imageBlocks.length > 0) {
-      content.push(...imageBlocks);
-    }
-  }
-
-  if (content.length > 0) {
-    return content;
-  }
-  return strippedTextPayloadCount > 0 ? [{ type: "text", text: "" }] : undefined;
-}
-
-function replaceAssistantContentTextBlocks(
-  content: readonly AssistantDisplayContentBlock[] | undefined,
-  transcriptMediaMessage: { content: Array<Record<string, unknown>> } | null,
-): AssistantDisplayContentBlock[] | undefined {
-  const transcriptTextBlocks = (transcriptMediaMessage?.content ?? []).filter(
-    (block): block is AssistantDisplayContentBlock =>
-      Boolean(block) &&
-      typeof block === "object" &&
-      block.type === "text" &&
-      typeof block.text === "string",
-  );
-  if (transcriptTextBlocks.length === 0) {
-    return content ? [...content] : undefined;
-  }
-  if (!content || content.length === 0) {
-    return [...transcriptTextBlocks];
-  }
-  const merged: AssistantDisplayContentBlock[] = [];
-  let transcriptTextIndex = 0;
-  for (const block of content) {
-    if (
-      block?.type === "text" &&
-      typeof block.text === "string" &&
-      transcriptTextIndex < transcriptTextBlocks.length
-    ) {
-      merged.push(transcriptTextBlocks[transcriptTextIndex++]);
-      continue;
-    }
-    merged.push(block);
-  }
-  if (transcriptTextIndex < transcriptTextBlocks.length) {
-    merged.unshift(...transcriptTextBlocks.slice(transcriptTextIndex));
-  }
-  return merged;
-}
 
 function isManagedOutgoingImageUrl(value: unknown): boolean {
   if (typeof value !== "string" || !value.trim()) {
@@ -3277,7 +3143,15 @@ export const chatHandlers: GatewayRequestHandlers = {
     }
     const intakeClassification = classifyOwnerRequestIntakeMessage(rawMessage);
     let ownerRequestIntake: OwnerRequestIntakeRecord | undefined;
+    let ownerRequestBinding: ReturnType<typeof resolveOwnerRequestIntakeBinding>;
     try {
+      ownerRequestBinding = intakeClassification.governed
+        ? resolveOwnerRequestIntakeBinding({
+            sessionKey,
+            expectedDurability: intakeClassification.expectedDurability,
+            cfg,
+          })
+        : undefined;
       ownerRequestIntake = createOwnerRequestIntakeRecord({
         message: rawMessage,
         sourceSessionKey: sessionKey,
@@ -3601,6 +3475,20 @@ export const chatHandlers: GatewayRequestHandlers = {
         },
         errorContext: "gateway chat user turn transcript",
         beforeMessageWrite: runAgentHarnessBeforeMessageWriteHook,
+        onPersisted: () => {
+          if (!ownerRequestIntake?.governed) {
+            return;
+          }
+          markOwnerRequestPromptPersisted({ requestId: ownerRequestIntake.requestId });
+          if (ownerRequestBinding) {
+            markOwnerRequestMissionRegistered({
+              requestId: ownerRequestIntake.requestId,
+              ...ownerRequestBinding,
+              lastExecutableAction: "prompt persisted under its active managed execution",
+              nextExecutableAction: "complete the owning managed execution and delivery",
+            });
+          }
+        },
         onPersistenceError: (error) => {
           context.logGateway.warn(
             `gateway user transcript persistence failed: ${formatForLog(error)}`,
@@ -3611,12 +3499,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         await measureDiagnosticsTimelineSpan(
           "gateway.chat_send.persist_user_transcript",
           async () => {
-            const persisted = await userTurnRecorder.persistFallback();
-            if (persisted && ownerRequestIntake?.governed) {
-              markOwnerRequestPromptPersisted({
-                requestId: ownerRequestIntake.requestId,
-              });
-            }
+            await userTurnRecorder.persistFallback();
           },
           {
             phase: "agent-turn",

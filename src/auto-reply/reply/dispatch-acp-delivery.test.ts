@@ -290,6 +290,49 @@ describe("createAcpDispatchDeliveryCoordinator", () => {
     expect(coordinator.getRoutedCounts().final).toBe(0);
   });
 
+  it("buffers every required final until core durably delivers the complete batch", async () => {
+    const dispatcher = createDispatcher();
+    const deliverFinalBatch = vi.fn(async () => ({
+      queuedFinal: true,
+      finalDeliveryDelivered: true,
+      finalDeliveryUnknown: false,
+    }));
+    const coordinator = createAcpDispatchDeliveryCoordinator({
+      cfg: createAcpTestConfig(),
+      ctx: buildTestCtx({
+        Provider: "visiblechat",
+        Surface: "visiblechat",
+        SessionKey: "agent:codex-acp:session-1",
+      }),
+      dispatcher,
+      deliverFinalBatch,
+      inboundAudio: false,
+      shouldRouteToOriginating: true,
+      originatingChannel: "visiblechat",
+      originatingTo: "channel:thread-1",
+    });
+
+    expect(await coordinator.deliver("final", { text: "first" })).toBe(false);
+    expect(await coordinator.deliver("final", { text: "second" })).toBe(false);
+    expect(coordinator.hasDeliveredFinalReply()).toBe(true);
+    expect(deliverFinalBatch).not.toHaveBeenCalled();
+    expect(deliveryMocks.routeReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+
+    await expect(coordinator.flushFinalBatch()).resolves.toEqual({
+      queuedFinal: true,
+      finalDeliveryDelivered: true,
+      finalDeliveryUnknown: false,
+    });
+    expect(deliverFinalBatch).toHaveBeenCalledExactlyOnceWith([
+      { text: "first" },
+      { text: "second" },
+    ]);
+    expect(coordinator.hasDeliveredVisibleText()).toBe(true);
+    expect(deliveryMocks.routeReply).not.toHaveBeenCalled();
+    expect(dispatcher.sendFinalReply).not.toHaveBeenCalled();
+  });
+
   it("tracks visible direct block text for dispatcher-backed delivery", async () => {
     const coordinator = createAcpDispatchDeliveryCoordinator({
       cfg: createAcpTestConfig(),

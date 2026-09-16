@@ -15,7 +15,7 @@ import { detectMime, extensionForMime } from "@openclaw/media-core/mime";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { fileStore } from "../infra/file-store.js";
 import { sanitizeUntrustedFileName } from "../infra/fs-safe-advanced.js";
-import { isPathInside } from "../infra/fs-safe.js";
+import { FsSafeError, isPathInside, root } from "../infra/fs-safe.js";
 import { retainSafeHeadersForCrossOriginRedirect } from "../infra/net/redirect-headers.js";
 import { resolvePinnedHostname } from "../infra/net/ssrf.js";
 import { writeSiblingTempFile } from "../infra/sibling-temp-file.js";
@@ -190,12 +190,49 @@ async function retryAfterRecreatingDir<T>(dir: string, run: () => Promise<T>): P
 }
 
 export async function cleanOldMedia(ttlMs = DEFAULT_TTL_MS, options: CleanOldMediaOptions = {}) {
-  await openMediaStore().pruneExpired({
-    maxDepth: options.recursive ? undefined : 1,
-    ttlMs,
-    recursive: options.recursive ?? true,
-    pruneEmptyDirs: options.pruneEmptyDirs,
-  });
+  const mediaDir = await fs.realpath(await ensureMediaDir());
+  const scoped = await root(mediaDir);
+  const originalRoot = await fs.lstat(mediaDir);
+  const removeFromOriginalRoot = async (relativePath: string) => {
+    // RootHandle pins each mutation; the traversal must also reject a replaced
+    // root before applying old TTL observations to files in its replacement.
+    const currentRoot = await fs.lstat(mediaDir);
+    if (
+      currentRoot.isSymbolicLink() ||
+      !currentRoot.isDirectory() ||
+      currentRoot.dev !== originalRoot.dev ||
+      currentRoot.ino !== originalRoot.ino ||
+      (await fs.realpath(mediaDir)) !== mediaDir
+    ) {
+      throw new FsSafeError("path-mismatch", "media root changed during prune");
+    }
+    await scoped.remove(relativePath).catch(() => {});
+  };
+  const now = Date.now();
+  const maxDepth = options.recursive ? Number.POSITIVE_INFINITY : 1;
+  const prune = async (relativeDir: string, depth: number): Promise<void> => {
+    const entries = await scoped.list(relativeDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
+      // Managed outgoing artifacts are retained by transcript/pending-publication
+      // ownership. Generic TTL pruning must not delete their records or bytes.
+      if ((!relativeDir && entry.name === "outgoing") || entry.isSymbolicLink) {
+        continue;
+      }
+      if (entry.isDirectory && depth < maxDepth) {
+        await prune(relativePath, depth + 1);
+        if (options.pruneEmptyDirs) {
+          const remaining = await scoped.list(relativePath).catch(() => undefined);
+          if (remaining?.length === 0) {
+            await removeFromOriginalRoot(relativePath);
+          }
+        }
+      } else if (entry.isFile && now - entry.mtimeMs > ttlMs) {
+        await removeFromOriginalRoot(relativePath);
+      }
+    }
+  };
+  await prune("", 0);
 }
 
 function looksLikeUrl(src: string) {

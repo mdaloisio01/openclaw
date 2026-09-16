@@ -172,6 +172,13 @@ type AcpDispatchDeliveryState = {
   settledDirectVisibleText: boolean;
   routedCounts: Record<ReplyDispatchKind, number>;
   toolMessageByCallId: Map<string, ToolMessageHandle>;
+  pendingFinalPayloads: ReplyPayload[];
+};
+
+type FinalBatchDeliveryResult = {
+  queuedFinal: boolean;
+  finalDeliveryDelivered: boolean;
+  finalDeliveryUnknown: boolean;
 };
 
 export type AcpDispatchDeliveryCoordinator = {
@@ -192,6 +199,7 @@ export type AcpDispatchDeliveryCoordinator = {
   hasFailedVisibleTextDelivery: () => boolean;
   getRoutedCounts: () => Record<ReplyDispatchKind, number>;
   applyRoutedCounts: (counts: Record<ReplyDispatchKind, number>) => void;
+  flushFinalBatch: () => Promise<FinalBatchDeliveryResult | undefined>;
 };
 
 export function createAcpDispatchDeliveryCoordinator(params: {
@@ -199,6 +207,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
   agentId?: string;
   ctx: FinalizedMsgContext;
   dispatcher: ReplyDispatcher;
+  deliverFinalBatch?: (payloads: readonly ReplyPayload[]) => Promise<FinalBatchDeliveryResult>;
   inboundAudio: boolean;
   sessionKey?: string;
   sessionTtsAuto?: TtsAutoMode;
@@ -254,6 +263,7 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       final: 0,
     },
     toolMessageByCallId: new Map(),
+    pendingFinalPayloads: [],
   };
   let hasPendingDirectBlockReplyDelivery = false;
   const waitForPendingDirectBlockReplyDelivery = async () => {
@@ -393,6 +403,13 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     }
 
     if (params.suppressUserDelivery) {
+      return false;
+    }
+
+    if (kind === "final" && params.deliverFinalBatch) {
+      // Required continuations freeze the complete final batch in core before
+      // any ACP route or dispatcher can create a visible side effect.
+      state.pendingFinalPayloads.push(payload);
       return false;
     }
 
@@ -536,7 +553,8 @@ export function createAcpDispatchDeliveryCoordinator(params: {
     getAccumulatedBlockTtsText: () => state.accumulatedBlockTtsText,
     getAccumulatedFinalText: () => state.accumulatedFinalText,
     settleVisibleText: settleDirectVisibleText,
-    hasDeliveredFinalReply: () => state.deliveredFinalReply,
+    hasDeliveredFinalReply: () =>
+      state.deliveredFinalReply || state.pendingFinalPayloads.length > 0,
     hasDeliveredVisibleText: () => state.deliveredVisibleText,
     hasFailedVisibleTextDelivery: () => state.failedVisibleTextDelivery,
     getRoutedCounts: () => ({ ...state.routedCounts }),
@@ -544,6 +562,18 @@ export function createAcpDispatchDeliveryCoordinator(params: {
       counts.tool += state.routedCounts.tool;
       counts.block += state.routedCounts.block;
       counts.final += state.routedCounts.final;
+    },
+    flushFinalBatch: async () => {
+      if (!params.deliverFinalBatch || state.pendingFinalPayloads.length === 0) {
+        return undefined;
+      }
+      const payloads = state.pendingFinalPayloads.splice(0);
+      const result = await params.deliverFinalBatch(payloads);
+      state.deliveredFinalReply ||= result.finalDeliveryDelivered;
+      state.deliveredVisibleText ||= result.finalDeliveryDelivered;
+      state.failedVisibleTextDelivery ||=
+        result.queuedFinal && !result.finalDeliveryDelivered && !result.finalDeliveryUnknown;
+      return result;
     },
   };
 }

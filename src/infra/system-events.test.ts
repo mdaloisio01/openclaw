@@ -111,6 +111,67 @@ describe("system events (session routing)", () => {
     expect(enqueueSystemEvent("Node connected", { sessionKey: key })).toBe(true);
   });
 
+  it("preserves exact parent wait identity across enqueue, clone, dedupe, and consume", () => {
+    const sessionKey = "agent:main:parent-wait";
+    const identity = { waitId: "wait-a", parentRunId: "parent-run" };
+    enqueueSystemEvent("Resume parent", {
+      sessionKey,
+      contextKey: "resume",
+      parentYieldWait: identity,
+    });
+    identity.waitId = "mutated";
+    const inspected = peekSystemEventEntries(sessionKey);
+    expect(inspected[0].parentYieldWait).toEqual({ waitId: "wait-a", parentRunId: "parent-run" });
+    inspected[0].parentYieldWait!.waitId = "other-wait";
+    expect(consumeSystemEventEntries(sessionKey, inspected)).toEqual([]);
+    expect(
+      enqueueSystemEvent("Resume parent", {
+        sessionKey,
+        contextKey: "resume",
+        parentYieldWait: { waitId: "wait-a", parentRunId: "parent-run" },
+      }),
+    ).toBe(false);
+    expect(
+      enqueueSystemEvent("Resume parent", {
+        sessionKey,
+        contextKey: "resume",
+        parentYieldWait: { waitId: "wait-b", parentRunId: "parent-run" },
+      }),
+    ).toBe(true);
+    expect(
+      drainSystemEventEntries(sessionKey).map((event) => event.parentYieldWait?.waitId),
+    ).toEqual(["wait-a", "wait-b"]);
+  });
+
+  it("retains activation report identity through queue pressure, dedupe and generic drains", async () => {
+    const sessionKey = "agent:main:activation";
+    const activationContinuation = { id: "activation", createdAt: 1, reportId: "report-a" };
+    const options = { sessionKey, contextKey: "activation", activationContinuation };
+    expect(enqueueSystemEvent("Activation report", options)).toBe(true);
+    activationContinuation.reportId = "changed";
+    const inspected = peekSystemEventEntries(sessionKey);
+    expect(inspected[0].activationContinuation?.reportId).toBe("report-a");
+    inspected[0].activationContinuation!.reportId = "wrong";
+    expect(consumeSelectedSystemEventEntries(sessionKey, inspected)).toEqual([]);
+    expect(
+      enqueueSystemEvent("Activation report", {
+        ...options,
+        activationContinuation: { ...activationContinuation, reportId: "report-a" },
+      }),
+    ).toBe(false);
+    expect(enqueueSystemEvent("Activation report", options)).toBe(true);
+    for (let index = 0; index < 25; index++) {
+      enqueueSystemEvent(`Notice ${index}`, { sessionKey });
+    }
+    expect(await drainFormattedEvents(sessionKey)).not.toContain("Activation report");
+    expect(
+      peekSystemEventEntries(sessionKey).map((event) => event.activationContinuation?.reportId),
+    ).toEqual(["report-a", "changed"]);
+    const selected = peekSystemEventEntries(sessionKey).slice(0, 1);
+    expect(consumeSelectedSystemEventEntries(sessionKey, selected)).toHaveLength(1);
+    expect(peekSystemEventEntries(sessionKey)[0].activationContinuation?.reportId).toBe("changed");
+  });
+
   it("consumes only the inspected prefix and leaves later queued events intact", () => {
     const key = "agent:main:test-consume-prefix";
     enqueueSystemEvent("first", { sessionKey: key, contextKey: "cron:first" });
@@ -194,6 +255,42 @@ describe("system events (session routing)", () => {
       Array.from({ length: 20 }, (_, index) => `event ${index + 3}`),
     );
   });
+
+  it.each([1, 21])(
+    "preserves %i required parent waits through ordinary notice pressure",
+    (count) => {
+      const sessionKey = "agent:main:parent-notice-pressure";
+      for (let index = 0; index < count; index += 1) {
+        enqueueSystemEvent(`Resume parent ${index}`, {
+          sessionKey,
+          contextKey: `parent:${index}`,
+          parentYieldWait: { waitId: `wait-${index}`, parentRunId: `parent-${index}` },
+        });
+      }
+      const requiredEvents = peekSystemEventEntries(sessionKey);
+      for (let index = 0; index < 25; index += 1) {
+        enqueueSystemEvent(`ordinary notice ${index}`, { sessionKey });
+      }
+
+      const after = peekSystemEventEntries(sessionKey);
+      expect(after.filter((event) => event.parentYieldWait)).toEqual(requiredEvents);
+      expect(after.filter((event) => !event.parentYieldWait).map((event) => event.text)).toEqual(
+        Array.from({ length: 20 }, (_, index) => `ordinary notice ${index + 5}`),
+      );
+      expect(
+        enqueueSystemEvent("Resume parent 0", {
+          sessionKey,
+          contextKey: "parent:0",
+          parentYieldWait: { waitId: "wait-0", parentRunId: "parent-0" },
+        }),
+      ).toBe(false);
+      expect(consumeSelectedSystemEventEntries(sessionKey, requiredEvents)).toEqual(requiredEvents);
+      expect(peekSystemEventEntries(sessionKey)).toHaveLength(20);
+      expect(peekSystemEventEntries(sessionKey).every((event) => !event.parentYieldWait)).toBe(
+        true,
+      );
+    },
+  );
 
   it("shares queued events across duplicate module instances", async () => {
     const first = await importSystemEventsModule(`first-${Date.now()}`);

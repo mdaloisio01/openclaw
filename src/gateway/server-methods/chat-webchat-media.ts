@@ -3,15 +3,27 @@ import { estimateBase64DecodedBytes } from "@openclaw/media-core/base64";
 import { isAudioFileName } from "@openclaw/media-core/mime";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { openLocalFileSafely } from "../../infra/fs-safe.js";
 import { assertNoWindowsNetworkPath, safeFileURLToPath } from "../../infra/local-file-access.js";
+import {
+  createOutboundPayloadPlan,
+  normalizeReplyPayloadsForDelivery,
+  projectOutboundPayloadPlanForMirror,
+} from "../../infra/outbound/payloads.js";
 import { assertLocalMediaAllowed, LocalMediaAccessError } from "../../media/local-media-access.js";
+import { MEDIA_MAX_BYTES } from "../../media/store.js";
 import { resolveSendableOutboundReplyParts } from "../../plugin-sdk/reply-payload.js";
 import { sanitizeReplyDirectiveId } from "../../utils/directive-tags.js";
+import { stripInlineDirectiveTagsForDisplay } from "../../utils/directive-tags.js";
+import { stripEnvelopeFromMessage } from "../chat-sanitize.js";
 import { isSuppressedControlReplyText } from "../control-reply-text.js";
+import {
+  createManagedOutgoingImageBlocks,
+  createManagedOutgoingAttachmentBlocks,
+  MAX_WEBCHAT_AUDIO_BYTES,
+} from "../managed-image-attachments.js";
 
-/** Cap local audio files exposed through assistant media. */
-const MAX_WEBCHAT_AUDIO_BYTES = 15 * 1024 * 1024;
 const MAX_WEBCHAT_IMAGE_DATA_URL_CHARS = 2_000_000;
 const MAX_WEBCHAT_IMAGE_DATA_BYTES = 1_500_000;
 const ALLOWED_WEBCHAT_DATA_IMAGE_MEDIA_TYPES = new Set([
@@ -326,4 +338,174 @@ export async function buildWebchatAssistantMessageFromReplyPayloads(
     content.unshift({ type: "text", text: transcriptText });
   }
   return { content, transcriptText };
+}
+
+type AssistantDisplayContentBlock = Record<string, unknown>;
+
+function sanitizeAssistantDisplayText(value?: string | null): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const withoutEnvelope = stripEnvelopeFromMessage(value);
+  const normalized = typeof withoutEnvelope === "string" ? withoutEnvelope : value;
+  const stripped = stripInlineDirectiveTagsForDisplay(normalized).text.trim();
+  return stripped || undefined;
+}
+
+export function extractAssistantDisplayTextFromContent(
+  content?: readonly AssistantDisplayContentBlock[] | null,
+): string | undefined {
+  if (!Array.isArray(content) || content.length === 0) {
+    return undefined;
+  }
+  const parts = content
+    .map((block) => {
+      if (block?.type !== "text" || typeof block.text !== "string") {
+        return "";
+      }
+      return block.text.trim();
+    })
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
+export async function buildAssistantDisplayContentFromReplyPayloads(params: {
+  sessionKey: string;
+  agentId?: string;
+  payloads: ReplyPayload[];
+  managedImageLocalRoots?: Parameters<typeof createManagedOutgoingImageBlocks>[0]["localRoots"];
+  includeSensitiveMedia?: boolean;
+  /** Required source publication must retain every admitted attachment. */
+  requireCompleteMedia?: boolean;
+  attachmentMaxBytes?: number;
+  onLocalAudioAccessDenied?: (message: string) => void;
+  onManagedImagePrepareError?: (message: string) => void;
+}): Promise<AssistantDisplayContentBlock[] | undefined> {
+  const rawTextPayloadCount = params.payloads.filter(
+    (payload) =>
+      payload.isReasoning !== true &&
+      typeof payload.text === "string" &&
+      payload.text.trim().length > 0,
+  ).length;
+  const normalized = normalizeReplyPayloadsForDelivery(params.payloads);
+  if (normalized.length === 0) {
+    return rawTextPayloadCount > 0 ? [{ type: "text", text: "" }] : undefined;
+  }
+
+  const content: AssistantDisplayContentBlock[] = [];
+  let strippedTextPayloadCount = 0;
+  for (const payload of normalized) {
+    const text = sanitizeAssistantDisplayText(payload.text);
+    if (text) {
+      content.push({ type: "text", text });
+    } else if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+      strippedTextPayloadCount += 1;
+    } else {
+      const mirrorText = sanitizeAssistantDisplayText(
+        projectOutboundPayloadPlanForMirror(createOutboundPayloadPlan([payload])).text,
+      );
+      if (mirrorText) {
+        content.push({ type: "text", text: mirrorText });
+      } else if (payload.channelData && Object.keys(payload.channelData).length > 0) {
+        // Channel-specific envelopes have no portable WebChat renderer. Keep the
+        // exact payload in the prepared owner record and make the durable mirror visible.
+        content.push({ type: "text", text: "Channel-specific rich message" });
+      }
+    }
+    if (params.includeSensitiveMedia === false && payload.sensitiveMedia === true) {
+      continue;
+    }
+    if (params.requireCompleteMedia) {
+      const parts = resolveSendableOutboundReplyParts(payload);
+      if (
+        payload.trustedLocalMedia !== true &&
+        parts.mediaUrls.some(
+          (url) => Boolean(resolveLocalMediaPathForEmbedding(url)) && isAudioFileName(url),
+        )
+      ) {
+        throw new Error("Required WebChat local audio is not trust-scoped");
+      }
+      content.push(
+        ...(await createManagedOutgoingAttachmentBlocks({
+          sessionKey: params.sessionKey,
+          agentId: params.agentId,
+          mediaUrls: parts.mediaUrls,
+          localRoots: params.managedImageLocalRoots,
+          audioAsVoice: payload.audioAsVoice,
+          attachmentMaxBytes: params.attachmentMaxBytes ?? MEDIA_MAX_BYTES,
+        })),
+      );
+      continue;
+    }
+    const audioBlocks = await buildWebchatAudioContentBlocksFromReplyPayloads([payload], {
+      localRoots: Array.isArray(params.managedImageLocalRoots)
+        ? params.managedImageLocalRoots
+        : undefined,
+      onLocalAudioAccessDenied: (err) => {
+        params.onLocalAudioAccessDenied?.(formatErrorMessage(err));
+      },
+    });
+    content.push(...audioBlocks);
+
+    const mediaUrls = Array.from(
+      new Set([
+        ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls : []),
+        ...(typeof payload.mediaUrl === "string" ? [payload.mediaUrl] : []),
+      ]),
+    );
+    const imageBlocks = await createManagedOutgoingImageBlocks({
+      sessionKey: params.sessionKey,
+      ...(params.sessionKey === "global" && params.agentId ? { agentId: params.agentId } : {}),
+      mediaUrls,
+      localRoots: params.managedImageLocalRoots,
+      continueOnPrepareError: true,
+      onPrepareError: (error) => {
+        params.onManagedImagePrepareError?.(error.message);
+      },
+    });
+    if (imageBlocks.length > 0) {
+      content.push(...imageBlocks);
+    }
+  }
+
+  if (content.length > 0) {
+    return content;
+  }
+  return strippedTextPayloadCount > 0 ? [{ type: "text", text: "" }] : undefined;
+}
+
+export function replaceAssistantContentTextBlocks(
+  content: readonly AssistantDisplayContentBlock[] | undefined,
+  transcriptMediaMessage: { content: Array<Record<string, unknown>> } | null,
+): AssistantDisplayContentBlock[] | undefined {
+  const transcriptTextBlocks = (transcriptMediaMessage?.content ?? []).filter(
+    (block): block is AssistantDisplayContentBlock =>
+      Boolean(block) &&
+      typeof block === "object" &&
+      block.type === "text" &&
+      typeof block.text === "string",
+  );
+  if (transcriptTextBlocks.length === 0) {
+    return content ? [...content] : undefined;
+  }
+  if (!content || content.length === 0) {
+    return [...transcriptTextBlocks];
+  }
+  const merged: AssistantDisplayContentBlock[] = [];
+  let transcriptTextIndex = 0;
+  for (const block of content) {
+    if (
+      block?.type === "text" &&
+      typeof block.text === "string" &&
+      transcriptTextIndex < transcriptTextBlocks.length
+    ) {
+      merged.push(transcriptTextBlocks[transcriptTextIndex++]);
+      continue;
+    }
+    merged.push(block);
+  }
+  if (transcriptTextIndex < transcriptTextBlocks.length) {
+    merged.unshift(...transcriptTextBlocks.slice(transcriptTextIndex));
+  }
+  return merged;
 }

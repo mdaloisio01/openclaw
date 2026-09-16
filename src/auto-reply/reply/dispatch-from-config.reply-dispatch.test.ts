@@ -15,6 +15,7 @@ import {
 } from "../../tasks/task-flow-runtime-internal.js";
 import { createInternalHookEventPayload } from "../../test-utils/internal-hook-event-payload.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import type { GetReplyOptions } from "../get-reply-options.types.js";
 import { setReplyPayloadMetadata } from "../reply-payload.js";
 import {
   acpManagerRuntimeMocks,
@@ -33,6 +34,7 @@ import {
   sessionStoreMocks,
   setDiscordTestRegistry,
 } from "./dispatch-from-config.shared.test-harness.js";
+import { createReplyDispatcher } from "./reply-dispatcher.js";
 
 let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatchReplyFromConfig;
 let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
@@ -451,12 +453,13 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
   });
 
-  it("dispatches the next Cleanup Crew action after a delivered open-build milestone report", async () => {
+  it("does not turn a prose-only milestone into execution or delivery proof", async () => {
     const registryPath = await useTempSourceTurnDeliveryRegistry();
     hookMocks.runner.hasHooks.mockReturnValue(false);
     mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
 
     await withCleanupCrewDispatchState(async () => {
+      const dispatcher = createDispatcher();
       const result = await dispatchReplyFromConfig({
         ctx: createSourceTurnCtx({
           SessionKey: "webchat:direct:mark",
@@ -465,45 +468,37 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
           BodyForCommands: "Cleanup Crew production repair build.",
         }),
         cfg: emptyConfig,
-        dispatcher: createDispatcher(),
+        dispatcher,
         replyResolver: async () => ({ text: CLEANUP_CREW_OPEN_MILESTONE_REPORT }),
       });
 
-      expect(result.queuedFinal).toBe(true);
+      expect(result.queuedFinal).toBe(false);
       const rows = await readSourceTurnDeliveryRows(registryPath);
-      expect(rows[0]).toMatchObject({
-        currentStage: "final_dispatch_delivered",
-        deliveryStatus: "final_delivered",
+      expect(rows[0]?.finalDeliveryDelivered).toBe(false);
+      expect(dispatcher.sendFinalReply).not.toHaveBeenCalledWith({
+        text: CLEANUP_CREW_OPEN_MILESTONE_REPORT,
       });
       const [flow] = listTaskFlowRecords();
       expect(flow).toBeDefined();
-      expect(flow?.currentStep).toBe("cleanup_crew_post_report_continuation");
-      expect(flow?.stateJson).toMatchObject({
-        currentCheckpointKind: "milestone_delivered",
-        nextExecutableAction: "dispatch ISSUE-040 post-milestone continuation repair",
-      });
       expect(getTaskFlowProductionContinuation(flow)).toMatchObject({
         activeProductionRun: true,
         parentRunOpen: true,
-        nextExecutableUnitIdentified: true,
-        nextExecutableUnitLaunched: true,
-        continuationRequiredAfterLocalSuccess: true,
+        nextExecutableUnitIdentified: false,
+        nextExecutableUnitLaunched: false,
+        continuationRequiredAfterLocalSuccess: false,
       });
       expect(getTaskFlowActiveProductionContinuation(flow)).toMatchObject({
         broaderBuildOpen: true,
-        status: "dispatched",
+        status: "dispatch_required",
         boundary: "plan_next_step",
-        nextAction: {
-          summary: "dispatch ISSUE-040 post-milestone continuation repair",
-          dispatchProofRef: "dispatch ISSUE-040 post-milestone continuation repair",
-        },
+        dispatchReceipts: [],
       });
       expect(listTasksForFlowId(flow.flowId)).toHaveLength(1);
     });
   });
 
-  it("keeps duplicate post-milestone continuation delivery idempotent", async () => {
-    await useTempSourceTurnDeliveryRegistry();
+  it("admits an executed milestone and keeps its pending next action idempotent on duplicate delivery", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
     hookMocks.runner.hasHooks.mockReturnValue(false);
     mocks.routeReply.mockResolvedValue({ ok: true, messageId: "mock" });
 
@@ -514,25 +509,63 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
         BodyForAgent: "Cleanup Crew production repair build.",
         BodyForCommands: "Cleanup Crew production repair build.",
       });
-      await dispatchReplyFromConfig({
+      let executedReceiptId: string | undefined;
+      const replyResolver = vi.fn(async (_ctx: unknown, opts?: GetReplyOptions) => {
+        expect(opts?.onExecutionProgress).toEqual(expect.any(Function));
+        await opts?.onExecutionProgress?.({
+          runId: "repair-run-1",
+          source: "tool",
+          phase: "start",
+          toolCallId: "exec-1",
+          name: "exec",
+        });
+        const [executingFlow] = listTaskFlowRecords();
+        const executing = getTaskFlowActiveProductionContinuation(executingFlow);
+        expect(executing).toMatchObject({
+          status: "dispatched",
+          nextAction: { dispatchProofRef: "run:repair-run-1:tool:start:exec-1:exec" },
+        });
+        executedReceiptId = executing?.lastDispatchReceiptId;
+        return { text: CLEANUP_CREW_OPEN_MILESTONE_REPORT };
+      });
+      const firstDispatcher = createDispatcher();
+      const firstResult = await dispatchReplyFromConfig({
         ctx,
         cfg: emptyConfig,
-        dispatcher: createDispatcher(),
-        replyResolver: async () => ({ text: CLEANUP_CREW_OPEN_MILESTONE_REPORT }),
+        dispatcher: firstDispatcher,
+        replyResolver,
+      });
+      expect(firstResult.queuedFinal).toBe(true);
+      expect(firstDispatcher.sendFinalReply).toHaveBeenCalledWith({
+        text: CLEANUP_CREW_OPEN_MILESTONE_REPORT,
+      });
+      expect((await readSourceTurnDeliveryRows(registryPath))[0]).toMatchObject({
+        currentStage: "final_dispatch_delivered",
+        finalDeliveryDelivered: true,
       });
       const [firstFlow] = listTaskFlowRecords();
       expect(firstFlow).toBeDefined();
       const firstTaskId = listTasksForFlowId(firstFlow.flowId)[0]?.taskId;
-      const firstReceipt =
-        getTaskFlowActiveProductionContinuation(firstFlow)?.lastDispatchReceiptId;
+      const firstContinuation = getTaskFlowProductionContinuation(firstFlow);
+      expect(firstFlow.currentStep).toBe("cleanup_crew_post_report_continuation");
+      expect(firstFlow.stateJson).toMatchObject({
+        currentCheckpointKind: "milestone_delivered",
+        nextExecutableAction: "dispatch ISSUE-040 post-milestone continuation repair",
+      });
+      expect(firstContinuation?.nextExecutableUnitLaunched).toBe(false);
 
+      const secondDispatcher = createDispatcher();
       await dispatchReplyFromConfig({
         ctx,
         cfg: emptyConfig,
-        dispatcher: createDispatcher(),
-        replyResolver: async () => ({ text: CLEANUP_CREW_OPEN_MILESTONE_REPORT }),
+        dispatcher: secondDispatcher,
+        replyResolver,
       });
 
+      expect(replyResolver).toHaveBeenCalledTimes(1);
+      expect(secondDispatcher.sendFinalReply).not.toHaveBeenCalledWith({
+        text: CLEANUP_CREW_OPEN_MILESTONE_REPORT,
+      });
       const flows = listTaskFlowRecords();
       expect(flows).toHaveLength(1);
       const [secondFlow] = flows;
@@ -540,16 +573,25 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
         firstTaskId,
       ]);
       expect(getTaskFlowActiveProductionContinuation(secondFlow)).toMatchObject({
-        status: "dispatched",
+        status: "dispatch_required",
         nextAction: {
           summary: "dispatch ISSUE-040 post-milestone continuation repair",
         },
       });
-      expect(getTaskFlowActiveProductionContinuation(secondFlow)?.dispatchReceipts).toHaveLength(1);
+      expect(getTaskFlowActiveProductionContinuation(secondFlow)?.dispatchReceipts).toEqual([]);
       expect(
         getTaskFlowActiveProductionContinuation(secondFlow)?.lastDispatchReceiptId,
-      ).not.toBeUndefined();
-      expect(firstReceipt).not.toBeUndefined();
+      ).toBeUndefined();
+      expect(executedReceiptId).not.toBeUndefined();
+      expect(getTaskFlowProductionContinuation(secondFlow)?.events).toEqual(
+        firstContinuation?.events,
+      );
+      expect(firstContinuation?.events).toContainEqual(
+        expect.objectContaining({
+          type: "NEXT_EXECUTABLE_UNIT_LAUNCHED",
+          detail: "run:repair-run-1:tool:start:exec-1:exec",
+        }),
+      );
     });
   });
 
@@ -817,6 +859,135 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
       finalDeliveryDelivered: false,
       sourceTurnState: "blocked_refused",
       visibleDeliveryCount: 0,
+    });
+  });
+
+  it("prepares a rich-only WebChat final before dispatch can abort", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    sessionStoreMocks.currentEntry = {
+      sessionId: "source-session",
+      sessionKey: "agent:test:session",
+    };
+    sessionStoreMocks.readSessionEntry.mockReturnValue(sessionStoreMocks.currentEntry);
+    const dispatcher = createReplyDispatcher({
+      deliver: async () => {
+        throw new Error("dispatch bubble closed");
+      },
+    });
+    const payload = {
+      presentation: {
+        title: "Approval required",
+        blocks: [
+          { type: "context" as const, text: "Review the proposed repair." },
+          {
+            type: "buttons" as const,
+            buttons: [{ label: "Approve", value: "approve" }],
+          },
+        ],
+      },
+    };
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx({
+        OriginatingChannel: "webchat",
+        ParentYieldWaits: [{ parentRunId: "parent-run", waitId: "parent-wait" }],
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyOptions: { runId: "required-source-run" },
+      replyResolver: async () => payload,
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    const rows = await readSourceTurnDeliveryRows(registryPath);
+    expect(rows[0]).toMatchObject({
+      currentStage: "final_dispatch_prepared_pending_delivery",
+      preparedSourceFinal: {
+        kind: "source_session_transcript",
+        parts: [
+          {
+            payload,
+            webchatContent: {
+              content: [
+                {
+                  type: "text",
+                  text: "Approval required\nReview the proposed repair.\nApprove",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+  });
+
+  it.each([
+    { name: "initial", tail: false },
+    { name: "tail", tail: true },
+  ])("routes an ACP $name handled final through required source persistence", async ({ tail }) => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    sessionStoreMocks.currentEntry = {
+      sessionId: "source-session",
+      sessionKey: "agent:test:session",
+    };
+    sessionStoreMocks.readSessionEntry.mockReturnValue(sessionStoreMocks.currentEntry);
+    const delivered: string[] = [];
+    const dispatcher = createReplyDispatcher({
+      deliver: async (payload) => {
+        delivered.push(payload.text ?? "");
+      },
+    });
+    hookMocks.runner.runReplyDispatch.mockImplementation(
+      async (eventUnknown: unknown, hookCtxUnknown: unknown) => {
+        const event = eventUnknown as { isTailDispatch?: boolean };
+        if (Boolean(event.isTailDispatch) !== tail) {
+          return undefined;
+        }
+        const hookCtx = hookCtxUnknown as {
+          deliverFinalBatch?: (payloads: Array<{ text: string }>) => Promise<{
+            queuedFinal: boolean;
+          }>;
+        };
+        if (!hookCtx.deliverFinalBatch) {
+          throw new Error("required final batch delivery missing");
+        }
+        const final = await hookCtx.deliverFinalBatch([
+          { text: `ACP ${tail ? "tail" : "initial"} final` },
+        ]);
+        return {
+          handled: true,
+          queuedFinal: final.queuedFinal,
+          counts: dispatcher.getQueuedCounts(),
+        };
+      },
+    );
+    const ctx = createSourceTurnCtx({
+      OriginatingChannel: "webchat",
+      ParentYieldWaits: [{ parentRunId: "parent-run", waitId: "parent-wait" }],
+    });
+
+    const result = await dispatchReplyFromConfig({
+      ctx,
+      cfg: emptyConfig,
+      dispatcher,
+      replyOptions: { runId: "required-acp-source-run" },
+      replyResolver: async (resolverCtx) => {
+        if (tail) {
+          resolverCtx.AcpDispatchTailAfterReset = true;
+        }
+        return undefined;
+      },
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    expect(delivered).toEqual([`ACP ${tail ? "tail" : "initial"} final`]);
+    expect((await readSourceTurnDeliveryRows(registryPath))[0]).toMatchObject({
+      currentStage: "final_dispatch_prepared_pending_delivery",
+      preparedSourceFinal: {
+        kind: "source_session_transcript",
+        parts: [{ text: `ACP ${tail ? "tail" : "initial"} final` }],
+      },
     });
   });
 

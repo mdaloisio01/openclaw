@@ -103,6 +103,128 @@ function parseJsonLines<T>(raw: string): T[] {
 }
 
 describe("mirrorCodexAppServerTranscript", () => {
+  it("returns the requested turn's exact persisted assistant identity across retries", async () => {
+    const sessionFile = await createTempSessionFile();
+    const makeAssistant = (turnId: string, text = "Same answer.") =>
+      attachCodexMirrorIdentity(
+        makeAgentAssistantMessage({ content: [{ type: "text", text }] }),
+        `${turnId}:assistant`,
+      );
+    const mirror = (messages: AgentMessage[], canonicalAssistantIdentity: string) =>
+      mirrorCodexAppServerTranscript({
+        sessionFile,
+        sessionId: "session-1",
+        messages,
+        idempotencyScope: "codex-app-server:thread-1",
+        canonicalAssistantIdentity,
+      });
+
+    const previous = await mirror([makeAssistant("turn-1")], "turn-1:assistant");
+    const current = await mirror(
+      [makeAssistant("turn-1"), makeAssistant("turn-2")],
+      "turn-2:assistant",
+    );
+    const retry = await mirror(
+      [makeAssistant("turn-2", "Rewritten proposal.")],
+      "turn-2:assistant",
+    );
+    const absentCurrentTurn = await mirror([makeAssistant("turn-1")], "turn-2:assistant");
+
+    const records = parseJsonLines<{
+      id: string;
+      message?: { idempotencyKey: string; content: Array<{ text: string }> };
+    }>(await fs.readFile(sessionFile, "utf8"));
+    const saved = records.find(
+      (record) => record.message?.idempotencyKey === "codex-app-server:thread-1:turn-2:assistant",
+    );
+    expect(current.canonicalAssistantTranscript).toEqual({
+      sessionId: "session-1",
+      sessionFile,
+      messageId: saved?.id,
+      idempotencyKey: "codex-app-server:thread-1:turn-2:assistant",
+      text: "Same answer.",
+    });
+    expect(current.canonicalAssistantTranscript?.messageId).toEqual(expect.any(String));
+    expect(current.canonicalAssistantTranscript?.messageId).not.toBe(
+      previous.canonicalAssistantTranscript?.messageId,
+    );
+    expect(retry.canonicalAssistantTranscript).toEqual(current.canonicalAssistantTranscript);
+    expect(absentCurrentTurn.canonicalAssistantTranscript).toBeUndefined();
+    expect(records.filter((record) => record.message)).toHaveLength(2);
+    expect(saved?.message?.content).toEqual([{ type: "text", text: "Same answer." }]);
+  });
+
+  it("returns actual post-write-hook assistant content on append and exact-key retry", async () => {
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_message_write",
+          handler: (event) => ({
+            message: castAgentMessage({
+              ...((event as { message: unknown }).message as Record<string, unknown>),
+              content: [{ type: "text", text: "[redacted by hook]" }],
+            }),
+          }),
+        },
+      ]),
+    );
+    const sessionFile = await createTempSessionFile();
+    const params = {
+      sessionFile,
+      sessionId: "session-1",
+      messages: [
+        attachCodexMirrorIdentity(
+          makeAgentAssistantMessage({ content: [{ type: "text", text: "Unredacted answer." }] }),
+          "turn-1:assistant",
+        ),
+      ],
+      idempotencyScope: "codex-app-server:thread-1",
+      canonicalAssistantIdentity: "turn-1:assistant",
+    };
+    const first = await mirrorCodexAppServerTranscript(params);
+    const retry = await mirrorCodexAppServerTranscript(params);
+
+    expect(first.canonicalAssistantTranscript?.text).toBe("[redacted by hook]");
+    expect(retry.canonicalAssistantTranscript).toEqual(first.canonicalAssistantTranscript);
+    expect(await fs.readFile(sessionFile, "utf8")).not.toContain("Unredacted answer.");
+  });
+
+  it.each(["hidden", "blocked", "error"] as const)(
+    "does not report a %s assistant as a visible canonical final",
+    async (mode) => {
+      initializeGlobalHookRunner(
+        createMockPluginRegistry([
+          {
+            hookName: "before_message_write",
+            handler: (event) =>
+              mode === "blocked"
+                ? { block: true }
+                : {
+                    message: castAgentMessage({
+                      ...((event as { message: unknown }).message as Record<string, unknown>),
+                      ...(mode === "hidden" ? { display: false } : { stopReason: "error" }),
+                    }),
+                  },
+          },
+        ]),
+      );
+      const result = await mirrorCodexAppServerTranscript({
+        sessionFile: await createTempSessionFile(),
+        sessionId: "session-1",
+        messages: [
+          attachCodexMirrorIdentity(
+            makeAgentAssistantMessage({ content: [{ type: "text", text: "Answer." }] }),
+            "turn-1:assistant",
+          ),
+        ],
+        idempotencyScope: "codex-app-server:thread-1",
+        canonicalAssistantIdentity: "turn-1:assistant",
+      });
+
+      expect(result.canonicalAssistantTranscript).toBeUndefined();
+    },
+  );
+
   it("mirrors user, assistant, and tool result messages into the embedded-agent transcript", async () => {
     const sessionFile = await createTempSessionFile();
     const userMessage = makeAgentUserMessage({

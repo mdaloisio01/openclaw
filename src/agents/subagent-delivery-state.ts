@@ -1,3 +1,4 @@
+import { peekSystemEventEntries } from "../infra/system-events.js";
 import type {
   PendingFinalDeliveryPayload,
   SubagentCompletionDeliveryState,
@@ -259,6 +260,30 @@ export function clearDeliveryState(entry: SubagentRunRecord): void {
   entry.delivery = {
     status: entry.expectsCompletionMessage === false ? "not_required" : "pending",
   };
+}
+
+export function isParentYieldCloseoutPending(entry: SubagentRunRecord): boolean {
+  return (
+    entry.parentYieldWait?.requiredCloseout === true &&
+    entry.parentYieldWait.status !== "closeout_delivered"
+  );
+}
+
+export function shouldRetainParentYieldCloseout(entry: SubagentRunRecord): boolean {
+  const wait = entry.parentYieldWait;
+  if (!wait?.requiredCloseout) {
+    return false;
+  }
+  if (isParentYieldCloseoutPending(entry)) {
+    return true;
+  }
+  // The exact wake can survive a committed closeout in the same process.
+  // Keep its child proof until the continuation owner retires that event.
+  return peekSystemEventEntries(wait.parentSessionKey).some(
+    (event) =>
+      event.parentYieldWait?.waitId === wait.waitId &&
+      event.parentYieldWait.parentRunId === wait.parentRunId,
+  );
 }
 
 export function isDeliverySuspended(entry: SubagentRunRecord): boolean {

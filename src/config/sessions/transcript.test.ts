@@ -345,6 +345,110 @@ describe("appendAssistantMessageToSessionTranscript", () => {
     expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
   });
 
+  it("pins a recoverable publication to its exact session and key despite matching older text", async () => {
+    writeTranscriptStore();
+    const text = "The saved final response.";
+    await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text,
+      storePath: fixture.storePath(),
+    });
+    const request = {
+      sessionKey,
+      text,
+      storePath: fixture.storePath(),
+      expectedSessionId: sessionId,
+      idempotencyKey: "prepared-final-1",
+    };
+    const first = await appendAssistantMessageToSessionTranscript(request);
+    const retry = await appendAssistantMessageToSessionTranscript(request);
+    expect(first.ok).toBe(true);
+    expect(retry).toEqual(first);
+    if (!first.ok) {
+      throw new Error(first.reason);
+    }
+    const messages = fs
+      .readFileSync(first.sessionFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.message?.role === "assistant");
+    expect(messages).toHaveLength(2);
+    expect(messages[1].message.idempotencyKey).toBe(request.idempotencyKey);
+    expect(
+      await appendAssistantMessageToSessionTranscript({
+        ...request,
+        expectedSessionId: "reset-session",
+      }),
+    ).toMatchObject({ ok: false });
+    expect(
+      await appendAssistantMessageToSessionTranscript({ ...request, idempotencyKey: undefined }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("records an exact hidden receipt for an already published native answer and rejects false references", async () => {
+    writeTranscriptStore();
+    const text = "The actual native answer.";
+    const nativeKey = "native-thread:actual-turn:assistant";
+    const native = await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      idempotencyKey: nativeKey,
+      message: createExactAssistantMessage({ text }),
+    });
+    if (!native.ok) {
+      throw new Error(native.reason);
+    }
+    const reference = {
+      sessionId,
+      sessionFile: native.sessionFile,
+      messageId: native.messageId,
+      idempotencyKey: nativeKey,
+      text,
+    };
+    const request = {
+      sessionKey,
+      storePath: fixture.storePath(),
+      expectedSessionId: sessionId,
+      idempotencyKey: "prepared-source-receipt",
+      text,
+      canonicalAssistantTranscript: reference,
+    };
+    const receipt = await appendAssistantMessageToSessionTranscript(request);
+    expect(receipt.ok).toBe(true);
+    expect(await appendAssistantMessageToSessionTranscript(request)).toEqual(receipt);
+    const records = fs
+      .readFileSync(native.sessionFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.message?.role === "assistant");
+    expect(records).toHaveLength(2);
+    expect(records.filter((entry) => entry.message.display !== false)).toHaveLength(1);
+    expect(records[1].message).toMatchObject({
+      display: false,
+      idempotencyKey: request.idempotencyKey,
+      sourceDelivery: { visibleMessageId: native.messageId },
+    });
+    for (const changed of [
+      { messageId: "different-message" },
+      { idempotencyKey: "different-native-key" },
+      { sessionFile: path.join(fixture.sessionsDir(), "another.jsonl") },
+      { sessionId: "different-session" },
+    ]) {
+      expect(
+        await appendAssistantMessageToSessionTranscript({
+          ...request,
+          idempotencyKey: "unproven-source-receipt",
+          canonicalAssistantTranscript: { ...reference, ...changed },
+        }),
+      ).toMatchObject({ ok: false });
+    }
+    expect(
+      await appendAssistantMessageToSessionTranscript({ ...request, text: "Changed by a hook." }),
+    ).toMatchObject({ ok: false });
+  });
+
   it("does not append a duplicate delivery mirror when the latest assistant message already matches", async () => {
     writeTranscriptStore();
 

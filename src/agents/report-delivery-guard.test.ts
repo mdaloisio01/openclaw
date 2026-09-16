@@ -337,6 +337,97 @@ describe("report delivery guard", () => {
     });
   });
 
+  it.each([
+    "Give me a Cleanup Crew production report only.",
+    "Give me the current Cleanup Crew production report only.",
+    "Cleanup Crew report only. Do not continue.",
+    "Cleanup Crew production repair: status only and do not continue.",
+    "Pause Cleanup Crew. Proceed with the Cleanup Crew status report only.",
+    "Stop. Start the Cleanup Crew report only.",
+    "Proceed with the Cleanup Crew production status report only because I don't authorize changes.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and execute the changes myself.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Please proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Please, proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Do not continue with the Cleanup Crew build, please.",
+    "Do not continue with the Cleanup Crew build because I only want a status update.",
+    "Do not continue with the Cleanup Crew build for now.",
+    "Pause the Cleanup Crew production repair.",
+    "Don't run.",
+    "Do not resume.",
+    "Do not start.",
+    "Do not proceed.",
+    "Stop the execution.",
+    "Do not do any work on this production build.",
+    "Cleanup Crew production repair: do not continue, please.",
+    "Cleanup Crew production repair: stop for the moment, please.",
+    "Cleanup Crew production repair: stop all work.",
+    "Cleanup Crew production repair: do not do any work, just answer.",
+  ])("delivers the requested hold report while keeping the mission open: %s", (currentTurnText) => {
+    const decision = resolveCleanupCrewReportCloseoutAcceptance({
+      currentTurnText,
+      reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+      reportBodyDeliveredInChat: true,
+    });
+    expect(decision).toMatchObject({
+      state: "stop_after_report_only_request",
+      allowedToAcceptReport: true,
+      allowedToCloseMission: false,
+      postReportContinuation: {
+        state: "terminal_stop_allowed_operator_stop",
+        broaderBuildOpen: true,
+        finalDeliveryDelivered: true,
+        stopAllowed: true,
+      },
+    });
+  });
+
+  it.each([
+    "Cleanup Crew production repair: fix pause/resume handling and run its tests.",
+    "Cleanup Crew production repair: fix status-only/report-only classification.",
+    "Cleanup Crew production repair: fix the 'status only and do not continue' regression and run its tests.",
+    "Cleanup Crew production repair: stop the repair helper and run the remaining checks.",
+    "Cleanup Crew production repair: do not do any work on the repair helper; run remaining checks.",
+    "Pause Cleanup Crew. Start the build now.",
+    "Stop. Proceed with the Cleanup Crew repair now.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and then execute the Cleanup Crew repair.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Please proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Please, proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Give me a Cleanup Crew production build plan. Execute it now.",
+  ])("keeps the same report nonterminal under a production instruction: %s", (currentTurnText) => {
+    expect(
+      resolveCleanupCrewReportCloseoutAcceptance({
+        currentTurnText,
+        reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+        reportBodyDeliveredInChat: true,
+      }),
+    ).toMatchObject({
+      state: "accepted_report_continue",
+      allowedToAcceptReport: true,
+      allowedToCloseMission: false,
+      postReportContinuation: {
+        state: "continuation_dispatch_required",
+        stopAllowed: false,
+      },
+    });
+  });
+
+  it("does not infer execution from a requested plan containing Cleanup Crew report examples", () => {
+    expect(
+      resolveCleanupCrewReportCloseoutAcceptance({
+        currentTurnText: "Only draft a Cleanup Crew build plan.",
+        activeCleanupCrewMission: true,
+        reportText: VALID_CLEANUP_CREW_CLOSEOUT,
+        reportBodyDeliveredInChat: true,
+      }),
+    ).toMatchObject({
+      state: "not_cleanup_crew_report",
+      activeCleanupCrewMission: false,
+      postReportContinuation: { state: "not_cleanup_crew_report" },
+    });
+  });
+
   it("requires continuation when a blocker report lacks hard-stop or exhaustion proof", () => {
     expect(
       resolveCleanupCrewPostReportContinuation({

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
@@ -23,6 +23,11 @@ import { formatReasoningMessage } from "../agents/embedded-agent-utils.js";
 import { resolveAgentHarnessPolicy } from "../agents/harness/policy.js";
 import { resolveModelRefFromString, type ModelRef } from "../agents/model-selection.js";
 import { resolvePersistedSessionRuntimeId } from "../agents/session-runtime-compat.js";
+import {
+  createSourceTurnDeliveryQueueOwnerReference,
+  resolveSourceTurnDeliveryRegistryPath,
+  type SourceTurnDeliveryRow,
+} from "../agents/source-turn-delivery-store.js";
 import { DEFAULT_HEARTBEAT_FILENAME } from "../agents/workspace.js";
 import { resolveHeartbeatReplyPayload } from "../auto-reply/heartbeat-reply-payload.js";
 import {
@@ -40,6 +45,10 @@ import {
   stripHeartbeatToken,
   type HeartbeatTask,
 } from "../auto-reply/heartbeat.js";
+import {
+  getReplyPayloadMetadata,
+  isReplyPayloadStatusNotice,
+} from "../auto-reply/reply-payload.js";
 import { replaceGenericExternalRunFailureText } from "../auto-reply/reply/agent-runner-failure-copy.js";
 import { resolveDefaultModel } from "../auto-reply/reply/directive-handling.defaults.js";
 import {
@@ -96,6 +105,7 @@ import {
 } from "../routing/session-key.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import { escapeRegExp } from "../utils.js";
+import { INTERNAL_MESSAGE_CHANNEL, isInternalMessageChannel } from "../utils/message-channel.js";
 import { MAX_SAFE_TIMEOUT_DELAY_MS, resolveSafeTimeoutDelayMs } from "../utils/timer-delay.js";
 import { loadOrCreateDeviceIdentity } from "./device-identity.js";
 import { formatErrorMessage, hasErrnoCode } from "./errors.js";
@@ -121,6 +131,7 @@ import { createHeartbeatTypingCallbacks } from "./heartbeat-typing.js";
 import { resolveHeartbeatVisibility } from "./heartbeat-visibility.js";
 import {
   areHeartbeatsEnabled,
+  HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING,
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
   HEARTBEAT_SKIP_LANES_BUSY,
   HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
@@ -129,7 +140,7 @@ import {
   type HeartbeatWakeIntent,
   type HeartbeatWakeRequest,
   type HeartbeatWakeSource,
-  isRetryableHeartbeatBusySkipReason,
+  isRetryableHeartbeatSkipReason,
   requestHeartbeat,
   setHeartbeatsEnabled,
   setHeartbeatWakeHandler,
@@ -147,6 +158,11 @@ import {
   type SystemEvent,
 } from "./system-events.js";
 
+type HeartbeatSourceDeliveryStoreDeps = Pick<
+  typeof import("../agents/source-turn-delivery-store.js"),
+  "settleSourceTurnDeliveryFinal" | "transitionExternalSourceDelivery"
+>;
+
 export type HeartbeatDeps = OutboundSendDeps &
   ChannelHeartbeatDeps & {
     getReplyFromConfig?: typeof import("./heartbeat-runner.runtime.js").getReplyFromConfig;
@@ -156,6 +172,8 @@ export type HeartbeatDeps = OutboundSendDeps &
     isReplyRunActive?: (sessionKey: string) => boolean;
     listActiveReplyRunSessionKeys?: () => readonly string[];
     nowMs?: () => number;
+    /** @internal Atomic source-delivery writes; injectable for crash-boundary tests. */
+    sourceDeliveryStore?: HeartbeatSourceDeliveryStoreDeps;
   };
 
 const log = createSubsystemLogger("gateway/heartbeat");
@@ -936,6 +954,7 @@ type HeartbeatPreflight = HeartbeatWakePayloadFlags & {
   turnSourceDeliveryContext: ReturnType<typeof resolveSystemEventDeliveryContext>;
   dueCommitments: CommitmentRecord[];
   hasTaggedCronEvents: boolean;
+  continuationEvent?: SystemEvent;
   shouldInspectPendingEvents: boolean;
   skipReason?: HeartbeatSkipReason;
   tasks?: HeartbeatTask[];
@@ -976,7 +995,9 @@ async function resolveHeartbeatPreflight(params: {
   cfg: OpenClawConfig;
   agentId: string;
   heartbeat?: HeartbeatConfig;
-  forcedSessionKey?: string;
+  session: HeartbeatPreflight["session"];
+  pendingEventEntries: SystemEvent[];
+  continuationEvent?: SystemEvent;
   reason?: string;
   source?: HeartbeatWakeSource;
   nowMs?: number;
@@ -985,24 +1006,23 @@ async function resolveHeartbeatPreflight(params: {
     source: params.source,
     reason: params.reason,
   });
-  const session = resolveHeartbeatSession(
-    params.cfg,
-    params.agentId,
-    params.heartbeat,
-    params.forcedSessionKey,
-  );
-  const pendingEventEntries = peekSystemEventEntries(session.sessionKey);
-  const dueCommitments = canHeartbeatDeliverCommitments(params.heartbeat)
-    ? selectCommitmentDeliveryBatch(
-        await listDueCommitmentsForSession({
-          cfg: params.cfg,
-          agentId: params.agentId,
-          sessionKey: session.sessionKey,
-          nowMs: params.nowMs,
-        }),
-      )
-    : [];
-  const turnSourceDeliveryContext = resolveSystemEventDeliveryContext(pendingEventEntries);
+  const { session, pendingEventEntries, continuationEvent } = params;
+  const dueCommitments =
+    !continuationEvent && canHeartbeatDeliverCommitments(params.heartbeat)
+      ? selectCommitmentDeliveryBatch(
+          await listDueCommitmentsForSession({
+            cfg: params.cfg,
+            agentId: params.agentId,
+            sessionKey: session.sessionKey,
+            nowMs: params.nowMs,
+          }),
+        )
+      : [];
+  // A required parent reply keeps its original destination. Merging unrelated
+  // wakes or commitments could send its closeout to a different conversation.
+  const turnSourceDeliveryContext = continuationEvent
+    ? continuationEvent.deliveryContext
+    : resolveSystemEventDeliveryContext(pendingEventEntries);
   const hasTaggedCronEvents = pendingEventEntries.some((event) =>
     event.contextKey?.startsWith("cron:"),
   );
@@ -1024,11 +1044,13 @@ async function resolveHeartbeatPreflight(params: {
     return isolatedSessionKey === session.sessionKey;
   })();
   const shouldInspectPendingEvents =
+    Boolean(continuationEvent) ||
     wakeFlags.isExecEventWake ||
     wakeFlags.isCronWake ||
     shouldInspectWakePendingEvents ||
     hasTaggedCronEvents;
   const shouldBypassFileGates =
+    Boolean(continuationEvent) ||
     wakeFlags.isExecEventWake ||
     wakeFlags.isCronWake ||
     wakeFlags.isWakePayload ||
@@ -1040,6 +1062,7 @@ async function resolveHeartbeatPreflight(params: {
     turnSourceDeliveryContext,
     dueCommitments,
     hasTaggedCronEvents,
+    continuationEvent,
     shouldInspectPendingEvents,
   } satisfies Omit<HeartbeatPreflight, "skipReason">;
 
@@ -1184,6 +1207,19 @@ function resolveHeartbeatRunPrompt(params: {
   useHeartbeatResponseTool: boolean;
 }): HeartbeatPromptResolution {
   const pendingEventEntries = params.preflight.pendingEventEntries;
+  if (params.preflight.continuationEvent) {
+    return {
+      prompt: params.preflight.continuationEvent.activationContinuation
+        ? "Deliver the verified activation report to the original conversation."
+        : "Resume the parent task using the completed child results in the system events. " +
+          "Finish the remaining work and deliver the required closeout to the original conversation.",
+      hasExecCompletion: false,
+      hasRelayableExecCompletion: false,
+      hasCronEvents: false,
+      hasDueCommitments: false,
+      usesHeartbeatResponseTool: false,
+    };
+  }
   const cronEvents = pendingEventEntries
     .filter(
       (event) =>
@@ -1291,6 +1327,9 @@ function selectSystemEventsConsumedByHeartbeat(params: {
   if (!preflight.shouldInspectPendingEvents || preflight.pendingEventEntries.length === 0) {
     return [];
   }
+  if (preflight.continuationEvent) {
+    return [preflight.continuationEvent];
+  }
   if (params.hasExecCompletion) {
     return preflight.pendingEventEntries.filter((event) => isExecCompletionEvent(event.text));
   }
@@ -1329,18 +1368,24 @@ export async function runHeartbeatOnce(opts: {
     source: opts.source,
     mergeRequestedHeartbeat: opts.source === "cron",
   });
-  if (!areHeartbeatsEnabled()) {
-    return { status: "skipped", reason: "disabled" };
-  }
-  if (!isHeartbeatEnabledForAgent(cfg, agentId)) {
-    return { status: "skipped", reason: "disabled" };
-  }
-  if (!resolveHeartbeatIntervalMs(cfg, undefined, heartbeat)) {
+  const session = resolveHeartbeatSession(cfg, agentId, heartbeat, opts.sessionKey);
+  const pendingEventEntries = peekSystemEventEntries(session.sessionKey);
+  const continuationEvent = pendingEventEntries.find(
+    (event) => event.parentYieldWait || event.activationContinuation,
+  );
+  // Required source replies use this wake owner even when optional heartbeat
+  // scheduling is disabled. Actual reply, lane, and cron busy guards still apply.
+  if (
+    !continuationEvent &&
+    (!areHeartbeatsEnabled() ||
+      !isHeartbeatEnabledForAgent(cfg, agentId) ||
+      !resolveHeartbeatIntervalMs(cfg, undefined, heartbeat))
+  ) {
     return { status: "skipped", reason: "disabled" };
   }
 
   const startedAt = opts.deps?.nowMs?.() ?? Date.now();
-  if (!isWithinActiveHours(cfg, heartbeat, startedAt)) {
+  if (!continuationEvent && !isWithinActiveHours(cfg, heartbeat, startedAt)) {
     return { status: "skipped", reason: "quiet-hours" };
   }
 
@@ -1392,38 +1437,14 @@ export async function runHeartbeatOnce(opts: {
     return { status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT };
   }
 
-  // Phase 2: Stronger heartbeat deferral while a final delivery replay is pending.
-  // Plain `updatedAt` changes are normal for heartbeat sessions and should not
-  // suppress heartbeat runs; only defer when final delivery recovery is active.
-  const { entry: recentSessionEntry } = resolveHeartbeatSession(
-    cfg,
-    agentId,
-    heartbeat,
-    opts.sessionKey,
-  );
-  const HEARTBEAT_DEFER_WINDOW_MS = 30_000;
-  const pendingFinalDeliveryText = recentSessionEntry?.pendingFinalDeliveryText;
-  const pendingFinalDeliveryIsHeartbeatAck =
-    typeof pendingFinalDeliveryText === "string" &&
-    stripHeartbeatToken(pendingFinalDeliveryText, {
-      mode: "heartbeat",
-      maxAckChars: resolveHeartbeatAckMaxChars(cfg, heartbeat),
-    }).shouldSkip;
-  if (
-    recentSessionEntry?.pendingFinalDelivery === true &&
-    !pendingFinalDeliveryIsHeartbeatAck &&
-    recentSessionEntry?.updatedAt &&
-    startedAt - recentSessionEntry.updatedAt < HEARTBEAT_DEFER_WINDOW_MS
-  ) {
-    return { status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT };
-  }
-
   // Preflight centralizes trigger classification, event inspection, and HEARTBEAT.md gating.
   const preflight = await resolveHeartbeatPreflight({
     cfg,
     agentId,
     heartbeat,
-    forcedSessionKey: opts.sessionKey,
+    session,
+    pendingEventEntries,
+    continuationEvent,
     source: opts.source,
     reason: opts.reason,
     nowMs: startedAt,
@@ -1437,6 +1458,26 @@ export async function runHeartbeatOnce(opts: {
     return { status: "skipped", reason: preflight.skipReason };
   }
   const { entry, sessionKey, storePath, suppressOriginatingContext } = preflight.session;
+  // Ordinary heartbeats yield to pending final delivery. Required source
+  // continuations own that recovery; the real reply/lane busy guards still apply.
+  const HEARTBEAT_DEFER_WINDOW_MS = 30_000;
+  const pendingFinalDeliveryText = entry?.pendingFinalDeliveryText;
+  const pendingFinalDeliveryIsHeartbeatAck =
+    typeof pendingFinalDeliveryText === "string" &&
+    stripHeartbeatToken(pendingFinalDeliveryText, {
+      mode: "heartbeat",
+      maxAckChars: resolveHeartbeatAckMaxChars(cfg, heartbeat),
+    }).shouldSkip;
+  if (
+    !preflight.continuationEvent &&
+    entry?.pendingFinalDelivery === true &&
+    !pendingFinalDeliveryIsHeartbeatAck &&
+    entry.updatedAt &&
+    startedAt - entry.updatedAt < HEARTBEAT_DEFER_WINDOW_MS
+  ) {
+    return { status: "skipped", reason: HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT };
+  }
+
   const isReplyRunActive =
     opts.deps?.isReplyRunActive ?? ((key: string) => replyRunRegistry.isActive(key));
   if (isReplyRunActive(sessionKey)) {
@@ -1463,15 +1504,27 @@ export async function runHeartbeatOnce(opts: {
 
   const previousUpdatedAt = entry?.updatedAt;
   const dueHeartbeatTasks = resolveDueHeartbeatTasks(preflight, startedAt);
+  const continuationSource = preflight.continuationEvent
+    ? preflight.turnSourceDeliveryContext
+    : undefined;
+  const continuationSourceIsWebchat = isInternalMessageChannel(continuationSource?.channel);
+  if (
+    preflight.continuationEvent &&
+    (!continuationSource?.channel || (!continuationSourceIsWebchat && !continuationSource.to))
+  ) {
+    return { status: "failed", reason: "parent-closeout-delivery-target-missing" };
+  }
 
   // When isolatedSession is enabled, create a fresh session via the same
   // pattern as cron sessionTarget: "isolated". This gives the heartbeat
   // a new session ID (empty transcript) each run, avoiding the cost of
   // sending the full conversation history (~100K tokens) to the LLM.
   // Delivery routing still uses the main session entry (lastChannel, lastTo).
-  const useIsolatedSession = heartbeat?.isolatedSession === true;
+  const useIsolatedSession = heartbeat?.isolatedSession === true && !preflight.continuationEvent;
   const firstDueCommitment =
-    canHeartbeatDeliverCommitments(heartbeat) && dueHeartbeatTasks.length === 0
+    !preflight.continuationEvent &&
+    canHeartbeatDeliverCommitments(heartbeat) &&
+    dueHeartbeatTasks.length === 0
       ? preflight.dueCommitments[0]
       : undefined;
   const commitmentDeliveryContext = firstDueCommitment
@@ -1482,13 +1535,19 @@ export async function runHeartbeatOnce(opts: {
         threadId: firstDueCommitment.threadId,
       }
     : undefined;
-  const heartbeatForDelivery = commitmentDeliveryContext
-    ? { ...heartbeat, target: "last", to: undefined, accountId: undefined }
-    : heartbeat;
+  const heartbeatForDelivery = continuationSourceIsWebchat
+    ? { target: "none" }
+    : preflight.continuationEvent
+      ? { target: "last" }
+      : commitmentDeliveryContext
+        ? { ...heartbeat, target: "last", to: undefined, accountId: undefined }
+        : heartbeat;
   const delivery = await resolveHeartbeatDeliveryTargetWithSessionRoute({
     cfg,
     agentId,
-    entry,
+    // A required reply may use only its captured route. Session history and
+    // optional heartbeat overrides can now refer to another conversation.
+    entry: preflight.continuationEvent ? undefined : entry,
     heartbeat: heartbeatForDelivery,
     currentSessionKey: sessionKey,
     // Isolated heartbeat runs drain system events from their dedicated
@@ -1534,13 +1593,15 @@ export async function runHeartbeatOnce(opts: {
     delivery.channel !== "none" && delivery.to && visibility.showAlerts,
   );
   const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-  const useHeartbeatResponseToolPrompt = shouldUseHeartbeatResponseToolPrompt({
-    cfg,
-    agentId,
-    heartbeat,
-    entry,
-    chatType: delivery.chatType,
-  });
+  const useHeartbeatResponseToolPrompt =
+    !preflight.continuationEvent &&
+    shouldUseHeartbeatResponseToolPrompt({
+      cfg,
+      agentId,
+      heartbeat,
+      entry,
+      chatType: delivery.chatType,
+    });
   const {
     prompt,
     hasExecCompletion,
@@ -1567,6 +1628,11 @@ export async function runHeartbeatOnce(opts: {
     hasExecCompletion,
     hasCronEvents,
   });
+  const parentYieldWaits = inspectedSystemEventsToConsume.flatMap((event) =>
+    event.parentYieldWait ? [{ ...event.parentYieldWait }] : [],
+  );
+  const activationContinuation = preflight.continuationEvent?.activationContinuation;
+  const continuationRunId = preflight.continuationEvent ? randomUUID() : undefined;
 
   // If no tasks are due, skip heartbeat entirely
   if (prompt === null) {
@@ -1581,7 +1647,9 @@ export async function runHeartbeatOnce(opts: {
   }
 
   let runSessionKey = sessionKey;
-  if (useIsolatedSession) {
+  // A parent continuation must resume the original conversation and its work.
+  // Starting a fresh heartbeat session would discard that execution context.
+  if (useIsolatedSession && !continuationRunId) {
     const configuredSession = resolveHeartbeatSession(cfg, agentId, heartbeat);
     // Collapse only the repeated `:heartbeat` suffixes introduced by wake-triggered
     // re-entry for heartbeat-created isolated sessions. Real session keys that
@@ -1690,18 +1758,44 @@ export async function runHeartbeatOnce(opts: {
   };
 
   const ctx = {
-    Body: appendCronStyleCurrentTimeLine(prompt, cfg, startedAt),
+    Body: appendCronStyleCurrentTimeLine(
+      continuationRunId
+        ? `${prompt}\n\n${inspectedSystemEventsToConsume.map((event) => event.text).join("\n")}`
+        : prompt,
+      cfg,
+      startedAt,
+    ),
     From: sender,
     To: sender,
-    OriginatingChannel:
-      !suppressOriginatingContext && delivery.channel !== "none" ? delivery.channel : undefined,
-    OriginatingTo: !suppressOriginatingContext ? delivery.to : undefined,
-    AccountId: delivery.accountId,
-    MessageThreadId: delivery.threadId,
-    Provider: hasExecCompletion ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat",
+    OriginatingChannel: continuationSourceIsWebchat
+      ? INTERNAL_MESSAGE_CHANNEL
+      : !suppressOriginatingContext && delivery.channel !== "none"
+        ? delivery.channel
+        : undefined,
+    OriginatingTo: continuationSourceIsWebchat
+      ? continuationSource?.to
+      : !suppressOriginatingContext
+        ? delivery.to
+        : undefined,
+    AccountId: continuationSource ? continuationSource.accountId : delivery.accountId,
+    MessageThreadId: continuationSource ? continuationSource.threadId : delivery.threadId,
+    Provider: continuationSource
+      ? continuationSource.channel
+      : hasExecCompletion
+        ? "exec-event"
+        : hasCronEvents
+          ? "cron-event"
+          : "heartbeat",
     SessionKey: runSessionKey,
+    ...(parentYieldWaits.length > 0 ? { ParentYieldWaits: parentYieldWaits } : {}),
+    ...(activationContinuation ? { ActivationContinuation: activationContinuation } : {}),
   };
-  if (!visibility.showAlerts && !visibility.showOk && !visibility.useIndicator) {
+  if (
+    !continuationRunId &&
+    !visibility.showAlerts &&
+    !visibility.showOk &&
+    !visibility.useIndicator
+  ) {
     emitHeartbeatEvent({
       status: "skipped",
       reason: "alerts-disabled",
@@ -1795,19 +1889,24 @@ export async function runHeartbeatOnce(opts: {
 
   try {
     await heartbeatTyping?.onReplyStart();
-    const heartbeatModelOverride = normalizeOptionalString(heartbeat?.model);
-    const suppressToolErrorWarnings = heartbeat?.suppressToolErrorWarnings === true;
-    const timeoutOverrideSeconds = resolveHeartbeatTimeoutOverrideSeconds(cfg, heartbeat);
+    const heartbeatModelOverride = continuationRunId
+      ? undefined
+      : normalizeOptionalString(heartbeat?.model);
+    const suppressToolErrorWarnings =
+      !continuationRunId && heartbeat?.suppressToolErrorWarnings === true;
+    const timeoutOverrideSeconds = continuationRunId
+      ? undefined
+      : resolveHeartbeatTimeoutOverrideSeconds(cfg, heartbeat);
     const bootstrapContextMode: "lightweight" | undefined =
-      heartbeat?.lightContext === true ? "lightweight" : undefined;
+      !continuationRunId && heartbeat?.lightContext === true ? "lightweight" : undefined;
+    const useHeartbeatTool = usesHeartbeatResponseTool && !continuationRunId;
     const replyOpts = {
-      isHeartbeat: true,
+      isHeartbeat: !continuationRunId,
+      ...(continuationRunId ? { runId: continuationRunId } : {}),
       ...(heartbeatModelOverride ? { heartbeatModelOverride } : {}),
       suppressToolErrorWarnings,
-      ...(usesHeartbeatResponseTool ? { enableHeartbeatTool: true, forceHeartbeatTool: true } : {}),
-      ...(usesHeartbeatResponseTool
-        ? { sourceReplyDeliveryMode: "message_tool_only" as const }
-        : {}),
+      ...(useHeartbeatTool ? { enableHeartbeatTool: true, forceHeartbeatTool: true } : {}),
+      ...(useHeartbeatTool ? { sourceReplyDeliveryMode: "message_tool_only" as const } : {}),
       ...(hasDueCommitments ? { disableTools: true, skillFilter: [] } : {}),
       // Heartbeat timeout is a per-run override so user turns keep the global default.
       timeoutOverrideSeconds,
@@ -1816,6 +1915,446 @@ export async function runHeartbeatOnce(opts: {
     };
     const getReplyFromConfig =
       opts.deps?.getReplyFromConfig ?? (await loadHeartbeatRunnerRuntime()).getReplyFromConfig;
+    if (continuationRunId) {
+      const heartbeatRuntime = await loadHeartbeatRunnerRuntime();
+      const {
+        dispatchInboundMessageWithBufferedDispatcher,
+        publishPreparedWebchatSourceReply,
+        getParentYieldWaitContinuation,
+        prepareParentYieldWaitContinuation,
+        reconcileParentYieldWaitDelivery,
+        reconcileActivationContinuationDelivery,
+        loadSourceTurnDeliveryRegistry,
+        clearPendingFinalDeliveryAfterSuccess,
+      } = heartbeatRuntime;
+      const { settleSourceTurnDeliveryFinal, transitionExternalSourceDelivery } =
+        opts.deps?.sourceDeliveryStore ?? heartbeatRuntime;
+      const sourceRegistryPath = resolveSourceTurnDeliveryRegistryPath();
+      const parentWaitIdentity = activationContinuation
+        ? undefined
+        : { controllerSessionKey: sessionKey, ...parentYieldWaits[0] };
+      let dispatchRunId: string = continuationRunId;
+      let activationMessage: string | undefined;
+      const reconcileSourceDelivery = async () => {
+        let outcome: "settled" | "pending" | "missing_receipt";
+        if (activationContinuation) {
+          const activation = await reconcileActivationContinuationDelivery({
+            continuation: activationContinuation,
+            sessionKey,
+          });
+          if (activation.status === "missing_receipt") {
+            activationMessage = activation.message;
+            outcome = "missing_receipt";
+          } else if (activation.status === "pending") {
+            if (activation.reason === "delivery_unconfirmed") {
+              // Recovery can re-publish the immutable WebChat report or consume
+              // an existing external receipt. It cannot repeat an uncertain send.
+              activationMessage = activation.message;
+              outcome = "missing_receipt";
+            } else {
+              outcome = "pending";
+            }
+          } else {
+            outcome = "settled";
+          }
+        } else {
+          const wait = parentYieldWaits[0];
+          outcome = await reconcileParentYieldWaitDelivery({
+            controllerSessionKey: sessionKey,
+            ...wait,
+            registryPath: sourceRegistryPath,
+          });
+        }
+        if (outcome === "settled") {
+          consumeInspectedSystemEvents();
+          if (
+            peekSystemEventEntries(sessionKey).some(
+              (event) => event.parentYieldWait || event.activationContinuation,
+            )
+          ) {
+            requestHeartbeat({
+              source: "subagent-progress",
+              intent: "event",
+              reason: "source-continuation-pending",
+              sessionKey,
+            });
+          }
+        }
+        return outcome;
+      };
+      const publishSourcePart = async (
+        part: NonNullable<SourceTurnDeliveryRow["preparedSourceFinal"]>["parts"][number],
+        sourceSessionId: string,
+      ) => {
+        // WebChat reads this canonical transcript on reconnect. An exact key
+        // acknowledges the saved part even after a process interruption.
+        await publishPreparedWebchatSourceReply({
+          sessionKey,
+          agentId,
+          storePath,
+          expectedSessionId: sourceSessionId,
+          part,
+          config: cfg,
+        });
+      };
+      const matchesContinuation = (row: SourceTurnDeliveryRow) =>
+        row.sourceSessionKey === sessionKey &&
+        (activationContinuation
+          ? row.obligationIdentity.deliveryId === activationContinuation.id &&
+            row.obligationIdentity.reportId === activationContinuation.reportId &&
+            String(row.obligationIdentity.generation) === String(activationContinuation.createdAt)
+          : row.parentYieldWaits?.some(
+              (wait) =>
+                wait.waitId === parentYieldWaits[0].waitId &&
+                wait.parentRunId === parentYieldWaits[0].parentRunId,
+            ));
+      const recoverPreparedSourceFinal = async () => {
+        const registry = await loadSourceTurnDeliveryRegistry(sourceRegistryPath);
+        let attempts = registry.rows.filter(matchesContinuation);
+        if (parentWaitIdentity) {
+          const continuation = getParentYieldWaitContinuation(parentWaitIdentity);
+          if (continuation?.status !== "ready") {
+            return "pending" as const;
+          }
+          const yieldedRunIds = new Set(continuation.yieldedRunIds);
+          if (
+            attempts.some(
+              (row) =>
+                yieldedRunIds.has(row.obligationIdentity.runId ?? "") &&
+                (row.preparedSourceFinal ||
+                  row.finalDeliveryDelivered ||
+                  row.sourceChannel !== continuationSource?.channel ||
+                  (["to", "accountId", "threadId"] as const).some(
+                    (key) =>
+                      String(row.deliveryContext?.[key] ?? "") !==
+                      String(continuationSource?.[key] ?? ""),
+                  )),
+            )
+          ) {
+            return "pending" as const;
+          }
+          // Only a durable backend-confirmed yield transfers this exact run's
+          // still-owed final. Unknown accepted executions remain below for recovery.
+          attempts = attempts.filter(
+            (row) => !yieldedRunIds.has(row.obligationIdentity.runId ?? ""),
+          );
+        }
+        if (attempts.length === 0) {
+          return "missing_receipt" as const;
+        }
+        const attempt = attempts[0];
+        const prepared = attempt.preparedSourceFinal;
+        if (
+          attempts.length !== 1 ||
+          !attempt.obligationIdentity.runId ||
+          attempt.sourceChannel !== continuationSource?.channel ||
+          (["to", "accountId", "threadId"] as const).some(
+            (key) =>
+              String(attempt.deliveryContext?.[key] ?? "") !==
+              String(continuationSource?.[key] ?? ""),
+          )
+        ) {
+          return "pending" as const;
+        }
+        if (!prepared) {
+          const priorRunId = attempt.obligationIdentity.runId;
+          if (
+            continuationSourceIsWebchat &&
+            activationContinuation &&
+            activationMessage !== undefined &&
+            attempt.id === `source:${sessionKey}:${priorRunId}` &&
+            attempt.sourceTurnId === attempt.id &&
+            attempt.sourceMessageId === priorRunId
+          ) {
+            // Activation retains an immutable checked report before dispatch.
+            // Finish its preparation under the accepted identity, without
+            // repeating a model execution or the restart side effect.
+            dispatchRunId = priorRunId;
+            return "missing_receipt" as const;
+          }
+          // An accepted run without a complete prepared final has an unknown
+          // execution outcome. A missing process-local run cache cannot authorize replay.
+          return "pending" as const;
+        }
+        if (
+          prepared.parts.length !== prepared.expectedPartCount ||
+          (prepared.kind === "source_session_transcript") !== continuationSourceIsWebchat
+        ) {
+          return "pending" as const;
+        }
+        if (
+          activationContinuation &&
+          (prepared.parts.length !== 1 ||
+            prepared.parts[0].mediaUrls?.length ||
+            createHash("sha256").update(prepared.parts[0].text).digest("hex") !==
+              activationContinuation.reportId)
+        ) {
+          return "pending" as const;
+        }
+        if (prepared.kind === "external_channel") {
+          // The transport owns unknown/partial outcomes. Its saved positive
+          // receipt permits settlement after a crash without another send.
+          if (prepared.outboundDelivery.status !== "delivered") {
+            return "pending" as const;
+          }
+        } else {
+          for (const part of prepared.parts) {
+            await publishSourcePart(part, prepared.sessionId);
+          }
+        }
+        await settleSourceTurnDeliveryFinal({
+          registryPath: sourceRegistryPath,
+          owner: createSourceTurnDeliveryQueueOwnerReference(attempt),
+        });
+        if (prepared.pendingFinalDeliveryCreatedAt !== undefined) {
+          await clearPendingFinalDeliveryAfterSuccess({
+            storePath,
+            sessionKey,
+            expectedCreatedAt: prepared.pendingFinalDeliveryCreatedAt,
+          });
+        }
+        return await reconcileSourceDelivery();
+      };
+      const priorDelivery = await reconcileSourceDelivery();
+      if (priorDelivery === "settled") {
+        return { status: "ran", durationMs: Date.now() - startedAt };
+      }
+      if (priorDelivery === "pending") {
+        return { status: "skipped", reason: HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING };
+      }
+      const recoverPreparedSourceFinalSafely = async () => {
+        try {
+          return await recoverPreparedSourceFinal();
+        } catch (error) {
+          log.warn(`source continuation recovery pending: ${String(error)}`);
+          return "pending" as const;
+        }
+      };
+      const recoveredDelivery = await recoverPreparedSourceFinalSafely();
+      if (recoveredDelivery === "settled") {
+        return { status: "ran", durationMs: Date.now() - startedAt };
+      }
+      if (recoveredDelivery === "pending") {
+        return { status: "skipped", reason: HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING };
+      }
+      const preparedActivationMessage = activationMessage;
+      if (parentWaitIdentity) {
+        try {
+          dispatchRunId = prepareParentYieldWaitContinuation({
+            ...parentWaitIdentity,
+            runId: dispatchRunId,
+          });
+        } catch (error) {
+          log.warn(`parent continuation ownership pending: ${String(error)}`);
+          return { status: "skipped", reason: HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING };
+        }
+      }
+      const replyResolver =
+        preparedActivationMessage !== undefined
+          ? async () => ({ text: preparedActivationMessage })
+          : async (...args: Parameters<typeof getReplyFromConfig>) => {
+              const reply = await getReplyFromConfig(...args);
+              if (
+                parentWaitIdentity &&
+                getParentYieldWaitContinuation(parentWaitIdentity)?.yieldedRunIds.includes(
+                  dispatchRunId,
+                )
+              ) {
+                // Text produced before a second yield is not the parent's final.
+                // The retained wait now owns the next actual child completion.
+                return undefined;
+              }
+              return reply;
+            };
+      const deliverExternalSourceFinal = async (payloads: readonly ReplyPayload[]) => {
+        const attempts = (await loadSourceTurnDeliveryRegistry(sourceRegistryPath)).rows.filter(
+          (row) => matchesContinuation(row) && row.obligationIdentity.runId === dispatchRunId,
+        );
+        const attempt = attempts[0];
+        const prepared = attempt?.preparedSourceFinal;
+        if (
+          attempts.length !== 1 ||
+          prepared?.kind !== "external_channel" ||
+          prepared.outboundDelivery.status !== "prepared" ||
+          prepared.parts.length !== prepared.expectedPartCount ||
+          JSON.stringify(prepared.parts.map((part) => part.payload)) !== JSON.stringify(payloads) ||
+          attempt.sourceChannel !== continuationSource?.channel ||
+          (["to", "accountId", "threadId"] as const).some(
+            (key) =>
+              String(attempt.deliveryContext?.[key] ?? "") !==
+              String(continuationSource?.[key] ?? ""),
+          )
+        ) {
+          throw new Error("source continuation external final was not prepared");
+        }
+        if (delivery.channel === "none" || !delivery.to) {
+          throw new Error("parent-closeout-delivery-target-missing");
+        }
+        const deliveryQueueOwner = createSourceTurnDeliveryQueueOwnerReference(attempt);
+        const sent = await sendDurableMessageBatch({
+          cfg,
+          channel: delivery.channel,
+          to: delivery.to,
+          accountId: delivery.accountId,
+          threadId: delivery.threadId,
+          session: outboundSession,
+          payloads: prepared.parts.map((part) => part.payload),
+          deps: opts.deps,
+          deliveryQueueOwner,
+          onDeliveryIntent: async (intent) => {
+            if (
+              intent.queuePolicy !== "required" ||
+              intent.channel !== delivery.channel ||
+              intent.to !== delivery.to ||
+              (intent.accountId ?? "") !== (delivery.accountId ?? "")
+            ) {
+              throw new Error("source continuation external intent changed");
+            }
+            // Persist all parts and this actual queue identity before the first
+            // platform side effect; later wakes must not manufacture a new send.
+            await transitionExternalSourceDelivery({
+              registryPath: sourceRegistryPath,
+              owner: deliveryQueueOwner,
+              delivery: { status: "queued", queueId: intent.id },
+            });
+          },
+          onDeliveryOwnerCommit: async ({ deliveryIntent, receipt, payloadOutcomes }) => {
+            if (
+              receipt.platformMessageIds.length === 0 ||
+              payloadOutcomes.length !== prepared.expectedPartCount ||
+              payloadOutcomes.some((outcome) => outcome.status !== "sent")
+            ) {
+              throw new Error("parent-closeout-delivery-unproven");
+            }
+            await transitionExternalSourceDelivery({
+              registryPath: sourceRegistryPath,
+              owner: deliveryQueueOwner,
+              delivery: {
+                status: "delivered",
+                queueId: deliveryIntent.id,
+                receipt,
+              },
+            });
+          },
+        });
+        if (sent.status === "failed" || sent.status === "partial_failed") {
+          throw sent.error;
+        }
+        if (
+          sent.status !== "sent" ||
+          !sent.deliveryIntent ||
+          sent.payloadOutcomes?.length !== prepared.expectedPartCount ||
+          sent.payloadOutcomes.some((outcome) => outcome.status !== "sent")
+        ) {
+          throw new Error("parent-closeout-delivery-unproven");
+        }
+      };
+      try {
+        await dispatchInboundMessageWithBufferedDispatcher({
+          ctx: { ...ctx, MessageSid: dispatchRunId },
+          cfg,
+          replyResolver,
+          replyOptions: {
+            ...replyOpts,
+            runId: dispatchRunId,
+            suppressDefaultToolProgressMessages: true,
+          },
+          dispatcherOptions: {
+            ...(!continuationSourceIsWebchat
+              ? { deliverFinalBatch: deliverExternalSourceFinal }
+              : {}),
+            deliver: async (payload, info) => {
+              if (
+                info.kind === "final" &&
+                (isReplyPayloadStatusNotice(payload) || payload.isError)
+              ) {
+                throw new Error("parent-closeout-delivery-unproven");
+              }
+              const sendable = resolveSendableOutboundReplyParts(payload);
+              if (
+                activationContinuation &&
+                (sendable.text !== preparedActivationMessage || sendable.mediaUrls.length > 0)
+              ) {
+                throw new Error("activation-report-content-changed-before-delivery");
+              }
+              if (continuationSourceIsWebchat) {
+                if (info.kind !== "final") {
+                  return;
+                }
+                const mirror = getReplyPayloadMetadata(payload)?.sourceReplyTranscriptMirror;
+                if (
+                  mirror?.sessionKey !== sessionKey ||
+                  !mirror.sessionId ||
+                  !mirror.idempotencyKey
+                ) {
+                  throw new Error("source continuation final was not prepared");
+                }
+                await publishSourcePart(
+                  {
+                    text: sendable.text,
+                    mediaUrls: sendable.mediaUrls,
+                    idempotencyKey: mirror.idempotencyKey,
+                    canonicalAssistantTranscript:
+                      getReplyPayloadMetadata(payload)?.canonicalAssistantTranscript,
+                    webchatContent: mirror.webchatContent,
+                  },
+                  mirror.sessionId,
+                );
+                return;
+              }
+              if (info.kind === "final") {
+                throw new Error("source continuation external final needs its complete batch");
+              }
+              if (delivery.channel === "none" || !delivery.to) {
+                throw new Error("parent-closeout-delivery-target-missing");
+              }
+              const sent = await sendDurableMessageBatch({
+                cfg,
+                channel: delivery.channel,
+                to: delivery.to,
+                accountId: delivery.accountId,
+                threadId: delivery.threadId,
+                session: outboundSession,
+                payloads: [payload],
+                deps: opts.deps,
+              });
+              if (sent.status === "failed" || sent.status === "partial_failed") {
+                throw sent.error;
+              }
+              if (sent.status !== "sent") {
+                throw new Error("parent-closeout-delivery-unproven");
+              }
+            },
+          },
+        });
+      } catch (error) {
+        log.warn(`source continuation dispatch interrupted: ${String(error)}`);
+      }
+      if (
+        parentWaitIdentity &&
+        getParentYieldWaitContinuation(parentWaitIdentity)?.yieldedRunIds.includes(dispatchRunId)
+      ) {
+        return { status: "ran", durationMs: Date.now() - startedAt };
+      }
+      // The dispatcher persists only accepted/prepared facts for required
+      // source replies. Settle the exact prepared owner after publication.
+      const finalDelivery = await recoverPreparedSourceFinalSafely();
+      if (finalDelivery === "pending" || (activationContinuation && finalDelivery !== "settled")) {
+        return { status: "skipped", reason: HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING };
+      }
+      if (finalDelivery !== "settled") {
+        const attempts = (await loadSourceTurnDeliveryRegistry(sourceRegistryPath)).rows.filter(
+          matchesContinuation,
+        );
+        if (attempts.some((attempt) => attempt.preparedSourceFinal)) {
+          return { status: "skipped", reason: HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING };
+        }
+      }
+      if (finalDelivery !== "settled") {
+        return { status: "failed", reason: "parent-closeout-delivery-unproven" };
+      }
+      return { status: "ran", durationMs: Date.now() - startedAt };
+    }
     const replyResult = await getReplyFromConfig(ctx, replyOpts, cfg);
     const heartbeatToolResponse = resolveHeartbeatToolResponseFromReplyResult(replyResult);
     const replyPayload = resolveHeartbeatReplyPayload(replyResult);
@@ -2368,6 +2907,35 @@ export function startHeartbeatRunner(opts: {
         reason: "disabled",
       } satisfies HeartbeatRunResult;
     }
+    const reason = params?.reason;
+    const intent = params.intent;
+    const requestedAgentId = params?.agentId ? normalizeAgentId(params.agentId) : undefined;
+    const requestedSessionKey = normalizeOptionalString(params?.sessionKey);
+    // Typed obligations retain their exact session even for agents absent from
+    // the optional heartbeat schedule. They do not consume its cooldown budget.
+    if (
+      requestedSessionKey &&
+      peekSystemEventEntries(requestedSessionKey).some(
+        (event) => event.parentYieldWait || event.activationContinuation,
+      )
+    ) {
+      const targetAgentId = resolveAgentIdFromSessionKey(requestedSessionKey);
+      if (
+        (requestedAgentId && requestedAgentId !== targetAgentId) ||
+        !listAgentIds(state.cfg).includes(targetAgentId)
+      ) {
+        return { status: "skipped", reason: "disabled" };
+      }
+      return await runOnce({
+        cfg: state.cfg,
+        agentId: targetAgentId,
+        source: params.source,
+        intent,
+        reason,
+        sessionKey: requestedSessionKey,
+        deps: { runtime: state.runtime },
+      });
+    }
     if (!areHeartbeatsEnabled()) {
       return {
         status: "skipped",
@@ -2381,10 +2949,6 @@ export function startHeartbeatRunner(opts: {
       } satisfies HeartbeatRunResult;
     }
 
-    const reason = params?.reason;
-    const intent = params.intent;
-    const requestedAgentId = params?.agentId ? normalizeAgentId(params.agentId) : undefined;
-    const requestedSessionKey = normalizeOptionalString(params?.sessionKey);
     const requestedHeartbeat = params?.heartbeat;
     const isInterval = reason === "interval";
     const startedAt = Date.now();
@@ -2424,7 +2988,7 @@ export function startHeartbeatRunner(opts: {
             sessionKey: requestedSessionKey,
             deps: { runtime: state.runtime },
           });
-          if (res.status === "skipped" && isRetryableHeartbeatBusySkipReason(res.reason)) {
+          if (res.status === "skipped" && isRetryableHeartbeatSkipReason(res.reason)) {
             // Retryable busy — do NOT record run bookkeeping. The wake layer
             // retries the same reason shortly; if we recorded `lastRunStartedAtMs`
             // here, the retry would falsely defer with `not-due`/`min-spacing`
@@ -2493,7 +3057,7 @@ export function startHeartbeatRunner(opts: {
           advanceAgentSchedule(agent, now, reason);
           return { ran: false };
         }
-        if (res.status === "skipped" && isRetryableHeartbeatBusySkipReason(res.reason)) {
+        if (res.status === "skipped" && isRetryableHeartbeatSkipReason(res.reason)) {
           // Do not advance the schedule or record run bookkeeping for this
           // agent — its target runtime is busy and the wake layer retries.
           return { ran: false, retryableBusySkip: res };
@@ -2540,7 +3104,7 @@ export function startHeartbeatRunner(opts: {
           }
           if (
             commitmentRes.status === "skipped" &&
-            isRetryableHeartbeatBusySkipReason(commitmentRes.reason)
+            isRetryableHeartbeatSkipReason(commitmentRes.reason)
           ) {
             return { ran: agentRan, retryableBusySkip: commitmentRes };
           }

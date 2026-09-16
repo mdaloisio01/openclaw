@@ -1,6 +1,7 @@
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { OutboundDeliveryError } from "./deliver-types.js";
 import { attachOutboundDeliveryCommitHook } from "./delivery-commit-hooks.js";
 import {
   enqueueDelivery,
@@ -131,6 +132,48 @@ describe("delivery-queue recovery", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0]?.retryCount).toBe(1);
     expect(entries[0]?.lastError).toBe("network down");
+    expect(entries[0]?.recoveryState).toBe("send_attempt_started");
+  });
+
+  it("requires reconciliation after a multipart recovery partially sends and throws", async () => {
+    const id = await enqueueDelivery(
+      {
+        channel: "demo-channel-a",
+        to: "+1",
+        payloads: [{ text: "first" }, { text: "second" }],
+      },
+      tmpDir(),
+    );
+    const deliver = vi.fn(async () => {
+      expect(await loadPendingDeliveries(tmpDir())).toEqual([
+        expect.objectContaining({ id, recoveryState: "send_attempt_started" }),
+      ]);
+      throw new OutboundDeliveryError("second part failed", {
+        cause: new Error("second part failed"),
+        results: [{ channel: "telegram", messageId: "first-platform-message" }],
+        stage: "platform_send",
+      });
+    });
+
+    const first = await runRecovery({ deliver });
+
+    expect(first.result.failed).toBe(1);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([
+      expect.objectContaining({ id, recoveryState: "send_attempt_started", retryCount: 1 }),
+    ]);
+
+    setQueuedEntryState(tmpDir(), id, {
+      retryCount: 1,
+      lastAttemptAt: Date.now() - 30_000,
+      recoveryState: "send_attempt_started",
+    });
+    const second = await runRecovery({ deliver });
+
+    expect(second.result.failed).toBe(1);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
+    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("failed");
   });
 
   it("moves entries abandoned after platform send may have started to failed without reconciliation", async () => {
@@ -427,7 +470,7 @@ describe("delivery-queue recovery", () => {
     expectMockMessageContaining(log.warn, "refusing blind replay without adapter reconciliation");
   });
 
-  it("moves entries to failed/ immediately on permanent delivery errors", async () => {
+  it("keeps post-attempt permanent errors reconciliation-gated", async () => {
     const id = await enqueueDelivery(
       { channel: "demo-channel", to: "user:abc", payloads: [{ text: "hi" }] },
       tmpDir(),
@@ -440,12 +483,14 @@ describe("delivery-queue recovery", () => {
 
     expect(result.failed).toBe(1);
     expect(result.recovered).toBe(0);
-    expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
-    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("failed");
-    expectMockMessageContaining(log.warn, "permanent error");
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([
+      expect.objectContaining({ id, recoveryState: "send_attempt_started", retryCount: 1 }),
+    ]);
+    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("pending");
+    expectMockMessageContaining(log.warn, "Retry failed");
   });
 
-  it("treats Matrix 'User not in room' as a permanent error", async () => {
+  it("keeps post-attempt Matrix membership errors reconciliation-gated", async () => {
     const id = await enqueueDelivery(
       { channel: "matrix", to: "!lowercased:matrix.example.com", payloads: [{ text: "hi" }] },
       tmpDir(),
@@ -462,9 +507,11 @@ describe("delivery-queue recovery", () => {
 
     expect(result.failed).toBe(1);
     expect(result.recovered).toBe(0);
-    expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
-    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("failed");
-    expectMockMessageContaining(log.warn, "permanent error");
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([
+      expect.objectContaining({ id, recoveryState: "send_attempt_started", retryCount: 1 }),
+    ]);
+    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("pending");
+    expectMockMessageContaining(log.warn, "Retry failed");
   });
 
   it("passes skipQueue: true to prevent re-enqueueing during recovery", async () => {
@@ -533,6 +580,181 @@ describe("delivery-queue recovery", () => {
     expect(order).toEqual(["deliver", "commit-after-ack"]);
     expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
     expect(readOutboundQueueStatus(tmpDir(), id)).toBeUndefined();
+  });
+
+  it("commits the recovered transport receipt to its owner before acking the queue entry", async () => {
+    const id = await enqueueDelivery(
+      {
+        channel: "demo-channel-a",
+        to: "+1",
+        payloads: [{ text: "first" }, { text: "second" }],
+        threadId: "thread-1",
+      },
+      tmpDir(),
+    );
+    const order: string[] = [];
+    const deliver = vi.fn(async () => {
+      order.push("deliver");
+      return [
+        { channel: "demo-channel-a", messageId: "m1" },
+        { channel: "demo-channel-a", messageId: "m2" },
+      ];
+    });
+    const commitRecoveredDelivery = vi.fn(async (_entry, receipt) => {
+      expect(await loadPendingDeliveries(tmpDir())).toEqual([
+        expect.objectContaining({ id, recoveryState: "unknown_after_send" }),
+      ]);
+      expect(receipt).toMatchObject({
+        platformMessageIds: ["m1", "m2"],
+        threadId: "thread-1",
+      });
+      order.push("owner-commit");
+    });
+
+    await recoverPendingDeliveries({
+      deliver: asDeliverFn(deliver),
+      log: createRecoveryLog(),
+      cfg: baseCfg,
+      stateDir: tmpDir(),
+      isRecoveryCommitted: vi.fn(async () => false),
+      commitRecoveredDelivery,
+    });
+
+    expect(commitRecoveredDelivery).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["deliver", "owner-commit"]);
+    expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
+  });
+
+  it("fails closed after a recovered send when owner receipt commit fails", async () => {
+    const id = await enqueueDelivery(
+      { channel: "demo-channel-a", to: "+1", payloads: [{ text: "source final" }] },
+      tmpDir(),
+    );
+    const deliver = vi.fn(async () => [
+      { channel: "demo-channel-a", messageId: "platform-message" },
+    ]);
+    const commitRecoveredDelivery = vi.fn(async () => {
+      throw new Error("source owner unavailable");
+    });
+
+    const first = await recoverPendingDeliveries({
+      deliver: asDeliverFn(deliver),
+      log: createRecoveryLog(),
+      cfg: baseCfg,
+      stateDir: tmpDir(),
+      isRecoveryCommitted: vi.fn(async () => false),
+      commitRecoveredDelivery,
+    });
+
+    expect(first.failed).toBe(1);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([
+      expect.objectContaining({ id, recoveryState: "unknown_after_send", retryCount: 1 }),
+    ]);
+
+    setQueuedEntryState(tmpDir(), id, {
+      retryCount: 1,
+      lastAttemptAt: Date.now() - 30_000,
+      recoveryState: "unknown_after_send",
+    });
+    const second = await recoverPendingDeliveries({
+      deliver: asDeliverFn(deliver),
+      log: createRecoveryLog(),
+      cfg: baseCfg,
+      stateDir: tmpDir(),
+      isRecoveryCommitted: vi.fn(async () => false),
+      commitRecoveredDelivery,
+    });
+
+    expect(second.failed).toBe(1);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
+    expect(readOutboundQueueStatus(tmpDir(), id)).toBe("failed");
+  });
+
+  it("acks without replay after the owner commits but the recovered queue ack fails", async () => {
+    const id = await enqueueDelivery(
+      { channel: "demo-channel-a", to: "+1", payloads: [{ text: "source final" }] },
+      tmpDir(),
+    );
+    const deliver = vi.fn(async () => [
+      { channel: "demo-channel-a", messageId: "platform-message" },
+    ]);
+    let ownerCommitted = false;
+    const commitRecoveredDelivery = vi.fn(async () => {
+      ownerCommitted = true;
+    });
+    const { db } = openOpenClawStateDatabase({
+      env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir() },
+    });
+    db.exec(`
+      CREATE TRIGGER fail_outbound_ack
+      BEFORE DELETE ON delivery_queue_entries
+      BEGIN
+        SELECT RAISE(ABORT, 'ack offline');
+      END
+    `);
+    try {
+      const first = await recoverPendingDeliveries({
+        deliver: asDeliverFn(deliver),
+        log: createRecoveryLog(),
+        cfg: baseCfg,
+        stateDir: tmpDir(),
+        isRecoveryCommitted: vi.fn(async () => ownerCommitted),
+        commitRecoveredDelivery,
+      });
+
+      expect(first.failed).toBe(1);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(commitRecoveredDelivery).toHaveBeenCalledTimes(1);
+      expect(await loadPendingDeliveries(tmpDir())).toEqual([
+        expect.objectContaining({ id, recoveryState: "unknown_after_send", retryCount: 1 }),
+      ]);
+    } finally {
+      db.exec("DROP TRIGGER fail_outbound_ack");
+    }
+
+    setQueuedEntryState(tmpDir(), id, {
+      retryCount: 1,
+      lastAttemptAt: Date.now() - 30_000,
+      recoveryState: "unknown_after_send",
+    });
+    const second = await recoverPendingDeliveries({
+      deliver: asDeliverFn(deliver),
+      log: createRecoveryLog(),
+      cfg: baseCfg,
+      stateDir: tmpDir(),
+      isRecoveryCommitted: vi.fn(async () => ownerCommitted),
+      commitRecoveredDelivery,
+    });
+
+    expect(second.recovered).toBe(1);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(commitRecoveredDelivery).toHaveBeenCalledTimes(1);
+    expect(await loadPendingDeliveries(tmpDir())).toEqual([]);
+  });
+
+  it("acks an owner-committed recovery without replaying its transport", async () => {
+    const id = await enqueueDelivery(
+      { channel: "demo-channel-a", to: "+1", payloads: [{ text: "already delivered" }] },
+      tmpDir(),
+    );
+    const deliver = vi.fn();
+    const commitRecoveredDelivery = vi.fn();
+
+    const result = await recoverPendingDeliveries({
+      deliver: asDeliverFn(deliver),
+      log: createRecoveryLog(),
+      cfg: baseCfg,
+      stateDir: tmpDir(),
+      isRecoveryCommitted: vi.fn(async (entry) => entry.id === id),
+      commitRecoveredDelivery,
+    });
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(commitRecoveredDelivery).not.toHaveBeenCalled();
+    expect(result.recovered).toBe(1);
+    expect(await loadPendingDeliveries(tmpDir())).toHaveLength(0);
   });
 
   it("replays stored delivery options during recovery", async () => {

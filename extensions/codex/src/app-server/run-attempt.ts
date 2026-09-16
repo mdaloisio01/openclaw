@@ -1264,6 +1264,9 @@ export async function runCodexAppServerAttempt(
       }
     | undefined;
   let terminalDynamicToolReleaseCheckScheduled = false;
+  let terminalDynamicToolReleaseWork: Promise<void> = Promise.resolve();
+  let terminalDynamicToolStopRequested = false;
+  let terminalDynamicToolInterruptAcknowledged = false;
   let currentTurnHadNonTerminalDynamicToolResult = false;
   const turnIdRef: { current?: string } = {};
   const projectorRef: { current?: CodexAppServerEventProjector } = {};
@@ -1344,7 +1347,7 @@ export async function runCodexAppServerAttempt(
     },
   });
 
-  const releaseTurnAfterTerminalDynamicTool = (paramsValue: {
+  const releaseTurnAfterTerminalDynamicTool = async (paramsValue: {
     call: CodexDynamicToolCallParams;
     response: CodexDynamicToolCallResponse;
     durationMs: number;
@@ -1363,30 +1366,44 @@ export async function runCodexAppServerAttempt(
       return;
     }
     pendingTerminalDynamicToolRelease = undefined;
-    trajectoryRecorder?.recordEvent("turn.dynamic_tool_terminal_release", {
+    terminalDynamicToolStopRequested = true;
+    const releaseEvidence = {
       threadId: paramsValue.call.threadId,
       turnId: paramsValue.call.turnId,
       toolCallId: paramsValue.call.callId,
       name: paramsValue.call.tool,
       durationMs: paramsValue.durationMs,
-    });
-    embeddedAgentLog.info("codex app-server turn released after terminal dynamic tool result", {
-      threadId: paramsValue.call.threadId,
-      turnId: paramsValue.call.turnId,
-      toolCallId: paramsValue.call.callId,
-      tool: paramsValue.call.tool,
-      durationMs: paramsValue.durationMs,
-    });
-    interruptCodexTurnBestEffort(client, {
-      threadId: paramsValue.call.threadId,
-      turnId: paramsValue.call.turnId,
-      timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
-    });
-    completed = true;
-    turnWatches.clearCompletionIdleTimer();
-    turnWatches.clearAssistantCompletionIdleTimer();
-    turnWatches.clearTerminalIdleTimer();
-    resolveCompletion?.();
+    };
+    trajectoryRecorder?.recordEvent(
+      "turn.dynamic_tool_terminal_release_requested",
+      releaseEvidence,
+    );
+    try {
+      // Codex 0.135 turn_processor.rs acknowledges this exact nonempty turn
+      // only after TurnAborted. Sending an interrupt alone cannot hand off the parent.
+      await client.request(
+        "turn/interrupt",
+        { threadId: paramsValue.call.threadId, turnId: paramsValue.call.turnId },
+        { timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS },
+      );
+      terminalDynamicToolInterruptAcknowledged = true;
+      trajectoryRecorder?.recordEvent("turn.dynamic_tool_terminal_release", releaseEvidence);
+      embeddedAgentLog.info(
+        "codex app-server terminal dynamic tool interrupt acknowledged",
+        releaseEvidence,
+      );
+    } catch (error) {
+      embeddedAgentLog.warn("codex app-server terminal dynamic tool interrupt unconfirmed", {
+        ...releaseEvidence,
+        error,
+      });
+    } finally {
+      completed = true;
+      turnWatches.clearCompletionIdleTimer();
+      turnWatches.clearAssistantCompletionIdleTimer();
+      turnWatches.clearTerminalIdleTimer();
+      resolveCompletion?.();
+    }
   };
 
   const scheduleTerminalDynamicToolReleaseCheck = () => {
@@ -1398,23 +1415,32 @@ export async function runCodexAppServerAttempt(
     }
     // Let the JSON-RPC tool-call response flush before interrupting the turn.
     terminalDynamicToolReleaseCheckScheduled = true;
-    const immediate = setImmediate(() => {
-      terminalDynamicToolReleaseCheckScheduled = false;
-      const action = resolveTerminalDynamicToolBatchAction({
-        activeAppServerTurnRequests,
-        activeTurnItemIdsCount: activeTurnItemIds.size,
-        pendingOpenClawDynamicToolCompletionIdsCount: pendingOpenClawDynamicToolCompletionIds.size,
-        currentTurnHadNonTerminalDynamicToolResult,
-        hasPendingTerminalDynamicToolRelease: pendingTerminalDynamicToolRelease !== undefined,
+    terminalDynamicToolReleaseWork = new Promise<void>((resolve) => {
+      const immediate = setImmediate(() => {
+        terminalDynamicToolReleaseCheckScheduled = false;
+        const action = resolveTerminalDynamicToolBatchAction({
+          activeAppServerTurnRequests,
+          activeTurnItemIdsCount: activeTurnItemIds.size,
+          pendingOpenClawDynamicToolCompletionIdsCount:
+            pendingOpenClawDynamicToolCompletionIds.size,
+          currentTurnHadNonTerminalDynamicToolResult,
+          hasPendingTerminalDynamicToolRelease: pendingTerminalDynamicToolRelease !== undefined,
+        });
+        const release =
+          action === "release-pending-terminal" && pendingTerminalDynamicToolRelease
+            ? releaseTurnAfterTerminalDynamicTool(pendingTerminalDynamicToolRelease)
+            : Promise.resolve();
+        if (action === "clear-nonterminal-batch") {
+          pendingTerminalDynamicToolRelease = undefined;
+          currentTurnHadNonTerminalDynamicToolResult = false;
+        }
+        void release.then(
+          () => resolve(),
+          () => resolve(),
+        );
       });
-      if (action === "release-pending-terminal" && pendingTerminalDynamicToolRelease) {
-        releaseTurnAfterTerminalDynamicTool(pendingTerminalDynamicToolRelease);
-      } else if (action === "clear-nonterminal-batch") {
-        pendingTerminalDynamicToolRelease = undefined;
-        currentTurnHadNonTerminalDynamicToolResult = false;
-      }
+      immediate.unref?.();
     });
-    immediate.unref?.();
   };
 
   const scheduleTurnReleaseAfterTerminalDynamicTool = (paramsLocal: {
@@ -2287,16 +2313,39 @@ export async function runCodexAppServerAttempt(
     // for already-queued projection work so the final result includes artifacts
     // from the notification that triggered the idle watchdog.
     await notificationQueue;
+    // A terminal notification may resolve completion while the corresponding
+    // interrupt acknowledgement is still pending. Join that exact stop before
+    // normalizing the expected interruption or handing control to a parent.
+    await terminalDynamicToolReleaseWork;
+    const completedTurnStatus = activeProjector.getCompletedTurnStatus();
+    const terminalDynamicToolStopConfirmed =
+      terminalDynamicToolStopRequested &&
+      (terminalDynamicToolInterruptAcknowledged ||
+        completedTurnStatus === "completed" ||
+        completedTurnStatus === "interrupted");
+    const terminalDynamicToolStopUnconfirmed =
+      terminalDynamicToolStopRequested && !terminalDynamicToolStopConfirmed;
+    // The matching turn may complete before the deferred release check runs.
+    // A completed turn already stopped naturally, so no interrupt can or needs to be acknowledged.
+    const yieldTerminalConfirmed =
+      yieldDetected && (terminalDynamicToolStopConfirmed || completedTurnStatus === "completed");
     const result = activeProjector.buildResult(toolBridge.telemetry, { yieldDetected });
     const finalAborted =
-      result.aborted || (runAbortController.signal.aborted && !clientClosedAbort);
+      (result.aborted && !terminalDynamicToolStopConfirmed) ||
+      (runAbortController.signal.aborted && !clientClosedAbort) ||
+      (yieldDetected && !yieldTerminalConfirmed) ||
+      terminalDynamicToolStopUnconfirmed;
     let finalPromptError =
-      clientClosedPromptError ??
-      (turnCompletionIdleTimedOut
-        ? turnCompletionIdleTimeoutMessage
-        : timedOut
-          ? "codex app-server attempt timed out"
-          : result.promptError);
+      yieldDetected && !yieldTerminalConfirmed
+        ? "Codex sessions_yield stop was not acknowledged; parent continuation remains pending."
+        : terminalDynamicToolStopUnconfirmed
+          ? "Codex terminal tool stop was not acknowledged."
+          : (clientClosedPromptError ??
+            (turnCompletionIdleTimedOut
+              ? turnCompletionIdleTimeoutMessage
+              : timedOut
+                ? "codex app-server attempt timed out"
+                : result.promptError));
     const finalPromptErrorMessage =
       typeof finalPromptError === "string"
         ? finalPromptError
@@ -2342,7 +2391,12 @@ export async function runCodexAppServerAttempt(
       finalPromptError = refreshedUsageLimitPromptError;
     }
     const finalPromptErrorSource =
-      timedOut || clientClosedPromptError ? "prompt" : result.promptErrorSource;
+      timedOut ||
+      clientClosedPromptError ||
+      (yieldDetected && !yieldTerminalConfirmed) ||
+      terminalDynamicToolStopUnconfirmed
+        ? "prompt"
+        : result.promptErrorSource;
     const codexAppServerFailureKind = clientClosedPromptError
       ? "client_closed_before_turn_completed"
       : turnCompletionIdleTimedOut
@@ -2391,10 +2445,13 @@ export async function runCodexAppServerAttempt(
       turnId: activeTurnId,
       timedOut,
       yieldDetected,
+      yieldTerminalConfirmed,
+      terminalDynamicToolStopRequested,
+      terminalDynamicToolStopConfirmed,
       promptError: normalizeCodexTrajectoryError(finalPromptError),
     });
     markTrajectoryEndRecorded();
-    await mirrorTranscriptBestEffort({
+    const canonicalAssistantTranscript = await mirrorTranscriptBestEffort({
       params,
       agentId: sessionAgentId,
       notifyUserMessagePersisted,
@@ -2484,7 +2541,6 @@ export async function runCodexAppServerAttempt(
       ctx: hookContext,
       hookRunner,
     });
-    const completedTurnStatus = activeProjector.getCompletedTurnStatus();
     shouldDelayNativeHookRelayUnregister =
       completedTurnStatus === "completed" &&
       !timedOut &&
@@ -2502,6 +2558,7 @@ export async function runCodexAppServerAttempt(
     }
     return {
       ...result,
+      ...(canonicalAssistantTranscript ? { canonicalAssistantTranscript } : {}),
       timedOut,
       aborted: finalAborted,
       promptError: finalPromptError,

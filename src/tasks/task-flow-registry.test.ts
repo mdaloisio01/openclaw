@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveMissionSettlementTail } from "../agents/mission-settlement-tail.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -13,6 +14,7 @@ import {
   failFlow,
   finishFlow,
   getTaskFlowById,
+  getTaskFlowActiveProductionContinuation,
   getTaskFlowMissionSettlement,
   getTaskFlowProductionContinuation,
   listTaskFlowRecords,
@@ -787,7 +789,7 @@ describe("task-flow-registry", () => {
         currentStep: "attempted_close",
       });
 
-      expect(closed.applied).toBe(false);
+      assert(!closed.applied);
       expect(closed.reason).toBe("guard_blocked");
       expect(closed.blockedSummary).toContain("Mission settlement tail is not settled");
       expect(closed.blockedSummary).toContain("DELIVERY_UNKNOWN");
@@ -851,7 +853,7 @@ describe("task-flow-registry", () => {
         reason: "whole_run_complete",
       });
 
-      expect(stopped.applied).toBe(false);
+      assert(!stopped.applied);
       expect(stopped.reason).toBe("guard_blocked");
       expect(stopped.blockedSummary).toContain("Mission settlement tail is not settled");
       expect(stopped.blockedSummary).toContain("DELIVERY_FAILED");
@@ -927,6 +929,61 @@ describe("task-flow-registry", () => {
         throw new Error("Expected managed flow close after next launch");
       }
       expect(closed.flow.status).toBe("succeeded");
+    });
+  });
+
+  it("projects the new pending action without reusing the previous execution receipt", async () => {
+    await withFlowRegistryTempDir(async () => {
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/managed-controller",
+        goal: "Run bounded production controller",
+        status: "running",
+        continuation: { activeProductionRun: true, parentRunOpen: true },
+      });
+      const launched = recordFlowNextExecutableLaunch({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        detail: "run:inspection-1:tool:start:read-1",
+        updatedAt: 200,
+      });
+      assert(launched.applied);
+      const continuation = getTaskFlowProductionContinuation(launched.flow);
+      assert(continuation);
+      const launchedState = launched.flow.stateJson;
+      assert(launchedState && typeof launchedState === "object" && !Array.isArray(launchedState));
+      const checkpoint = resumeFlow({
+        flowId: launched.flow.flowId,
+        expectedRevision: launched.flow.revision,
+        currentStep: "inspection_report_delivered",
+        stateJson: {
+          ...launchedState,
+          productionContinuation: {
+            ...continuation,
+            nextExecutableUnitLaunched: false,
+            events: [
+              ...continuation.events,
+              { type: "NEXT_EXECUTABLE_UNIT_IDENTIFIED", at: 300, detail: "Run next validation" },
+            ],
+          },
+        },
+      });
+      assert(checkpoint.applied);
+      const readback = getTaskFlowById(created.flowId);
+      assert(readback);
+      expect(getTaskFlowActiveProductionContinuation(readback)).toMatchObject({
+        status: "dispatch_required",
+        nextAction: { summary: "Run next validation" },
+        dispatchReceipts: [],
+      });
+      expect(
+        getTaskFlowActiveProductionContinuation(readback)?.nextAction?.dispatchProofRef,
+      ).toBeUndefined();
+      expect(getTaskFlowProductionContinuation(readback)?.events).toContainEqual({
+        type: "NEXT_EXECUTABLE_UNIT_LAUNCHED",
+        at: 200,
+        detail: "run:inspection-1:tool:start:read-1",
+      });
     });
   });
 

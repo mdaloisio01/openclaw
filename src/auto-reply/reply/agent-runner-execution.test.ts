@@ -2319,6 +2319,7 @@ describe("runAgentTurnWithFallback", () => {
     });
 
     const onToolStart = vi.fn<NonNullable<GetReplyOptions["onToolStart"]>>(async () => undefined);
+    const onExecutionProgress = vi.fn();
     const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
     const followupRun = createFollowupRun();
     followupRun.run.provider = "claude-cli";
@@ -2328,7 +2329,7 @@ describe("runAgentTurnWithFallback", () => {
       commandBody: "hi",
       followupRun,
       sessionCtx: { Provider: "telegram", MessageSid: "msg" } as unknown as TemplateContext,
-      opts: { onToolStart },
+      opts: { onToolStart, onExecutionProgress },
       typingSignals: createMockTypingSignaler(),
       blockReplyPipeline: null,
       blockStreamingEnabled: false,
@@ -2352,6 +2353,14 @@ describe("runAgentTurnWithFallback", () => {
     expect(call?.name).toBe("Bash");
     expect(call?.phase).toBe("start");
     expect(call?.args).toEqual({ command: "ls -la" });
+    expect(onExecutionProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "tool",
+        phase: "start",
+        toolCallId: "toolu_01ABCD",
+        name: "Bash",
+      }),
+    );
   });
 
   it("does not bridge CLI tool deltas when silentExpected is set", async () => {
@@ -2380,6 +2389,7 @@ describe("runAgentTurnWithFallback", () => {
     });
 
     const onToolStart = vi.fn<NonNullable<GetReplyOptions["onToolStart"]>>(async () => undefined);
+    const onExecutionProgress = vi.fn();
     const runAgentTurnWithFallback = await getRunAgentTurnWithFallback();
     const followupRun = createFollowupRun();
     followupRun.run.provider = "claude-cli";
@@ -2390,7 +2400,7 @@ describe("runAgentTurnWithFallback", () => {
       commandBody: "hi",
       followupRun,
       sessionCtx: { Provider: "telegram", MessageSid: "msg" } as unknown as TemplateContext,
-      opts: { onToolStart },
+      opts: { onToolStart, onExecutionProgress },
       typingSignals: createMockTypingSignaler(),
       blockReplyPipeline: null,
       blockStreamingEnabled: false,
@@ -2410,6 +2420,9 @@ describe("runAgentTurnWithFallback", () => {
     });
 
     expect(onToolStart).not.toHaveBeenCalled();
+    expect(onExecutionProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ source: "tool", toolCallId: "toolu_silent", phase: "start" }),
+    );
   });
 
   it("does not bridge CLI assistant deltas when silentExpected is set (#76869)", async () => {
@@ -4049,6 +4062,7 @@ describe("runAgentTurnWithFallback", () => {
       await itemEventGate;
     });
     const onCommandOutput = vi.fn();
+    const onExecutionProgress = vi.fn();
     state.runEmbeddedAgentMock.mockImplementationOnce(async (params: EmbeddedAgentParams) => {
       await params.onAgentEvent?.({
         stream: "tool",
@@ -4106,6 +4120,7 @@ describe("runAgentTurnWithFallback", () => {
       opts: {
         onItemEvent,
         onCommandOutput,
+        onExecutionProgress,
       } satisfies GetReplyOptions,
       typingSignals: createMockTypingSignaler(),
       blockReplyPipeline: null,
@@ -4130,6 +4145,14 @@ describe("runAgentTurnWithFallback", () => {
       }),
     );
     expect(onCommandOutput).not.toHaveBeenCalled();
+    expect(onExecutionProgress).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "command_output",
+        phase: "end",
+        toolCallId: "exec-1",
+        name: "exec",
+      }),
+    );
   });
 
   it("keeps progress callbacks active after message-tool-only reads", async () => {

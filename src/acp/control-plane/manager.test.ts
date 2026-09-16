@@ -6,6 +6,7 @@ import {
   requireTaskByRunId,
   withAcpManagerTaskStateDir,
 } from "../../../test/helpers/acp-manager-task-state.js";
+import type { SessionAcpMeta } from "../../config/sessions/types.js";
 import { isAcpTurnActive } from "./active-turns.js";
 import {
   AcpRuntimeError,
@@ -24,7 +25,6 @@ import {
   readySessionMeta,
   type OpenClawConfig,
   resetAcpSessionManagerForTests,
-  type SessionAcpMeta,
 } from "./manager.test-helpers.js";
 
 describe("AcpSessionManager", () => {
@@ -1163,7 +1163,7 @@ describe("AcpSessionManager", () => {
         return null;
       }
       if (next) {
-        entry.acp = next;
+        entry.acp = next as typeof entry.acp;
       }
       return entry;
     });
@@ -1290,7 +1290,7 @@ describe("AcpSessionManager", () => {
         return null;
       }
       if (next) {
-        entry.acp = next;
+        entry.acp = next as typeof entry.acp;
       }
       return entry;
     });

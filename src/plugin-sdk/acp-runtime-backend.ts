@@ -71,6 +71,7 @@ export async function tryDispatchAcpReplyHook(
     ctx: event.ctx,
     cfg: ctx.cfg,
     dispatcher: ctx.dispatcher,
+    deliverFinalBatch: ctx.deliverFinalBatch,
     runId: event.runId,
     sessionKey: event.sessionKey,
     images: event.images,

@@ -18,7 +18,10 @@ import {
 } from "../../infra/system-events.js";
 
 function selectGenericSystemEvents(events: readonly SystemEvent[]): SystemEvent[] {
-  return events.filter((event) => !isExecCompletionEvent(event.text));
+  return events.filter(
+    (event) =>
+      !event.parentYieldWait && !event.activationContinuation && !isExecCompletionEvent(event.text),
+  );
 }
 
 function compactSystemEvent(line: string): string | null {
@@ -95,8 +98,8 @@ export async function drainFormattedSystemEvents(params: {
 }): Promise<string | undefined> {
   const summaryLines: string[] = [];
   const systemLines: string[] = [];
-  // Exec completions have a dedicated heartbeat prompt; leave those entries queued
-  // so the heartbeat path can consume and deliver them.
+  // Required continuations belong to the heartbeat delivery owner. Draining
+  // them here would discard the exact report or parent-wait receipt correlation.
   const queued = consumeSelectedSystemEventEntries(
     params.sessionKey,
     selectGenericSystemEvents(peekSystemEventEntries(params.sessionKey)),

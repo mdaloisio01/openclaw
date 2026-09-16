@@ -14,6 +14,7 @@ import { resolveProductionWatchdogLifecycleDecision } from "./active-production-
 import {
   ensureForegroundCleanupCrewTaskFlow,
   isForegroundCleanupCrewProductionMission,
+  recordForegroundCleanupCrewExecutionStarted,
   supersedeForegroundCleanupCrewExecutor,
 } from "./foreground-cleanup-crew-taskflow.js";
 import { linkTaskToFlowById, listTasksForFlowId } from "./runtime-internal.js";
@@ -180,6 +181,88 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     ).toBe(false);
   });
 
+  it.each([
+    "Give me a Cleanup Crew production report only.",
+    "Give me the current Cleanup Crew production report only.",
+    "Cleanup Crew production build: only draft a prompt for the repair.",
+    "Cleanup Crew production repair: do not do any work, just answer.",
+    "Pause Cleanup Crew. Proceed with the Cleanup Crew status report only.",
+    "Stop. Start the Cleanup Crew report only.",
+    "Proceed with the Cleanup Crew production status report only because I don't authorize changes.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and execute the changes myself.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Please proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Please, proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Pause the Cleanup Crew production repair.",
+    "Cleanup Crew production repair: please pause here.",
+    "Cleanup Crew production repair: status only; do not continue.",
+    "Cleanup Crew production repair: status only and do not continue.",
+    "Cleanup Crew production repair: do not continue all work.",
+    "Cleanup Crew production repair: do not execute work.",
+    "Cleanup Crew production repair: no execution of all work.",
+    "Cleanup Crew production repair: no execution of production work.",
+    "Cleanup Crew production repair: do not continue any work.",
+    "Cleanup Crew production repair: do not execute any work.",
+    "Cleanup Crew production repair: no execution of any work.",
+    "Give me a Cleanup Crew status update and do not continue.",
+    "Draft a plan. Run Cleanup Crew. Mention blockers and then pause now.",
+    "Stop.",
+    "Don't run.",
+    "Do not resume.",
+    "Do not start.",
+    "Do not proceed.",
+    "Stop the execution.",
+    "Do not do any work on this production build.",
+    "Cleanup Crew production repair: do not continue, please.",
+    "Cleanup Crew production repair: stop for the moment, please.",
+    "Stop working on the Cleanup Crew production repair.",
+    "Stop all work on the Cleanup Crew production repair.",
+    "Cleanup Crew production repair: stop all work.",
+    "Do not proceed with work on the Cleanup Crew mission.",
+    "Do not run the Cleanup Crew production build.",
+    "Do not continue with the Cleanup Crew build, please.",
+    "Do not continue with the Cleanup Crew build because I only want a status update.",
+    "Do not continue with the Cleanup Crew build for now.",
+    "Do not continue with the Cleanup Crew build, please, for now, because I only want status.",
+    "No execution of this Cleanup Crew production mission.",
+    "Give me an optimized research prompt to have Cleanup Crew review the system and research common issues and fixes.",
+    "Okay, make up a full production SOP build plan for Cleanup Crew.",
+  ])("does not register work from the current no-execution instruction: %s", (input) => {
+    expect(isForegroundCleanupCrewProductionMission(input)).toBe(false);
+  });
+
+  it.each([
+    "Cleanup Crew production repair: fix the planning-only closeout regression.",
+    "Cleanup Crew production build: repair prompt-only handling and run its tests.",
+    "Cleanup Crew production repair: fix pause/resume handling and run its tests.",
+    "Cleanup Crew production repair: fix the paused task recovery.",
+    "Cleanup Crew production repair: test no execution handling and run its tests.",
+    "Cleanup Crew production repair: fix status-only/report-only classification.",
+    "Cleanup Crew production repair: fix the 'status only and do not continue' regression and run its tests.",
+    "Cleanup Crew production repair: fix status only and do not continue classification.",
+    "Cleanup Crew production repair: fix the parser and do not run tests.",
+    "Cleanup Crew production repair: fix the parser and do not run the production build tests.",
+    "Cleanup Crew production repair: fix the parser and do not execute the production build tests.",
+    "Cleanup Crew production repair: fix the parser and do not continue the repair helper.",
+    "Cleanup Crew production repair: stop the repair helper and run the remaining checks.",
+    "Cleanup Crew production repair: do not do any work on the repair helper; run remaining checks.",
+    "Cleanup Crew production repair: fix the parser; no execution of this mission classifier.",
+    "Pause Cleanup Crew. Start the build now.",
+    "Stop. Proceed with the Cleanup Crew repair now.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and then execute the Cleanup Crew repair.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Please proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Please, proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Draft a Cleanup Crew production build plan and then execute it.",
+    "Draft a Cleanup Crew production build plan, but execute it now.",
+    "Draft a production plan for Cleanup Crew and execute it now.",
+    "Draft a production plan to fix Cleanup Crew and execute it now.",
+    "Draft a Cleanup Crew production plan and include rollback steps; then execute it now.",
+    "Give me a Cleanup Crew production build plan. Execute it now.",
+  ])("keeps production work active when it mentions instruction handling: %s", (input) => {
+    expect(isForegroundCleanupCrewProductionMission(input)).toBe(true);
+  });
+
   it("creates an active-production TaskFlow and foreground execution task", () => {
     const intakeStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-foreground-intake-"));
     const result = ensureForegroundCleanupCrewTaskFlow({
@@ -278,10 +361,12 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
         sourceProvider: "openclaw-control-ui",
         taskFlowId: result.flow.flowId,
         taskId: result.taskId,
-        promptPersistedAtMs: 1000,
         missionRegisteredAtMs: 1000,
       },
     ]);
+    expect(
+      listOwnerRequestIntakeRecords({ stateDir: intakeStateDir })[0]?.promptPersistedAtMs,
+    ).toBeUndefined();
     fs.rmSync(intakeStateDir, { recursive: true, force: true });
   });
 
@@ -418,7 +503,7 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     expect(listTasksForFlowId(first.flow.flowId)).toHaveLength(1);
   });
 
-  it("records report-boundary and tool-batch checkpoints with the next executable action", () => {
+  it("identifies checkpoint work without inventing a dispatch receipt", () => {
     const first = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: "webchat:direct:mark",
       currentTurnText: "Cleanup Crew production repair build.",
@@ -458,16 +543,21 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     );
     expect(getTaskFlowProductionContinuation(checkpoint.flow)).toMatchObject({
       nextExecutableUnitIdentified: true,
-      nextExecutableUnitLaunched: true,
+      nextExecutableUnitLaunched: false,
     });
     expect(getTaskFlowActiveProductionContinuation(checkpoint.flow)).toMatchObject({
-      status: "dispatched",
+      status: "dispatch_required",
       boundary: "plan_next_step",
-      lastDispatchReceiptId: expect.stringContaining(":next-executable:dispatch:"),
     });
+    expect(getTaskFlowActiveProductionContinuation(checkpoint.flow)?.dispatchReceipts).toEqual([]);
     expect(
-      getTaskFlowActiveProductionContinuation(checkpoint.flow)?.dispatchReceipts[0]?.proofRef,
-    ).toBe("write design lock and patch the selected source owner");
+      recordForegroundCleanupCrewExecutionStarted({
+        flowId: checkpoint.flow.flowId,
+        sessionKey: "webchat:direct:other-owner",
+        proofRef: "run:unrelated:tool:start:exec-1",
+        now: 2100,
+      }),
+    ).toBeUndefined();
   });
 
   it("preserves dispatched checkpoint state when a later foreground attach has no tracking", () => {
@@ -496,13 +586,20 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     if (checkpoint.status !== "attached") {
       throw new Error("expected attached result");
     }
-    const activeContinuation = getTaskFlowActiveProductionContinuation(checkpoint.flow);
+    const executed = recordForegroundCleanupCrewExecutionStarted({
+      flowId: checkpoint.flow.flowId,
+      sessionKey: "webchat:direct:mark",
+      proofRef: "run:repair-1:tool:start:exec-1",
+      now: 1600,
+    });
+    expect(executed).toBeDefined();
+    const activeContinuation = executed && getTaskFlowActiveProductionContinuation(executed);
     expect(activeContinuation).toMatchObject({
       status: "dispatched",
       lastDispatchReceiptId: expect.stringContaining(":next-executable:dispatch:"),
     });
     expect(activeContinuation?.dispatchReceipts[0]?.proofRef).toBe(
-      "re-triage the remaining ISSUE-040 family",
+      "run:repair-1:tool:start:exec-1",
     );
 
     const laterAttach = ensureForegroundCleanupCrewTaskFlow({
@@ -526,10 +623,10 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     });
     expect(
       getTaskFlowActiveProductionContinuation(laterAttach.flow)?.dispatchReceipts[0]?.proofRef,
-    ).toBe("re-triage the remaining ISSUE-040 family");
+    ).toBe("run:repair-1:tool:start:exec-1");
   });
 
-  it("settles an obsolete restart boundary when a later checkpoint advances the foreground run", () => {
+  it("retains a restart boundary when checkpoint prose claims runtime proof passed", () => {
     const first = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: "webchat:direct:mark",
       currentTurnText: "Cleanup Crew production repair build.",
@@ -577,24 +674,18 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
       activeProductionRun: true,
       parentRunOpen: true,
       currentUnitStatus: "started",
-      restartOrReloadRequired: false,
+      restartOrReloadRequired: true,
       lawfulWholeRunCompletion: false,
-      nextExecutableUnitIdentified: true,
-      nextExecutableUnitLaunched: true,
+      nextExecutableUnitLaunched: false,
       continuationViolation: false,
     });
-    expect(continuation?.lawfulStopReason).toBeUndefined();
+    expect(continuation?.lawfulStopReason).toBe("restart_or_reload");
     expect(activeContinuation).toMatchObject({
       broaderBuildOpen: true,
-      status: "dispatched",
-      boundary: "plan_next_step",
+      status: "hard_boundary",
+      boundary: "runtime_restart_recovery",
     });
-    expect(activeContinuation?.nextAction?.summary).toContain(
-      "write the active-production continuation settlement package",
-    );
-    expect(activeContinuation?.dispatchReceipts[0]?.proofRef).toBe(
-      "write the active-production continuation settlement package",
-    );
+    expect(activeContinuation?.dispatchReceipts).toEqual([]);
 
     const closeoutCheckpoint = ensureForegroundCleanupCrewTaskFlow({
       sessionKey: "webchat:direct:mark",
@@ -610,13 +701,11 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
     if (closeoutCheckpoint.status !== "attached") {
       throw new Error("expected attached result");
     }
-    expect(
-      getTaskFlowActiveProductionContinuation(closeoutCheckpoint.flow)?.nextAction?.summary,
-    ).toBe("re-triage the remaining ISSUE-040 family");
-    expect(
-      getTaskFlowActiveProductionContinuation(closeoutCheckpoint.flow)?.dispatchReceipts[0]
-        ?.proofRef,
-    ).toBe("re-triage the remaining ISSUE-040 family");
+    expect(getTaskFlowActiveProductionContinuation(closeoutCheckpoint.flow)).toMatchObject({
+      status: "hard_boundary",
+      boundary: "runtime_restart_recovery",
+      dispatchReceipts: [],
+    });
   });
 
   it("preserves restart boundaries when foreground progress lacks an explicit checkpoint", () => {

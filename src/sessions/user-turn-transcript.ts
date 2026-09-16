@@ -138,6 +138,7 @@ type CreateUserTurnTranscriptRecorderParams = {
   beforeMessageWrite?: UserTurnBeforeMessageWrite;
   errorContext?: string;
   onPersistenceError?: (error: unknown) => void;
+  onPersisted?: () => void;
 };
 
 type ResolvePersistedUserTurnTextOptions = {
@@ -489,6 +490,13 @@ export function createUserTurnTranscriptRecorder(
   let runtimePersistencePromise: Promise<void> | undefined;
   let selfPersistencePromise: Promise<UserTurnTranscriptPersistResult | undefined> | undefined;
   let resolvedMessagePromise: Promise<PersistedUserTurnMessage | undefined> | undefined;
+  let persistenceNotified = false;
+  const notifyPersisted = () => {
+    if (!persistenceNotified) {
+      params.onPersisted?.();
+      persistenceNotified = true;
+    }
+  };
 
   const handlePersistenceError = (error: unknown) => {
     if (params.onPersistenceError) {
@@ -598,6 +606,7 @@ export function createUserTurnTranscriptRecorder(
       if (result) {
         persisted = true;
         persistedResult = result;
+        notifyPersisted();
       }
       return result;
     })();
@@ -623,6 +632,9 @@ export function createUserTurnTranscriptRecorder(
           message: persistedMessage,
         };
       }
+      // Runtime persistence does not produce this recorder's append result.
+      // Notify intake at the durable event so every runtime shares the same contract.
+      notifyPersisted();
     },
     markBlocked: () => {
       blocked = true;

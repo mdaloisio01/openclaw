@@ -5,6 +5,11 @@ import { createChatRunState } from "./server-chat-state.js";
 import { DEDUPE_MAX, DEDUPE_TTL_MS } from "./server-constants.js";
 
 const cleanOldMediaMock = vi.fn(async () => {});
+const cleanupManagedOutgoingImageRecordsMock = vi.fn(async () => ({
+  deletedRecordCount: 0,
+  deletedFileCount: 0,
+  retainedCount: 0,
+}));
 
 vi.mock("../media/store.js", async () => {
   const actual = await vi.importActual<typeof import("../media/store.js")>("../media/store.js");
@@ -13,6 +18,10 @@ vi.mock("../media/store.js", async () => {
     cleanOldMedia: cleanOldMediaMock,
   };
 });
+
+vi.mock("./managed-image-attachments.js", () => ({
+  cleanupManagedOutgoingImageRecords: cleanupManagedOutgoingImageRecordsMock,
+}));
 
 const MEDIA_CLEANUP_TTL_MS = 24 * 60 * 60_000;
 const ABORTED_RUN_TTL_MS = 60 * 60_000;
@@ -132,7 +141,7 @@ describe("startGatewayMaintenanceTimers", () => {
     vi.clearAllMocks();
   });
 
-  it("does not schedule recursive media cleanup unless ttl is configured", async () => {
+  it("always schedules ownership-aware outgoing cleanup without enabling generic TTL cleanup", async () => {
     vi.useFakeTimers();
     const { startGatewayMaintenanceTimers } = await import("./server-maintenance.js");
 
@@ -141,7 +150,8 @@ describe("startGatewayMaintenanceTimers", () => {
     });
 
     expect(cleanOldMediaMock).not.toHaveBeenCalled();
-    expect(timers.mediaCleanup).toBeNull();
+    expect(cleanupManagedOutgoingImageRecordsMock).toHaveBeenCalledOnce();
+    expect(timers.mediaCleanup).not.toBeNull();
 
     stopMaintenanceTimers(timers);
   });
@@ -154,18 +164,22 @@ describe("startGatewayMaintenanceTimers", () => {
       ...createMaintenanceTimerDeps(),
       mediaCleanupTtlMs: MEDIA_CLEANUP_TTL_MS,
     });
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(cleanOldMediaMock).toHaveBeenCalledWith(MEDIA_CLEANUP_TTL_MS, {
       recursive: true,
       pruneEmptyDirs: true,
     });
+    expect(cleanupManagedOutgoingImageRecordsMock).toHaveBeenCalledOnce();
 
     cleanOldMediaMock.mockClear();
+    cleanupManagedOutgoingImageRecordsMock.mockClear();
     await vi.advanceTimersByTimeAsync(60 * 60_000);
     expect(cleanOldMediaMock).toHaveBeenCalledWith(MEDIA_CLEANUP_TTL_MS, {
       recursive: true,
       pruneEmptyDirs: true,
     });
+    expect(cleanupManagedOutgoingImageRecordsMock).toHaveBeenCalledOnce();
 
     stopMaintenanceTimers(timers);
   });

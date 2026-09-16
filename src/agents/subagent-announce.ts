@@ -646,7 +646,14 @@ async function wakeSubagentRunAfterDescendants(params: {
   });
 
   let wakeRunId;
+  const {
+    assertParentYieldWaitAllowsRestart,
+    getLatestSubagentRunByChildSessionKey,
+    replaceSubagentRunAfterSteer,
+  } = await loadSubagentRegistryRuntime();
+  const priorRun = getLatestSubagentRunByChildSessionKey(params.childSessionKey);
   try {
+    await assertParentYieldWaitAllowsRestart(params.runId);
     const wakeResponse = await runAnnounceDeliveryWithRetry<{ runId?: string }>({
       operation: "descendant wake agent call",
       signal: params.signal,
@@ -679,10 +686,10 @@ async function wakeSubagentRunAfterDescendants(params: {
     return false;
   }
 
-  const { replaceSubagentRunAfterSteer } = await loadSubagentRegistryRuntime();
   return replaceSubagentRunAfterSteer({
     previousRunId: params.runId,
     nextRunId: wakeRunId,
+    fallback: priorRun?.runId === params.runId ? priorRun : undefined,
     preserveFrozenResultFallback: true,
   });
 }

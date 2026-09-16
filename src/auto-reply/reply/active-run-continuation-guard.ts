@@ -9,6 +9,7 @@ import type {
   ContinuityGateIssue,
 } from "../../continuity/continuity-gate-v2.js";
 import { createCleanupCrewBootstrapB0TypedDecisionReceipt } from "../../continuity/continuity-gate-v2.js";
+import { classifyCurrentInboundInstruction } from "../../governance/current-inbound-instruction.js";
 import { evaluateFalseCloseoutAdmission } from "../../governance/false-closeout-admission-controller.js";
 import { writeFalseCloseoutAdmissionDecisionReceipt } from "../../governance/false-closeout-runtime-evidence.js";
 import {
@@ -121,45 +122,6 @@ function includesAny(text: string, values: string[]): boolean {
 
 function isCleanupCrewText(text: string): boolean {
   return includesAny(text, ["cleanup crew", "cleanup-crew"]);
-}
-
-function isExplicitReportOnlyRequest(text: string): boolean {
-  return includesAny(text, [
-    "report only",
-    "report-only",
-    "status update only",
-    "status only",
-    "status-only",
-    "only report",
-    "just report",
-    "no execution",
-    "don't continue",
-    "do not continue",
-  ]);
-}
-
-function isExplicitStopRequest(text: string): boolean {
-  return includesAny(text, [
-    "pause",
-    "explicitly stop",
-    "stop after this",
-    "stop now",
-    "pause after this",
-    "do nothing else",
-    "dont do any work",
-    "don't do any work",
-    "do not do any work",
-    "just answer",
-    "don't do anything else",
-    "do not do anything else",
-    "do not continue",
-    "don't continue",
-  ]);
-}
-
-function isExplicitOperatorPauseHoldRequest(text: string | undefined): boolean {
-  const normalized = normalizeText(text);
-  return isExplicitReportOnlyRequest(normalized) || isExplicitStopRequest(normalized);
 }
 
 function isMilestoneVisibilityReport(text: string): boolean {
@@ -338,10 +300,13 @@ export function resolveCleanupCrewFinalResponseGate(params: {
   const currentTurnText = normalizeText(params.currentTurnText);
   const responseText = normalizeText(params.responseText);
   const combinedText = `${currentTurnText}\n${responseText}`;
+  const instruction = classifyCurrentInboundInstruction(params.currentTurnText);
   const activeCleanupCrewMission =
-    params.activeCleanupCrewMission === true || isCleanupCrewText(combinedText);
-  const explicitReportOnlyRequest = isExplicitReportOnlyRequest(currentTurnText);
-  const explicitStopRequest = isExplicitStopRequest(currentTurnText);
+    instruction !== "planning_only" &&
+    (params.activeCleanupCrewMission === true || isCleanupCrewText(combinedText));
+  const explicitReportOnlyRequest =
+    instruction === "planning_only" || instruction === "report_only";
+  const explicitStopRequest = instruction === "no_work";
   const milestoneVisibilityReport = isMilestoneVisibilityReport(responseText);
   const terminalAttempt = isTerminalAttemptText(responseText);
   const fullBuildCompleteReport = reportNamesFullBuildComplete(responseText);
@@ -600,7 +565,10 @@ function emitBlockedCloseout(state: GuardState): void {
 }
 
 function applyOperatorPauseHold(state: GuardState, currentTurnText: string | undefined): void {
-  if (!isExplicitOperatorPauseHoldRequest(currentTurnText) || state.operatorPauseHold) {
+  if (
+    classifyCurrentInboundInstruction(currentTurnText) === "unrestricted" ||
+    state.operatorPauseHold
+  ) {
     return;
   }
   state.operatorPauseHold = true;
@@ -766,6 +734,14 @@ export function installActiveRunContinuationGuard(
   guardStateByDispatcher.set(dispatcher, state);
 }
 
+export function beginActiveRunContinuationGuard(dispatcher: ReplyDispatcher): void {
+  // A dispatcher can be reused across inbound turns. Its prior mission/pause
+  // evidence must not decide whether a new, unrelated turn can answer.
+  guardStateByDispatcher.delete(dispatcher);
+  installActiveRunContinuationGuard(dispatcher);
+  recordActiveRunStarted(dispatcher);
+}
+
 export function recordActiveRunStarted(dispatcher: ReplyDispatcher): void {
   const state = guardStateByDispatcher.get(dispatcher);
   if (!state || state.activeRunStarted) {
@@ -863,7 +839,12 @@ export function allowTerminalCloseout(
       (payload ? getReplyPayloadMetadata(payload)?.falseCloseoutAdmission : undefined) ??
       buildRuntimeCloseoutAdmissionInput({
         activeCleanupCrewMission: cleanupCrewDecision.activeCleanupCrewMission,
-        terminalAttempt: cleanupCrewDecision.terminalAttempt,
+        // Ending an explicitly requested report/hold is not a mission COMPLETE
+        // transition. Explicit typed completion evidence above still applies.
+        terminalAttempt:
+          cleanupCrewDecision.terminalAttempt &&
+          !cleanupCrewDecision.explicitReportOnlyRequest &&
+          !cleanupCrewDecision.explicitStopRequest,
         currentTurnText: state.cleanupCrewFinalResponse?.currentTurnText,
         responseText: payload?.text,
         mode: state.cleanupCrewFinalResponse?.falseCloseoutAdmissionMode,

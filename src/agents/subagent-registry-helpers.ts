@@ -13,7 +13,11 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { defaultRuntime } from "../runtime.js";
 import { withSubagentOutcomeTiming } from "./subagent-announce-output.js";
-import { getDeliveryAttemptCount, getDeliveryLastError } from "./subagent-delivery-state.js";
+import {
+  getDeliveryAttemptCount,
+  getDeliveryLastError,
+  shouldRetainParentYieldCloseout,
+} from "./subagent-delivery-state.js";
 import { SUBAGENT_ENDED_REASON_ERROR } from "./subagent-lifecycle-events.js";
 import { shouldUpdateRunOutcome } from "./subagent-registry-completion.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
@@ -155,6 +159,11 @@ export function resolveSubagentRunOrphanReason(params: {
   includeStaleUnended?: boolean;
   now?: number;
 }): SubagentRunOrphanReason | null {
+  // A terminal child's canonical result still belongs to its open parent wait,
+  // even if session cleanup already removed the transcript before a restart.
+  if (typeof params.entry.endedAt === "number" && shouldRetainParentYieldCloseout(params.entry)) {
+    return null;
+  }
   const childSessionKey = params.entry.childSessionKey?.trim();
   if (!childSessionKey) {
     return "missing-session-entry";
@@ -273,6 +282,9 @@ export function reconcileOrphanedRun(params: {
   runs: Map<string, SubagentRunRecord>;
   resumedRuns: Set<string>;
 }) {
+  if (typeof params.entry.endedAt === "number" && shouldRetainParentYieldCloseout(params.entry)) {
+    return false;
+  }
   const now = Date.now();
   let changed = false;
   if (typeof params.entry.endedAt !== "number") {
@@ -304,6 +316,13 @@ export function reconcileOrphanedRun(params: {
   if (typeof params.entry.cleanupCompletedAt !== "number") {
     params.entry.cleanupCompletedAt = now;
     changed = true;
+  }
+  if (shouldRetainParentYieldCloseout(params.entry)) {
+    // Keep the actual orphan failure available to fan-in and the parent closeout;
+    // pruning it here would leave an expected child permanently missing.
+    delete params.entry.pauseReason;
+    params.resumedRuns.delete(params.runId);
+    return changed;
   }
   const shouldDeleteAttachments =
     params.entry.cleanup === "delete" || !params.entry.retainAttachmentsOnKeep;

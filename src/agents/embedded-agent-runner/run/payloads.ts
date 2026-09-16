@@ -235,6 +235,7 @@ function resolveToolErrorWarningPolicy(params: {
 
 export function buildEmbeddedRunPayloads(params: {
   assistantTexts: string[];
+  canonicalAssistantTranscript?: ReplyPayloadMetadata["canonicalAssistantTranscript"];
   toolMetas: ToolMetaEntry[];
   lastAssistant: AssistantMessage | undefined;
   currentAssistant?: AssistantMessage | null;
@@ -278,6 +279,7 @@ export function buildEmbeddedRunPayloads(params: {
     interactive?: ReplyPayload["interactive"];
     channelData?: Record<string, unknown>;
     nonTerminalToolErrorWarning?: boolean;
+    canonicalAssistantTranscript?: ReplyPayloadMetadata["canonicalAssistantTranscript"];
     sourceReplyMirror?: {
       idempotencyKey?: string;
     };
@@ -526,6 +528,14 @@ export function buildEmbeddedRunPayloads(params: {
       replyToId,
       replyToTag,
       replyToCurrent,
+      // Identity comes from this attempt's persisted message, never a text search.
+      // Directives or media transforms invalidate a plain-text publication reference.
+      ...(!lastAssistantNeedsErrorSurface &&
+      cleanedText === params.canonicalAssistantTranscript?.text &&
+      !mediaUrls?.length &&
+      !audioAsVoice
+        ? { canonicalAssistantTranscript: params.canonicalAssistantTranscript }
+        : {}),
     });
     hasUserFacingAssistantReply = true;
     if (cleanedText && hasExplicitMutatingToolFailureAcknowledgement(cleanedText)) {
@@ -596,6 +606,14 @@ export function buildEmbeddedRunPayloads(params: {
       }
       if (item.isError !== undefined) {
         payload.isError = item.isError;
+      }
+      if (
+        item.canonicalAssistantTranscript &&
+        payload.text === item.canonicalAssistantTranscript.text
+      ) {
+        setReplyPayloadMetadata(payload, {
+          canonicalAssistantTranscript: item.canonicalAssistantTranscript,
+        });
       }
       if (item.nonTerminalToolErrorWarning) {
         setReplyPayloadMetadata(payload, {

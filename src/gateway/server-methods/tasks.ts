@@ -9,6 +9,7 @@ import {
   validateTasksGetParams,
   validateTasksListParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { waitForAgentRun } from "../../agents/run-wait.js";
 import {
   createActiveProductionDispatchReceipt,
   evaluateActiveProductionFinality,
@@ -20,12 +21,22 @@ import {
   ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME,
   reconcileProductionWatchdogCron,
 } from "../../tasks/active-production-watchdog-lifecycle.js";
+import { handleBuildIssueAction } from "../../tasks/build-issue-controller.js";
 import { cancelDetachedTaskRunById } from "../../tasks/detached-task-runtime.js";
+import {
+  parseProductionExecutorAssignmentAuthority,
+  recordProductionExecutorAssignment,
+} from "../../tasks/production-executor-assignment.js";
 import {
   evaluateProductionOwnerLaneGuard,
   type ProductionOwnerLaneOverride,
 } from "../../tasks/production-owner-lane-guard.js";
-import { getTaskById, listTaskRecords, listTasksForFlowId } from "../../tasks/runtime-internal.js";
+import {
+  deleteTaskRecordById,
+  getTaskById,
+  listTaskRecords,
+  listTasksForFlowId,
+} from "../../tasks/runtime-internal.js";
 import {
   completeTaskRunByRunId,
   failTaskRunByRunId,
@@ -57,6 +68,7 @@ import {
   formatTaskStatusTitle,
   sanitizeTaskStatusText,
 } from "../../tasks/task-status.js";
+import { invokeGatewayTool } from "../tools-invoke-shared.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 
 const DEFAULT_TASKS_LIST_LIMIT = 100;
@@ -477,6 +489,38 @@ function parseCursor(cursor: string | undefined): number | null {
 // Control UI task methods expose the stable gateway protocol shape; helpers
 // above keep runtime registry details out of the wire result.
 export const tasksHandlers: GatewayRequestHandlers = {
+  "tasks.handleBuildIssue": async ({ params, respond, context }) => {
+    const cfg = context.getRuntimeConfig();
+    try {
+      const receipt = await handleBuildIssueAction({
+        input: params,
+        dispatch: (request) =>
+          invokeGatewayTool({
+            cfg,
+            input: {
+              name: "sessions_send",
+              sessionKey: request.ownerKey,
+              idempotencyKey: request.actionId,
+              args: {
+                sessionKey: request.sessionKey,
+                message: request.message,
+                timeoutSeconds: 30,
+              },
+            },
+            toolCallIdPrefix: "build-issue",
+            approvalMode: "report",
+            // This authenticated TaskFlow action uses the same runtime policy
+            // as native MCP. Generic tools.invoke keeps its HTTP-only denies.
+            toolPolicySurface: "loopback",
+          }),
+        waitForRun: (runId) => waitForAgentRun({ runId, timeoutMs: 1_000 }),
+      });
+      respond(true, { receipt });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "build_issue_action_failed";
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, message));
+    }
+  },
   "tasks.list": ({ params, respond }) => {
     if (!validateTasksListParams(params)) {
       respond(
@@ -863,6 +907,22 @@ export const tasksHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    const assignmentAuthority = parseProductionExecutorAssignmentAuthority({
+      role: fields.executorRole,
+      permitted: input.permitted,
+      prohibited: input.prohibited,
+    });
+    if (!assignmentAuthority.ok) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "child_task_assignment_invalid: executorRole, permitted, and prohibited must define a valid executor assignment",
+        ),
+      );
+      return;
+    }
     const child = runTaskInFlowForOwner({
       callerOwnerKey: flow.ownerKey,
       flowId: flow.flowId,
@@ -892,7 +952,36 @@ export const tasksHandlers: GatewayRequestHandlers = {
     }
     const backingSession = validateProductionChildBackingSession(child.task);
     if (!backingSession.ok) {
+      deleteTaskRecordById(child.task.taskId);
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, backingSession.message));
+      return;
+    }
+    // Child assignment is the authority boundary. Commit it to flow state before
+    // returning execution proof so later routing never trusts request assertions.
+    const assignment = recordProductionExecutorAssignment({
+      flowId: flow.flowId,
+      taskId: child.task.taskId,
+      expectedRunId: runId,
+      executorId: fields.attemptedExecutor,
+      ownerLane: fields.attemptedOwnerLane,
+      role: assignmentAuthority.role,
+      permitted: assignmentAuthority.permitted,
+      prohibited: assignmentAuthority.prohibited,
+      evidenceRefs: [fields.workPacketRef, fields.handoffRef],
+      assignedAt: now,
+    });
+    if (!assignment.applied) {
+      // Registration is not complete without its authority record. Remove the
+      // exact child so a retry cannot leave or duplicate unassigned execution.
+      const compensated = deleteTaskRecordById(child.task.taskId);
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.UNAVAILABLE,
+          `child_task_assignment_persist_failed: ${assignment.reason}${compensated ? "" : "; child_task_compensation_failed"}`,
+        ),
+      );
       return;
     }
     const proof = buildChildExecutionProof({
@@ -913,7 +1002,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
       deliveryStatus: child.task.deliveryStatus,
     });
     respond(true, {
-      flow: getTaskFlowById(flow.flowId) ?? child.flow,
+      flow: assignment.flow,
       task: mapTaskSummary(child.task),
       executorIdentityProof: proof,
     });

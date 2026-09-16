@@ -9,6 +9,76 @@ import {
   expectSingleToolErrorPayload,
 } from "./payloads.test-helpers.js";
 
+describe("buildEmbeddedRunPayloads canonical transcript reference", () => {
+  const canonicalAssistantTranscript = {
+    sessionId: "session-1",
+    sessionFile: "/tmp/session-1.jsonl",
+    messageId: "native-message-2",
+    idempotencyKey: "codex-app-server:thread-1:turn-2:assistant",
+    text: "Current answer.",
+  };
+
+  it("carries the current attempt's exact reference only on its unchanged final payload", () => {
+    const payloads = buildPayloads({
+      assistantTexts: ["Current answer."],
+      canonicalAssistantTranscript,
+    });
+
+    expectSinglePayloadText(payloads, "Current answer.");
+    expect(getReplyPayloadMetadata(payloads[0] as object)?.canonicalAssistantTranscript).toEqual(
+      canonicalAssistantTranscript,
+    );
+    expect(
+      getReplyPayloadMetadata(buildPayloads({ assistantTexts: ["Current answer."] })[0] as object)
+        ?.canonicalAssistantTranscript,
+    ).toBeUndefined();
+  });
+
+  it.each([
+    { label: "different body", text: "Changed answer.", saved: "Current answer." },
+    { label: "trimmed body", text: " Current answer. ", saved: " Current answer. " },
+    {
+      label: "reply directive",
+      text: "[[reply_to_current]] Current answer.",
+      saved: "[[reply_to_current]] Current answer.",
+    },
+    {
+      label: "media directive",
+      text: "Current answer.\nMEDIA:/tmp/reply.png",
+      saved: "Current answer.\nMEDIA:/tmp/reply.png",
+    },
+  ])("drops the reference after a $label transform", ({ text, saved }) => {
+    const payloads = buildPayloads({
+      assistantTexts: [text],
+      canonicalAssistantTranscript: { ...canonicalAssistantTranscript, text: saved },
+    });
+
+    expect(payloads).toHaveLength(1);
+    expect(
+      getReplyPayloadMetadata(payloads[0] as object)?.canonicalAssistantTranscript,
+    ).toBeUndefined();
+  });
+
+  it("does not give a same-text message-tool reply the ordinary native final's identity", () => {
+    const payloads = buildPayloads({
+      assistantTexts: ["Current answer."],
+      canonicalAssistantTranscript,
+      didSendViaMessagingTool: true,
+      messagingToolSourceReplyPayloads: [{ text: "Current answer." }],
+      sourceReplyDeliveryMode: "message_tool_only",
+      runId: "run-1",
+    });
+
+    expectSinglePayloadText(payloads, "Current answer.");
+    expect(getReplyPayloadMetadata(payloads[0] as object)).toMatchObject({
+      sourceReplyTranscriptMirror: { idempotencyKey: "run-1:internal-source-reply:0" },
+    });
+    expect(
+      getReplyPayloadMetadata(payloads[0] as object)?.canonicalAssistantTranscript,
+    ).toBeUndefined();
+  });
+});
+
 describe("buildEmbeddedRunPayloads tool-error warnings", () => {
   function makeTaskCompletionEvent(
     overrides: Partial<Extract<AgentInternalEvent, { type: "task_completion" }>>,

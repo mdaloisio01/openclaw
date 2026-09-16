@@ -1,3 +1,4 @@
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -594,7 +595,7 @@ describe("cleanup-watchdog live controller", () => {
       now: 1600,
     });
 
-    expect(result.status).toBe("blocked");
+    assert(result.status === "blocked");
     expect(result.reason).toBe("duplicate_executor_reconciliation_required");
     expect(result.reconciliationArtifact).toMatchObject({
       trigger: "watchdog_needs_review",

@@ -25,6 +25,7 @@ import {
 } from "./subagent-registry-read.js";
 import { getSubagentRunsSnapshotForRead } from "./subagent-registry-state.js";
 import {
+  assertParentYieldWaitAllowsRestart,
   clearSubagentRunSteerRestart,
   countPendingDescendantRuns,
   markSubagentRunTerminated,
@@ -516,102 +517,114 @@ export async function steerControlledSubagentRun(params: {
     steerRateLimit.set(rateKey, now);
   }
 
-  markSubagentRunForSteerRestart(params.entry.runId);
-
-  const targetSession = resolveSessionEntryForKey({
-    cfg: params.cfg,
-    key: params.entry.childSessionKey,
-    cache: new Map<string, Record<string, SessionEntry>>(),
-  });
-  const sessionId =
-    typeof targetSession.entry?.sessionId === "string" && targetSession.entry.sessionId.trim()
-      ? targetSession.entry.sessionId.trim()
-      : undefined;
-  const restartSessionId = sessionId ? crypto.randomUUID() : undefined;
-
-  if (sessionId) {
-    const runtime = await resolveSubagentControlRuntime();
-    runtime.abortEmbeddedAgentRun(sessionId);
-  }
-  const runtime = await resolveSubagentControlRuntime();
-  const cleared = runtime.clearSessionQueues([params.entry.childSessionKey, sessionId]);
-  if (cleared.followupCleared > 0 || cleared.laneCleared > 0) {
-    logVerbose(
-      `subagents control steer: cleared followups=${cleared.followupCleared} lane=${cleared.laneCleared} keys=${cleared.keys.join(",")}`,
-    );
+  if (!markSubagentRunForSteerRestart(params.entry.runId)) {
+    return {
+      status: "error",
+      runId: params.entry.runId,
+      sessionKey: params.entry.childSessionKey,
+      error: "Child restart admission is unavailable or another steer is still in progress.",
+    };
   }
 
   try {
-    await subagentControlDeps.callGateway({
-      method: "agent.wait",
-      params: {
-        runId: params.entry.runId,
-        timeoutMs: STEER_ABORT_SETTLE_TIMEOUT_MS,
-      },
-      timeoutMs: STEER_ABORT_SETTLE_TIMEOUT_MS + 2_000,
+    const targetSession = resolveSessionEntryForKey({
+      cfg: params.cfg,
+      key: params.entry.childSessionKey,
+      cache: new Map<string, Record<string, SessionEntry>>(),
     });
-  } catch {
-    // Continue even if wait fails; steer should still be attempted.
-  }
+    const sessionId =
+      typeof targetSession.entry?.sessionId === "string" && targetSession.entry.sessionId.trim()
+        ? targetSession.entry.sessionId.trim()
+        : undefined;
+    const restartSessionId = sessionId ? crypto.randomUUID() : undefined;
 
-  const idempotencyKey = crypto.randomUUID();
-  let runId: string = idempotencyKey;
-  try {
-    const response = await subagentControlDeps.callGateway<{ runId: string }>({
-      method: "agent",
-      params: {
-        message: params.message,
+    if (sessionId) {
+      const runtime = await resolveSubagentControlRuntime();
+      runtime.abortEmbeddedAgentRun(sessionId);
+    }
+    const runtime = await resolveSubagentControlRuntime();
+    const cleared = runtime.clearSessionQueues([params.entry.childSessionKey, sessionId]);
+    if (cleared.followupCleared > 0 || cleared.laneCleared > 0) {
+      logVerbose(
+        `subagents control steer: cleared followups=${cleared.followupCleared} lane=${cleared.laneCleared} keys=${cleared.keys.join(",")}`,
+      );
+    }
+
+    try {
+      await subagentControlDeps.callGateway({
+        method: "agent.wait",
+        params: {
+          runId: params.entry.runId,
+          timeoutMs: STEER_ABORT_SETTLE_TIMEOUT_MS,
+        },
+        timeoutMs: STEER_ABORT_SETTLE_TIMEOUT_MS + 2_000,
+      });
+    } catch {
+      // Continue even if wait fails; steer should still be attempted.
+    }
+
+    const idempotencyKey = crypto.randomUUID();
+    let runId: string = idempotencyKey;
+    try {
+      await assertParentYieldWaitAllowsRestart(params.entry.runId);
+      const response = await subagentControlDeps.callGateway<{ runId: string }>({
+        method: "agent",
+        params: {
+          message: params.message,
+          sessionKey: params.entry.childSessionKey,
+          sessionId: restartSessionId,
+          idempotencyKey,
+          deliver: false,
+          channel: INTERNAL_MESSAGE_CHANNEL,
+          lane: AGENT_LANE_SUBAGENT,
+          timeout: 0,
+        },
+        timeoutMs: 10_000,
+      });
+      if (typeof response?.runId === "string" && response.runId) {
+        runId = response.runId;
+      }
+    } catch (err) {
+      const error = formatErrorMessage(err);
+      return {
+        status: "error",
+        runId,
         sessionKey: params.entry.childSessionKey,
         sessionId: restartSessionId,
-        idempotencyKey,
-        deliver: false,
-        channel: INTERNAL_MESSAGE_CHANNEL,
-        lane: AGENT_LANE_SUBAGENT,
-        timeout: 0,
-      },
-      timeoutMs: 10_000,
-    });
-    if (typeof response?.runId === "string" && response.runId) {
-      runId = response.runId;
+        error,
+      };
     }
-  } catch (err) {
-    clearSubagentRunSteerRestart(params.entry.runId);
-    const error = formatErrorMessage(err);
+
+    const replaced = await replaceSubagentRunAfterSteer({
+      previousRunId: params.entry.runId,
+      nextRunId: runId,
+      fallback: params.entry,
+      runTimeoutSeconds: params.entry.runTimeoutSeconds ?? 0,
+    });
+    if (!replaced) {
+      return {
+        status: "error",
+        runId,
+        sessionKey: params.entry.childSessionKey,
+        sessionId: restartSessionId,
+        error: "failed to replace steered subagent run",
+      };
+    }
+
     return {
-      status: "error",
+      status: "accepted",
       runId,
       sessionKey: params.entry.childSessionKey,
       sessionId: restartSessionId,
-      error,
+      mode: "restart",
+      label: resolveSubagentLabel(params.entry),
+      text: `steered ${resolveSubagentLabel(params.entry)}.`,
     };
-  }
-
-  const replaced = replaceSubagentRunAfterSteer({
-    previousRunId: params.entry.runId,
-    nextRunId: runId,
-    fallback: params.entry,
-    runTimeoutSeconds: params.entry.runTimeoutSeconds ?? 0,
-  });
-  if (!replaced) {
+  } finally {
+    // Abort, queue cleanup, and Gateway handoff can each fail. Always retire the
+    // caller's steer ownership so its actual terminal outcome can reach the parent.
     clearSubagentRunSteerRestart(params.entry.runId);
-    return {
-      status: "error",
-      runId,
-      sessionKey: params.entry.childSessionKey,
-      sessionId: restartSessionId,
-      error: "failed to replace steered subagent run",
-    };
   }
-
-  return {
-    status: "accepted",
-    runId,
-    sessionKey: params.entry.childSessionKey,
-    sessionId: restartSessionId,
-    mode: "restart",
-    label: resolveSubagentLabel(params.entry),
-    text: `steered ${resolveSubagentLabel(params.entry)}.`,
-  };
 }
 
 export async function sendControlledSubagentMessage(params: {

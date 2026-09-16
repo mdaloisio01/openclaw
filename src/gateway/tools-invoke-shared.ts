@@ -153,6 +153,7 @@ export async function invokeGatewayTool(params: {
   senderIsOwner?: boolean;
   toolCallIdPrefix: string;
   approvalMode?: "request" | "report";
+  toolPolicySurface?: "http" | "loopback";
 }): Promise<ToolsInvokeOutcome> {
   const toolName = normalizeOptionalString(params.input.name ?? params.input.tool) ?? "";
   if (!toolName) {
@@ -203,7 +204,7 @@ export async function invokeGatewayTool(params: {
       senderIsOwner: params.senderIsOwner,
       allowGatewaySubagentBinding: true,
       allowMediaInvokeCommands: true,
-      surface: "http",
+      surface: params.toolPolicySurface ?? "http",
       disablePluginTools,
       gatewayRequestedTools,
     });

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { resolveFailoverReasonFromError } from "../../agents/failover-error.js";
@@ -8,7 +9,7 @@ import type { CronConfig, CronRetryOn } from "../../config/types.cron.js";
 import type { HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
 import {
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
-  isRetryableHeartbeatBusySkipReason,
+  isRetryableHeartbeatSkipReason,
 } from "../../infra/heartbeat-wake.js";
 import {
   DEFAULT_AGENT_ID,
@@ -25,6 +26,7 @@ import {
   normalizeCronRunDiagnostics,
   summarizeCronRunDiagnostics,
 } from "../run-diagnostics.js";
+import { createCronExecutionId } from "../run-id.js";
 import { computeNextRunAtMs } from "../schedule.js";
 import { sweepCronRunSessions } from "../session-reaper.js";
 import type {
@@ -176,6 +178,9 @@ type WatchdogReceiptRecord = {
   };
   scan_recommended_next_action?: {
     recommendation_code?: string;
+  };
+  watchdog_cron?: {
+    run_id?: string;
   };
   chat_delivery?: WatchdogChatDeliveryRecord;
 };
@@ -432,13 +437,19 @@ async function waitForWatchdogProofSurfaces(params: {
   }
 }
 
-function resolveWatchdogCronProofSummary(receiptPath?: string): string | undefined {
+function resolveWatchdogCronProofSummary(
+  receiptPath: string | undefined,
+  expectedCronRunId: string,
+): string | undefined {
   if (!receiptPath) {
     return undefined;
   }
   const receipt = loadJsonFile(receiptPath) as WatchdogReceiptRecord | undefined;
   const status = loadJsonFile(WATCHDOG_STATUS_JSON_PATH) as WatchdogStatusRecord | undefined;
   if (receipt?.watchdog !== "system_wide_active_work_watchdog") {
+    return undefined;
+  }
+  if (receipt.watchdog_cron?.run_id !== expectedCronRunId) {
     return undefined;
   }
   const label = status?.status ?? "UNKNOWN";
@@ -453,6 +464,7 @@ function resolveWatchdogCronProofSummary(receiptPath?: string): string | undefin
     `suspicious_count=${typeof suspiciousCount === "number" ? suspiciousCount : "unknown"}`,
     `recommendation=${recommendation ?? "unknown"}`,
     `receipt=${receiptPath}`,
+    `cron_run_id=${expectedCronRunId}`,
   ].join(" | ");
 }
 
@@ -1851,11 +1863,17 @@ async function executeMainSessionCronJob(
     typeof job.state.runningAtMs === "number" ? job.state.runningAtMs : state.deps.nowMs();
   const cronRunSessionKey = resolveMainSessionCronRunSessionKey(job, cronStartedAt);
   const requiresWatchdogReceiptProof = isWatchdogReceiptProofJob(job);
+  const cronRunId = requiresWatchdogReceiptProof
+    ? `${createCronExecutionId(job.id, cronStartedAt)}:proof:${randomUUID()}`
+    : createCronExecutionId(job.id, cronStartedAt);
+  const eventText = requiresWatchdogReceiptProof
+    ? `${text}\n\nThis scheduled invocation must pass --cron-run-id ${cronRunId} to the watchdog command.`
+    : text;
   const watchdogProofBefore = requiresWatchdogReceiptProof
     ? captureWatchdogProofSurfaceSnapshot()
     : undefined;
   const deliveryContext = resolveMainSessionCronDeliveryContext(state, job);
-  state.deps.enqueueSystemEvent(text, {
+  state.deps.enqueueSystemEvent(eventText, {
     agentId: job.agentId,
     sessionKey: cronRunSessionKey,
     contextKey: `cron:${job.id}`,
@@ -1886,7 +1904,7 @@ async function executeMainSessionCronJob(
       });
       if (
         heartbeatResult.status !== "skipped" ||
-        !isRetryableHeartbeatBusySkipReason(heartbeatResult.reason)
+        !isRetryableHeartbeatSkipReason(heartbeatResult.reason)
       ) {
         break;
       }
@@ -1959,7 +1977,7 @@ async function executeMainSessionCronJob(
       }
       if (requiresWatchdogReceiptProof) {
         const proofAfter = captureWatchdogProofSurfaceSnapshot();
-        const proofSummary = resolveWatchdogCronProofSummary(proofAfter.receiptPath);
+        const proofSummary = resolveWatchdogCronProofSummary(proofAfter.receiptPath, cronRunId);
         if (!proofSummary) {
           return {
             status: "error",

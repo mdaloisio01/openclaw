@@ -2,8 +2,13 @@ import { spawnSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CallGatewayOptions } from "../gateway/call.js";
+import {
+  drainSystemEventEntries,
+  enqueueSystemEvent,
+  resetSystemEventsForTest,
+} from "../infra/system-events.js";
 import { createTaskRecord, resetTaskRegistryForTests } from "../tasks/runtime-internal.js";
 import { listTaskFlowAuditFindings } from "../tasks/task-flow-registry.audit.js";
 import {
@@ -28,6 +33,7 @@ import { createSubagentRegistryLifecycleController } from "./subagent-registry-l
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 type LifecycleControllerParams = Parameters<typeof createSubagentRegistryLifecycleController>[0];
+afterEach(resetSystemEventsForTest);
 const repoRoot = path.resolve(import.meta.dirname, "../..");
 const grantRetirementRequestScriptPath = path.join(
   repoRoot,
@@ -221,7 +227,8 @@ function createLifecycleController({
     emitSubagentEndedHookForRun: vi.fn(async () => {}),
     notifyContextEngineSubagentEnded: vi.fn(async () => {}),
     resumeSubagentRun: vi.fn(),
-    replaceSubagentRunAfterSteer: vi.fn(() => true),
+    assertParentYieldWaitAllowsRestart: vi.fn(async () => {}),
+    replaceSubagentRunAfterSteer: vi.fn(async () => true),
     callGateway: async <T = Record<string, unknown>>(opts: CallGatewayOptions): Promise<T> =>
       (await gatewayMocks.callGateway(opts)) as T,
     captureSubagentCompletionReply: vi.fn(async () => "final completion reply"),
@@ -648,6 +655,71 @@ describe("subagent registry lifecycle hardening", () => {
     await vi.waitFor(() => expect(entry.cleanupCompletedAt).toBeTypeOf("number"));
     expect(entry.delivery?.status).toBe("not_required");
     expect(entry.delivery?.announcedAt).toBeUndefined();
+  });
+
+  it("retains delete-mode child proof until the delivered parent wake is retired", async () => {
+    const entry = createRunEntry({ cleanup: "delete", expectsCompletionMessage: true });
+    const wait = {
+      waitId: "parent-wait",
+      parentRunId: "parent-run",
+      parentSessionKey: entry.requesterSessionKey,
+      expectedChildRunIds: [entry.runId],
+      childSessionKeys: [entry.childSessionKey],
+      waitStartedAt: 1_000,
+      staleAt: 2_000,
+      continuationScheduledAt: 3_000,
+      status: "continuation_scheduled" as const,
+      requiredCloseout: true,
+    };
+    entry.parentYieldWait = wait;
+    const runs = new Map([[entry.runId, entry]]);
+    const runSubagentAnnounceFlow = vi.fn(async () => true);
+    const controller = createLifecycleController({ entry, runs, runSubagentAnnounceFlow });
+    await controller.completeSubagentRun({
+      runId: entry.runId,
+      endedAt: 4_000,
+      outcome: { status: "ok" },
+      reason: SUBAGENT_ENDED_REASON_COMPLETE,
+      triggerCleanup: true,
+    });
+    await vi.waitFor(() => expect(entry.cleanupCompletedAt).toBeTypeOf("number"));
+    expect(runs.has(entry.runId)).toBe(true);
+    expect(entry.completion?.resultText).toBe("final completion reply");
+    expect(runSubagentAnnounceFlow).toHaveBeenCalledWith(
+      expect.objectContaining({ cleanup: "keep" }),
+    );
+    expect(helperMocks.safeRemoveAttachmentsDir).not.toHaveBeenCalled();
+    entry.parentYieldWait = {
+      ...wait,
+      status: "closeout_delivered",
+      closeout: {
+        parentRunId: "parent-run",
+        deliveryRecordId: "final",
+        deliveryIdempotencyKey: "final-key",
+        deliveryRegistryPath: "/isolated/delivery.json",
+        deliveredAt: 5_000,
+      },
+    };
+    enqueueSystemEvent("Resume parent", {
+      sessionKey: wait.parentSessionKey,
+      parentYieldWait: { waitId: wait.waitId, parentRunId: wait.parentRunId },
+    });
+    controller.completeCleanupBookkeeping({
+      runId: entry.runId,
+      entry,
+      cleanup: "delete",
+      completedAt: 5_000,
+    });
+    expect(runs.has(entry.runId)).toBe(true);
+    expect(entry.completion?.resultText).toBe("final completion reply");
+    drainSystemEventEntries(wait.parentSessionKey);
+    controller.completeCleanupBookkeeping({
+      runId: entry.runId,
+      entry,
+      cleanup: "delete",
+      completedAt: 5_000,
+    });
+    expect(runs.has(entry.runId)).toBe(false);
   });
 
   it("archives delete-mode sessions when completion messages are disabled", async () => {

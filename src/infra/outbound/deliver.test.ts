@@ -946,6 +946,60 @@ describe("deliverOutboundPayloads", () => {
     expect(sendMatrix).not.toHaveBeenCalled();
   });
 
+  it.each(["bound", "binding-failed"] as const)(
+    "holds platform sends behind the asynchronous intent owner (%s)",
+    async (outcome) => {
+      let resolveBinding!: () => void;
+      let resolveAdmitted!: () => void;
+      const binding = new Promise<void>((resolve) => {
+        resolveBinding = resolve;
+      });
+      const admitted = new Promise<void>((resolve) => {
+        resolveAdmitted = resolve;
+      });
+      const payloads = [{ text: "First final part." }, { text: "Second final part." }];
+      let bound = false;
+      const sendMatrix = vi.fn(async () => {
+        expect(bound).toBe(true);
+        return { messageId: "sent-part" };
+      });
+      const pending = deliverOutboundPayloads({
+        cfg: {},
+        channel: "matrix",
+        to: "!original:example",
+        payloads,
+        deps: { matrix: sendMatrix },
+        queuePolicy: "required",
+        onDeliveryIntent: async (intent) => {
+          expect(intent.id).toBe("mock-queue-id");
+          expect(queueMocks.withActiveDeliveryClaim).toHaveBeenCalled();
+          resolveAdmitted();
+          await binding;
+          if (outcome === "binding-failed") {
+            throw new Error("owner binding unavailable");
+          }
+          bound = true;
+        },
+      });
+      await admitted;
+      expect(queueMocks.enqueueDelivery).toHaveBeenCalledWith(
+        expect.objectContaining({ payloads }),
+      );
+      expect(sendMatrix).not.toHaveBeenCalled();
+      if (outcome === "binding-failed") {
+        const rejected = expect(pending).rejects.toThrow("owner binding unavailable");
+        resolveBinding();
+        await rejected;
+        expect(sendMatrix).not.toHaveBeenCalled();
+        expect(queueMocks.ackDelivery).not.toHaveBeenCalled();
+      } else {
+        resolveBinding();
+        await pending;
+        expect(sendMatrix).toHaveBeenCalledTimes(2);
+      }
+    },
+  );
+
   it("falls back to direct send when best-effort queue writes fail", async () => {
     queueMocks.enqueueDelivery.mockRejectedValueOnce(new Error("queue offline"));
     const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1" });
@@ -1079,6 +1133,65 @@ describe("deliverOutboundPayloads", () => {
 
     expect(sendMatrix).toHaveBeenCalled();
     expect(queueMocks.markDeliveryPlatformOutcomeUnknown).toHaveBeenCalledWith("mock-queue-id");
+    expect(queueMocks.failDelivery).not.toHaveBeenCalled();
+  });
+
+  it("commits a delivery owner after unknown marking and before queue ack", async () => {
+    const order: string[] = [];
+    const sendMatrix = vi.fn(async () => {
+      order.push("platform-send");
+      return { messageId: "m1" };
+    });
+    queueMocks.markDeliveryPlatformOutcomeUnknown.mockImplementationOnce(async () => {
+      order.push("unknown-after-send");
+    });
+    queueMocks.ackDelivery.mockImplementationOnce(async () => {
+      order.push("queue-ack");
+    });
+    const onDeliveryOwnerCommit = vi.fn(async (commit) => {
+      expect(commit).toMatchObject({
+        id: "mock-queue-id",
+        channel: "matrix",
+        to: "!room:example",
+        results: [{ messageId: "m1" }],
+      });
+      order.push("owner-commit");
+    });
+
+    await deliverOutboundPayloads({
+      cfg: {},
+      channel: "matrix",
+      to: "!room:example",
+      payloads: [{ text: "hi" }],
+      deps: { matrix: sendMatrix },
+      queuePolicy: "required",
+      onDeliveryOwnerCommit,
+    });
+
+    expect(order).toEqual(["platform-send", "unknown-after-send", "owner-commit", "queue-ack"]);
+  });
+
+  it("leaves an owner-commit failure unknown and unacked", async () => {
+    const sendMatrix = vi.fn().mockResolvedValue({ messageId: "m1" });
+    const onDeliveryOwnerCommit = vi.fn(async () => {
+      expect(queueMocks.markDeliveryPlatformOutcomeUnknown).toHaveBeenCalledWith("mock-queue-id");
+      throw new Error("owner commit interrupted");
+    });
+
+    await expect(
+      deliverOutboundPayloads({
+        cfg: {},
+        channel: "matrix",
+        to: "!room:example",
+        payloads: [{ text: "hi" }],
+        deps: { matrix: sendMatrix },
+        queuePolicy: "required",
+        onDeliveryOwnerCommit,
+      }),
+    ).rejects.toThrow("owner commit interrupted");
+
+    expect(sendMatrix).toHaveBeenCalledTimes(1);
+    expect(queueMocks.ackDelivery).not.toHaveBeenCalled();
     expect(queueMocks.failDelivery).not.toHaveBeenCalled();
   });
 

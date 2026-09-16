@@ -40,6 +40,11 @@ export type QueuedReplyPayloadSendingHook = {
   context: PluginHookReplyPayloadSendingContext;
 };
 
+export type DeliveryQueueOwnerReference = {
+  kind: string;
+  key: string;
+};
+
 export type QueuedDeliveryPayload = {
   channel: Exclude<OutboundChannel, "none">;
   to: string;
@@ -68,6 +73,8 @@ export type QueuedDeliveryPayload = {
   session?: OutboundSessionContext;
   /** Gateway caller scopes at enqueue time, preserved for recovery replay. */
   gatewayClientScopes?: readonly string[];
+  /** Durable owner correlation persisted before this entry can be recovered. */
+  owner?: DeliveryQueueOwnerReference;
 };
 
 export interface QueuedDelivery extends QueuedDeliveryPayload {
@@ -117,6 +124,7 @@ export async function enqueueDelivery(
     mirror: params.mirror,
     session: params.session,
     gatewayClientScopes: params.gatewayClientScopes,
+    owner: params.owner,
     retryCount: 0,
   };
   upsertDeliveryQueueEntry({

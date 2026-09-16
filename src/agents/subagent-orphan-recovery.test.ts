@@ -11,6 +11,10 @@ import {
 import * as subagentRegistrySteerRuntime from "./subagent-registry-steer-runtime.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
+// Other registry suites load this owner with their own session-store mocks.
+// Reload this file's dependency graph once so the non-isolated runner uses its records.
+vi.hoisted(() => vi.resetModules());
+
 // Mock dependencies before importing the module under test
 vi.mock("../config/config.js", () => ({
   getRuntimeConfig: vi.fn(() => ({
@@ -44,7 +48,8 @@ vi.mock("./subagent-announce-origin.js", () => ({
 }));
 
 vi.mock("./subagent-registry-steer-runtime.js", () => ({
-  replaceSubagentRunAfterSteer: vi.fn(() => true),
+  assertParentYieldWaitAllowsRestart: vi.fn(async () => {}),
+  replaceSubagentRunAfterSteer: vi.fn(async () => true),
   finalizeInterruptedSubagentRun: vi.fn(async () => 1),
 }));
 
@@ -587,7 +592,7 @@ describe("subagent-orphan-recovery", () => {
 
   it("does not retry a session after the gateway accepted resume but run remap failed", async () => {
     vi.mocked(gateway.callGateway).mockResolvedValue({ runId: "new-run" } as never);
-    vi.mocked(subagentRegistrySteerRuntime.replaceSubagentRunAfterSteer).mockReturnValue(false);
+    vi.mocked(subagentRegistrySteerRuntime.replaceSubagentRunAfterSteer).mockResolvedValue(false);
 
     vi.mocked(sessions.loadSessionStore).mockReturnValue({
       "agent:main:subagent:test-session-1": {

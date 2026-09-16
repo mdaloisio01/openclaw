@@ -118,11 +118,28 @@ export type SubagentParentYieldWaitState = {
   waitStartedAt: number;
   staleAt: number;
   requiredCloseout: boolean;
-  status: "waiting" | "ready_to_resume" | "continuation_scheduled";
   terminalChildRunIds?: string[];
   continuationScheduledAt?: number;
+  /** The actual execution owns the wait until its final or confirmed yield. */
+  continuation?: { runId: string; phase: "running" | "yield_requested" };
+  yieldedContinuations?: Array<{ runId: string; endedAt: number }>;
   lastUpdatedAt?: number;
-};
+} & (
+  | {
+      status: "waiting" | "ready_to_resume" | "continuation_scheduled";
+      closeout?: never;
+    }
+  | {
+      status: "closeout_delivered";
+      closeout: {
+        parentRunId: string;
+        deliveryRecordId: string;
+        deliveryIdempotencyKey: string;
+        deliveryRegistryPath: string;
+        deliveredAt: number;
+      };
+    }
+);
 
 export type SubagentRunRecord = {
   runId: string;

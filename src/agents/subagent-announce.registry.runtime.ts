@@ -1,4 +1,5 @@
 export {
+  assertParentYieldWaitAllowsRestart,
   countActiveDescendantRuns,
   countPendingDescendantRuns,
   countPendingDescendantRunsExcludingRun,

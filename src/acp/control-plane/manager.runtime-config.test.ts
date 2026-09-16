@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { SessionAcpMeta } from "../../config/sessions/types.js";
 import {
   type AcpRuntime,
   AcpRuntimeError,
@@ -14,7 +15,6 @@ import {
   installAcpSessionManagerTestLifecycle,
   mockCallArg,
   readySessionMeta,
-  type SessionAcpMeta,
 } from "./manager.test-helpers.js";
 
 describe("AcpSessionManager runtime config", () => {
@@ -228,10 +228,12 @@ describe("AcpSessionManager runtime config", () => {
       mode: "oneshot",
     });
 
-    expectRecordFields(currentMeta?.identity, {
-      state: "pending",
-      acpxSessionId: "acpx-oneshot",
-      source: "ensure",
+    expect(currentMeta).toMatchObject({
+      identity: {
+        state: "pending",
+        acpxSessionId: "acpx-oneshot",
+        source: "ensure",
+      },
     });
 
     await manager.runTurn({
@@ -251,11 +253,13 @@ describe("AcpSessionManager runtime config", () => {
       backendSessionId: "acpx-oneshot",
       agentSessionId: "agent-oneshot",
     });
-    expectRecordFields(currentMeta?.identity, {
-      state: "resolved",
-      acpxSessionId: "acpx-oneshot",
-      agentSessionId: "agent-oneshot",
-      source: "status",
+    expect(currentMeta).toMatchObject({
+      identity: {
+        state: "resolved",
+        acpxSessionId: "acpx-oneshot",
+        agentSessionId: "agent-oneshot",
+        source: "status",
+      },
     });
   });
 
@@ -668,7 +672,7 @@ describe("AcpSessionManager runtime config", () => {
       }
       currentEntry = {
         ...currentEntry,
-        acp: nextMeta ?? currentEntry.acp,
+        acp: (nextMeta ?? currentEntry.acp) as typeof currentEntry.acp,
       };
       return currentEntry;
     });

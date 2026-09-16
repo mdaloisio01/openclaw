@@ -17,6 +17,7 @@ import {
 } from "../../infra/outbound/session-binding-service.js";
 import {
   enqueueSystemEvent,
+  peekSystemEventEntries,
   peekSystemEvents,
   resetSystemEventsForTest,
 } from "../../infra/system-events.js";
@@ -3046,6 +3047,26 @@ describe("initSessionState preserves behavior overrides across /new and /reset",
 });
 
 describe("drainFormattedSystemEvents", () => {
+  it("preserves typed parent waits for their delivery owner while draining generic notices", async () => {
+    const sessionKey = "agent:main:parent-closeout";
+    const parentYieldWait = { waitId: "wait-1", parentRunId: "original-parent-run" };
+    enqueueSystemEvent("Resume parent closeout.", { sessionKey, parentYieldWait });
+    enqueueSystemEvent("Model switched.", { sessionKey });
+
+    const result = await drainFormattedSystemEvents({
+      cfg: {},
+      sessionKey,
+      isMainSession: false,
+      isNewSession: false,
+    });
+
+    expect(result).toContain("Model switched.");
+    expect(result).not.toContain("Resume parent closeout.");
+    expect(peekSystemEventEntries(sessionKey)).toEqual([
+      expect.objectContaining({ text: "Resume parent closeout.", parentYieldWait }),
+    ]);
+  });
+
   it("adds a user-timezone timestamp to queued system events by default when configured", async () => {
     vi.useFakeTimers();
     try {

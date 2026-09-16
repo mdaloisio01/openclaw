@@ -168,6 +168,19 @@ describe("tryDispatchAcpReplyHook", () => {
     });
   });
 
+  it("passes core-owned required final batch delivery through to ACP", async () => {
+    bypassMock.mockResolvedValue(false);
+    dispatchMock.mockResolvedValue({
+      queuedFinal: true,
+      counts: { tool: 0, block: 0, final: 1 },
+    });
+    const deliverFinalBatch = vi.fn();
+
+    await tryDispatchAcpReplyHook(event, { ...ctx, deliverFinalBatch });
+
+    expectDispatchPayloadFields({ deliverFinalBatch });
+  });
+
   it("passes a live tool-summary predicate through to ACP runtime", async () => {
     bypassMock.mockResolvedValue(false);
     dispatchMock.mockResolvedValue({

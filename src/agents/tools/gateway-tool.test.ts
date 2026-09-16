@@ -269,6 +269,58 @@ describe("gateway tool restart continuation", () => {
     expect(writeRestartSentinelMock).not.toHaveBeenCalled();
   });
 
+  it("persists the explicit current WebChat source instead of an older stored Telegram route", async () => {
+    extractDeliveryInfoMock.mockReturnValueOnce({
+      deliveryContext: { channel: "telegram", to: "telegram:old", accountId: "old-account" },
+      threadId: "old-topic",
+    });
+    const currentDeliveryContext = { channel: "webchat", to: "source-conversation" };
+    const tool = createGatewayTool({
+      agentSessionKey: "agent:main:main",
+      currentDeliveryContext,
+      config: {},
+    });
+    await tool.execute?.("current-source-restart", { action: "restart" });
+    expect(extractDeliveryInfoMock).not.toHaveBeenCalled();
+    expect(persistActivationContinuationBeforeRestartMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        route: { sessionKey: "agent:main:main", deliveryContext: currentDeliveryContext },
+      }),
+    );
+    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
+    expect(requireRestartSentinelPayload().deliveryContext).toEqual(currentDeliveryContext);
+  });
+
+  it("resolves an explicitly different restart target without borrowing the current source", async () => {
+    extractDeliveryInfoMock.mockReturnValueOnce({
+      deliveryContext: { channel: "telegram", to: "telegram:target", accountId: "target-account" },
+      threadId: "target-topic",
+    });
+    const tool = createGatewayTool({
+      agentSessionKey: "agent:main:main",
+      currentDeliveryContext: { channel: "webchat", to: "current-source" },
+      config: {},
+    });
+    await tool.execute?.("other-source-restart", {
+      action: "restart",
+      sessionKey: "agent:main:telegram:direct:target",
+    });
+    expect(extractDeliveryInfoMock).toHaveBeenCalledWith("agent:main:telegram:direct:target");
+    expect(persistActivationContinuationBeforeRestartMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        route: {
+          sessionKey: "agent:main:telegram:direct:target",
+          deliveryContext: {
+            channel: "telegram",
+            to: "telegram:target",
+            accountId: "target-account",
+            threadId: "target-topic",
+          },
+        },
+      }),
+    );
+  });
+
   it.each([-1, 1.5, "soon"])("rejects invalid restart delayMs value %s", async (delayMs) => {
     const tool = createGatewayTool({
       agentSessionKey: "agent:main:main",

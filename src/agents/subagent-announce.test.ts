@@ -49,7 +49,8 @@ const { subagentRegistryRuntimeMock } = vi.hoisted(() => ({
     countPendingDescendantRunsExcludingRun: vi.fn(() => 0),
     getLatestSubagentRunByChildSessionKey: vi.fn(() => undefined),
     listSubagentRunsForRequester: vi.fn(() => []),
-    replaceSubagentRunAfterSteer: vi.fn(() => true),
+    assertParentYieldWaitAllowsRestart: vi.fn(async () => {}),
+    replaceSubagentRunAfterSteer: vi.fn(async () => true),
     resolveRequesterForChildSession: vi.fn(() => null),
   },
 }));
@@ -310,7 +311,7 @@ describe("subagent announce seam flow", () => {
     subagentRegistryRuntimeMock.listSubagentRunsForRequester.mockReset();
     subagentRegistryRuntimeMock.listSubagentRunsForRequester.mockReturnValue([]);
     subagentRegistryRuntimeMock.replaceSubagentRunAfterSteer.mockReset();
-    subagentRegistryRuntimeMock.replaceSubagentRunAfterSteer.mockReturnValue(true);
+    subagentRegistryRuntimeMock.replaceSubagentRunAfterSteer.mockResolvedValue(true);
     subagentRegistryRuntimeMock.resolveRequesterForChildSession.mockReset();
     subagentRegistryRuntimeMock.resolveRequesterForChildSession.mockReturnValue(null);
   });

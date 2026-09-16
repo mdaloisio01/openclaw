@@ -50,6 +50,43 @@ export type SessionTranscriptAssistantMessage = Parameters<SessionManager["appen
   role: "assistant";
 };
 
+/** Exact reference returned by the owner that persisted this assistant message. */
+export type CanonicalAssistantTranscript = {
+  sessionId: string;
+  sessionFile: string;
+  messageId: string;
+  idempotencyKey: string;
+  text: string;
+};
+
+/** Full post-policy WebChat content and the exact managed bytes backing it. */
+export type PreparedWebchatSourceContent = {
+  content: Array<
+    | { type: "text"; text: string }
+    | {
+        type: "image";
+        url: string;
+        openUrl: string;
+        alt: string;
+        mimeType: string;
+        width: number | null;
+        height: number | null;
+      }
+    | {
+        type: "attachment";
+        attachment: {
+          url: string;
+          managedMediaUrl: string;
+          kind: "audio" | "video" | "document";
+          label: string;
+          mimeType: string;
+          isVoiceNote?: boolean;
+        };
+      }
+  >;
+  assets: Array<{ url: string; sha256: string }>;
+};
+
 type AssistantTranscriptText = {
   id?: string;
   text: string;
@@ -202,6 +239,9 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   text?: string;
   mediaUrls?: string[];
   idempotencyKey?: string;
+  /** Pin recoverable publication to this session and its exact idempotency key. */
+  expectedSessionId?: string;
+  canonicalAssistantTranscript?: CanonicalAssistantTranscript;
   /** Optional override for store path (mostly for tests). */
   storePath?: string;
   updateMode?: SessionTranscriptUpdateMode;
@@ -225,6 +265,8 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     sessionKey,
     storePath: params.storePath,
     idempotencyKey: params.idempotencyKey,
+    expectedSessionId: params.expectedSessionId,
+    canonicalAssistantTranscript: params.canonicalAssistantTranscript,
     updateMode: params.updateMode,
     config: params.config,
     message: {
@@ -258,6 +300,8 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
   sessionKey: string;
   message: SessionTranscriptAssistantMessage;
   idempotencyKey?: string;
+  expectedSessionId?: string;
+  canonicalAssistantTranscript?: CanonicalAssistantTranscript;
   storePath?: string;
   updateMode?: SessionTranscriptUpdateMode;
   config?: OpenClawConfig;
@@ -276,6 +320,12 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
   const entry = resolved.existing;
   if (!entry?.sessionId) {
     return { ok: false, reason: `unknown sessionKey: ${sessionKey}` };
+  }
+  if (
+    params.expectedSessionId &&
+    (entry.sessionId !== params.expectedSessionId || !params.idempotencyKey?.trim())
+  ) {
+    return { ok: false, reason: "source publication session or idempotency identity changed" };
   }
 
   let sessionFile: string;
@@ -303,15 +353,41 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
       const explicitIdempotencyKey =
         params.idempotencyKey ??
         ((params.message as { idempotencyKey?: unknown }).idempotencyKey as string | undefined);
-      const latestEquivalentAssistantId = isRedundantDeliveryMirror(params.message)
-        ? await findLatestEquivalentAssistantMessageId(sessionFile, params.message, params.config)
-        : undefined;
+      const publishedAssistant = params.canonicalAssistantTranscript;
+      if (publishedAssistant) {
+        if (
+          params.expectedSessionId !== publishedAssistant.sessionId ||
+          path.resolve(sessionFile) !== path.resolve(publishedAssistant.sessionFile) ||
+          !(await matchesPublishedAssistant(
+            sessionFile,
+            publishedAssistant,
+            params.message,
+            params.config,
+          ))
+        ) {
+          return { ok: false, reason: "canonical assistant publication reference is unproven" };
+        }
+      }
+      // A recoverable publication needs its own durable key. Text equality with
+      // an older assistant turn cannot acknowledge this delivery obligation.
+      const latestEquivalentAssistantId =
+        !params.expectedSessionId && isRedundantDeliveryMirror(params.message)
+          ? await findLatestEquivalentAssistantMessageId(sessionFile, params.message, params.config)
+          : undefined;
       if (latestEquivalentAssistantId) {
         return { ok: true, sessionFile, messageId: latestEquivalentAssistantId };
       }
       const message = {
         ...params.message,
         ...(explicitIdempotencyKey ? { idempotencyKey: explicitIdempotencyKey } : {}),
+        // The native answer is already visible. This exact-key receipt preserves
+        // crash recovery without publishing that same answer a second time.
+        ...(publishedAssistant
+          ? {
+              display: false,
+              sourceDelivery: { visibleMessageId: publishedAssistant.messageId },
+            }
+          : {}),
       } as Parameters<SessionManager["appendMessage"]>[0];
       const {
         messageId,
@@ -360,6 +436,43 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
       return { ok: true, sessionFile, messageId };
     },
   );
+}
+
+async function matchesPublishedAssistant(
+  sessionFile: string,
+  reference: CanonicalAssistantTranscript,
+  message: SessionTranscriptAssistantMessage,
+  config?: OpenClawConfig,
+): Promise<boolean> {
+  const expectedText = extractAssistantMessageText(
+    redactTranscriptMessage(message, config) as SessionTranscriptAssistantMessage,
+  );
+  if (!expectedText || expectedText !== reference.text.trim()) {
+    return false;
+  }
+  for await (const line of streamSessionTranscriptLinesReverse(sessionFile)) {
+    try {
+      const record = JSON.parse(line) as {
+        id?: string;
+        message?: SessionTranscriptAssistantMessage & {
+          idempotencyKey?: string;
+          display?: boolean;
+        };
+      };
+      if (record.id !== reference.messageId) {
+        continue;
+      }
+      return (
+        record.message?.role === "assistant" &&
+        record.message.display !== false &&
+        record.message.idempotencyKey === reference.idempotencyKey &&
+        extractAssistantMessageText(record.message) === expectedText
+      );
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }
 
 function isRedundantDeliveryMirror(message: SessionTranscriptAssistantMessage): boolean {

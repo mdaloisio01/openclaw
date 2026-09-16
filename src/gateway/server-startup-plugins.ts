@@ -80,7 +80,7 @@ export async function prepareGatewayPluginBootstrap(params: {
     await Promise.all(startupTasks);
   }
 
-  initSubagentRegistry();
+  await initSubagentRegistry({ gatewayStartup: true });
 
   // Activation uses the pre-runtime source so auto-enable policy cannot be skewed by
   // defaults injected while loading runtime config; runtime-only plugin config still merges in.

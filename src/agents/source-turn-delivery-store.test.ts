@@ -1,13 +1,24 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import fs, { chmod, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { setTimeout } from "node:timers/promises";
+import { acquireFileLock } from "@openclaw/fs-safe/file-lock";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildSourceTurnDeliveryObligationKey,
   classifySourceTurnDeliveryWatchdogStatus,
+  createSourceTurnDeliveryQueueOwnerReference,
+  inspectExternalSourceDeliveryQueueOwner,
   loadSourceTurnDeliveryRegistry,
   persistSourceTurnDeliveryState,
+  prepareExternalSourceDeliveryQueueOwner,
+  recordRecoveredExternalSourceDelivery,
+  resolveSourceTurnDeliveryRegistryPath,
+  settleSourceTurnDeliveryFinal,
   sourceTurnDeliveryBlocksWatchdog,
+  transitionExternalSourceDelivery,
+  type PersistSourceTurnDeliveryParams,
 } from "./source-turn-delivery-store.js";
 
 let tempDir: string;
@@ -27,6 +38,30 @@ describe("source turn delivery storage adapter", () => {
 
   afterEach(async () => {
     await rm(tempDir, { recursive: true, force: true });
+    vi.unstubAllEnvs();
+  });
+
+  it("keeps default registry writes inside the worker-local home", async () => {
+    vi.stubEnv("HOME", tempDir);
+    vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", undefined);
+    vi.stubEnv("OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR", undefined);
+    const expectedPath = join(
+      tempDir,
+      ".openclaw",
+      "workspace-orchestrator",
+      "var",
+      "source_delivery_obligations",
+      "source_delivery_obligations.json",
+    );
+    const workerRegistryPath = resolveSourceTurnDeliveryRegistryPath();
+    // Check isolation before any write, so a regression cannot touch host state.
+    expect(workerRegistryPath).toBe(expectedPath);
+    const row = await persistSourceTurnDeliveryState({
+      registryPath: workerRegistryPath,
+      id: "worker-local-default-registry",
+      facts: {},
+    });
+    expect(await loadSourceTurnDeliveryRegistry(expectedPath)).toEqual({ rows: [row] });
   });
 
   it("persists accepted state correctly", async () => {
@@ -78,6 +113,525 @@ describe("source turn delivery storage adapter", () => {
         threadId: "42",
       },
     });
+  });
+
+  function preparedFinalParams() {
+    return {
+      registryPath,
+      id: "source-parent-final",
+      sourceSessionKey: "agent:main:parent",
+      sourceChannel: "webchat",
+      deliveryContext: { channel: "webchat", to: "agent:main:parent" },
+      runId: "actual-continuation-run",
+      parentYieldWaits: [{ parentRunId: "original-parent-run", waitId: "original-wait" }],
+      preparedSourceFinal: {
+        kind: "source_session_transcript",
+        sessionId: "original-session",
+        expectedPartCount: 1,
+        parts: [
+          {
+            text: "The original final, after delivery hooks.",
+            mediaUrls: ["https://example.com/result.png"],
+          },
+        ],
+      },
+      facts: { finalDeliveryRequired: true },
+      currentStage: "source_final_prepared",
+    } satisfies PersistSourceTurnDeliveryParams;
+  }
+
+  it("preserves a prepared final and its exact execution identity through delivery settlement", async () => {
+    const params = preparedFinalParams();
+    const prepared = await persistSourceTurnDeliveryState(params);
+    expect(prepared.finalDeliveryDelivered).toBe(false);
+    expect(prepared.preparedSourceFinal).toMatchObject(params.preparedSourceFinal);
+    expect(prepared.preparedSourceFinal?.parts[0]?.idempotencyKey).toMatch(
+      /^source-session-final:[a-f0-9]{64}$/,
+    );
+    params.preparedSourceFinal.parts[0].mediaUrls.push("https://example.com/later.png");
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toEqual([prepared]);
+
+    const delivered = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: params.id,
+      runId: params.runId,
+      facts: { finalDeliveryDelivered: true, evidenceKinds: ["source_chat_final"] },
+    });
+    expect(delivered.preparedSourceFinal).toEqual(prepared.preparedSourceFinal);
+    expect(delivered.obligationIdentity.runId).toBe("actual-continuation-run");
+    expect(delivered.parentYieldWaits).toEqual(params.parentYieldWaits);
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toEqual([delivered]);
+
+    const distinctRun = await persistSourceTurnDeliveryState({
+      ...preparedFinalParams(),
+      runId: "another-actual-run",
+    });
+    expect(distinctRun.preparedSourceFinal?.parts[0]?.idempotencyKey).not.toBe(
+      prepared.preparedSourceFinal?.parts[0]?.idempotencyKey,
+    );
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toHaveLength(2);
+  });
+
+  it.each([
+    [
+      "payload",
+      {
+        preparedSourceFinal: {
+          ...preparedFinalParams().preparedSourceFinal,
+          parts: [{ text: "changed" }],
+        },
+      },
+    ],
+    [
+      "session",
+      {
+        preparedSourceFinal: {
+          ...preparedFinalParams().preparedSourceFinal,
+          sessionId: "reset-session",
+        },
+      },
+    ],
+    ["controller", { sourceSessionKey: "agent:main:other" }],
+    ["route", { deliveryContext: { channel: "webchat", to: "other" } }],
+    ["parent wait", { parentYieldWaits: [{ parentRunId: "other-parent", waitId: "other-wait" }] }],
+  ] satisfies Array<[string, Partial<PersistSourceTurnDeliveryParams>]>)(
+    "refuses to replace a prepared final's %s",
+    async (_label, replacement) => {
+      const params = preparedFinalParams();
+      await persistSourceTurnDeliveryState(params);
+      const originalBytes = await readFile(registryPath, "utf8");
+      await expect(persistSourceTurnDeliveryState({ ...params, ...replacement })).rejects.toThrow(
+        /Prepared source final .* cannot change/,
+      );
+      expect(await readFile(registryPath, "utf8")).toBe(originalBytes);
+    },
+  );
+
+  it("keeps failed preparation unpublished so its caller cannot start source delivery", async () => {
+    const params = preparedFinalParams();
+    const accepted = await persistSourceTurnDeliveryState({
+      ...params,
+      preparedSourceFinal: undefined,
+      facts: {},
+    });
+    const failure = Object.assign(new Error("prepared final commit failed"), { code: "EIO" });
+    const rename = vi.spyOn(fs, "rename").mockRejectedValue(failure);
+    try {
+      await expect(persistSourceTurnDeliveryState(params)).rejects.toBe(failure);
+    } finally {
+      rename.mockRestore();
+    }
+    expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [accepted] });
+  });
+
+  it("retains multipart preparation by ordinal and refuses partial final delivery", async () => {
+    const params = preparedFinalParams();
+    params.preparedSourceFinal.expectedPartCount = 2;
+    const prefix = await persistSourceTurnDeliveryState(params);
+    const deliveredParams: PersistSourceTurnDeliveryParams = {
+      registryPath,
+      id: params.id,
+      runId: params.runId,
+      facts: { finalDeliveryDelivered: true, evidenceKinds: ["source_chat_final"] },
+    };
+    await expect(persistSourceTurnDeliveryState(deliveredParams)).rejects.toThrow(
+      "Incomplete prepared source final cannot be delivered",
+    );
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toEqual([prefix]);
+
+    params.preparedSourceFinal.parts.push({
+      text: "The second admitted final part.",
+      mediaUrls: [],
+    });
+    const complete = await persistSourceTurnDeliveryState(params);
+    expect(complete.preparedSourceFinal?.parts[0]).toEqual(prefix.preparedSourceFinal?.parts[0]);
+    expect(complete.preparedSourceFinal?.parts[1]?.idempotencyKey).not.toBe(
+      complete.preparedSourceFinal?.parts[0]?.idempotencyKey,
+    );
+    await expect(
+      persistSourceTurnDeliveryState({
+        ...params,
+        preparedSourceFinal: {
+          ...params.preparedSourceFinal,
+          parts: params.preparedSourceFinal.parts.slice(0, 1),
+        },
+      }),
+    ).rejects.toThrow("Prepared source final payload cannot change");
+    const delivered = await persistSourceTurnDeliveryState(deliveredParams);
+    expect(delivered.preparedSourceFinal).toEqual(complete.preparedSourceFinal);
+    expect(delivered.finalDeliveryDelivered).toBe(true);
+  });
+
+  it("retains the complete external final and accepts only its bound transport receipt", async () => {
+    const payloads = [
+      { text: "First report part." },
+      {
+        text: "Second report part.",
+        mediaUrls: ["https://example.com/result.png"],
+        audioAsVoice: true,
+      },
+    ];
+    const params: PersistSourceTurnDeliveryParams = {
+      ...preparedFinalParams(),
+      sourceChannel: "telegram",
+      deliveryContext: { channel: "telegram", to: "original-conversation", threadId: "42" },
+      preparedSourceFinal: {
+        kind: "external_channel",
+        sessionId: "original-session",
+        expectedPartCount: payloads.length,
+        parts: payloads.map((payload) => ({
+          text: payload.text,
+          mediaUrls: payload.mediaUrls,
+          payload,
+        })),
+        outboundDelivery: { status: "prepared" },
+      },
+    };
+    const prepared = await persistSourceTurnDeliveryState(params);
+    expect(prepared.preparedSourceFinal).toMatchObject({
+      kind: "external_channel",
+      parts: payloads.map((payload) => ({ payload })),
+      outboundDelivery: { status: "prepared" },
+    });
+    const update = {
+      registryPath,
+      id: params.id,
+      runId: params.runId,
+      facts: { finalDeliveryRequired: true },
+    };
+    const finalFacts = {
+      finalDeliveryRequired: true,
+      finalDeliveryDelivered: true,
+      evidenceKinds: ["direct_source_final" as const],
+    };
+    await expect(persistSourceTurnDeliveryState({ ...update, facts: finalFacts })).rejects.toThrow(
+      "Incomplete prepared source final cannot be delivered",
+    );
+    const queued = await persistSourceTurnDeliveryState({
+      ...update,
+      preparedExternalFinalDelivery: { status: "queued", queueId: "actual-queue-id" },
+    });
+    await expect(
+      persistSourceTurnDeliveryState({
+        ...update,
+        preparedExternalFinalDelivery: { status: "queued", queueId: "another-queue-id" },
+      }),
+    ).rejects.toThrow("Prepared external final transport identity cannot change");
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toEqual([queued]);
+    const delivered = await persistSourceTurnDeliveryState({
+      ...update,
+      facts: finalFacts,
+      preparedExternalFinalDelivery: {
+        status: "delivered",
+        queueId: "actual-queue-id",
+        receipt: { platformMessageIds: ["message-1", "message-2"], parts: [], sentAt: Date.now() },
+      },
+    });
+    expect(delivered.preparedSourceFinal?.parts).toEqual(prepared.preparedSourceFinal?.parts);
+    expect(delivered.finalDeliveryDelivered).toBe(true);
+    expect(delivered.acceptedAt).toBe(prepared.acceptedAt);
+    expect(delivered.obligationIdentity).toEqual(prepared.obligationIdentity);
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toEqual([delivered]);
+  });
+
+  it("retains a rich-only external final without requiring a text/media projection", async () => {
+    const payload = {
+      channelData: { line: { flexMessage: { altText: "Status card", contents: {} } } },
+    };
+    const prepared = await persistSourceTurnDeliveryState({
+      ...preparedFinalParams(),
+      sourceChannel: "line",
+      deliveryContext: { channel: "line", to: "original-conversation" },
+      preparedSourceFinal: {
+        kind: "external_channel",
+        sessionId: "original-session",
+        expectedPartCount: 1,
+        parts: [{ text: "", payload }],
+        outboundDelivery: { status: "prepared" },
+      },
+    });
+
+    expect(prepared.preparedSourceFinal).toMatchObject({
+      kind: "external_channel",
+      parts: [{ text: "", payload }],
+      outboundDelivery: { status: "prepared" },
+    });
+  });
+
+  it("commits a recovered transport receipt only to its exact queued source owner", async () => {
+    const payloads = [{ text: "First report part." }, { text: "Second report part." }];
+    const params: PersistSourceTurnDeliveryParams = {
+      ...preparedFinalParams(),
+      sourceChannel: "telegram",
+      deliveryContext: { channel: "telegram", to: "original-conversation", threadId: "42" },
+      facts: {
+        finalDeliveryRequired: true,
+        reportRequired: true,
+        reportArtifactPath: "/workspace/report.md",
+        markFacingExportRequired: true,
+        markFacingExportRoot: "/workspace/exports",
+        markFacingExportPath: "/workspace/exports/report.md",
+        markFacingExportVerified: true,
+        trbGateDecisionStatus: "passed",
+        trbGateDecisionRecordId: "trb-gate:passed",
+        trbRecoveryRecordId: "trb-recovery:complete",
+      },
+      reportArtifactPaths: ["/workspace/report.md"],
+      watchdogReconciliation: {
+        status: "retry_scheduled",
+        action: "retry-source-delivery",
+        reason: "transport interrupted",
+        proofPath: "/workspace/recovery.json",
+      },
+      preparedSourceFinal: {
+        kind: "external_channel",
+        sessionId: "original-session",
+        expectedPartCount: payloads.length,
+        parts: payloads.map((payload) => ({ text: payload.text, payload })),
+        outboundDelivery: { status: "prepared" },
+      },
+    };
+    const prepared = await persistSourceTurnDeliveryState(params);
+    const preservedMetadata = {
+      reportArtifactPaths: prepared.reportArtifactPaths,
+      markFacingExport: prepared.markFacingExport,
+      trbRecovery: prepared.trbRecovery,
+      watchdogReconciliation: prepared.watchdogReconciliation,
+      deliveryDecision: prepared.deliveryDecision,
+      durabilityDecision: prepared.durabilityDecision,
+    };
+    const identity = {
+      queueId: "recovered-queue",
+      channel: "telegram",
+      to: "original-conversation",
+      threadId: "42",
+      payloads,
+      owner: createSourceTurnDeliveryQueueOwnerReference(prepared),
+    };
+    await expect(
+      transitionExternalSourceDelivery({
+        registryPath,
+        owner: identity.owner,
+        delivery: {
+          status: "delivered",
+          queueId: identity.queueId,
+          receipt: { platformMessageIds: ["message-1"], parts: [], sentAt: 1 },
+        },
+      }),
+    ).rejects.toThrow("must bind its queue owner before receipt commit");
+    expect(await inspectExternalSourceDeliveryQueueOwner({ registryPath, identity })).toEqual({
+      status: "pending",
+      sourceSessionKey: params.sourceSessionKey,
+    });
+    expect(await prepareExternalSourceDeliveryQueueOwner({ registryPath, identity })).toEqual({
+      status: "pending",
+      sourceSessionKey: params.sourceSessionKey,
+    });
+    const queued = (await loadSourceTurnDeliveryRegistry(registryPath)).rows[0];
+    expect(queued).toMatchObject({
+      preparedSourceFinal: {
+        kind: "external_channel",
+        outboundDelivery: { status: "queued", queueId: "recovered-queue" },
+      },
+    });
+    expect({
+      reportArtifactPaths: queued?.reportArtifactPaths,
+      markFacingExport: queued?.markFacingExport,
+      trbRecovery: queued?.trbRecovery,
+      watchdogReconciliation: queued?.watchdogReconciliation,
+      deliveryDecision: queued?.deliveryDecision,
+      durabilityDecision: queued?.durabilityDecision,
+    }).toEqual(preservedMetadata);
+    await expect(
+      transitionExternalSourceDelivery({
+        registryPath,
+        owner: identity.owner,
+        delivery: { status: "queued", queueId: "different-queue" },
+      }),
+    ).rejects.toThrow("transport identity cannot change");
+    await expect(
+      recordRecoveredExternalSourceDelivery({
+        registryPath,
+        identity: { ...identity, payloads: [{ text: "different" }] },
+        receipt: { platformMessageIds: ["message-1"], parts: [], sentAt: 1 },
+      }),
+    ).rejects.toThrow("does not match its saved route and payload");
+
+    const receipt = {
+      platformMessageIds: ["message-1", "message-2"],
+      parts: [],
+      sentAt: 1,
+    };
+    expect(
+      await recordRecoveredExternalSourceDelivery({ registryPath, identity, receipt }),
+    ).toEqual({ status: "delivered", sourceSessionKey: params.sourceSessionKey });
+    expect(await inspectExternalSourceDeliveryQueueOwner({ registryPath, identity })).toEqual({
+      status: "delivered",
+      sourceSessionKey: params.sourceSessionKey,
+    });
+    const row = (await loadSourceTurnDeliveryRegistry(registryPath)).rows[0];
+    expect(row).toMatchObject({
+      finalDeliveryDelivered: false,
+      preparedSourceFinal: {
+        kind: "external_channel",
+        outboundDelivery: { status: "delivered", queueId: "recovered-queue", receipt },
+      },
+    });
+    expect({
+      reportArtifactPaths: row?.reportArtifactPaths,
+      markFacingExport: row?.markFacingExport,
+      trbRecovery: row?.trbRecovery,
+      watchdogReconciliation: row?.watchdogReconciliation,
+      deliveryDecision: row?.deliveryDecision,
+      durabilityDecision: row?.durabilityDecision,
+    }).toEqual(preservedMetadata);
+    await expect(
+      recordRecoveredExternalSourceDelivery({
+        registryPath,
+        identity,
+        receipt: { ...receipt, platformMessageIds: ["conflicting-message"] },
+      }),
+    ).rejects.toThrow("transport receipt cannot change");
+
+    const settled = await settleSourceTurnDeliveryFinal({
+      registryPath,
+      owner: identity.owner,
+    });
+    expect(settled).toMatchObject({
+      finalDeliveryDelivered: true,
+      obligationStage: "delivered",
+      sourceTurnState: "final_delivered",
+      currentStage: "final_dispatch_delivered",
+      deliveryDecision: { state: "final_delivered" },
+      durabilityDecision: { state: "settled", allowedToSettle: true },
+    });
+    expect({
+      reportArtifactPaths: settled.reportArtifactPaths,
+      markFacingExport: settled.markFacingExport,
+      trbRecovery: settled.trbRecovery,
+      watchdogReconciliation: settled.watchdogReconciliation,
+    }).toEqual({
+      reportArtifactPaths: preservedMetadata.reportArtifactPaths,
+      markFacingExport: preservedMetadata.markFacingExport,
+      trbRecovery: preservedMetadata.trbRecovery,
+      watchdogReconciliation: preservedMetadata.watchdogReconciliation,
+    });
+  });
+
+  it.each(["sourceSessionKey", "runId"] as const)(
+    "refuses prepared delivery without exact %s correlation",
+    async (field) => {
+      await expect(
+        persistSourceTurnDeliveryState({ ...preparedFinalParams(), [field]: " " }),
+      ).rejects.toThrow("Prepared source final requires its source session and execution run");
+      expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toEqual([]);
+    },
+  );
+
+  it("preserves every obligation when deliveries update the registry concurrently", async () => {
+    const ids = Array.from({ length: 8 }, (_, index) => `source:main:concurrent-${index}`);
+    const written = await Promise.all(
+      ids.map((id) => persistSourceTurnDeliveryState({ registryPath, id, facts: {} })),
+    );
+
+    const registry = await loadSourceTurnDeliveryRegistry(registryPath);
+    expect(registry.rows.map((row) => row.id).toSorted()).toEqual(ids.toSorted());
+    expect(registry.rows).toEqual(expect.arrayContaining(written));
+  });
+
+  it.each(["EPERM", "EEXIST"])(
+    "preserves the existing registry when rename fails with %s",
+    async (code) => {
+      const original = await persistSourceTurnDeliveryState({
+        registryPath,
+        id: "existing-obligation",
+        facts: {},
+      });
+      const originalBytes = await readFile(registryPath, "utf8");
+      const failure = Object.assign(new Error("rename denied"), { code });
+      const rename = vi.spyOn(fs, "rename").mockRejectedValue(failure);
+      try {
+        await expect(
+          persistSourceTurnDeliveryState({ registryPath, id: "new-obligation", facts: {} }),
+        ).rejects.toBe(failure);
+      } finally {
+        rename.mockRestore();
+      }
+      expect(await readFile(registryPath, "utf8")).toBe(originalBytes);
+      expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [original] });
+    },
+  );
+
+  it("recovers one unchanged abandoned lock before serializing concurrent writers", async () => {
+    const owner = spawnSync(process.execPath, ["-e", ""], { timeout: 5_000 });
+    expect(owner.status).toBe(0);
+    expect(owner.pid).toBeGreaterThan(0);
+    const abandonedLock = JSON.stringify({ pid: owner.pid, createdAt: new Date().toISOString() });
+    await writeFile(`${registryPath}.lock`, abandonedLock);
+    const attempts = await Promise.allSettled(
+      Array.from({ length: 8 }, (_, index) =>
+        persistSourceTurnDeliveryState({ registryPath, id: `after-crash-${index}`, facts: {} }),
+      ),
+    );
+
+    expect(attempts.every((attempt) => attempt.status === "fulfilled")).toBe(true);
+    await expect(readFile(`${registryPath}.lock`, "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toHaveLength(8);
+  });
+
+  it("recovers an old partial lock left by a crash during lock creation", async () => {
+    const lockPath = `${registryPath}.lock`;
+    await writeFile(lockPath, "{partial", "utf8");
+    const staleTime = new Date(Date.now() - 60_000);
+    await utimes(lockPath, staleTime, staleTime);
+
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "after-partial-lock-crash",
+      facts: {},
+    });
+
+    expect(row.id).toBe("after-partial-lock-crash");
+    await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.skipIf(process.platform === "win32").each([0o700, 0o1777, 0o2770])(
+    "preserves directory mode %o during atomic replacement",
+    async (mode) => {
+      await chmod(tempDir, mode);
+      expect((await stat(tempDir)).mode & 0o7777).toBe(mode);
+      const backupPath = join(tempDir, "previous-registry.json");
+      await writeFile(backupPath, "private delivery history", { mode: 0o664 });
+      await persistSourceTurnDeliveryState({ registryPath, id: "private-delivery", facts: {} });
+      expect((await stat(tempDir)).mode & 0o7777).toBe(mode);
+      expect(await readFile(backupPath, "utf8")).toBe("private delivery history");
+    },
+  );
+
+  it("waits for a live writer even when its lock timestamp is old", async () => {
+    const holder = await acquireFileLock(registryPath, {
+      managerKey: "source-delivery-test-holder",
+      payload: () => ({ pid: process.pid, createdAt: new Date(0).toISOString() }),
+    });
+    const update = persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:after-live-writer",
+      facts: {},
+    }).then(
+      (row) => ({ row }),
+      (error: unknown) => ({ error }),
+    );
+    try {
+      await setTimeout(25);
+      expect(JSON.parse(await readFile(holder.lockPath, "utf8"))).toMatchObject({
+        pid: process.pid,
+      });
+    } finally {
+      await holder.release();
+    }
+    expect(await update).toMatchObject({ row: { id: "source:main:after-live-writer" } });
   });
 
   it("keys governed report delivery obligations by mission, run, report, delivery, and generation", async () => {

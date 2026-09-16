@@ -196,10 +196,12 @@ vi.mock("./subagent-announce.registry.runtime.js", () => ({
   countActiveDescendantRuns: () => 0,
   countPendingDescendantRuns: () => pendingDescendantRuns,
   countPendingDescendantRunsExcludingRun: () => 0,
+  getLatestSubagentRunByChildSessionKey: () => undefined,
   listSubagentRunsForRequester: () => [],
   isSubagentSessionRunActive: () => subagentSessionRunActive,
   shouldIgnorePostCompletionAnnounceForSession: () => shouldIgnorePostCompletion,
-  replaceSubagentRunAfterSteer: () => true,
+  assertParentYieldWaitAllowsRestart: async () => {},
+  replaceSubagentRunAfterSteer: async () => true,
   resolveRequesterForChildSession: () => fallbackRequesterResolution,
 }));
 import { runSubagentAnnounceFlow } from "./subagent-announce.js";

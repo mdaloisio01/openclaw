@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
+import { classifyCurrentInboundInstruction } from "../governance/current-inbound-instruction.js";
 
 export const OWNER_REQUEST_INTAKE_KIND = "openclaw.owner-request-intake";
 export const OWNER_REQUEST_INTAKE_SCHEMA_VERSION = 1;
@@ -153,6 +154,15 @@ export function classifyOwnerRequestIntakeMessage(
   message: string,
 ): OwnerRequestIntakeClassificationResult {
   const normalized = message.toLowerCase();
+  const instruction = classifyCurrentInboundInstruction(message);
+  if (instruction !== "unrestricted") {
+    return {
+      classification: "chat_only",
+      expectedDurability: "chat_only_exemption",
+      governed: false,
+      reason: `current ${instruction} instruction does not authorize build execution`,
+    };
+  }
   if (
     /\b(cleanup crew|cleanup-crew|remediation build|repair build|resume.*sop)\b/.test(normalized)
   ) {
@@ -341,7 +351,7 @@ export function markOwnerRequestPromptPersisted(params: {
 
 export function markOwnerRequestMissionRegistered(params: {
   requestId: string;
-  taskFlowId: string;
+  taskFlowId?: string;
   taskId?: string;
   lastExecutableAction?: string | null;
   nextExecutableAction?: string | null;
@@ -351,21 +361,29 @@ export function markOwnerRequestMissionRegistered(params: {
   const nowMs = params.nowMs ?? Date.now();
   return updateRecord(
     params.requestId,
-    (record) => ({
-      ...record,
-      status: "mission_registered",
-      updatedAt: nowIso(nowMs),
-      updatedAtMs: nowMs,
-      missionRegisteredAtMs: nowMs,
-      taskFlowId: params.taskFlowId,
-      ...(normalizeOptionalString(params.taskId, 240) ? { taskId: params.taskId } : {}),
-      ...(normalizeOptionalString(params.lastExecutableAction, 500)
-        ? { lastExecutableAction: normalizeOptionalString(params.lastExecutableAction, 500) }
-        : {}),
-      ...(normalizeOptionalString(params.nextExecutableAction, 500)
-        ? { nextExecutableAction: normalizeOptionalString(params.nextExecutableAction, 500) }
-        : {}),
-    }),
+    (record) => {
+      if (
+        (!params.taskFlowId?.trim() && !params.taskId?.trim()) ||
+        (record.expectedDurability === "taskflow_required" && !params.taskFlowId?.trim())
+      ) {
+        throw new Error("Owner request requires its durable mission identity");
+      }
+      return {
+        ...record,
+        status: "mission_registered",
+        updatedAt: nowIso(nowMs),
+        updatedAtMs: nowMs,
+        missionRegisteredAtMs: nowMs,
+        ...(params.taskFlowId ? { taskFlowId: params.taskFlowId } : {}),
+        ...(normalizeOptionalString(params.taskId, 240) ? { taskId: params.taskId } : {}),
+        ...(normalizeOptionalString(params.lastExecutableAction, 500)
+          ? { lastExecutableAction: normalizeOptionalString(params.lastExecutableAction, 500) }
+          : {}),
+        ...(normalizeOptionalString(params.nextExecutableAction, 500)
+          ? { nextExecutableAction: normalizeOptionalString(params.nextExecutableAction, 500) }
+          : {}),
+      };
+    },
     params.stateDir,
   );
 }
@@ -485,7 +503,7 @@ export function classifyOwnerRequestIntakeGaps(
   return readLedger(params.stateDir).records.flatMap<OwnerRequestIntakeGap>((record) => {
     if (
       !record.governed ||
-      record.status === "mission_registered" ||
+      (record.status === "mission_registered" && record.promptPersistedAtMs !== undefined) ||
       record.status === "terminal"
     ) {
       return [];
@@ -510,7 +528,7 @@ export function classifyOwnerRequestIntakeGaps(
         { category: "client_send_no_server_ack", requestId: record.requestId, ageMs, record },
       ];
     }
-    if (record.status === "server_acknowledged") {
+    if (record.status === "server_acknowledged" || record.status === "mission_registered") {
       return [
         { category: "server_ack_no_prompt_persist", requestId: record.requestId, ageMs, record },
       ];

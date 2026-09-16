@@ -457,6 +457,12 @@ export type PluginHookReplyDispatchEvent = {
 export type PluginHookReplyDispatchContext = {
   cfg: OpenClawConfig;
   dispatcher: ReplyDispatcher;
+  /** Core-owned durable final delivery for parent/activation continuations. */
+  deliverFinalBatch?: (payloads: readonly ReplyPayload[]) => Promise<{
+    queuedFinal: boolean;
+    finalDeliveryDelivered: boolean;
+    finalDeliveryUnknown: boolean;
+  }>;
   abortSignal?: AbortSignal;
   onReplyStart?: () => Promise<void> | void;
   recordProcessed: (

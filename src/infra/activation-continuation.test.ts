@@ -1,34 +1,142 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  persistSourceTurnDeliveryState,
+  type PersistSourceTurnDeliveryParams,
+} from "../agents/source-turn-delivery-store.js";
+import {
   persistActivationContinuationBeforeRestart,
   recoverPendingActivationContinuations,
+  reconcileActivationContinuationDelivery,
   resolveActivationContinuationContinuityGatePersistence,
   resumeActivationContinuation,
   testing,
   type ActivationContinuationCheckName,
   type ActivationContinuationCheckResult,
+  type ActivationContinuationRecord,
+  type ActivationContinuationDeliveryResult,
 } from "./activation-continuation.js";
+import { resetHeartbeatWakeStateForTests } from "./heartbeat-wake.js";
+import {
+  enqueueSystemEvent,
+  peekSystemEventEntries,
+  resetSystemEventsForTest,
+} from "./system-events.js";
 
 let tempRoot: string;
 let stateDir: string;
 let exportsDir: string;
+let sourceDeliveryRegistryPath: string;
 
 beforeEach(async () => {
   tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-activation-continuation-"));
   stateDir = path.join(tempRoot, "state");
   exportsDir = path.join(tempRoot, "exports");
+  sourceDeliveryRegistryPath = path.join(tempRoot, "source-delivery.json");
+  vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", sourceDeliveryRegistryPath);
 });
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+  resetHeartbeatWakeStateForTests();
+  resetSystemEventsForTest();
   await fs.rm(tempRoot, { recursive: true, force: true });
 });
 
 function passCheck(name: ActivationContinuationCheckName): ActivationContinuationCheckResult {
   return { name, status: "pass", detail: "ok" };
+}
+
+async function saveDeliveryReceipt(
+  record: ActivationContinuationRecord,
+  overrides: Partial<PersistSourceTurnDeliveryParams> = {},
+) {
+  const ref = record.result?.proof?.deliveryRef;
+  if (!ref) {
+    throw new Error("prepared activation reference missing");
+  }
+  return persistSourceTurnDeliveryState({
+    registryPath: sourceDeliveryRegistryPath,
+    id: `source:${ref.id}:${ref.createdAt}:${ref.reportId}`,
+    sourceSessionKey: record.route.sessionKey,
+    deliveryContext: record.route.deliveryContext,
+    runId: "activation-publication-run",
+    deliveryId: ref.id,
+    generation: ref.createdAt,
+    reportId: ref.reportId,
+    facts: {
+      finalDeliveryRequired: true,
+      finalDeliveryDelivered: true,
+      visibleFinalProofKind: "source_chat_final",
+    },
+    ...overrides,
+  });
+}
+
+async function deliverWithReceipt(
+  record: ActivationContinuationRecord,
+  message: string,
+): Promise<ActivationContinuationDeliveryResult> {
+  const saved = (await testing.readStore(stateDir)).records.find(
+    (candidate) => candidate.id === record.id,
+  );
+  expect(saved?.result?.message).toBe(message);
+  expect(saved?.result?.proof?.deliveryRef?.reportId).toBe(
+    crypto.createHash("sha256").update(message).digest("hex"),
+  );
+  expect(saved?.status).toBe("pending_delivery");
+  expect(saved?.completedAt).toBeUndefined();
+  const receipt = await saveDeliveryReceipt(record);
+  return { status: "delivered", deliveryRecordId: receipt.id };
+}
+
+async function prepareQueuedReport(
+  id = "activation-pending",
+  sessionKey = "main",
+  deliveryContext: ActivationContinuationRecord["route"]["deliveryContext"] = {
+    channel: "webchat",
+    to: "source",
+    accountId: "account",
+    threadId: "thread",
+  },
+) {
+  const record = await persistActivationContinuationBeforeRestart(
+    {
+      id,
+      now: 100,
+      route: {
+        sessionKey,
+        deliveryContext,
+      },
+      requiredChecks: ["http_health", "visible_delivery"],
+    },
+    { stateDir },
+  );
+  return resumeActivationContinuation(record, {
+    stateDir,
+    exportsDir,
+    now: () => 200,
+    check: async (_record, check) => passCheck(check),
+  });
+}
+
+function reconcile(record: ActivationContinuationRecord) {
+  const continuation = record.result?.proof?.deliveryRef;
+  if (!continuation || !record.route.sessionKey) {
+    throw new Error("prepared activation missing");
+  }
+  return reconcileActivationContinuationDelivery({
+    continuation,
+    sessionKey: record.route.sessionKey,
+    registryPath: sourceDeliveryRegistryPath,
+    stateDir,
+    exportsDir,
+    now: 300,
+  });
 }
 
 function continuityGateOutputDir(root = stateDir): string {
@@ -46,6 +154,199 @@ async function readJsonArtifacts<T>(dir: string, subdir: string): Promise<T[]> {
 }
 
 describe("activation restart continuations", () => {
+  it("keeps the default session-only queue pending and never accepts a custom visible-delivery PASS", async () => {
+    const record = await persistActivationContinuationBeforeRestart(
+      {
+        id: "session-only",
+        now: 100,
+        route: { sessionKey: "main" },
+        requiredChecks: ["visible_delivery"],
+      },
+      { stateDir },
+    );
+    const check = vi.fn(async (_record, name: ActivationContinuationCheckName) => passCheck(name));
+    const pending = await resumeActivationContinuation(record, {
+      stateDir,
+      exportsDir,
+      now: () => 200,
+      check,
+    });
+    expect(pending.status).toBe("pending_delivery");
+    expect(pending.completedAt).toBeUndefined();
+    expect(pending.closeoutPath).toBeUndefined();
+    expect(pending.result?.proof).toMatchObject({
+      visibleDeliveryCompleted: false,
+      deliveryStatus: "queued",
+    });
+    expect(pending.result?.checks).toContainEqual(
+      expect.objectContaining({ name: "visible_delivery", status: "pending" }),
+    );
+    expect(check).not.toHaveBeenCalled();
+    expect(peekSystemEventEntries("main")).toEqual([
+      expect.objectContaining({ activationContinuation: pending.result?.proof?.deliveryRef }),
+    ]);
+    expect(await fs.readFile(pending.result?.proof?.artifactPath ?? "", "utf8")).toContain(
+      "Status: pending_delivery",
+    );
+  });
+
+  it("requeues a lost wake, then reconciles a committed source receipt without repeating validation or delivery", async () => {
+    const pending = await prepareQueuedReport();
+    resetSystemEventsForTest();
+    const check = vi.fn();
+    await recoverPendingActivationContinuations({ stateDir, exportsDir, now: () => 250, check });
+    expect(check).not.toHaveBeenCalled();
+    expect(peekSystemEventEntries("main")).toHaveLength(1);
+    const receipt = await saveDeliveryReceipt(pending);
+    enqueueSystemEvent("Another activation", {
+      sessionKey: "main",
+      activationContinuation: { id: "sibling", createdAt: 1, reportId: "sibling" },
+    });
+    const deliver = vi.fn();
+    await recoverPendingActivationContinuations({
+      stateDir,
+      exportsDir,
+      now: () => 9_000_000,
+      check,
+      deliver,
+    });
+    const settled = (await testing.readStore(stateDir)).records[0];
+    expect(settled.status).toBe("continuation_completed");
+    expect(settled.result?.message).toBe(pending.result?.message);
+    expect(settled.result?.proof).toMatchObject({
+      visibleDeliveryCompleted: true,
+      deliveryStatus: "delivered",
+      deliveryRecordId: receipt.id,
+    });
+    expect(check).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(peekSystemEventEntries("main").map((event) => event.activationContinuation?.id)).toEqual(
+      ["sibling"],
+    );
+  });
+
+  it.each([
+    "session",
+    "destination",
+    "generation",
+    "report",
+    "timestamp",
+    "refused",
+    "durability",
+    "stage",
+    "run",
+  ])("rejects mismatched or withheld %s source receipts", async (field) => {
+    const pending = await prepareQueuedReport();
+    const row = await saveDeliveryReceipt(pending);
+    if (field === "session") {
+      row.sourceSessionKey = "other";
+    }
+    if (field === "destination") {
+      row.deliveryContext = { ...row.deliveryContext, to: "other" };
+    }
+    if (field === "generation") {
+      row.obligationIdentity.generation = 99;
+    }
+    if (field === "report") {
+      row.obligationIdentity.reportId = "other";
+    }
+    if (field === "timestamp") {
+      row.updatedAt = new Date(1).toISOString();
+    }
+    if (field === "refused") {
+      row.deliveryDecision.refused = true;
+    }
+    if (field === "durability") {
+      row.durabilityDecision.allowedToSettle = false;
+    }
+    if (field === "stage") {
+      row.obligationStage = "prepared";
+    }
+    if (field === "run") {
+      row.obligationIdentity.runId = "";
+    }
+    await fs.writeFile(sourceDeliveryRegistryPath, JSON.stringify({ rows: [row] }));
+    expect((await reconcile(pending)).status).not.toBe("settled");
+    const current = (await testing.readStore(stateDir)).records[0];
+    expect(current.status).toBe("pending_delivery");
+    expect(current.result?.proof?.visibleDeliveryCompleted).toBe(false);
+    expect(peekSystemEventEntries("main")).toHaveLength(1);
+  });
+
+  it("keeps an uncertain send distinguishable from a missing receipt", async () => {
+    const pending = await prepareQueuedReport();
+    expect(await reconcile(pending)).toMatchObject({
+      status: "missing_receipt",
+      message: pending.result?.message,
+    });
+    await saveDeliveryReceipt(pending, {
+      facts: { finalDeliveryRequired: true, deliveryOutcomeUnknown: true },
+    });
+    expect(await reconcile(pending)).toMatchObject({
+      status: "pending",
+      reason: "delivery_unconfirmed",
+      runId: "activation-publication-run",
+      message: pending.result?.message,
+    });
+  });
+
+  it("refuses an external receipt when the original route omitted its destination", async () => {
+    const pending = await prepareQueuedReport("channel-only-external", "main", {
+      channel: "telegram",
+    });
+    await saveDeliveryReceipt(pending, {
+      deliveryContext: { channel: "telegram", to: "later-conversation" },
+    });
+    expect((await reconcile(pending)).status).not.toBe("settled");
+    expect((await testing.readStore(stateDir)).records[0].status).toBe("pending_delivery");
+    expect(peekSystemEventEntries("main")).toHaveLength(1);
+  });
+
+  it("accepts a WebChat receipt owned by the exact source session without an external destination", async () => {
+    const pending = await prepareQueuedReport("channel-only-webchat", "main", {
+      channel: "webchat",
+    });
+    await saveDeliveryReceipt(pending);
+    expect((await reconcile(pending)).status).toBe("settled");
+    expect(peekSystemEventEntries("main")).toEqual([]);
+  });
+
+  it("retries owner settlement after a post-delivery artifact failure without republishing", async () => {
+    const pending = await prepareQueuedReport();
+    await saveDeliveryReceipt(pending);
+    const artifactPath = pending.result?.proof?.artifactPath;
+    if (!artifactPath) {
+      throw new Error("artifact missing");
+    }
+    await fs.unlink(artifactPath);
+    await fs.mkdir(artifactPath);
+    expect(await reconcile(pending)).toMatchObject({
+      status: "pending",
+      reason: "settlement_failed",
+    });
+    expect((await testing.readStore(stateDir)).records[0].status).toBe("pending_delivery");
+    await fs.rmdir(artifactPath);
+    const deliver = vi.fn();
+    await recoverPendingActivationContinuations({ stateDir, exportsDir, now: () => 300, deliver });
+    expect(deliver).not.toHaveBeenCalled();
+    expect((await testing.readStore(stateDir)).records[0].status).toBe("continuation_completed");
+    expect(peekSystemEventEntries("main")).toHaveLength(0);
+  });
+
+  it("preserves distinct activation records when delivery callbacks settle concurrently", async () => {
+    const first = await prepareQueuedReport("first", "first-session");
+    const second = await prepareQueuedReport("second", "second-session");
+    await Promise.all([saveDeliveryReceipt(first), saveDeliveryReceipt(second)]);
+    expect(await Promise.all([reconcile(first), reconcile(second)])).toEqual([
+      { status: "settled" },
+      { status: "settled" },
+    ]);
+    const records = (await testing.readStore(stateDir)).records;
+    expect(records).toHaveLength(2);
+    expect(records.every((record) => record.status === "continuation_completed")).toBe(true);
+    expect(records[0].closeoutPath).not.toBe(records[1].closeoutPath);
+  });
+
   it("resolves Continuity Gate persistence only for absolute activation state directories", () => {
     expect(resolveActivationContinuationContinuityGatePersistence()).toBeUndefined();
     expect(
@@ -169,6 +470,8 @@ describe("activation restart continuations", () => {
   });
 
   it("keeps visible delivery proof separate from delivery route proof", async () => {
+    // Exercise the existing normalizer with an untyped delivery label from an external caller.
+    const rawRequiredChecks: unknown = ["visible_delivery", "delivery route is configured"];
     const record = await persistActivationContinuationBeforeRestart(
       {
         id: "activation-visible-proof",
@@ -176,7 +479,7 @@ describe("activation restart continuations", () => {
         route: { sessionKey: "main" },
         objective: "activate patched gateway",
         expectedRuntime: { commit: "abc" },
-        requiredChecks: ["visible_delivery", "delivery route is configured"],
+        requiredChecks: rawRequiredChecks as ActivationContinuationCheckName[],
       },
       { stateDir },
     );
@@ -189,7 +492,7 @@ describe("activation restart continuations", () => {
       {
         id: "activation-default-proof-bundle",
         now: 10,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         objective: "activate patched gateway",
         expectedRuntime: { commit: "abc" },
       },
@@ -212,7 +515,7 @@ describe("activation restart continuations", () => {
         check === "runtime_identity"
           ? { name: check, status: "fail", detail: "build-info missing from runtime" }
           : passCheck(check),
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const store = await testing.readStore(stateDir);
@@ -304,7 +607,7 @@ describe("activation restart continuations", () => {
       {
         id: "activation-2",
         now: 100,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         objective: "post restart validation",
         requiredChecks: ["systemd", "http_health"],
       },
@@ -319,6 +622,7 @@ describe("activation restart continuations", () => {
       check: async (_record, check) => passCheck(check),
       deliver: (_record, message) => {
         delivered.push(message);
+        return deliverWithReceipt(_record, message);
       },
     });
 
@@ -327,7 +631,7 @@ describe("activation restart continuations", () => {
     expect(store.records[0]?.status).toBe("continuation_completed");
     expect(store.records[0]?.attempts).toBe(1);
     expect(delivered.join("\n")).toContain(
-      "side effect completed, parent turn interrupted, continuation resumed and validation passed",
+      "side effect completed, parent turn interrupted, continuation resumed and runtime validation passed",
     );
     expect(delivered.join("\n")).not.toContain("aborted");
     await expect(fs.stat(store.records[0]?.closeoutPath ?? "")).resolves.toBeTruthy();
@@ -338,7 +642,7 @@ describe("activation restart continuations", () => {
       {
         id: "activation-3",
         now: 100,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         hardStopRules: ["do not resume GIE/SADB", "do not relaunch SADB"],
         requiredChecks: ["http_health"],
       },
@@ -353,6 +657,7 @@ describe("activation restart continuations", () => {
       check: async (_record, check) => passCheck(check),
       deliver: (_record, message) => {
         delivered.push(message);
+        return deliverWithReceipt(_record, message);
       },
     });
 
@@ -366,7 +671,7 @@ describe("activation restart continuations", () => {
       {
         id: "activation-4",
         now: 100,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         requiredChecks: ["http_health"],
       },
       { stateDir },
@@ -380,14 +685,14 @@ describe("activation restart continuations", () => {
       exportsDir,
       now: () => 200,
       check,
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
     await recoverPendingActivationContinuations({
       stateDir,
       exportsDir,
       now: () => 300,
       check,
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const store = await testing.readStore(stateDir);
@@ -414,7 +719,7 @@ describe("activation restart continuations", () => {
         check === "http_health"
           ? passCheck(check)
           : { name: check, status: "fail", detail: "missing smoke proof" },
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const store = await testing.readStore(stateDir);
@@ -431,7 +736,7 @@ describe("activation restart continuations", () => {
       {
         id: "activation-proof-gap-continuity",
         now: 100,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         requiredChecks: ["http_health", "manual:yield-resume"],
       },
       { stateDir },
@@ -445,7 +750,7 @@ describe("activation restart continuations", () => {
         check === "http_health"
           ? passCheck(check)
           : { name: check, status: "fail", detail: "missing smoke proof" },
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const outputDir = continuityGateOutputDir();
@@ -498,7 +803,7 @@ describe("activation restart continuations", () => {
       exportsDir,
       now: () => 200,
       check: async (_record, check) => passCheck(check),
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const outputDir = continuityGateOutputDir();
@@ -596,7 +901,7 @@ describe("activation restart continuations", () => {
     const record = testing.createContinuationRecord({
       id: "activation-success-continuity",
       now: 100,
-      route: { sessionKey: "main" },
+      route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
       requiredChecks: ["http_health"],
     });
     await testing.writeStore({ version: 1, records: [record] }, stateDir);
@@ -610,7 +915,7 @@ describe("activation restart continuations", () => {
         now: "2026-07-04T23:11:00.000Z",
       },
       check: async (_record, check) => passCheck(check),
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     expect(result.status).toBe("continuation_completed");
@@ -642,6 +947,7 @@ describe("activation restart continuations", () => {
       check: async (_record, check) => passCheck(check),
       deliver: (_record, message) => {
         delivered.push(message);
+        return deliverWithReceipt(_record, message);
       },
     });
 
@@ -663,7 +969,7 @@ describe("activation restart continuations", () => {
     const record = testing.createContinuationRecord({
       id: "activation-old-smoke",
       now: 100,
-      route: { sessionKey: "main" },
+      route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
       objective: "post restart validation",
       expectedRuntime: { commit: "abc" },
       requiredChecks: ["smoke:yield-resume" as ActivationContinuationCheckName],
@@ -680,6 +986,7 @@ describe("activation restart continuations", () => {
       now: () => 200,
       deliver: (_record, message) => {
         delivered.push(message);
+        return deliverWithReceipt(_record, message);
       },
     });
 
@@ -698,7 +1005,7 @@ describe("activation restart continuations", () => {
       {
         id: "activation-generated-pre-restart-proof-labels",
         now: 100,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         objective: "post restart validation",
         expectedRuntime: { commit: "abc" },
         requiredChecks: [
@@ -718,6 +1025,7 @@ describe("activation restart continuations", () => {
       now: () => 200,
       deliver: (_record, message) => {
         delivered.push(message);
+        return deliverWithReceipt(_record, message);
       },
     });
 
@@ -764,7 +1072,7 @@ describe("activation restart continuations", () => {
         {
           id: "activation-known-restart-manuals",
           now: 100,
-          route: { sessionKey: "main" },
+          route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
           objective: "post restart validation",
           expectedRuntime: { commit: "abc", version: "2026.6.2", builtAt: "now" },
           requiredChecks: [
@@ -786,6 +1094,7 @@ describe("activation restart continuations", () => {
         now: () => 200,
         deliver: (_record, message) => {
           delivered.push(message);
+          return deliverWithReceipt(_record, message);
         },
       });
 
@@ -851,7 +1160,7 @@ describe("activation restart continuations", () => {
       stateDir,
       exportsDir,
       now: () => 200,
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const store = await testing.readStore(stateDir);
@@ -931,12 +1240,12 @@ describe("activation restart continuations", () => {
     }
   });
 
-  it("keeps visible delivery proof and message in agreement", async () => {
+  it("records actual delivery receipt separately from the immutable prepared message", async () => {
     await persistActivationContinuationBeforeRestart(
       {
         id: "activation-delivery-proof",
         now: 100,
-        route: { sessionKey: "main" },
+        route: { sessionKey: "main", deliveryContext: { channel: "webchat" } },
         objective: "post restart validation",
         requiredChecks: ["http_health"],
       },
@@ -948,13 +1257,15 @@ describe("activation restart continuations", () => {
       exportsDir,
       now: () => 200,
       check: async (_record, check) => passCheck(check),
-      deliver: () => {},
+      deliver: deliverWithReceipt,
     });
 
     const store = await testing.readStore(stateDir);
     expect(store.records[0]?.result?.proof?.visibleDeliveryCompleted).toBe(true);
-    expect(store.records[0]?.result?.proof?.deliveryStatus).toBe("queued");
-    expect(store.records[0]?.result?.message).toContain("visibleSourceDeliveryCompleted: yes");
-    expect(store.records[0]?.result?.message).toContain("deliveryStatus: queued");
+    expect(store.records[0]?.result?.proof?.deliveryStatus).toBe("delivered");
+    expect(store.records[0]?.result?.message).not.toContain("visibleSourceDeliveryCompleted: yes");
+    expect(store.records[0]?.result?.checks).toContainEqual(
+      expect.objectContaining({ name: "visible_delivery", status: "pass" }),
+    );
   });
 });

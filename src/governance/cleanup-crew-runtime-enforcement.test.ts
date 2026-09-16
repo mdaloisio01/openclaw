@@ -44,7 +44,7 @@ function allGreen() {
     toolPreflight: {
       toolName: "functions.apply_patch",
       targetPath: "/home/will/openclaw-source/src/governance/cleanup-crew-runtime-enforcement.ts",
-      riskClasses: ["write", "file-write"],
+      riskClasses: ["write", "file-write"] as const,
       mutation: true,
       activeMissionScopePresent: true,
       controllingBuildPlanPresent: true,

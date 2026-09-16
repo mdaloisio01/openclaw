@@ -69,14 +69,18 @@ describe("governed operator override foundation", () => {
 
   it("requires every SOP-ENF-05 override record field", () => {
     expect(missingGovernedOperatorOverrideFields(override)).toEqual([]);
+    // Deliberately malformed input must still reject a false host-authority constraint.
+    const malformedRecord: unknown = {
+      overrideId: "",
+      target: { missionId: "", scopeHash: "" },
+      allowableClasses: [],
+      prohibitedClasses: [],
+      cannotExpandBeyondHostAuthority: false,
+    };
     expect(
-      missingGovernedOperatorOverrideFields({
-        overrideId: "",
-        target: { missionId: "", scopeHash: "" },
-        allowableClasses: [],
-        prohibitedClasses: [],
-        cannotExpandBeyondHostAuthority: false,
-      }),
+      missingGovernedOperatorOverrideFields(
+        malformedRecord as Partial<GovernedOperatorOverrideRecord>,
+      ),
     ).toEqual(
       expect.arrayContaining([
         "overrideId",

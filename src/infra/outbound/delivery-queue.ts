@@ -9,6 +9,7 @@ export {
   moveToFailed,
 } from "./delivery-queue-storage.js";
 export type {
+  DeliveryQueueOwnerReference,
   QueuedDelivery,
   QueuedDeliveryPayload,
   QueuedReplyPayloadSendingHook,
@@ -25,6 +26,7 @@ export {
 } from "./delivery-queue-recovery.js";
 export type {
   ActiveDeliveryClaimResult,
+  DeliveryRecoveryOwnerCallbacks,
   DeliverFn,
   PendingDeliveryDrainDecision,
   RecoveryLogger,

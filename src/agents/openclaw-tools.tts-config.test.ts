@@ -330,7 +330,7 @@ describe("createOpenClawTools media generation session wiring", () => {
     );
   });
 
-  it("keeps the requester session key for non-cron media completions", () => {
+  it("keeps non-cron media completion on its task owner instead of a subagent wait", async () => {
     const config = {
       agents: {
         defaults: {
@@ -339,19 +339,27 @@ describe("createOpenClawTools media generation session wiring", () => {
       },
     } satisfies OpenClawConfig;
 
+    const onYield = vi.fn();
     createOpenClawTools({
       config,
       agentSessionKey: "agent:main:slack:channel:C123",
       runSessionKey: "agent:main:slack:channel:C123:run:run-123",
       disableMessageTool: true,
       disablePluginTools: true,
+      onYield,
     });
 
+    const imageOptions = mocks.createImageGenerateToolOptions.mock.calls[0]?.[0] as
+      | { agentSessionKey?: string; onAsyncTaskStarted?: (message: string) => Promise<void> }
+      | undefined;
     expect(mocks.createImageGenerateToolOptions).toHaveBeenCalledWith(
       expect.objectContaining({
         agentSessionKey: "agent:main:slack:channel:C123",
+        onAsyncTaskStarted: onYield,
       }),
     );
+    await imageOptions?.onAsyncTaskStarted?.("image task accepted");
+    expect(onYield).toHaveBeenCalledExactlyOnceWith("image task accepted");
   });
 });
 

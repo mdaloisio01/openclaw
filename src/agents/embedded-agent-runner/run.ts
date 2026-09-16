@@ -2962,6 +2962,7 @@ export async function runEmbeddedAgent(
 
           const payloads = buildEmbeddedRunPayloads({
             assistantTexts: attempt.assistantTexts,
+            canonicalAssistantTranscript: attempt.canonicalAssistantTranscript,
             toolMetas: attempt.toolMetas,
             lastAssistant: attempt.lastAssistant,
             currentAssistant: currentAttemptAssistant ?? null,
@@ -3573,6 +3574,24 @@ export async function runEmbeddedAgent(
             stopReason,
             yielded: attempt.yieldDetected === true,
           });
+          if (
+            attempt.yieldDetected &&
+            !attempt.aborted &&
+            !attempt.externalAbort &&
+            !attempt.clientToolCalls?.length &&
+            !attempt.timedOut &&
+            !attempt.promptError &&
+            params.sessionKey
+          ) {
+            // A requested yield alone cannot release another parent execution.
+            // Both harnesses reach this owner only after their backend returns.
+            const { completeParentYieldWaitContinuationYield } =
+              await import("../subagent-registry.js");
+            completeParentYieldWaitContinuationYield({
+              controllerSessionKey: params.sessionKey,
+              runId: params.runId,
+            });
+          }
           return {
             payloads: terminalPayloads?.length ? terminalPayloads : undefined,
             ...(attempt.diagnosticTrace

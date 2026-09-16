@@ -5,10 +5,12 @@ import { computeNextHeartbeatPhaseDueMs, resolveHeartbeatPhaseMs } from "./heart
 import {
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
   HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
-  type RetryableHeartbeatBusySkipReason,
+  type RetryableHeartbeatSkipReason,
   requestHeartbeat,
   resetHeartbeatWakeStateForTests,
+  setHeartbeatsEnabled,
 } from "./heartbeat-wake.js";
+import { enqueueSystemEvent, resetSystemEventsForTest } from "./system-events.js";
 
 describe("startHeartbeatRunner", () => {
   type RunOnce = Parameters<typeof startHeartbeatRunner>[0]["runOnce"];
@@ -51,7 +53,7 @@ describe("startHeartbeatRunner", () => {
     });
   }
 
-  function createRetryableBusyRunSpy(reason: RetryableHeartbeatBusySkipReason, skipCount: number) {
+  function createRetryableBusyRunSpy(reason: RetryableHeartbeatSkipReason, skipCount: number) {
     let callCount = 0;
     return vi.fn().mockImplementation(async () => {
       callCount++;
@@ -164,9 +166,58 @@ describe("startHeartbeatRunner", () => {
 
   afterEach(() => {
     resetHeartbeatWakeStateForTests();
+    resetSystemEventsForTest();
+    setHeartbeatsEnabled(true);
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
+
+  it.each(["parent", "activation"] as const)(
+    "dispatches a required %s continuation for an agent outside a disabled heartbeat schedule",
+    async (kind) => {
+      useFakeHeartbeatTime();
+      const runSpy = createRetryableBusyRunSpy(HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT, 1);
+      const cfg: OpenClawConfig = {
+        agents: { list: [{ id: "main" }, { id: "ops", heartbeat: { every: "0m" } }] },
+      };
+      const runner = startHeartbeatRunner({
+        cfg,
+        runOnce: runSpy,
+        stableSchedulerSeed: TEST_SCHEDULER_SEED,
+      });
+      const sessionKey = "agent:main:source";
+      setHeartbeatsEnabled(false);
+      enqueueSystemEvent("Deliver the required source report.", {
+        sessionKey,
+        deliveryContext: { channel: "webchat" },
+        ...(kind === "parent"
+          ? { parentYieldWait: { waitId: "required-wait", parentRunId: "original-parent" } }
+          : {
+              activationContinuation: {
+                id: "required-activation",
+                createdAt: 1,
+                reportId: "original-report",
+              },
+            }),
+      });
+      try {
+        requestHeartbeat(wake("background-task", { sessionKey, coalesceMs: 0 }));
+        await vi.advanceTimersByTimeAsync(1);
+        expect(runSpy).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(runSpy).toHaveBeenCalledTimes(2);
+        expectRunCallFields(runSpy, 1, { agentId: "main", sessionKey });
+        // An ordinary wake still obeys the disabled optional schedule.
+        requestHeartbeat(
+          wake("background-task", { sessionKey: "agent:main:ordinary", coalesceMs: 0 }),
+        );
+        await vi.advanceTimersByTimeAsync(1);
+        expect(runSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        runner.stop();
+      }
+    },
+  );
 
   it("updates scheduling when config changes without restart", async () => {
     useFakeHeartbeatTime();

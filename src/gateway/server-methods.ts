@@ -444,6 +444,7 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
       "tasks.cancel",
       "tasks.startProductionFlow",
       "tasks.resumeProductionFlow",
+      "tasks.handleBuildIssue",
       "tasks.runTaskInFlow",
       "tasks.recordTaskInFlowProgress",
       "tasks.completeTaskInFlow",

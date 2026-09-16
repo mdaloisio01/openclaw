@@ -1535,13 +1535,14 @@ export function validateCleanupCrewMissionAbortExhaustionReceipt(
   if (receipt.schema !== "openclaw.cleanup_crew_mission_abort_exhaustion_receipt.v1") {
     errors.push("mission_abort_exhaustion_schema_invalid");
   }
-  if (!optionalText(receipt.receipt_id)) {
+  if (typeof receipt.receipt_id !== "string" || !receipt.receipt_id.trim()) {
     errors.push("mission_abort_exhaustion_receipt_id_missing");
   }
-  if (!optionalText(receipt.created_at)) {
+  if (typeof receipt.created_at !== "string" || !receipt.created_at.trim()) {
     errors.push("mission_abort_exhaustion_created_at_missing");
   }
-  const missionId = optionalText(receipt.mission_id);
+  const missionId =
+    typeof receipt.mission_id === "string" ? optionalText(receipt.mission_id) : undefined;
   if (!missionId) {
     errors.push("mission_abort_exhaustion_mission_id_missing");
   }
@@ -1561,6 +1562,10 @@ export function validateCleanupCrewMissionAbortExhaustionReceipt(
     CleanupCrewMissionAbortExhaustionEntry
   >();
   for (const entry of receipt.entries) {
+    if (!entry || typeof entry !== "object") {
+      errors.push("mission_abort_exhaustion_entry_invalid");
+      continue;
+    }
     if (!CLEANUP_CREW_MISSION_ABORT_CONTINUATION_CLASSES.includes(entry.class)) {
       errors.push(`mission_abort_exhaustion_unknown_class:${entry.class}`);
       continue;
@@ -1568,7 +1573,7 @@ export function validateCleanupCrewMissionAbortExhaustionReceipt(
     if (entry.status !== "unavailable" && entry.status !== "inapplicable") {
       errors.push(`mission_abort_exhaustion_status_invalid:${entry.class}`);
     }
-    if (!optionalText(entry.evidence)) {
+    if (typeof entry.evidence !== "string" || !entry.evidence.trim()) {
       errors.push(`mission_abort_exhaustion_evidence_missing:${entry.class}`);
     }
     if (byClass.has(entry.class)) {

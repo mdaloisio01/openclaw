@@ -14,10 +14,13 @@ const hoisted = vi.hoisted(() => {
     startGatewayModelPricingRefresh: vi.fn(() => stopModelPricingRefresh),
     loadModelPricingCacheModule: vi.fn(),
     isVitestRuntimeEnv: vi.fn(() => false),
-    recoverPendingDeliveries: vi.fn(async () => undefined),
+    recoverPendingDeliveries: vi.fn(async (_opts: unknown) => undefined),
     recoverPendingRestartContinuationDeliveries: vi.fn(async () => undefined),
     recoverPendingActivationContinuations: vi.fn(async () => []),
     deliverOutboundPayloads: vi.fn(),
+    isRecoveryCommitted: vi.fn(async () => false),
+    commitRecoveredDelivery: vi.fn(async () => undefined),
+    createSourceTurnDeliveryRecoveryCallbacks: vi.fn(),
   };
 });
 
@@ -36,6 +39,10 @@ vi.mock("../infra/outbound/deliver.js", () => ({
 
 vi.mock("../infra/outbound/delivery-queue.js", () => ({
   recoverPendingDeliveries: hoisted.recoverPendingDeliveries,
+}));
+
+vi.mock("../agents/source-turn-delivery-recovery.js", () => ({
+  createSourceTurnDeliveryRecoveryCallbacks: hoisted.createSourceTurnDeliveryRecoveryCallbacks,
 }));
 
 vi.mock("./server-restart-sentinel.js", () => ({
@@ -80,6 +87,12 @@ describe("server-runtime-services", () => {
     hoisted.recoverPendingRestartContinuationDeliveries.mockClear();
     hoisted.recoverPendingActivationContinuations.mockClear();
     hoisted.deliverOutboundPayloads.mockClear();
+    hoisted.isRecoveryCommitted.mockClear();
+    hoisted.commitRecoveredDelivery.mockClear();
+    hoisted.createSourceTurnDeliveryRecoveryCallbacks.mockReset().mockReturnValue({
+      isRecoveryCommitted: hoisted.isRecoveryCommitted,
+      commitRecoveredDelivery: hoisted.commitRecoveredDelivery,
+    });
   });
 
   afterEach(() => {
@@ -205,7 +218,10 @@ describe("server-runtime-services", () => {
       deliver: hoisted.deliverOutboundPayloads,
       cfg: {},
       log: deliveryLog,
+      isRecoveryCommitted: hoisted.isRecoveryCommitted,
+      commitRecoveredDelivery: hoisted.commitRecoveredDelivery,
     });
+    expect(hoisted.createSourceTurnDeliveryRecoveryCallbacks).toHaveBeenCalledTimes(1);
     expect(hoisted.recoverPendingRestartContinuationDeliveries).toHaveBeenCalledWith({
       deps: {},
       maxEnqueuedAt: 123,

@@ -5,6 +5,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { CallGatewayOptions } from "../gateway/call.js";
+import { reactivateCompletedSubagentSession } from "../gateway/session-subagent-reactivation.js";
+import { peekSystemEventEntries, resetSystemEventsForTest } from "../infra/system-events.js";
 import {
   testing,
   killAllControlledSubagentRuns,
@@ -14,11 +16,18 @@ import {
   steerControlledSubagentRun,
 } from "./subagent-control.js";
 import {
+  SUBAGENT_ENDED_REASON_COMPLETE,
+  SUBAGENT_ENDED_REASON_KILLED,
+} from "./subagent-lifecycle-events.js";
+import {
   testing as subagentRegistryTesting,
   addSubagentRunForTests,
   getSubagentRunByChildSessionKey,
+  initSubagentRegistry,
+  markParentYieldWaitForController,
   resetSubagentRegistryForTests,
 } from "./subagent-registry.js";
+import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: vi.fn(),
@@ -1163,7 +1172,188 @@ describe("killAllControlledSubagentRuns", () => {
 describe("steerControlledSubagentRun", () => {
   afterEach(() => {
     resetSubagentRegistryForTests({ persist: false });
+    resetSystemEventsForTest();
     testing.setDepsForTest();
+  });
+
+  it.each(["committed", "dispatch-failed"])(
+    "keeps the last-child parent wait behind the actual steer handoff: %s",
+    async (handoff) => {
+      const parentSessionKey = "agent:main:main";
+      const old: SubagentRunRecord = {
+        runId: "last-child-old",
+        childSessionKey: "agent:main:subagent:last-child",
+        controllerSessionKey: parentSessionKey,
+        requesterSessionKey: parentSessionKey,
+        requesterDisplayKey: "main",
+        task: "finish the child task",
+        cleanup: "keep",
+        createdAt: Date.now() - 100,
+        startedAt: Date.now() - 100,
+      };
+      addSubagentRunForTests(old);
+      const marked = markParentYieldWaitForController({
+        controllerSessionKey: parentSessionKey,
+        parentRunId: "original-parent",
+      });
+      const parentEvents = () =>
+        peekSystemEventEntries(parentSessionKey).filter((event) => event.parentYieldWait);
+      setSubagentControlDepsForTest({
+        callGateway: async <T = Record<string, unknown>>(request: CallGatewayOptions) => {
+          if (request.method === "agent.wait") {
+            await subagentRegistryTesting.completeSubagentRunForTests({
+              runId: old.runId,
+              endedAt: Date.now(),
+              outcome: { status: "error", error: "subagent run terminated" },
+              reason: SUBAGENT_ENDED_REASON_KILLED,
+              triggerCleanup: false,
+            });
+            // A warm startup can occur while the controller awaits the handoff.
+            await initSubagentRegistry({ gatewayStartup: true });
+            expect(old.suppressAnnounceReason).toBe("steer-restart");
+            expect(old.parentYieldWait?.continuationScheduledAt).toBeUndefined();
+            expect(parentEvents()).toEqual([]);
+            return { status: "ok" } as T;
+          }
+          if (request.method === "agent") {
+            if (handoff === "dispatch-failed") {
+              throw new Error("restart dispatch failed");
+            }
+            // This is the real Gateway admission owner, before its accepted
+            // response reaches the control caller's duplicate handoff.
+            expect(
+              await reactivateCompletedSubagentSession({
+                sessionKey: old.childSessionKey,
+                runId: "last-child-new",
+              }),
+            ).toBe(true);
+            return { runId: "last-child-new" } as T;
+          }
+          throw new Error(`unexpected method: ${request.method}`);
+        },
+      });
+
+      const result = await steerControlledSubagentRun({
+        cfg: cfgWithSessionStore(),
+        controller: {
+          controllerSessionKey: parentSessionKey,
+          callerSessionKey: parentSessionKey,
+          callerIsSubagent: false,
+          controlScope: "children",
+        },
+        entry: old,
+        message: "finish with this revised direction",
+      });
+      if (handoff === "committed") {
+        expect(result.status).toBe("accepted");
+        const next = getSubagentRunByChildSessionKey(old.childSessionKey)!;
+        expect(next.runId).toBe("last-child-new");
+        expect(next.parentYieldWait?.expectedChildRunIds).toEqual([next.runId]);
+        expect(parentEvents()).toEqual([]);
+        await subagentRegistryTesting.completeSubagentRunForTests({
+          runId: next.runId,
+          endedAt: Date.now(),
+          outcome: { status: "ok" },
+          reason: SUBAGENT_ENDED_REASON_COMPLETE,
+          triggerCleanup: false,
+        });
+      } else {
+        expect(result).toMatchObject({ status: "error", error: "restart dispatch failed" });
+        expect(old.outcome).toEqual({
+          status: "error",
+          error: "subagent run terminated",
+          startedAt: old.startedAt,
+          endedAt: old.endedAt,
+          elapsedMs: old.endedAt! - old.startedAt!,
+        });
+        expect(old.suppressAnnounceReason).toBeUndefined();
+      }
+      expect(parentEvents()).toHaveLength(1);
+      expect(parentEvents()[0].parentYieldWait).toEqual({
+        waitId: marked.waitId,
+        parentRunId: "original-parent",
+      });
+    },
+  );
+
+  it("does not abort when durable steer admission fails", async () => {
+    const childSessionKey = "agent:main:subagent:admission-failed";
+    const entry: SubagentRunRecord = {
+      runId: "admission-failed",
+      childSessionKey,
+      controllerSessionKey: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "keep running until admission succeeds",
+      cleanup: "keep",
+      createdAt: Date.now(),
+    };
+    addSubagentRunForTests(entry);
+    const abort = vi.fn(() => false);
+    const gateway = vi.fn();
+    const callGateway = async <T = Record<string, unknown>>(
+      _request: CallGatewayOptions,
+    ): Promise<T> => {
+      gateway();
+      return {} as T;
+    };
+    setSubagentControlDepsForTest({ abortEmbeddedAgentRun: abort, callGateway });
+    const persist = vi.fn(() => {
+      throw new Error("storage unavailable");
+    });
+    subagentRegistryTesting.setDepsForTest({ persistSubagentRunsToDiskOrThrow: persist });
+    const result = await steerControlledSubagentRun({
+      cfg: cfgWithSessionStore(),
+      controller: {
+        controllerSessionKey: "agent:main:main",
+        callerSessionKey: "agent:main:main",
+        callerIsSubagent: false,
+        controlScope: "children",
+      },
+      entry,
+      message: "revised direction",
+    });
+    expect(result.status).toBe("error");
+    expect(entry.suppressAnnounceReason).toBeUndefined();
+    expect(abort).not.toHaveBeenCalled();
+    expect(gateway).not.toHaveBeenCalled();
+  });
+
+  it("releases steer ownership when queue cleanup throws before Gateway dispatch", async () => {
+    const entry: SubagentRunRecord = {
+      runId: "queue-failed",
+      childSessionKey: "agent:main:subagent:queue-failed",
+      controllerSessionKey: "agent:main:main",
+      requesterSessionKey: "agent:main:main",
+      requesterDisplayKey: "main",
+      task: "recover from queue cleanup failure",
+      cleanup: "keep",
+      createdAt: Date.now(),
+    };
+    addSubagentRunForTests(entry);
+    setSubagentControlDepsForTest({
+      clearSessionQueues: () => {
+        throw new Error("queue cleanup failed");
+      },
+    });
+    const params = {
+      cfg: cfgWithSessionStore(),
+      controller: {
+        controllerSessionKey: "agent:main:main",
+        callerSessionKey: "agent:main:main",
+        callerIsSubagent: false,
+        controlScope: "children" as const,
+      },
+      entry,
+      message: "revised direction",
+    };
+    await expect(steerControlledSubagentRun(params)).rejects.toThrow("queue cleanup failed");
+    expect(entry.suppressAnnounceReason).toBeUndefined();
+    setSubagentControlDepsForTest({
+      callGateway: async <T = Record<string, unknown>>(request: CallGatewayOptions) =>
+        (request.method === "agent" ? { runId: "queue-recovered" } : {}) as T,
+    });
+    expect((await steerControlledSubagentRun(params)).status).toBe("accepted");
   });
 
   it("returns an error and clears the restart marker when run remap fails", async () => {
@@ -1181,7 +1371,7 @@ describe("steerControlledSubagentRun", () => {
 
     const replaceSpy = vi
       .spyOn(await import("./subagent-registry.js"), "replaceSubagentRunAfterSteer")
-      .mockReturnValue(false);
+      .mockResolvedValue(false);
 
     setSubagentControlDepsForTest({
       callGateway: async <T = Record<string, unknown>>(request: CallGatewayOptions) => {

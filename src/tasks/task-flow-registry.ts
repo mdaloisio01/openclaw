@@ -718,8 +718,12 @@ function buildActiveProductionContinuationFromLegacy(params: {
     ? mapContinuationStopReasonToBoundary(continuation.lawfulStopReason)
     : "complete";
   const actionId = `${flow.flowId}:next-executable`;
-  const launchDetail =
-    latestContinuationEventDetail(continuation, "NEXT_EXECUTABLE_UNIT_LAUNCHED") ??
+  // A new checkpoint identifies the current action without launching it. Prior
+  // execution remains in events for audit and must not replace the pending action.
+  const actionDetail =
+    (continuation.nextExecutableUnitLaunched
+      ? latestContinuationEventDetail(continuation, "NEXT_EXECUTABLE_UNIT_LAUNCHED")
+      : undefined) ??
     latestContinuationEventDetail(continuation, "NEXT_EXECUTABLE_UNIT_IDENTIFIED") ??
     flow.currentStep ??
     "Continue active production run";
@@ -728,10 +732,10 @@ function buildActiveProductionContinuationFromLegacy(params: {
       ? {
           actionId,
           owner: flow.ownerKey,
-          summary: launchDetail,
+          summary: actionDetail,
           boundary,
           surface: "taskflow_child",
-          ...(continuation.nextExecutableUnitLaunched ? { dispatchProofRef: launchDetail } : {}),
+          ...(continuation.nextExecutableUnitLaunched ? { dispatchProofRef: actionDetail } : {}),
         }
       : undefined;
   const launchedAt = latestContinuationEventTime(continuation, "NEXT_EXECUTABLE_UNIT_LAUNCHED");
@@ -746,7 +750,7 @@ function buildActiveProductionContinuationFromLegacy(params: {
             dispatchedAt: launchedAt,
             owner: nextAction.owner,
             summary: nextAction.summary,
-            proofRef: nextAction.dispatchProofRef ?? launchDetail,
+            proofRef: nextAction.dispatchProofRef ?? actionDetail,
           },
         ]
       : [];

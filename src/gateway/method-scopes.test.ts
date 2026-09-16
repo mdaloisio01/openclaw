@@ -47,6 +47,7 @@ describe("method scope resolution", () => {
     ["tasks.cancel", ["operator.write"]],
     ["tasks.startProductionFlow", ["operator.write"]],
     ["tasks.resumeProductionFlow", ["operator.write"]],
+    ["tasks.handleBuildIssue", ["operator.write"]],
     ["tasks.runTaskInFlow", ["operator.write"]],
     ["tasks.recordProductionFlowLawfulStop", ["operator.write"]],
     ["tasks.probeProductionWatchdogLifecycle", ["operator.write"]],

@@ -30,7 +30,7 @@ import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { resolveStatusTtsSnapshot } from "../../tts/status-config.js";
 import { resolveConfiguredTtsMode } from "../../tts/tts-config.js";
 import type { SourceReplyDeliveryMode } from "../get-reply-options.types.js";
-import { markReplyPayloadAsTtsSupplement } from "../reply-payload.js";
+import { markReplyPayloadAsTtsSupplement, type ReplyPayload } from "../reply-payload.js";
 import type { FinalizedMsgContext } from "../templating.js";
 import { createAcpReplyProjector } from "./acp-projector.js";
 import {
@@ -166,7 +166,7 @@ type AcpDispatchStatsSnapshot = {
 };
 type AcpDispatchOutcome = { kind: "ok" } | { kind: "error"; error: AcpRuntimeError };
 
-function finishAcpDispatchAttempt(params: {
+async function finishAcpDispatchAttempt(params: {
   queuedFinal: boolean;
   dispatcher: ReplyDispatcher;
   delivery: AcpDispatchDeliveryCoordinator;
@@ -178,7 +178,8 @@ function finishAcpDispatchAttempt(params: {
   lifecyclePhase?: "end" | "error";
   recordProcessed: DispatchProcessedRecorder;
   markIdle: (reason: string) => void;
-}): AcpDispatchAttemptResult {
+}): Promise<AcpDispatchAttemptResult> {
+  const finalBatch = await params.delivery.flushFinalBatch();
   const counts = params.dispatcher.getQueuedCounts();
   params.delivery.applyRoutedCounts(counts);
   const acpStats = params.getStats();
@@ -210,7 +211,7 @@ function finishAcpDispatchAttempt(params: {
     });
   }
   params.markIdle("message_completed");
-  return { queuedFinal: params.queuedFinal, counts };
+  return { queuedFinal: params.queuedFinal || finalBatch?.queuedFinal === true, counts };
 }
 
 const ACP_STALE_BINDING_UNBIND_REASON = "acp-session-init-failed";
@@ -362,6 +363,11 @@ export async function tryDispatchAcpReply(params: {
   ctx: FinalizedMsgContext;
   cfg: OpenClawConfig;
   dispatcher: ReplyDispatcher;
+  deliverFinalBatch?: (payloads: readonly ReplyPayload[]) => Promise<{
+    queuedFinal: boolean;
+    finalDeliveryDelivered: boolean;
+    finalDeliveryUnknown: boolean;
+  }>;
   runId?: string;
   sessionKey?: string;
   images?: Array<{ data: string; mimeType: string }>;
@@ -424,6 +430,7 @@ export async function tryDispatchAcpReply(params: {
     agentId: acpAgentId,
     ctx: params.ctx,
     dispatcher: params.dispatcher,
+    deliverFinalBatch: params.deliverFinalBatch,
     inboundAudio: params.inboundAudio,
     sessionKey: canonicalSessionKey,
     sessionTtsAuto: params.sessionTtsAuto,
@@ -525,7 +532,7 @@ export async function tryDispatchAcpReply(params: {
         text: deliveredText,
         isError: true,
       });
-      return finishAttempt({
+      return await finishAttempt({
         queuedFinal: delivered,
         outcome: { kind: "error", error: acpResolution.error },
       });
@@ -640,7 +647,7 @@ export async function tryDispatchAcpReply(params: {
         shouldEmitResolvedIdentityNotice,
       })) || queuedFinal;
 
-    return finishAttempt({
+    return await finishAttempt({
       queuedFinal,
       outcome: { kind: "ok" },
       lifecyclePhase: "end",
@@ -670,7 +677,7 @@ export async function tryDispatchAcpReply(params: {
       isError: true,
     });
     queuedFinal = queuedFinal || delivered;
-    return finishAttempt({
+    return await finishAttempt({
       queuedFinal,
       outcome: { kind: "error", error: acpError },
       lifecyclePhase: "error",

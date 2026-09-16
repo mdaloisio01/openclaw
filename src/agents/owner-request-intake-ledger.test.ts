@@ -76,6 +76,88 @@ describe("owner request intake ledger", () => {
     });
   });
 
+  it.each([
+    "Give me a Cleanup Crew production report only.",
+    "Give me the current Cleanup Crew production report only.",
+    "Give me an optimized research prompt to have Cleanup Crew review the system and research common issues and fixes.",
+    "Okay, make up a full production SOP build plan for Cleanup Crew.",
+    "Cleanup Crew production build: only draft a prompt for the repair.",
+    "Cleanup Crew production repair: status only; do not continue.",
+    "Cleanup Crew production repair: status only and do not continue.",
+    "Pause Cleanup Crew. Proceed with the Cleanup Crew status report only.",
+    "Stop. Start the Cleanup Crew report only.",
+    "Proceed with the Cleanup Crew production status report only because I don't authorize changes.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and execute the changes myself.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Please proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Please, proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Do not continue with the Cleanup Crew build.",
+    "Cleanup Crew production repair: do not continue all work.",
+    "Cleanup Crew production repair: do not execute work.",
+    "Cleanup Crew production repair: no execution of all work.",
+    "Cleanup Crew production repair: no execution of production work.",
+    "Cleanup Crew production repair: do not continue any work.",
+    "Cleanup Crew production repair: do not execute any work.",
+    "Cleanup Crew production repair: no execution of any work.",
+    "Give me a Cleanup Crew status update and do not continue.",
+    "Do not continue with the Cleanup Crew build, please.",
+    "Do not continue with the Cleanup Crew build because I only want a status update.",
+    "Do not continue with the Cleanup Crew build for now.",
+    "Draft a plan. Run Cleanup Crew. Mention blockers and then pause now.",
+    "Stop.",
+    "Don't run.",
+    "Do not resume.",
+    "Do not start.",
+    "Do not proceed.",
+    "Stop the execution.",
+    "Do not do any work on this production build.",
+    "Cleanup Crew production repair: do not continue, please.",
+    "Cleanup Crew production repair: stop for the moment, please.",
+    "Stop working on the Cleanup Crew production repair.",
+    "Stop all work on the Cleanup Crew production repair.",
+    "Cleanup Crew production repair: stop all work.",
+    "Do not proceed with work on the Cleanup Crew mission.",
+    "Do not run the Cleanup Crew production build.",
+    "No execution of this Cleanup Crew production mission.",
+    "Pause the Cleanup Crew production repair.",
+    "Cleanup Crew production repair: do not do any work, just answer.",
+  ])("does not create an executable mission obligation for a restricted request: %s", (message) => {
+    expect(classifyOwnerRequestIntakeMessage(message)).toMatchObject({
+      classification: "chat_only",
+      expectedDurability: "chat_only_exemption",
+      governed: false,
+    });
+  });
+
+  it.each([
+    "Draft a Cleanup Crew production build plan and then execute it.",
+    "Draft a Cleanup Crew production build plan, but execute it now.",
+    "Draft a plan for Cleanup Crew and execute it now.",
+    "Draft a plan to fix Cleanup Crew and execute it now.",
+    "Draft a Cleanup Crew production plan and include rollback steps; then execute it now.",
+    "Give me a Cleanup Crew production build plan. Execute it now.",
+    "Cleanup Crew production repair: fix the planning-only closeout regression.",
+    "Cleanup Crew production repair: fix status-only/report-only classification.",
+    "Cleanup Crew production repair: fix pause/resume handling and run its tests.",
+    "Cleanup Crew production repair: fix the parser and do not run tests.",
+    "Cleanup Crew production repair: fix the parser and do not run the production build tests.",
+    "Cleanup Crew production repair: fix the parser and do not execute the production build tests.",
+    "Cleanup Crew production repair: fix the parser and do not continue the repair helper.",
+    "Cleanup Crew production repair: stop the repair helper and run the remaining checks.",
+    "Cleanup Crew production repair: do not do any work on the repair helper; run remaining checks.",
+    "Cleanup Crew production repair: fix the parser; no execution of this mission classifier.",
+    "Cleanup Crew production repair: fix the 'status only and do not continue' regression and run its tests.",
+    "Pause Cleanup Crew. Start the build now.",
+    "Stop. Proceed with the Cleanup Crew repair now.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and then execute the Cleanup Crew repair.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Please proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Please, proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+    "Write production code for a plan validator.",
+  ])("keeps the current execution request governed: %s", (message) => {
+    expect(classifyOwnerRequestIntakeMessage(message).governed).toBe(true);
+  });
+
   it("classifies intake gaps at each pre-registration stage", () => {
     const clientOnly = createOwnerRequestIntakeRecord({
       message: "client send",
@@ -134,6 +216,10 @@ describe("owner request intake ledger", () => {
       stateDir,
       nowMs: 2_000,
     });
+    expect(classifyOwnerRequestIntakeGaps({ stateDir, nowMs: 200_000, graceMs: 1 })).toMatchObject([
+      { requestId: registered.requestId, category: "server_ack_no_prompt_persist" },
+    ]);
+    markOwnerRequestPromptPersisted({ requestId: registered.requestId, stateDir, nowMs: 2_100 });
     const chatOnly = createOwnerRequestIntakeRecord({
       message: "hello",
       classification: "chat_only",
@@ -151,6 +237,30 @@ describe("owner request intake ledger", () => {
 
     expect(classifyOwnerRequestIntakeGaps({ stateDir, nowMs: 200_000, graceMs: 1 })).toEqual([]);
   });
+
+  it.each(["taskflow_or_exemption", "taskflow_required"] as const)(
+    "binds a managed task only when %s allows it",
+    (expectedDurability) => {
+      const record = createOwnerRequestIntakeRecord({
+        message: "bounded delegated acknowledgement",
+        classification: "governed_mission",
+        expectedDurability,
+        stateDir,
+      });
+      const bind = () =>
+        markOwnerRequestMissionRegistered({
+          requestId: record.requestId,
+          taskId: "managed-acp-task",
+          stateDir,
+        });
+      if (expectedDurability === "taskflow_required") {
+        expect(bind).toThrow("durable mission identity");
+        expect(listOwnerRequestIntakeRecords({ stateDir })[0].status).toBe("server_acknowledged");
+      } else {
+        expect(bind()).toMatchObject({ status: "mission_registered", taskId: "managed-acp-task" });
+      }
+    },
+  );
 
   it("records proof-backed recovery dispatches and excludes them from open gaps", () => {
     const record = createOwnerRequestIntakeRecord({

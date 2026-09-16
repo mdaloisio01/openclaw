@@ -1,5 +1,5 @@
 import { registerSessionMaintenancePreserveKeysProvider } from "../config/sessions/store-maintenance-preserve.js";
-import { isDeliverySuspended } from "./subagent-delivery-state.js";
+import { isDeliverySuspended, shouldRetainParentYieldCloseout } from "./subagent-delivery-state.js";
 import { subagentRuns } from "./subagent-registry-memory.js";
 import { getSubagentRunsSnapshotForRead } from "./subagent-registry-state.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
@@ -21,6 +21,9 @@ function isAwaitingCompletionAnnounceForMaintenance(entry: SubagentRunRecord): b
 }
 
 function shouldPreserveForMaintenance(entry: SubagentRunRecord): boolean {
+  if (shouldRetainParentYieldCloseout(entry)) {
+    return true;
+  }
   if (isCleanupCompleteForMaintenance(entry)) {
     return false;
   }

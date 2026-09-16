@@ -2,9 +2,11 @@ import {
   resolveDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
 } from "@openclaw/normalization-core/number-coercion";
+import { createMessageReceiptFromOutboundResults } from "../../channels/message/receipt.js";
 import type {
   ChannelMessageSendCommitContext,
   ChannelMessageUnknownSendReconciliationResult,
+  MessageReceipt,
 } from "../../channels/message/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { formatErrorMessage } from "../errors.js";
@@ -19,6 +21,8 @@ import {
   failDelivery,
   loadPendingDelivery,
   loadPendingDeliveries,
+  markDeliveryPlatformOutcomeUnknown,
+  markDeliveryPlatformSendAttemptStarted,
   moveToFailed,
   type QueuedDelivery,
   type QueuedDeliveryPayload,
@@ -29,6 +33,14 @@ export type RecoverySummary = {
   failed: number;
   skippedMaxRetries: number;
   deferredBackoff: number;
+};
+
+export type DeliveryRecoveryOwnerCallbacks = {
+  isRecoveryCommitted?: (entry: QueuedDelivery) => Promise<boolean>;
+  commitRecoveredDelivery?: (
+    entry: QueuedDelivery,
+    receipt: MessageReceipt | undefined,
+  ) => Promise<void>;
 };
 
 export type DeliverFn = (
@@ -380,9 +392,31 @@ async function drainQueuedEntry(opts: {
   log: RecoveryLogger;
   stateDir?: string;
   onRecovered?: (entry: QueuedDelivery) => void;
+  isRecoveryCommitted?: DeliveryRecoveryOwnerCallbacks["isRecoveryCommitted"];
+  commitRecoveredDelivery?: DeliveryRecoveryOwnerCallbacks["commitRecoveredDelivery"];
   onFailed?: (entry: QueuedDelivery, errMsg: string) => void;
 }): Promise<"recovered" | "failed" | "moved-to-failed" | "already-gone"> {
   const { entry } = opts;
+  // The durable owner can win a crash after committing the receipt but before
+  // queue acknowledgement. In that state, remove the queue entry without resending.
+  try {
+    if (await opts.isRecoveryCommitted?.(entry)) {
+      await ackDelivery(entry.id, opts.stateDir);
+      opts.onRecovered?.(entry);
+      return "recovered";
+    }
+  } catch (err) {
+    const errMsg = `delivery owner recovery failed: ${formatErrorMessage(err)}`;
+    opts.onFailed?.(entry, errMsg);
+    try {
+      await failDelivery(entry.id, errMsg, opts.stateDir);
+    } catch (failErr) {
+      if (getErrnoCode(failErr) === "ENOENT") {
+        return "already-gone";
+      }
+    }
+    return "failed";
+  }
   if (
     entry.recoveryState === "send_attempt_started" ||
     entry.recoveryState === "unknown_after_send"
@@ -394,6 +428,7 @@ async function drainQueuedEntry(opts: {
     });
     if (reconciliation?.status === "sent") {
       try {
+        await opts.commitRecoveredDelivery?.(entry, reconciliation.receipt);
         await ackDelivery(entry.id, opts.stateDir);
         await runReconciledSentCommitHooks({
           entry,
@@ -456,7 +491,67 @@ async function drainQueuedEntry(opts: {
     }
   }
   try {
-    const result = await opts.deliver(buildRecoveryDeliverParams(entry, opts.cfg, opts.stateDir));
+    // Recovery uses skipQueue and therefore bypasses the live queue wrapper's
+    // onPlatformSendStart hook. Persist the same boundary before entering the
+    // opaque delivery call, where any later throw can follow a partial send.
+    await markDeliveryPlatformSendAttemptStarted(entry.id, opts.stateDir);
+  } catch (err) {
+    if (getErrnoCode(err) === "ENOENT") {
+      return "already-gone";
+    }
+    const errMsg = `failed to mark recovered send attempt: ${formatErrorMessage(err)}`;
+    opts.onFailed?.(entry, errMsg);
+    try {
+      await failDelivery(entry.id, errMsg, opts.stateDir);
+    } catch (failErr) {
+      if (getErrnoCode(failErr) === "ENOENT") {
+        return "already-gone";
+      }
+    }
+    return "failed";
+  }
+  let result: Awaited<ReturnType<DeliverFn>>;
+  try {
+    result = await opts.deliver(buildRecoveryDeliverParams(entry, opts.cfg, opts.stateDir));
+  } catch (err) {
+    const errMsg = formatErrorMessage(err);
+    opts.onFailed?.(entry, errMsg);
+    try {
+      await failDelivery(entry.id, errMsg, opts.stateDir);
+      return "failed";
+    } catch (failErr) {
+      if (getErrnoCode(failErr) === "ENOENT") {
+        return "already-gone";
+      }
+    }
+    return "failed";
+  }
+  try {
+    // Recovery bypasses the live queue wrapper. Once its adapter returns,
+    // persist the unknown boundary before owner commit or ack can fail.
+    await markDeliveryPlatformOutcomeUnknown(entry.id, opts.stateDir);
+  } catch (err) {
+    const errMsg = `failed to protect recovered send outcome: ${formatErrorMessage(err)}`;
+    opts.onFailed?.(entry, errMsg);
+    try {
+      await moveToFailed(entry.id, opts.stateDir);
+      return "moved-to-failed";
+    } catch (moveErr) {
+      if (getErrnoCode(moveErr) === "ENOENT") {
+        return "already-gone";
+      }
+    }
+    return "failed";
+  }
+  try {
+    const receipt = isOutboundDeliveryResultArray(result)
+      ? createMessageReceiptFromOutboundResults({
+          results: result,
+          ...(entry.threadId == null ? {} : { threadId: String(entry.threadId) }),
+          ...(entry.replyToId == null ? {} : { replyToId: entry.replyToId }),
+        })
+      : undefined;
+    await opts.commitRecoveredDelivery?.(entry, receipt);
     await ackDelivery(entry.id, opts.stateDir);
     if (isOutboundDeliveryResultArray(result)) {
       await runOutboundDeliveryCommitHooks(result);
@@ -466,38 +561,29 @@ async function drainQueuedEntry(opts: {
   } catch (err) {
     const errMsg = formatErrorMessage(err);
     opts.onFailed?.(entry, errMsg);
-    if (isPermanentDeliveryError(errMsg)) {
-      try {
-        await moveToFailed(entry.id, opts.stateDir);
-        return "moved-to-failed";
-      } catch (moveErr) {
-        if (getErrnoCode(moveErr) === "ENOENT") {
-          return "already-gone";
-        }
-      }
-    } else {
-      try {
-        await failDelivery(entry.id, errMsg, opts.stateDir);
-        return "failed";
-      } catch (failErr) {
-        if (getErrnoCode(failErr) === "ENOENT") {
-          return "already-gone";
-        }
+    try {
+      await failDelivery(entry.id, errMsg, opts.stateDir);
+      return "failed";
+    } catch (failErr) {
+      if (getErrnoCode(failErr) === "ENOENT") {
+        return "already-gone";
       }
     }
     return "failed";
   }
 }
 
-export async function drainPendingDeliveries(opts: {
-  drainKey: string;
-  logLabel: string;
-  cfg: OpenClawConfig;
-  log: RecoveryLogger;
-  stateDir?: string;
-  deliver: DeliverFn;
-  selectEntry: (entry: QueuedDelivery, now: number) => PendingDeliveryDrainDecision;
-}): Promise<void> {
+export async function drainPendingDeliveries(
+  opts: {
+    drainKey: string;
+    logLabel: string;
+    cfg: OpenClawConfig;
+    log: RecoveryLogger;
+    stateDir?: string;
+    deliver: DeliverFn;
+    selectEntry: (entry: QueuedDelivery, now: number) => PendingDeliveryDrainDecision;
+  } & DeliveryRecoveryOwnerCallbacks,
+): Promise<void> {
   if (drainInProgress.get(opts.drainKey)) {
     opts.log.info(`${opts.logLabel}: already in progress for ${opts.drainKey}, skipping`);
     return;
@@ -573,13 +659,9 @@ export async function drainPendingDeliveries(opts: {
           deliver,
           log: opts.log,
           stateDir: opts.stateDir,
+          isRecoveryCommitted: opts.isRecoveryCommitted,
+          commitRecoveredDelivery: opts.commitRecoveredDelivery,
           onFailed: (failedEntry, errMsg) => {
-            if (isPermanentDeliveryError(errMsg)) {
-              opts.log.warn(
-                `${opts.logLabel}: entry ${failedEntry.id} hit permanent error — moving to failed/: ${errMsg}`,
-              );
-              return;
-            }
             opts.log.warn(`${opts.logLabel}: retry failed for entry ${failedEntry.id}: ${errMsg}`);
           },
         });
@@ -606,6 +688,10 @@ export async function recoverPendingDeliveries(opts: {
   log: RecoveryLogger;
   cfg: OpenClawConfig;
   stateDir?: string;
+  /** Checks whether a durable owner already committed this exact queue delivery. */
+  isRecoveryCommitted?: DeliveryRecoveryOwnerCallbacks["isRecoveryCommitted"];
+  /** Commits a successful transport receipt to its durable owner before queue acknowledgement. */
+  commitRecoveredDelivery?: DeliveryRecoveryOwnerCallbacks["commitRecoveredDelivery"];
   /** Maximum wall-clock time for recovery in ms. Remaining entries are deferred to next startup. Default: 60 000. */
   maxRecoveryMs?: number;
 }): Promise<RecoverySummary> {
@@ -665,18 +751,14 @@ export async function recoverPendingDeliveries(opts: {
         deliver: opts.deliver,
         log: opts.log,
         stateDir: opts.stateDir,
+        isRecoveryCommitted: opts.isRecoveryCommitted,
+        commitRecoveredDelivery: opts.commitRecoveredDelivery,
         onRecovered: (recoveredEntry) => {
           summary.recovered += 1;
           opts.log.info(`Recovered delivery ${recoveredEntry.id} on ${recoveredEntry.channel}`);
         },
         onFailed: (failedEntry, errMsg) => {
           summary.failed += 1;
-          if (isPermanentDeliveryError(errMsg)) {
-            opts.log.warn(
-              `Delivery ${failedEntry.id} hit permanent error — moving to failed/: ${errMsg}`,
-            );
-            return;
-          }
           opts.log.warn(`Retry failed for delivery ${failedEntry.id}: ${errMsg}`);
         },
       });

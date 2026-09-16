@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING,
   HEARTBEAT_SKIP_CRON_IN_PROGRESS,
   HEARTBEAT_SKIP_LANES_BUSY,
   HEARTBEAT_SKIP_REQUESTS_IN_FLIGHT,
@@ -112,21 +113,22 @@ describe("heartbeat-wake", () => {
     });
   });
 
-  it.each([HEARTBEAT_SKIP_CRON_IN_PROGRESS, HEARTBEAT_SKIP_LANES_BUSY])(
-    "retries %s after the default retry delay",
-    async (reason) => {
-      vi.useFakeTimers();
-      const handler = vi
-        .fn()
-        .mockResolvedValueOnce({ status: "skipped", reason })
-        .mockResolvedValueOnce({ status: "ran", durationMs: 1 });
-      await expectRetryAfterDefaultDelay({
-        handler,
-        initialReason: "interval",
-        expectedRetryReason: "interval",
-      });
-    },
-  );
+  it.each([
+    HEARTBEAT_SKIP_CRON_IN_PROGRESS,
+    HEARTBEAT_SKIP_LANES_BUSY,
+    HEARTBEAT_SKIP_CONTINUATION_SETTLEMENT_PENDING,
+  ])("retries %s after the default retry delay", async (reason) => {
+    vi.useFakeTimers();
+    const handler = vi
+      .fn()
+      .mockResolvedValueOnce({ status: "skipped", reason })
+      .mockResolvedValueOnce({ status: "ran", durationMs: 1 });
+    await expectRetryAfterDefaultDelay({
+      handler,
+      initialReason: "interval",
+      expectedRetryReason: "interval",
+    });
+  });
 
   it("keeps retry cooldown even when a sooner request arrives", async () => {
     vi.useFakeTimers();

@@ -1,6 +1,15 @@
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  createSourceTurnDeliveryQueueOwnerReference,
+  loadSourceTurnDeliveryRegistry,
+  persistSourceTurnDeliveryState,
+} from "../../agents/source-turn-delivery-store.js";
 import type { OpenClawConfig } from "../../config/config.js";
+import { drainPendingDeliveries as drainPluginPendingDeliveries } from "../../plugin-sdk/delivery-queue-runtime.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { resetHeartbeatWakeStateForTests } from "../heartbeat-wake.js";
 import {
   type DeliverFn,
   drainPendingDeliveries,
@@ -363,6 +372,113 @@ describe("drainPendingDeliveries for reconnect", () => {
 
     expect(deliver).toHaveBeenCalledTimes(1);
     expect(await loadPendingDeliveries(tmpDir)).toStrictEqual([]);
+  });
+
+  it("commits a reconnect-drained receipt to its exact source owner before ack", async () => {
+    const registryPath = path.join(tmpDir, "source-delivery.json");
+    vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", registryPath);
+    const payloads = [{ text: "Recovered parent final" }];
+    const sourceOwner = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:parent:run-1",
+      sourceTurnId: "source:parent:run-1",
+      sourceSessionKey: "agent:main:parent",
+      sourceChannel: "directchat",
+      deliveryContext: { channel: "directchat", to: "+1555", accountId: "acct1" },
+      runId: "run-1",
+      facts: { finalDeliveryRequired: true },
+      preparedSourceFinal: {
+        kind: "external_channel",
+        sessionId: "source-session",
+        expectedPartCount: 1,
+        parts: payloads.map((payload) => ({ text: payload.text, payload })),
+        outboundDelivery: { status: "prepared" },
+      },
+    });
+    const id = await enqueueDelivery(
+      {
+        channel: "directchat",
+        to: "+1555",
+        accountId: "acct1",
+        payloads,
+        owner: createSourceTurnDeliveryQueueOwnerReference(sourceOwner),
+      },
+      tmpDir,
+    );
+    const deliver = vi.fn<DeliverFn>(async () => [
+      { channel: "directchat", messageId: "recovered-message" },
+    ]);
+
+    try {
+      await drainPluginPendingDeliveries({
+        drainKey: "directchat:acct1",
+        logLabel: "DirectChat reconnect drain",
+        cfg: stubCfg,
+        log: createRecoveryLog(),
+        stateDir: tmpDir,
+        deliver,
+        selectEntry: (entry) => ({
+          match: entry.id === id,
+          bypassBackoff: true,
+        }),
+      });
+
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(await loadPendingDeliveries(tmpDir)).toEqual([]);
+      expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows[0]).toMatchObject({
+        finalDeliveryDelivered: false,
+        preparedSourceFinal: {
+          kind: "external_channel",
+          outboundDelivery: {
+            status: "delivered",
+            queueId: id,
+            receipt: { platformMessageIds: ["recovered-message"] },
+          },
+        },
+      });
+    } finally {
+      resetHeartbeatWakeStateForTests();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([
+    { label: "unowned", owner: undefined },
+    { label: "owned by another subsystem", owner: { kind: "other_owner", key: "other-key" } },
+  ])("drains an $label entry without reading a damaged source registry", async ({ owner }) => {
+    const registryPath = path.join(tmpDir, "damaged-source-delivery.json");
+    vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", registryPath);
+    await writeFile(registryPath, "{not-json", "utf8");
+    const id = await enqueueDelivery(
+      {
+        channel: "directchat",
+        to: "+1555",
+        accountId: "acct1",
+        payloads: [{ text: "ordinary queued message" }],
+        ...(owner ? { owner } : {}),
+      },
+      tmpDir,
+    );
+    const deliver = vi.fn<DeliverFn>(async () => [
+      { channel: "directchat", messageId: "ordinary-message" },
+    ]);
+
+    try {
+      await drainPluginPendingDeliveries({
+        drainKey: `directchat:acct1:${owner?.kind ?? "unowned"}`,
+        logLabel: "DirectChat reconnect drain",
+        cfg: stubCfg,
+        log: createRecoveryLog(),
+        stateDir: tmpDir,
+        deliver,
+        selectEntry: (entry) => ({ match: entry.id === id, bypassBackoff: true }),
+      });
+
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(await loadPendingDeliveries(tmpDir)).toEqual([]);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("drains backoff-eligible retries on reconnect", async () => {

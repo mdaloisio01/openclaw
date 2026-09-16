@@ -10,6 +10,7 @@ import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent.js";
 import { updateSessionStore, type SessionEntry } from "../../config/sessions.js";
 import type { AgentEventPayload } from "../../infra/agent-events.js";
 import { emitAgentEvent, onAgentEvent } from "../../infra/agent-events.js";
+import type { GetReplyOptions, ReplyExecutionProgress } from "../get-reply-options.types.js";
 
 function shouldBridgeCliAssistantTextToReasoning(provider: string): boolean {
   return normalizeLowercaseStringOrEmpty(provider) === "claude-cli";
@@ -184,6 +185,7 @@ export async function runCliAgentWithLifecycle(params: {
   onAssistantText?: (text: string) => Promise<void>;
   onReasoningText?: (text: string) => Promise<void>;
   onToolEvent?: (payload: CliToolEventPayload) => Promise<void>;
+  onExecutionProgress?: GetReplyOptions["onExecutionProgress"];
   onErrorBeforeLifecycle?: (err: unknown) => Promise<void>;
   transformResult?: (result: EmbeddedAgentRunResult) => EmbeddedAgentRunResult;
 }): Promise<EmbeddedAgentRunResult> {
@@ -218,6 +220,24 @@ export async function runCliAgentWithLifecycle(params: {
     suppressed: params.suppressAssistantBridge,
     deliver: params.onToolEvent,
   });
+  const executionBridge = createAgentEventBridge<ReplyExecutionProgress>({
+    runId: params.runId,
+    deliver: params.onExecutionProgress
+      ? async (event) => await params.onExecutionProgress?.(event)
+      : undefined,
+    read: (evt) => {
+      if (evt.stream !== "tool" || typeof evt.data.phase !== "string") {
+        return undefined;
+      }
+      return {
+        runId: params.runId,
+        source: "tool",
+        phase: evt.data.phase,
+        toolCallId: normalizeOptionalString(evt.data.toolCallId),
+        name: normalizeOptionalString(evt.data.name),
+      };
+    },
+  });
   let lifecycleTerminalEmitted = false;
   try {
     const rawResult = await runCliAgent(params.runParams);
@@ -225,9 +245,11 @@ export async function runCliAgentWithLifecycle(params: {
     assistantBridge.unsubscribe();
     reasoningBridge.unsubscribe();
     toolBridge.unsubscribe();
+    executionBridge.unsubscribe();
     await assistantBridge.drain();
     await reasoningBridge.drain();
     await toolBridge.drain();
+    await executionBridge.drain();
 
     const cliText = normalizeOptionalString(result.payloads?.[0]?.text);
     if (cliText) {
@@ -255,9 +277,11 @@ export async function runCliAgentWithLifecycle(params: {
     assistantBridge.unsubscribe();
     reasoningBridge.unsubscribe();
     toolBridge.unsubscribe();
+    executionBridge.unsubscribe();
     await assistantBridge.drain();
     await reasoningBridge.drain();
     await toolBridge.drain();
+    await executionBridge.drain();
     await params.onErrorBeforeLifecycle?.(err);
     if (emitLifecycleTerminal) {
       emitAgentEvent({
@@ -277,6 +301,7 @@ export async function runCliAgentWithLifecycle(params: {
     assistantBridge.unsubscribe();
     reasoningBridge.unsubscribe();
     toolBridge.unsubscribe();
+    executionBridge.unsubscribe();
     if (emitLifecycleTerminal && !lifecycleTerminalEmitted) {
       emitAgentEvent({
         runId: params.runId,

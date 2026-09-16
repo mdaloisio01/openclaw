@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   classifyAgentHarnessTerminalOutcome,
   embeddedAgentLog,
@@ -240,6 +241,9 @@ export class CodexAppServerEventProjector {
   private readonly toolTrajectoryCallIds = new Set<string>();
   private readonly toolTrajectoryResultIds = new Set<string>();
   private readonly toolTrajectoryNamesById = new Map<string, string>();
+  private readonly nativeCommandItemsById = new Map<string, CodexThreadItem>();
+  private readonly nativeCommandStartedAtMsById = new Map<string, number>();
+  private readonly rawCommandOutputsById = new Map<string, string>();
   private readonly transcriptToolProgressCallIds = new Set<string>();
   private lastNativeToolError: EmbeddedRunAttemptResult["lastToolError"];
   private readonly nativeGeneratedMediaUrls = new Set<string>();
@@ -354,6 +358,7 @@ export class CodexAppServerEventProjector {
       this.reasoningItemOrder,
     ).join("\n\n");
     const planText = collectTextValues(this.planTextByItem).join("\n\n");
+    this.reconcileNativeCommandOutputs();
     this.synthesizeMissingToolResults({
       failClosed:
         !this.completedTurn ||
@@ -614,6 +619,13 @@ export class CodexAppServerEventProjector {
 
   private async handleItemStarted(params: JsonObject): Promise<void> {
     const item = readItem(params.item);
+    if (item?.type === "commandExecution") {
+      this.nativeCommandItemsById.set(item.id, item);
+      const startedAtMs = readNonNegativeInteger(params, "startedAtMs");
+      if (startedAtMs !== undefined) {
+        this.nativeCommandStartedAtMsById.set(item.id, startedAtMs);
+      }
+    }
     const itemId = item?.id ?? readString(params, "itemId") ?? readString(params, "id");
     this.rememberAssistantPhase(item);
     if (itemId) {
@@ -663,6 +675,9 @@ export class CodexAppServerEventProjector {
     if (itemId) {
       this.activeItemIds.delete(itemId);
       this.completedItemIds.add(itemId);
+      this.nativeCommandItemsById.delete(itemId);
+      this.nativeCommandStartedAtMsById.delete(itemId);
+      this.rawCommandOutputsById.delete(itemId);
     }
     this.rememberAssistantPhase(item);
     if (item?.type === "agentMessage" && typeof item.text === "string" && item.text) {
@@ -911,6 +926,16 @@ export class CodexAppServerEventProjector {
     if (!item) {
       return;
     }
+    const callId = readString(item, "call_id");
+    const output = readString(item, "output");
+    if (
+      item.type === "function_call_output" &&
+      callId &&
+      output !== undefined &&
+      this.nativeCommandItemsById.has(callId)
+    ) {
+      this.rawCommandOutputsById.set(callId, output);
+    }
     await this.recordRawGeneratedImageMedia(item);
     if (readString(item, "role") !== "assistant") {
       return;
@@ -1126,7 +1151,7 @@ export class CodexAppServerEventProjector {
     const meta = itemMeta(item, this.toolProgressDetailMode());
     this.recordToolTrajectoryEvent({ phase: params.phase, item, name, args, status });
     this.emitDiagnosticToolExecutionEvent({ phase: params.phase, item, name, status });
-    if (params.phase === "result") {
+    if (params.phase === "result" && status !== "running") {
       this.recordNativeToolError({ item, name, meta, status });
     }
     if (!shouldEmitTranscriptToolProgress(name, args)) {
@@ -1203,13 +1228,27 @@ export class CodexAppServerEventProjector {
     if (params.phase === "start") {
       this.toolTrajectoryCallIds.add(params.item.id);
       this.toolTrajectoryNamesById.set(params.item.id, params.name);
+      const ownerExecutionStartedAtMs = this.nativeCommandStartedAtMsById.get(params.item.id);
+      const ownerExecutionProcessId =
+        params.item.type === "commandExecution" && typeof params.item.processId === "string"
+          ? params.item.processId
+          : undefined;
+      const toolArguments =
+        params.item.type === "commandExecution"
+          ? {
+              ...params.args,
+              ownerProjectionFingerprint: nativeCommandProjectionFingerprint(params.item),
+              ...(ownerExecutionStartedAtMs !== undefined ? { ownerExecutionStartedAtMs } : {}),
+              ...(ownerExecutionProcessId ? { ownerExecutionProcessId } : {}),
+            }
+          : params.args;
       this.options.trajectoryRecorder?.recordEvent("tool.call", {
         threadId: this.threadId,
         turnId: this.turnId,
         itemId: params.item.id,
         toolCallId: params.item.id,
         name: params.name,
-        arguments: params.args,
+        arguments: toolArguments,
       });
       return;
     }
@@ -1248,6 +1287,9 @@ export class CodexAppServerEventProjector {
         type: "tool.execution.started",
         ...base,
       });
+      return;
+    }
+    if (params.status === "running") {
       return;
     }
 
@@ -1503,6 +1545,49 @@ export class CodexAppServerEventProjector {
         `${this.turnId}:tool:${params.id}:result`,
       ),
     );
+  }
+
+  private reconcileNativeCommandOutputs(): void {
+    for (const [id, output] of this.rawCommandOutputsById) {
+      if (this.toolTrajectoryResultIds.has(id)) {
+        continue;
+      }
+      const startedItem = this.nativeCommandItemsById.get(id);
+      if (!startedItem) {
+        continue;
+      }
+      // Codex 0.135 tools/context.rs emits a tool result when unified exec
+      // yields; commandExecution completes only after process exit. Read the
+      // protocol header, not stdout, so a live process is never called missing.
+      const outputOffset = output.indexOf("\nOutput:\n");
+      if (outputOffset < 0 || !/^(?:Chunk ID: [^\n]+\n)?Wall time: [\d.]+ seconds\n/.test(output)) {
+        continue;
+      }
+      const header = output.slice(0, outputOffset);
+      const processId = /^Process running with session ID (\d+)$/m.exec(header)?.[1];
+      const exitCodeText = /^Process exited with code (-?\d+)$/m.exec(header)?.[1];
+      if (!processId && exitCodeText === undefined) {
+        continue;
+      }
+      const exitCode = exitCodeText === undefined ? undefined : Number(exitCodeText);
+      const status = processId ? "running" : exitCode === 0 ? "completed" : "failed";
+      const item = {
+        ...startedItem,
+        status,
+        ...(processId ? { processId } : {}),
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        aggregatedOutput: output,
+      };
+      this.emitNormalizedToolItemEvent({ phase: "result", item });
+      this.recordNativeToolTranscriptResult(item);
+      if (processId) {
+        const meta = this.toolMetas.get(id);
+        this.toolMetas.set(id, { ...meta, toolName: "bash", asyncStarted: true });
+      } else {
+        this.activeItemIds.delete(id);
+        this.completedItemIds.add(id);
+      }
+    }
   }
 
   private synthesizeMissingToolResults(params: { failClosed: boolean }): void {
@@ -2208,6 +2293,16 @@ function itemToolArgs(item: CodexThreadItem): Record<string, unknown> | undefine
   return undefined;
 }
 
+function nativeCommandProjectionFingerprint(
+  item: Pick<CodexThreadItem, "command" | "cwd">,
+): string {
+  const projection = {
+    command: item.command,
+    ...(typeof item.cwd === "string" ? { cwd: item.cwd } : {}),
+  };
+  return createHash("sha256").update(JSON.stringify(projection)).digest("hex");
+}
+
 function webSearchToolArgs(item: CodexThreadItem): Record<string, unknown> {
   const action = isJsonObject(item.action) ? item.action : undefined;
   const actionType = action ? readNonEmptyString(action, "type") : undefined;
@@ -2246,6 +2341,7 @@ function itemToolResult(item: CodexThreadItem): { result?: Record<string, unknow
     return {
       result: sanitizeCodexAgentEventRecord({
         status: item.status,
+        ...(typeof item.processId === "string" ? { processId: item.processId } : {}),
         exitCode: item.exitCode,
         durationMs: item.durationMs,
       }),

@@ -18,6 +18,7 @@ import { CodexAppServerEventProjector } from "./event-projector.js";
 import type { CodexServerNotification } from "./protocol.js";
 import { readRecentCodexRateLimits } from "./rate-limit-cache.js";
 import {
+  createCodexRuntimePlanFixture,
   createParams,
   extractRelayIdFromThreadRequest,
   createRuntimeDynamicTool,
@@ -39,6 +40,24 @@ setupRunAttemptTestHooks();
 
 const tinyPngBase64 =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+function installTerminalDynamicTool(name: "message" | "sessions_yield"): void {
+  testing.setOpenClawCodingToolsFactoryForTests((options) => [
+    {
+      ...createRuntimeDynamicTool(name),
+      execute: vi.fn(async () => {
+        if (name === "sessions_yield") {
+          await options?.onYield?.("Waiting for child completion.");
+        }
+        return {
+          content: [{ type: "text" as const, text: `${name} done` }],
+          details: {},
+          terminate: true,
+        };
+      }),
+    },
+  ]);
+}
 
 describe("createCodexAttemptTurnWatchController", () => {
   it("reschedules the attempt watch when notification progress shortens its timeout", async () => {
@@ -97,6 +116,208 @@ describe("createCodexAttemptTurnWatchController", () => {
 });
 
 describe("runCodexAppServerAttempt turn watches", () => {
+  it("joins the sessions_yield interrupt acknowledgement before returning", async () => {
+    installTerminalDynamicTool("sessions_yield");
+    let acknowledgeInterrupt!: () => void;
+    const interruptAcknowledged = new Promise<void>((resolve) => {
+      acknowledgeInterrupt = resolve;
+    });
+    const harness = createStartedThreadHarness(async (method) => {
+      if (method === "turn/interrupt") {
+        await interruptAcknowledged;
+        return {};
+      }
+      return undefined;
+    });
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
+    params.disableTools = false;
+    params.runtimePlan = createCodexRuntimePlanFixture();
+    let settled = false;
+    const run = runCodexAppServerAttempt(params).finally(() => {
+      settled = true;
+    });
+    await harness.waitForMethod("turn/start");
+
+    await harness.handleServerRequest({
+      id: "request-yield",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "yield-1",
+        namespace: null,
+        tool: "sessions_yield",
+        arguments: {},
+      },
+    });
+    await harness.waitForMethod("turn/interrupt");
+    await harness.notify({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        turn: { id: "turn-1", status: "interrupted" },
+      },
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(settled).toBe(false);
+
+    acknowledgeInterrupt();
+    const result = await run;
+
+    expect(result.yieldDetected).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(result.promptError).toBeFalsy();
+    expect(harness.request).toHaveBeenCalledWith(
+      "turn/interrupt",
+      { threadId: "thread-1", turnId: "turn-1" },
+      { timeoutMs: 5_000 },
+    );
+  });
+
+  it("accepts natural turn completion before the deferred sessions_yield release", async () => {
+    const harness = createStartedThreadHarness();
+    testing.setOpenClawCodingToolsFactoryForTests((options) => [
+      {
+        ...createRuntimeDynamicTool("sessions_yield"),
+        execute: vi.fn(async () => {
+          await options?.onYield?.("Waiting for child completion.");
+          await harness.notify({
+            method: "turn/completed",
+            params: {
+              threadId: "thread-1",
+              turnId: "turn-1",
+              turn: { id: "turn-1", status: "completed" },
+            },
+          });
+          return {
+            content: [{ type: "text" as const, text: "sessions_yield done" }],
+            details: {},
+            terminate: true,
+          };
+        }),
+      },
+    ]);
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
+    params.disableTools = false;
+    params.runtimePlan = createCodexRuntimePlanFixture();
+    const run = runCodexAppServerAttempt(params);
+    await harness.waitForMethod("turn/start");
+
+    await harness.handleServerRequest({
+      id: "request-yield",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "yield-1",
+        namespace: null,
+        tool: "sessions_yield",
+        arguments: {},
+      },
+    });
+    const result = await run;
+
+    expect(result.yieldDetected).toBe(true);
+    expect(result.aborted).toBe(false);
+    expect(result.promptError).toBeFalsy();
+    expect(harness.request).not.toHaveBeenCalledWith(
+      "turn/interrupt",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("fails closed when a sessions_yield interrupt is not acknowledged", async () => {
+    installTerminalDynamicTool("sessions_yield");
+    const harness = createStartedThreadHarness(async (method) => {
+      if (method === "turn/interrupt") {
+        throw new Error("interrupt unavailable");
+      }
+      return undefined;
+    });
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
+    params.disableTools = false;
+    params.runtimePlan = createCodexRuntimePlanFixture();
+    const run = runCodexAppServerAttempt(params);
+    await harness.waitForMethod("turn/start");
+
+    await harness.handleServerRequest({
+      id: "request-yield",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "yield-1",
+        namespace: null,
+        tool: "sessions_yield",
+        arguments: {},
+      },
+    });
+    const result = await run;
+
+    expect(result.yieldDetected).toBe(true);
+    expect(result.aborted).toBe(true);
+    expect(result.promptError).toBe(
+      "Codex sessions_yield stop was not acknowledged; parent continuation remains pending.",
+    );
+  });
+
+  it("normalizes an acknowledged interruption for every terminal dynamic tool", async () => {
+    installTerminalDynamicTool("message");
+    const harness = createStartedThreadHarness(async (method) => {
+      if (method === "turn/interrupt") {
+        await harness.notify({
+          method: "turn/completed",
+          params: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            turn: { id: "turn-1", status: "interrupted" },
+          },
+        });
+        return {};
+      }
+      return undefined;
+    });
+    const params = createParams(
+      path.join(tempDir, "session.jsonl"),
+      path.join(tempDir, "workspace"),
+    );
+    params.disableTools = false;
+    params.runtimePlan = createCodexRuntimePlanFixture();
+    const run = runCodexAppServerAttempt(params);
+    await harness.waitForMethod("turn/start");
+
+    await harness.handleServerRequest({
+      id: "request-message",
+      method: "item/tool/call",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        callId: "message-1",
+        namespace: null,
+        tool: "message",
+        arguments: {},
+      },
+    });
+    const result = await run;
+
+    expect(result.yieldDetected).toBe(false);
+    expect(result.aborted).toBe(false);
+    expect(result.promptError).toBeFalsy();
+  });
+
   it("releases the session when Codex never completes after a dynamic tool response", async () => {
     let handleRequest:
       | ((request: { id: string; method: string; params?: unknown }) => Promise<unknown>)

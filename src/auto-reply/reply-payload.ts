@@ -1,4 +1,8 @@
 import type { StructuredMissionCloseout } from "../agents/mission-settlement-tail.js";
+import type {
+  CanonicalAssistantTranscript,
+  PreparedWebchatSourceContent,
+} from "../config/sessions/transcript.js";
 import type { TrbRecoveryRecordV1 } from "../config/sessions/types.js";
 import type { GovernedFinalReleaseDecisionInput } from "../governance/governed-final-release-decision.js";
 import type { CloseoutAdmissionInput } from "../governance/mission-manifest.types.js";
@@ -151,6 +155,8 @@ export function buildTtsSupplementMediaPayload(payload: ReplyPayload): ReplyPayl
 
 export type ReplyPayloadMetadata = {
   assistantMessageIndex?: number;
+  /** Actual current-attempt transcript publication; transport must revalidate its target and body. */
+  canonicalAssistantTranscript?: CanonicalAssistantTranscript;
   /**
    * Internal OpenClaw notices generated after a runtime/provider failure are
    * not assistant source replies. Dispatch may deliver them even when normal
@@ -165,10 +171,12 @@ export type ReplyPayloadMetadata = {
    */
   sourceReplyTranscriptMirror?: {
     sessionKey: string;
+    sessionId?: string;
     agentId?: string;
     text?: string;
     mediaUrls?: string[];
     idempotencyKey?: string;
+    webchatContent?: PreparedWebchatSourceContent;
   };
   beforeAgentRunBlocked?: boolean;
   /** Warning synthesized from an observed tool error after the run produced assistant output. */

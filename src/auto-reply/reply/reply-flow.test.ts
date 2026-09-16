@@ -770,11 +770,15 @@ describe("createReplyDispatcher", () => {
     );
   });
 
-  it("allows explicit Mark report-only request to end after the report", () => {
+  it.each([
+    "Cleanup Crew report only. Do not continue.",
+    "Give me a Cleanup Crew production report only.",
+    "Give me the current Cleanup Crew production report only.",
+  ])("allows explicit Mark report-only request to end after the report: %s", (currentTurnText) => {
     expect(
       resolveCleanupCrewFinalResponseGate({
         activeCleanupCrewMission: true,
-        currentTurnText: "Cleanup Crew report only. Do not continue.",
+        currentTurnText,
         responseText: [
           "STATUS: blocked",
           "BLOCKER: repairable blocker in watchdog lifecycle",
@@ -1021,9 +1025,14 @@ describe("createReplyDispatcher", () => {
     );
   });
 
-  it("blocks false-closeout admission rejection in enforce mode", () => {
+  it("blocks explicit false-closeout admission rejection even during an operator hold", () => {
     const dispatcher = createGuardedDispatcher();
-    installActiveRunContinuationGuard(dispatcher);
+    installActiveRunContinuationGuard(dispatcher, {
+      cleanupCrewFinalResponse: {
+        currentTurnText: "Report only; do not continue the Cleanup Crew mission in this reply.",
+        falseCloseoutAdmissionMode: "enforce",
+      },
+    });
     const payload = setReplyPayloadMetadata(
       { text: "Final closeout report: complete." },
       { falseCloseoutAdmission: falseCloseoutAdmissionInput("enforce") },
@@ -1066,31 +1075,31 @@ describe("createReplyDispatcher", () => {
     );
   });
 
-  it("auto-produces false-closeout admission input for Cleanup Crew terminal replies in shadow mode", () => {
+  it("does not infer a mission COMPLETE transition from an explicitly requested report", () => {
     const dispatcher = createGuardedDispatcher();
     installActiveRunContinuationGuard(dispatcher, {
       cleanupCrewFinalResponse: {
         activeCleanupCrewMission: true,
         currentTurnText: "Report only; do not continue the Cleanup Crew mission in this reply.",
-        falseCloseoutAdmissionMode: "shadow",
+        falseCloseoutAdmissionMode: "enforce",
       },
     });
     recordActiveRunStarted(dispatcher);
 
     expect(
       allowTerminalCloseout(dispatcher, "sendFinalReply", {
-        text: "Final closeout report: complete.",
+        text: "STATUS: blocked\nBLOCKER: repairable watchdog failure\nNEXT ACTION: inspect the failure",
       }).allowed,
     ).toBe(true);
-    expect(dispatcher.sendToolResult).toHaveBeenCalledWith(
+    expect(dispatcher.sendToolResult).not.toHaveBeenCalledWith(
       expect.objectContaining({
-        text: expect.stringContaining("FALSE_CLOSEOUT_SHADOW_REJECTED"),
+        text: expect.stringContaining("FALSE_CLOSEOUT"),
         isStatusNotice: true,
       }),
     );
     expect(activeRunContinuationTesting.getEvents(dispatcher)).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: "FALSE_CLOSEOUT_ADMISSION_SHADOW_REJECTED" }),
+        expect.objectContaining({ type: "OPERATOR_PAUSE_HOLD_RECORDED" }),
         expect.objectContaining({ type: "TERMINAL_CLOSEOUT_ALLOWED" }),
       ]),
     );

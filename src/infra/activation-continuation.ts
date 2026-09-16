@@ -4,18 +4,34 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { readMainSessionRestartRecoveryStatus } from "../agents/main-session-restart-recovery.js";
+import {
+  loadSourceTurnDeliveryRegistry,
+  resolveSourceTurnDeliveryRegistryPath,
+  type SourceTurnDeliveryRow,
+} from "../agents/source-turn-delivery-store.js";
 import { persistCleanupCrewContinuityGateDecision } from "../commands/cleanup-plan.js";
 import { resolveGatewayPort, resolveStateDir } from "../config/paths.js";
 import { parseRootOperatorOverride } from "../continuity/continuity-gate-v2.js";
 import { resolveGatewaySystemdServiceName } from "../daemon/constants.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import { readJsonIfExists, writeTextAtomic } from "./json-files.js";
+import { isInternalMessageChannel } from "../utils/message-channel.js";
+import { requestHeartbeat } from "./heartbeat-wake.js";
+import { createAsyncLock, readJsonIfExists, writeTextAtomic } from "./json-files.js";
 import { runRuntimeAssetGuardPreflight } from "./runtime-asset-guard-preflight.js";
-import { enqueueSystemEvent } from "./system-events.js";
+import {
+  consumeSelectedSystemEventEntries,
+  enqueueSystemEvent,
+  peekSystemEventEntries,
+  type ActivationContinuationRef,
+} from "./system-events.js";
 
 const log = createSubsystemLogger("activation-continuation");
 const STORE_FILENAME = "activation-continuations.json";
+// Restart admission, recovery and source-delivery callbacks share this owner.
+// Serialize their read/replace cycle so one receipt cannot erase another record.
+const withStoreLock = createAsyncLock();
 const CONTINUITY_GATE_ACTIVATION_OUTPUT_DIR = path.join(
   "var",
   "continuity_gate_v2",
@@ -35,6 +51,7 @@ export const ACTIVATION_CONTINUATION_STATUSES = [
   "side_effect_completed_parent_interrupted",
   "side_effect_failed",
   "pending_restart",
+  "pending_delivery",
   "continuation_completed",
   "continuation_blocked",
 ] as const;
@@ -90,10 +107,12 @@ export type ActivationContinuationProof = {
   sideEffectCompleted: boolean;
   parentTurnInterrupted: boolean;
   parentContinuationQueued: boolean;
-  visibleDeliveryCompleted: boolean;
-  deliveryStatus: "not_requested" | "queued" | "failed";
   artifactPath?: string;
-};
+  deliveryRef?: ActivationContinuationRef;
+} & (
+  | { visibleDeliveryCompleted: false; deliveryStatus: "not_requested" | "queued" | "failed" }
+  | { visibleDeliveryCompleted: true; deliveryStatus: "delivered"; deliveryRecordId: string }
+);
 
 export type ActivationContinuationRecord = {
   version: 1;
@@ -149,7 +168,7 @@ export type ActivationContinuationCreateInput = {
 
 export type ActivationContinuationCheckResult = {
   name: ActivationContinuationCheckName;
-  status: "pass" | "fail";
+  status: "pass" | "fail" | "pending";
   detail: string;
 };
 
@@ -157,18 +176,35 @@ export type ActivationContinuationRunnerDeps = {
   now?: () => number;
   stateDir?: string;
   exportsDir?: string;
+  sourceDeliveryRegistryPath?: string;
   continuityGate?: ActivationContinuationContinuityGatePersistenceOptions;
   check?: (
     record: ActivationContinuationRecord,
     check: ActivationContinuationCheckName,
   ) => Promise<ActivationContinuationCheckResult>;
-  deliver?: (record: ActivationContinuationRecord, message: string) => Promise<void> | void;
+  deliver?: (
+    record: ActivationContinuationRecord,
+    message: string,
+  ) => Promise<ActivationContinuationDeliveryResult> | ActivationContinuationDeliveryResult;
   log?: {
     info?: (message: string, meta?: Record<string, unknown>) => void;
     warn?: (message: string, meta?: Record<string, unknown>) => void;
     error?: (message: string, meta?: Record<string, unknown>) => void;
   };
 };
+
+export type ActivationContinuationDeliveryResult =
+  | { status: "queued" }
+  | { status: "delivered"; deliveryRecordId: string };
+
+export type ActivationContinuationDeliveryReconciliation =
+  | { status: "missing_receipt"; message: string }
+  | { status: "pending"; reason: "delivery_unconfirmed"; message: string; runId?: string }
+  | { status: "pending"; reason: "settlement_failed"; detail: string }
+  | { status: "settled" }
+  | { status: "obsolete" };
+
+type RecoveryStatus = "pending_delivery" | "continuation_completed" | "continuation_blocked";
 
 export type ActivationContinuationContinuityGatePersistenceOptions = {
   outputDir: string;
@@ -485,14 +521,16 @@ export async function persistActivationContinuationBeforeRestart(
   opts: { stateDir?: string } = {},
 ): Promise<ActivationContinuationRecord> {
   const record = createContinuationRecord(input);
-  const store = await readStore(opts.stateDir);
-  const existingIndex = store.records.findIndex((candidate) => candidate.id === record.id);
-  if (existingIndex >= 0) {
-    store.records[existingIndex] = record;
-  } else {
-    store.records.push(record);
-  }
-  await writeStore(store, opts.stateDir);
+  await withStoreLock(async () => {
+    const store = await readStore(opts.stateDir);
+    const existingIndex = store.records.findIndex((candidate) => candidate.id === record.id);
+    if (existingIndex >= 0) {
+      store.records[existingIndex] = record;
+    } else {
+      store.records.push(record);
+    }
+    await writeStore(store, opts.stateDir);
+  });
   await persistActivationContinuationContinuityGateDecision({
     record,
     lifecycleStatus: "pending_restart",
@@ -509,16 +547,20 @@ export async function markActivationContinuationCommandNotStarted(
   id: string,
   opts: { stateDir?: string } = {},
 ): Promise<void> {
-  const store = await readStore(opts.stateDir);
   const now = Date.now();
-  for (const record of store.records) {
-    if (record.id === id && record.status === "pending_restart") {
-      record.status = "command_not_started";
-      record.completedAt = now;
-      record.result = { checks: [], message: "restart request was rejected before dispatch" };
-    }
-  }
-  await writeStore(store, opts.stateDir);
+  await updateRecord(
+    id,
+    (record) =>
+      record.status === "pending_restart"
+        ? {
+            ...record,
+            status: "command_not_started",
+            completedAt: now,
+            result: { checks: [], message: "restart request was rejected before dispatch" },
+          }
+        : record,
+    opts.stateDir,
+  );
 }
 
 async function updateRecord(
@@ -526,19 +568,21 @@ async function updateRecord(
   updater: (record: ActivationContinuationRecord) => ActivationContinuationRecord,
   stateDir?: string,
 ): Promise<ActivationContinuationRecord | null> {
-  const store = await readStore(stateDir);
-  let updated: ActivationContinuationRecord | null = null;
-  store.records = store.records.map((record) => {
-    if (record.id !== id) {
-      return record;
+  return withStoreLock(async () => {
+    const store = await readStore(stateDir);
+    let updated: ActivationContinuationRecord | null = null;
+    store.records = store.records.map((record) => {
+      if (record.id !== id) {
+        return record;
+      }
+      updated = updater(record);
+      return updated;
+    });
+    if (updated) {
+      await writeStore(store, stateDir);
     }
-    updated = updater(record);
     return updated;
   });
-  if (updated) {
-    await writeStore(store, stateDir);
-  }
-  return updated;
 }
 
 function runSpawnCheck(
@@ -784,13 +828,7 @@ async function runDefaultCheck(
     };
   }
   if (check === "visible_delivery") {
-    return record.route.sessionKey
-      ? {
-          name: check,
-          status: "pass",
-          detail: `visible delivery route exists for ${record.route.sessionKey}`,
-        }
-      : { name: check, status: "fail", detail: "visible delivery route missing" };
+    return { name: check, status: "pending", detail: "awaiting the exact source delivery receipt" };
   }
   if (check === "log_scan") {
     return {
@@ -823,13 +861,12 @@ function isCompletedPreRestartManualProofCheck(check: ActivationContinuationChec
 function formatResultMessage(params: {
   record: ActivationContinuationRecord;
   checks: ActivationContinuationCheckResult[];
-  status: "continuation_completed" | "continuation_blocked";
   proof: ActivationContinuationProof;
 }): string {
   const failed = params.checks.filter((check) => check.status === "fail");
   const summary =
-    params.status === "continuation_completed"
-      ? "side effect completed, parent turn interrupted, continuation resumed and validation passed"
+    failed.length === 0
+      ? "side effect completed, parent turn interrupted, continuation resumed and runtime validation passed"
       : `side effect completed, parent turn interrupted, continuation resumed but blocked on ${failed
           .map((check) => check.name)
           .join(", ")}`;
@@ -841,8 +878,7 @@ function formatResultMessage(params: {
     `sideEffectCompleted: ${params.proof.sideEffectCompleted ? "yes" : "no"}`,
     `parentTurnInterrupted: ${params.proof.parentTurnInterrupted ? "yes" : "no"}`,
     `parentContinuationQueued: ${params.proof.parentContinuationQueued ? "yes" : "no"}`,
-    `visibleSourceDeliveryCompleted: ${params.proof.visibleDeliveryCompleted ? "yes" : "no"}`,
-    `deliveryStatus: ${params.proof.deliveryStatus}`,
+    "Report delivery is confirmed separately by the original conversation's durable receipt.",
     `artifact: ${params.proof.artifactPath ?? "none"}`,
     `checks: ${params.checks.map((check) => `${check.name}=${check.status}`).join(", ")}`,
     `failedCheckDetails: ${
@@ -856,36 +892,45 @@ function formatResultMessage(params: {
 async function writeContinuationArtifact(params: {
   record: ActivationContinuationRecord;
   checks: ActivationContinuationCheckResult[];
-  status: "continuation_completed" | "continuation_blocked";
+  status: RecoveryStatus;
   exportsDir: string;
   now: number;
+  proof?: ActivationContinuationProof;
 }): Promise<string> {
   const stamp = new Date(params.now)
     .toISOString()
     .slice(0, 16)
     .replace(/[-:]/g, "")
     .replace("T", "T");
-  const filename =
-    params.status === "continuation_completed"
-      ? `gateway_restart_activation_continuation_closeout_${stamp}Z.md`
-      : `gateway_restart_activation_continuation_blocker_${stamp}Z.md`;
-  const filePath = path.join(params.exportsDir, filename);
+  const identity = crypto
+    .createHash("sha256")
+    .update(`${params.record.id}:${params.record.createdAt}`)
+    .digest("hex")
+    .slice(0, 16);
+  const filename = `gateway_restart_activation_continuation_${identity}_${stamp}Z.md`;
+  const filePath =
+    params.record.result?.proof?.artifactPath ?? path.join(params.exportsDir, filename);
   const failed = params.checks.filter((check) => check.status === "fail");
+  const unproven = params.checks.filter((check) => check.status !== "pass");
   const content = [
-    `# Gateway Restart Activation Continuation ${params.status === "continuation_completed" ? "Closeout" : "Blocker"}`,
+    "# Gateway Restart Activation Continuation",
     "",
-    `Status: ${params.status === "continuation_completed" ? "Success" : "Blocked"}`,
+    `Status: ${params.status}`,
     `Continuation id: ${params.record.id}`,
     "Side effect: restart completed or parent turn interrupted during restart handoff",
     `Objective: ${params.record.objective}`,
     `Hard stop rules enforced: ${params.record.hardStopRules.join("; ")}`,
     `Parent session key: ${params.record.parent?.sessionKey ?? params.record.route.sessionKey ?? "none"}`,
     `Checks: ${params.checks.map((check) => `${check.name}=${check.status} (${check.detail})`).join("; ")}`,
-    `Missing proof/check: ${failed.length > 0 ? failed.map((check) => check.name).join(", ") : "none"}`,
+    `Visible source delivery completed: ${params.proof?.visibleDeliveryCompleted === true ? "yes" : "no"}`,
+    `Delivery receipt: ${params.proof?.visibleDeliveryCompleted ? params.proof.deliveryRecordId : "pending"}`,
+    `Missing proof/check: ${unproven.length > 0 ? unproven.map((check) => check.name).join(", ") : "none"}`,
     `Exact next repair step: ${
       failed.length > 0
         ? "repair the failing continuation check and allow the startup scanner to resume again"
-        : "none"
+        : unproven.length > 0
+          ? "await and reconcile the original source delivery receipt"
+          : "none"
     }`,
     "",
   ].join("\n");
@@ -1025,18 +1070,280 @@ async function persistActivationContinuationContinuityGateDecision(params: {
   }
 }
 
+function matchesContinuationRef(
+  record: ActivationContinuationRecord,
+  ref: ActivationContinuationRef,
+): boolean {
+  return (
+    record.id === ref.id &&
+    record.createdAt === ref.createdAt &&
+    record.result?.proof?.deliveryRef?.reportId === ref.reportId &&
+    crypto.createHash("sha256").update(record.result.message).digest("hex") === ref.reportId
+  );
+}
+
+function retireActivationEvent(sessionKey: string, ref: ActivationContinuationRef): void {
+  consumeSelectedSystemEventEntries(
+    sessionKey,
+    peekSystemEventEntries(sessionKey).filter(
+      (event) =>
+        event.activationContinuation?.id === ref.id &&
+        event.activationContinuation.createdAt === ref.createdAt &&
+        event.activationContinuation.reportId === ref.reportId,
+    ),
+  );
+}
+
+function matchesSourceDelivery(
+  record: ActivationContinuationRecord,
+  ref: ActivationContinuationRef,
+  row: SourceTurnDeliveryRow,
+): boolean {
+  const expected = record.route.deliveryContext;
+  const actual = row.deliveryContext;
+  return (
+    Boolean(expected?.channel) &&
+    (isInternalMessageChannel(expected?.channel) || Boolean(expected?.to)) &&
+    row.sourceSessionKey === record.route.sessionKey &&
+    row.obligationIdentity.deliveryId === ref.id &&
+    String(row.obligationIdentity.generation) === String(ref.createdAt) &&
+    row.obligationIdentity.reportId === ref.reportId &&
+    Boolean(row.obligationIdentity.runId) &&
+    expected?.channel === actual?.channel &&
+    expected?.to === actual?.to &&
+    expected?.accountId === actual?.accountId &&
+    String(expected?.threadId ?? "") === String(actual?.threadId ?? "")
+  );
+}
+
+export async function reconcileActivationContinuationDelivery(params: {
+  continuation: ActivationContinuationRef;
+  sessionKey: string;
+  deliveryRecordId?: string;
+  registryPath?: string;
+  stateDir?: string;
+  exportsDir?: string;
+  now?: number;
+}): Promise<ActivationContinuationDeliveryReconciliation> {
+  try {
+    return await withStoreLock(async () => {
+      const store = await readStore(params.stateDir);
+      const record = store.records.find((candidate) => candidate.id === params.continuation.id);
+      if (
+        !record ||
+        !matchesContinuationRef(record, params.continuation) ||
+        record.route.sessionKey !== params.sessionKey ||
+        !record.result?.proof
+      ) {
+        return { status: "obsolete" };
+      }
+      const registry = await loadSourceTurnDeliveryRegistry(
+        params.registryPath ?? resolveSourceTurnDeliveryRegistryPath(),
+      );
+      const rows = registry.rows.filter(
+        (row) =>
+          (!params.deliveryRecordId || row.id === params.deliveryRecordId) &&
+          matchesSourceDelivery(record, params.continuation, row),
+      );
+      const receipt = rows.find(
+        (row) =>
+          row.sourceTurnState === "final_delivered" &&
+          row.finalDeliveryDelivered &&
+          row.visibleDeliveryCount > 0 &&
+          row.obligationStage === "delivered" &&
+          row.deliveryDecision.finalDeliveryDelivered &&
+          !row.deliveryDecision.refused &&
+          row.durabilityDecision.allowedToSettle &&
+          Boolean(row.idempotencyKey.trim()) &&
+          Number.isFinite(Date.parse(row.updatedAt)) &&
+          Date.parse(row.updatedAt) >= (record.lastAttemptAt ?? record.createdAt),
+      );
+      if (!receipt) {
+        const pending = rows[0];
+        if (record.result.proof.visibleDeliveryCompleted) {
+          return {
+            status: "pending",
+            reason: "settlement_failed",
+            detail: "completed activation source receipt is unavailable",
+          };
+        }
+        // The report is immutable and contains already completed checks. Its
+        // delivery owner may retry the same idempotent publication; this never
+        // authorizes replaying a model turn or the restart side effect.
+        return pending
+          ? {
+              status: "pending",
+              reason: "delivery_unconfirmed",
+              message: record.result.message,
+              ...(pending.obligationIdentity.runId
+                ? { runId: pending.obligationIdentity.runId }
+                : {}),
+            }
+          : { status: "missing_receipt", message: record.result.message };
+      }
+      if (
+        record.result.proof.visibleDeliveryCompleted &&
+        (record.status === "continuation_completed" || record.status === "continuation_blocked")
+      ) {
+        retireActivationEvent(params.sessionKey, params.continuation);
+        return { status: "settled" };
+      }
+      const checks = record.result.checks.map(
+        (check): ActivationContinuationCheckResult =>
+          check.name === "visible_delivery"
+            ? { name: check.name, status: "pass", detail: `source delivery receipt ${receipt.id}` }
+            : check,
+      );
+      const status = checks.every((check) => check.status === "pass")
+        ? "continuation_completed"
+        : "continuation_blocked";
+      const proof: ActivationContinuationProof = {
+        ...record.result.proof,
+        visibleDeliveryCompleted: true,
+        deliveryStatus: "delivered",
+        deliveryRecordId: receipt.id,
+      };
+      const now = params.now ?? Date.now();
+      const artifactPath = await writeContinuationArtifact({
+        record,
+        checks,
+        status,
+        proof,
+        now,
+        exportsDir: params.exportsDir ?? resolveDefaultExportsDir(),
+      });
+      const settled: ActivationContinuationRecord = {
+        ...record,
+        status,
+        completedAt: now,
+        ...(status === "continuation_completed"
+          ? { closeoutPath: artifactPath }
+          : { blockerPath: artifactPath }),
+        result: { ...record.result, checks, proof: { ...proof, artifactPath } },
+      };
+      store.records = store.records.map((candidate) =>
+        candidate.id === record.id ? settled : candidate,
+      );
+      await writeStore(store, params.stateDir);
+      const readback = (await readStore(params.stateDir)).records.find(
+        (candidate) => candidate.id === record.id,
+      );
+      if (!readback || !isDeepStrictEqual(readback, settled)) {
+        throw new Error("activation delivery settlement readback failed");
+      }
+      retireActivationEvent(params.sessionKey, params.continuation);
+      return { status: "settled" };
+    });
+  } catch (error) {
+    // A committed source receipt must not trigger a second publication when
+    // the activation artifact/store write fails. Retry this reconciliation only.
+    return { status: "pending", reason: "settlement_failed", detail: String(error) };
+  }
+}
+
 async function defaultDeliver(
   record: ActivationContinuationRecord,
   message: string,
-): Promise<void> {
+): Promise<ActivationContinuationDeliveryResult> {
   const sessionKey = record.route.sessionKey;
-  if (!sessionKey) {
-    throw new Error("activation continuation has no sessionKey route");
+  const ref = record.result?.proof?.deliveryRef;
+  if (!sessionKey || !ref) {
+    throw new Error("activation continuation has no prepared source route");
   }
   enqueueSystemEvent(message, {
     sessionKey,
+    contextKey: `activation:${ref.id}:${ref.createdAt}:${ref.reportId}`,
+    activationContinuation: ref,
     ...(record.route.deliveryContext ? { deliveryContext: record.route.deliveryContext } : {}),
   });
+  requestHeartbeat({
+    source: "restart-sentinel",
+    intent: "event",
+    reason: "activation-continuation",
+    sessionKey,
+  });
+  return { status: "queued" };
+}
+
+async function deliverPreparedActivationReport(
+  record: ActivationContinuationRecord,
+  deps: ActivationContinuationRunnerDeps,
+): Promise<ActivationContinuationRecord> {
+  const ref = record.result?.proof?.deliveryRef;
+  if (!ref || !record.result || !record.route.sessionKey) {
+    throw new Error("activation report identity missing before delivery");
+  }
+  try {
+    const delivered = await (deps.deliver ?? defaultDeliver)(record, record.result.message);
+    if (delivered.status === "delivered") {
+      await reconcileActivationContinuationDelivery({
+        continuation: ref,
+        sessionKey: record.route.sessionKey,
+        deliveryRecordId: delivered.deliveryRecordId,
+        registryPath: deps.sourceDeliveryRegistryPath,
+        stateDir: deps.stateDir,
+        exportsDir: deps.exportsDir,
+        now: deps.now?.(),
+      });
+    } else {
+      await updateRecord(
+        record.id,
+        (current) => {
+          if (
+            !matchesContinuationRef(current, ref) ||
+            !current.result?.proof ||
+            current.result.proof.visibleDeliveryCompleted
+          ) {
+            return current;
+          }
+          return {
+            ...current,
+            result: {
+              ...current.result,
+              proof: {
+                ...current.result.proof,
+                deliveryStatus: "queued",
+                parentContinuationQueued: true,
+              },
+            },
+          };
+        },
+        deps.stateDir,
+      );
+    }
+  } catch (error) {
+    await updateRecord(
+      record.id,
+      (current) => {
+        if (
+          !matchesContinuationRef(current, ref) ||
+          !current.result?.proof ||
+          current.result.proof.visibleDeliveryCompleted
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          result: {
+            ...current.result,
+            proof: {
+              ...current.result.proof,
+              deliveryStatus: "failed",
+            },
+          },
+        };
+      },
+      deps.stateDir,
+    );
+    deps.log?.warn?.("activation report delivery remains pending", {
+      continuationId: record.id,
+      error: String(error),
+    });
+  }
+  return (
+    (await readStore(deps.stateDir)).records.find((candidate) => candidate.id === record.id) ??
+    record
+  );
 }
 
 export async function resumeActivationContinuation(
@@ -1059,12 +1366,44 @@ export async function resumeActivationContinuation(
     });
     return record;
   }
-  if (now > record.expiresAt) {
+  const current = (await readStore(deps.stateDir)).records.find(
+    (candidate) => candidate.id === record.id,
+  );
+  if (!current) {
+    throw new Error("activation continuation is not persisted");
+  }
+  if (current.createdAt !== record.createdAt) {
+    return current;
+  }
+  const ref = current.result?.proof?.deliveryRef;
+  if (ref && current.route.sessionKey) {
+    // Reconcile before TTL/checks/queueing. A crash after acknowledged delivery
+    // must settle the existing report without another restart or publication.
+    const reconciliation = await reconcileActivationContinuationDelivery({
+      continuation: ref,
+      sessionKey: current.route.sessionKey,
+      registryPath: deps.sourceDeliveryRegistryPath,
+      stateDir: deps.stateDir,
+      exportsDir: deps.exportsDir,
+      now,
+    });
+    if (
+      reconciliation.status === "missing_receipt" ||
+      (reconciliation.status === "pending" && reconciliation.reason === "delivery_unconfirmed")
+    ) {
+      return deliverPreparedActivationReport(current, deps);
+    }
+    return (
+      (await readStore(deps.stateDir)).records.find((candidate) => candidate.id === record.id) ??
+      current
+    );
+  }
+  if (now > current.expiresAt) {
     const updated =
       (await updateRecord(
-        record.id,
-        (current) => ({
-          ...current,
+        current.id,
+        (entry) => ({
+          ...entry,
           status: "continuation_blocked",
           completedAt: now,
           result: {
@@ -1073,7 +1412,7 @@ export async function resumeActivationContinuation(
           },
         }),
         deps.stateDir,
-      )) ?? record;
+      )) ?? current;
     await persistActivationContinuationContinuityGateDecision({
       record: updated,
       lifecycleStatus: "expired_before_recovery",
@@ -1082,26 +1421,36 @@ export async function resumeActivationContinuation(
     });
     return updated;
   }
-  const locked = await updateRecord(
-    record.id,
-    (current) => ({
-      ...current,
-      status: "side_effect_completed_parent_interrupted",
-      attempts: current.attempts + 1,
-      lastAttemptAt: now,
-    }),
-    deps.stateDir,
-  );
-  const active = locked ?? record;
+  const active =
+    (await updateRecord(
+      current.id,
+      (entry) => ({
+        ...entry,
+        status: "side_effect_completed_parent_interrupted",
+        attempts: entry.attempts + 1,
+        lastAttemptAt: now,
+      }),
+      deps.stateDir,
+    )) ?? current;
   const checkRunner = deps.check ?? runDefaultCheck;
   const checks: ActivationContinuationCheckResult[] = [];
   for (const check of active.requiredChecks) {
+    if (check === "visible_delivery") {
+      continue;
+    }
     try {
       checks.push(await checkRunner(active, check));
-    } catch (err) {
-      checks.push({ name: check, status: "fail", detail: String(err) });
+    } catch (error) {
+      checks.push({ name: check, status: "fail", detail: String(error) });
     }
   }
+  // Route/config/artifact existence and a custom check callback cannot prove a
+  // report delivery. Only source-receipt reconciliation can pass this check.
+  checks.push({
+    name: "visible_delivery",
+    status: "pending",
+    detail: "awaiting the exact source delivery receipt",
+  });
   if (!active.route.sessionKey && !checks.some((check) => check.name === "delivery_route")) {
     checks.push({
       name: "delivery_route",
@@ -1109,78 +1458,62 @@ export async function resumeActivationContinuation(
       detail: "no sessionKey route persisted for visible continuation delivery",
     });
   }
-  const failed = checks.some((check) => check.status === "fail");
-  let status: "continuation_completed" | "continuation_blocked" = failed
-    ? "continuation_blocked"
-    : "continuation_completed";
+  const status: RecoveryStatus = active.route.sessionKey
+    ? "pending_delivery"
+    : "continuation_blocked";
   const proof: ActivationContinuationProof = {
     sideEffectCompleted: true,
     parentTurnInterrupted: true,
-    parentContinuationQueued: active.requiredChecks.includes("parent_restart_recovery")
-      ? checks.some((check) => check.name === "parent_restart_recovery" && check.status === "pass")
-      : Boolean(active.parent?.sessionKey ?? active.route.sessionKey),
+    parentContinuationQueued: checks.some(
+      (check) => check.name === "parent_restart_recovery" && check.status === "pass",
+    ),
     visibleDeliveryCompleted: false,
     deliveryStatus: active.route.sessionKey ? "not_requested" : "failed",
   };
-  let artifactPath = await writeContinuationArtifact({
+  proof.artifactPath = await writeContinuationArtifact({
     record: active,
     checks,
     status,
-    exportsDir: deps.exportsDir ?? resolveDefaultExportsDir(),
+    proof,
     now,
+    exportsDir: deps.exportsDir ?? resolveDefaultExportsDir(),
   });
-  proof.artifactPath = artifactPath;
-  let message = formatResultMessage({ record: active, checks, status, proof });
+  const message = formatResultMessage({ record: active, checks, proof });
   if (active.route.sessionKey) {
-    try {
-      proof.deliveryStatus = "queued";
-      proof.visibleDeliveryCompleted = true;
-      message = formatResultMessage({ record: active, checks, status, proof });
-      await (deps.deliver ?? defaultDeliver)(active, message);
-    } catch (err) {
-      proof.deliveryStatus = "failed";
-      proof.visibleDeliveryCompleted = false;
-      checks.push({
-        name: "delivery_route",
-        status: "fail",
-        detail: `delivery failed: ${String(err)}`,
-      });
-      status = "continuation_blocked";
-      message = formatResultMessage({ record: active, checks, status, proof });
-      artifactPath = await writeContinuationArtifact({
-        record: active,
-        checks,
-        status,
-        exportsDir: deps.exportsDir ?? resolveDefaultExportsDir(),
-        now,
-      });
-      proof.artifactPath = artifactPath;
-    }
+    proof.deliveryRef = {
+      id: active.id,
+      createdAt: active.createdAt,
+      reportId: crypto.createHash("sha256").update(message).digest("hex"),
+    };
   }
-  const next =
+  // Persist the immutable message and its correlation before the queue or any
+  // delivery callback can run; a receipt arriving immediately must find it.
+  const prepared =
     (await updateRecord(
-      record.id,
-      (current) => ({
-        ...current,
+      active.id,
+      (entry) => ({
+        ...entry,
         status,
-        completedAt: now,
-        ...(status === "continuation_completed"
-          ? { closeoutPath: artifactPath }
-          : { blockerPath: artifactPath }),
+        ...(status === "continuation_blocked"
+          ? { blockerPath: proof.artifactPath, completedAt: now }
+          : {}),
         result: { checks, message, proof },
       }),
       deps.stateDir,
     )) ?? active;
-  if (status === "continuation_blocked") {
+  if (checks.some((check) => check.status === "fail")) {
     await persistActivationContinuationContinuityGateDecision({
-      record: next,
-      lifecycleStatus: status,
+      record: prepared,
+      lifecycleStatus: "continuation_blocked",
       stateDir: deps.stateDir,
       continuityGate,
       checks,
-      proofPath: artifactPath,
+      proofPath: proof.artifactPath,
     });
   }
+  const next = active.route.sessionKey
+    ? await deliverPreparedActivationReport(prepared, deps)
+    : prepared;
   deps.log?.info?.("activation continuation resumed", {
     continuationId: next.id,
     status: next.status,
@@ -1195,7 +1528,8 @@ export async function recoverPendingActivationContinuations(
   const resumable = store.records.filter(
     (record) =>
       record.status === "pending_restart" ||
-      record.status === "side_effect_completed_parent_interrupted",
+      record.status === "side_effect_completed_parent_interrupted" ||
+      record.status === "pending_delivery",
   );
   const completed: ActivationContinuationRecord[] = [];
   for (const record of resumable) {

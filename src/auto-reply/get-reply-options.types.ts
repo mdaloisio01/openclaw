@@ -46,6 +46,15 @@ export type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
   replace?: true;
 };
 
+export type ReplyExecutionProgress = {
+  runId: string;
+  source: "tool" | "command_output" | "patch";
+  phase: string;
+  itemId?: string;
+  toolCallId?: string;
+  name?: string;
+};
+
 export type GetReplyOptions = {
   /** Override run id for agent events (defaults to random UUID). */
   runId?: string;
@@ -57,6 +66,8 @@ export type GetReplyOptions = {
   imageOrder?: PromptImageOrderEntry[];
   /** Notifies when an agent run actually starts (useful for webchat command handling). */
   onAgentRunStart?: (runId: string) => void;
+  /** Owner execution evidence, independent of channel progress visibility/capabilities. */
+  onExecutionProgress?: (event: ReplyExecutionProgress) => Promise<void> | void;
   /** Shared lifecycle owner for the current user-turn transcript append. */
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
   onReplyStart?: () => Promise<void> | void;

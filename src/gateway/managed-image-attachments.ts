@@ -1,8 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { isPassThroughRemoteMediaSource } from "@openclaw/media-core/media-source-url";
+import { isAudioFileName } from "@openclaw/media-core/mime";
 import { resolveDefaultAgentId } from "../agents/agent-scope-config.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
@@ -34,6 +36,9 @@ const MANAGED_OUTGOING_ATTACHMENT_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const DATA_URL_RE = /^data:/i;
 const WINDOWS_DRIVE_RE = /^[A-Za-z]:[\\/]/;
+
+/** Existing WebChat local-audio display limit, shared by preparation and retention. */
+export const MAX_WEBCHAT_AUDIO_BYTES = 15 * 1024 * 1024;
 
 export const DEFAULT_MANAGED_IMAGE_ATTACHMENT_LIMITS = {
   maxBytes: 12 * 1024 * 1024,
@@ -74,6 +79,8 @@ type ManagedImageRecord = {
   retentionClass?: ManagedImageRetentionClass;
   alt: string;
   original: ManagedImageRecordVariant;
+  /** Non-image WebChat attachments share the same authenticated artifact lifecycle. */
+  attachment?: { kind: "audio" | "video" | "document"; isVoiceNote?: boolean };
 };
 
 type ParsedImageDataUrl =
@@ -424,6 +431,25 @@ export async function cleanupManagedOutgoingImageRecords(params?: {
   let deletedFileCount = 0;
   let retainedCount = 0;
   const retainedReferencedPaths = new Set<string>();
+  // A prepared source final can outlive the transient asset TTL or crash after
+  // append but before binding. Its existing delivery obligation owns those bytes.
+  const { loadSourceTurnDeliveryRegistry, resolveSourceTurnDeliveryRegistryPath } =
+    await import("../agents/source-turn-delivery-store.js");
+  const sourceRows = (await loadSourceTurnDeliveryRegistry(resolveSourceTurnDeliveryRegistryPath()))
+    .rows;
+  const pendingAttachments = new Set(
+    sourceRows.flatMap((row) =>
+      row.obligationStage === "delivered" ||
+      row.obligationStage === "settled_by_verified_later_delivery"
+        ? []
+        : (row.preparedSourceFinal?.parts ?? []).flatMap((part) =>
+            collectManagedOutgoingAttachmentRefs(
+              part.webchatContent?.content,
+              row.sourceSessionKey,
+            ).map((ref) => `${ref.sessionKey}:${ref.attachmentId}`),
+          ),
+    ),
+  );
   const transcriptAttachmentIndexCache = new Map<
     string,
     SessionManagedOutgoingAttachmentIndex | null
@@ -470,6 +496,8 @@ export async function cleanupManagedOutgoingImageRecords(params?: {
       (!sessionKeyFilter || record.sessionKey === sessionKeyFilter)
     ) {
       shouldDelete = true;
+    } else if (pendingAttachments.has(`${record.sessionKey}:${record.attachmentId}`)) {
+      shouldDelete = false;
     } else if (record.messageId) {
       shouldDelete = !(await recordMatchesTranscriptMessage(
         record,
@@ -521,6 +549,21 @@ async function readManagedImageRecord(
 
 function buildManagedImageBlock(record: ManagedImageRecord): ManagedImageBlock {
   const fullUrl = buildOutgoingVariantUrl(record.sessionKey, record.attachmentId, "full");
+  if (record.attachment) {
+    return {
+      type: "attachment",
+      attachment: {
+        // Audio/video/documents use the existing authenticated local-media ticket
+        // renderer; only image cards fetch managed URLs with authorization headers.
+        url: record.original.path,
+        managedMediaUrl: fullUrl,
+        kind: record.attachment.kind,
+        label: record.alt,
+        mimeType: record.original.contentType,
+        ...(record.attachment.isVoiceNote ? { isVoiceNote: true } : {}),
+      },
+    };
+  }
   return {
     type: "image",
     url: fullUrl,
@@ -587,10 +630,14 @@ function collectManagedOutgoingAttachmentRefs(
 ) {
   const refs = new Map<string, { attachmentId: string; sessionKey: string }>();
   for (const block of blocks ?? []) {
-    if (block?.type !== "image") {
-      continue;
-    }
-    for (const candidate of [block.url, block.openUrl]) {
+    const attachment = block?.type === "attachment" ? block.attachment : undefined;
+    const candidates =
+      block?.type === "image"
+        ? [block.url, block.openUrl]
+        : attachment && typeof attachment === "object" && "managedMediaUrl" in attachment
+          ? [attachment.managedMediaUrl]
+          : [];
+    for (const candidate of candidates) {
       if (typeof candidate !== "string") {
         continue;
       }
@@ -783,7 +830,7 @@ export async function attachManagedOutgoingImagesToMessage(params: {
   );
 }
 
-export async function createManagedOutgoingImageBlocks(params: {
+type CreateManagedOutgoingImageParams = {
   sessionKey: string;
   agentId?: string;
   mediaUrls?: string[] | null;
@@ -793,7 +840,29 @@ export async function createManagedOutgoingImageBlocks(params: {
   localRoots?: readonly string[] | "any";
   continueOnPrepareError?: boolean;
   onPrepareError?: (error: Error) => void;
-}): Promise<ManagedImageBlock[]> {
+};
+
+export async function createManagedOutgoingImageBlocks(params: CreateManagedOutgoingImageParams) {
+  return createManagedOutgoingMediaBlocks(params);
+}
+
+/** Required WebChat finals use the same durable owner for images, audio, and files. */
+export async function createManagedOutgoingAttachmentBlocks(
+  params: CreateManagedOutgoingImageParams & {
+    audioAsVoice?: boolean;
+    attachmentMaxBytes: number;
+  },
+) {
+  return createManagedOutgoingMediaBlocks({ ...params, includeAttachments: true });
+}
+
+async function createManagedOutgoingMediaBlocks(
+  params: CreateManagedOutgoingImageParams & {
+    includeAttachments?: boolean;
+    audioAsVoice?: boolean;
+    attachmentMaxBytes?: number;
+  },
+): Promise<ManagedImageBlock[]> {
   const sessionKey = params.sessionKey.trim();
   if (!sessionKey) {
     return [];
@@ -813,6 +882,11 @@ export async function createManagedOutgoingImageBlocks(params: {
     if (parsedDataUrl.kind === "non-image-data-url") {
       continue;
     }
+    const localMediaPath = resolveLocalMediaPath(mediaUrl);
+    const attachmentMaxBytes =
+      localMediaPath && isAudioFileName(localMediaPath)
+        ? MAX_WEBCHAT_AUDIO_BYTES
+        : (params.attachmentMaxBytes ?? MEDIA_MAX_BYTES);
 
     let savedOriginalPath: string | null = null;
     try {
@@ -830,7 +904,6 @@ export async function createManagedOutgoingImageBlocks(params: {
               `generated-image-${index + 1}`,
             )
           : await (async () => {
-              const localMediaPath = resolveLocalMediaPath(mediaUrl);
               if (localMediaPath) {
                 await assertLocalMediaAllowed(localMediaPath, params.localRoots);
               }
@@ -838,12 +911,51 @@ export async function createManagedOutgoingImageBlocks(params: {
                 mediaUrl,
                 undefined,
                 "outgoing/originals",
-                Math.max(limits.maxBytes, MEDIA_MAX_BYTES),
+                Math.max(
+                  limits.maxBytes,
+                  params.includeAttachments ? attachmentMaxBytes : MEDIA_MAX_BYTES,
+                ),
               );
             })();
       savedOriginalPath = savedOriginal.path;
       let savedOriginalContentType = savedOriginal.contentType;
       if (!savedOriginalContentType?.startsWith("image/")) {
+        if (params.includeAttachments) {
+          if (savedOriginal.size > attachmentMaxBytes) {
+            throw createManagedImageAttachmentError(
+              `Managed attachment ${JSON.stringify(alt)} exceeds the ${formatLimitMiB(attachmentMaxBytes)} byte limit`,
+            );
+          }
+          const kind = savedOriginalContentType?.startsWith("audio/")
+            ? "audio"
+            : savedOriginalContentType?.startsWith("video/")
+              ? "video"
+              : "document";
+          const record: ManagedImageRecord = {
+            attachmentId: randomUUID(),
+            sessionKey,
+            ...(sessionKey === "global" && params.agentId ? { agentId: params.agentId } : {}),
+            messageId: params.messageId ?? null,
+            createdAt: new Date().toISOString(),
+            retentionClass: params.messageId ? "history" : "transient",
+            alt,
+            original: {
+              path: savedOriginal.path,
+              contentType: savedOriginalContentType ?? "application/octet-stream",
+              width: null,
+              height: null,
+              sizeBytes: savedOriginal.size,
+              filename: toRecordFilename(savedOriginal.path),
+            },
+            attachment: {
+              kind,
+              ...(kind === "audio" && params.audioAsVoice ? { isVoiceNote: true } : {}),
+            },
+          };
+          await writeManagedImageRecord(record, stateDir);
+          blocks.push(buildManagedImageBlock(record));
+          continue;
+        }
         await fs.rm(savedOriginal.path, { force: true }).catch(() => {});
         savedOriginalPath = null;
         continue;
@@ -956,6 +1068,37 @@ export async function createManagedOutgoingImageBlocks(params: {
     }
   }
   return blocks;
+}
+
+/** Read actual backing bytes; a skipped attach or a URL alone cannot settle a final. */
+export async function readManagedOutgoingAttachmentProof(params: {
+  sessionKey: string;
+  blocks: readonly Record<string, unknown>[];
+  messageId?: string;
+  stateDir?: string;
+}): Promise<Array<{ url: string; sha256: string }>> {
+  const refs = collectManagedOutgoingAttachmentRefs(params.blocks);
+  return Promise.all(
+    refs.map(async ({ attachmentId, sessionKey }) => {
+      const record = await readManagedImageRecord(attachmentId, params.stateDir);
+      if (
+        !record ||
+        sessionKey !== params.sessionKey ||
+        record.sessionKey !== sessionKey ||
+        !params.blocks.some((block) => isDeepStrictEqual(block, buildManagedImageBlock(record))) ||
+        (params.messageId &&
+          (record.messageId !== params.messageId ||
+            !(await recordMatchesTranscriptMessage(record))))
+      ) {
+        throw new Error("Required WebChat attachment is not bound to its source message");
+      }
+      const bytes = (await readLocalFileSafely({ filePath: record.original.path })).buffer;
+      return {
+        url: buildOutgoingVariantUrl(sessionKey, attachmentId, "full"),
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      };
+    }),
+  );
 }
 
 function sendStatus(res: ServerResponse, statusCode: number, body: string) {

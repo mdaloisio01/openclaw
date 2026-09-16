@@ -815,6 +815,26 @@ describe("media store", () => {
       run: async (storeValue: typeof import("./store.js")) =>
         await storeValue.cleanOldMedia(1_000, { recursive: true, pruneEmptyDirs: true }),
     },
+    {
+      name: "removes empty top-level media containers without removing the media root",
+      setup: async (storeValue: typeof import("./store.js")) => {
+        const saved = await storeValue.saveMediaBuffer(
+          Buffer.from("expired attachment"),
+          "text/plain",
+          path.join("empty-owner-container", "nested"),
+        );
+        const past = Date.now() - 10_000;
+        await fs.utimes(saved.path, past / 1000, past / 1000);
+        return {
+          removedFiles: [saved.path],
+          preservedFiles: [],
+          removedDirs: [path.dirname(path.dirname(saved.path))],
+          preservedDirs: [await storeValue.ensureMediaDir()],
+        };
+      },
+      run: async (storeValue: typeof import("./store.js")) =>
+        await storeValue.cleanOldMedia(1_000, { recursive: true, pruneEmptyDirs: true }),
+    },
   ] as const)("$name", async ({ setup, run }) => {
     await expectCleanupBehaviorCase({ setup, run });
   });
@@ -842,6 +862,52 @@ describe("media store", () => {
       });
     },
   );
+
+  it("refuses a replacement media root instead of deleting files using stale TTL observations", async () => {
+    await withTempStore(async (storeLocal) => {
+      const expired = await storeLocal.saveMediaBuffer(
+        Buffer.from("expired original"),
+        "text/plain",
+        "",
+      );
+      const mediaDir = path.dirname(expired.path);
+      const movedDir = `${mediaDir}-before-prune`;
+      const past = Date.now() - 10_000;
+      await fs.utimes(expired.path, past / 1000, past / 1000);
+      const fsSafe = await import("../infra/fs-safe.js");
+      const openRoot = fsSafe.root;
+      let replaced = false;
+      const rootSpy = vi.spyOn(fsSafe, "root").mockImplementationOnce(async (...args) => {
+        const handle = await openRoot(...args);
+        const list = handle.list.bind(handle);
+        vi.spyOn(handle, "list").mockImplementationOnce(async (relativePath, options) => {
+          const entries = await list(relativePath, options);
+          await fs.rename(mediaDir, movedDir);
+          await fs.mkdir(mediaDir);
+          replaced = true;
+          await fs.writeFile(expired.path, "fresh replacement");
+          return entries;
+        });
+        return handle;
+      });
+      try {
+        await expect(storeLocal.cleanOldMedia(1_000)).rejects.toMatchObject({
+          code: "path-mismatch",
+        });
+        expect(replaced).toBe(true);
+        expect(await fs.readFile(expired.path, "utf8")).toBe("fresh replacement");
+        expect(await fs.readFile(path.join(movedDir, path.basename(expired.path)), "utf8")).toBe(
+          "expired original",
+        );
+      } finally {
+        rootSpy.mockRestore();
+        if (replaced) {
+          await fs.rm(mediaDir, { recursive: true, force: true });
+          await fs.rename(movedDir, mediaDir);
+        }
+      }
+    });
+  });
 
   it.each([
     {

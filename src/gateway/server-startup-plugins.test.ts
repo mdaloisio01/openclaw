@@ -108,7 +108,7 @@ vi.mock("../agents/agent-scope.js", () => ({
 }));
 
 vi.mock("../agents/subagent-registry.js", () => ({
-  initSubagentRegistry: () => initSubagentRegistry(),
+  initSubagentRegistry: (options: unknown) => initSubagentRegistry(options),
 }));
 
 vi.mock("../channels/plugins/lifecycle-startup.js", () => ({
@@ -250,6 +250,25 @@ describe("prepareGatewayPluginBootstrap startup plugins", () => {
     runChannelPluginStartupMaintenance.mockClear();
     runStartupSessionMigration.mockClear();
   });
+  it("awaits parent-wait recovery for each Gateway lifecycle before loading runtime plugins", async () => {
+    let resolveRecovery!: () => void;
+    const recovery = new Promise<void>((resolve) => {
+      resolveRecovery = resolve;
+    });
+    initSubagentRegistry.mockReturnValueOnce(recovery);
+    const bootstrap = prepareBootstrapWithRuntimeConfig(slackConfig());
+    try {
+      await vi.waitFor(() => {
+        expect(initSubagentRegistry).toHaveBeenCalledWith({ gatewayStartup: true });
+      });
+      expect(loadGatewayStartupPlugins).not.toHaveBeenCalled();
+    } finally {
+      resolveRecovery();
+      await bootstrap;
+    }
+    expect(loadGatewayStartupPlugins).toHaveBeenCalledTimes(1);
+  });
+
   it("derives startup activation from source config instead of runtime plugin defaults", async () => {
     const sourceConfig = {
       channels: {

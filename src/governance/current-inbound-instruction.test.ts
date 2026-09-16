@@ -1,0 +1,196 @@
+import { describe, expect, it } from "vitest";
+import { classifyCurrentInboundInstruction } from "./current-inbound-instruction.js";
+
+describe("current inbound instruction", () => {
+  it.each([
+    ["Give me a Cleanup Crew production build plan. Execute it now.", "unrestricted"],
+    ["Draft the plan and execute it. Actually, do not execute yet.", "planning_only"],
+    ["Run Cleanup Crew. Actually, do not execute yet.", "no_work"],
+    ["Pause Cleanup Crew. Resume the build now.", "unrestricted"],
+    ["Run Cleanup Crew and then pause now.", "no_work"],
+    ["Run Cleanup Crew and then pause now and resume the build.", "unrestricted"],
+    ["Draft the plan and execute it and then do not execute yet.", "planning_only"],
+    ["Draft a Cleanup Crew production build plan, but execute it now.", "unrestricted"],
+    ["Draft a plan for Cleanup Crew and execute it now.", "unrestricted"],
+    ["Draft a plan to fix Cleanup Crew and execute it now.", "unrestricted"],
+    ["Draft a plan and include rollback steps; then execute it now.", "unrestricted"],
+    [
+      "Draft a Cleanup Crew production build plan to fix the parser, then execute it.",
+      "unrestricted",
+    ],
+    ["Draft a Cleanup Crew plan about the repair; then run Cleanup Crew.", "unrestricted"],
+    ["Run Cleanup Crew, but do not continue.", "no_work"],
+    ["Give me a Cleanup Crew status update and do not continue.", "no_work"],
+    ["Draft a plan. Run Cleanup Crew. Mention blockers and then pause now.", "planning_only"],
+    ["Do not start this production build. Resume the build now.", "unrestricted"],
+    ["Run Cleanup Crew, but no execution of this production build.", "no_work"],
+    ["Pause Cleanup Crew. Start the build now.", "unrestricted"],
+    ["Stop. Proceed with the Cleanup Crew repair now.", "unrestricted"],
+    ["Pause Cleanup Crew. Proceed with the Cleanup Crew status report only.", "report_only"],
+    ["Stop. Start the Cleanup Crew report only.", "report_only"],
+    [
+      "Proceed with the Cleanup Crew production status report only because I will review it and execute the changes myself.",
+      "report_only",
+    ],
+    [
+      "Proceed with the Cleanup Crew production status report only because I will review it and then execute the Cleanup Crew repair.",
+      "unrestricted",
+    ],
+    [
+      "Proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+      "report_only",
+    ],
+    [
+      "Proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+      "unrestricted",
+    ],
+    [
+      "Please proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+      "report_only",
+    ],
+    [
+      "Please proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+      "unrestricted",
+    ],
+    [
+      "Please, proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+      "report_only",
+    ],
+    [
+      "Please, proceed with the Cleanup Crew production status report only and I will review it and then execute the Cleanup Crew repair.",
+      "unrestricted",
+    ],
+  ] as const)("applies the latest explicit instruction in order: %s", (input, instruction) => {
+    expect(classifyCurrentInboundInstruction(input)).toBe(instruction);
+  });
+
+  it.each([
+    "Give me an optimized research prompt to have Cleanup Crew review the system.",
+    "Give me a prompt for a Cleanup Crew production report only.",
+    "Okay, make up a full production SOP build plan for Cleanup Crew.",
+    "Cleanup Crew build planning-only: prepare the repair prompt.",
+    "Only draft a prompt for Cleanup Crew; include the words then execute the build in it.",
+    "Draft a Cleanup Crew build plan. Do not continue the build.",
+    "Draft a prompt for Cleanup Crew to report status only and then continue the build.",
+    "Draft a prompt: status only and then execute the build.",
+    "Status only and draft a prompt about reporting status and then run the build.",
+    "Draft a Cleanup Crew plan that quotes 'but execute it now'.",
+    "Draft a Cleanup Crew prompt, but include execute it now in the prompt.",
+    "Draft a prompt that says 'do not run the Cleanup Crew production build'.",
+  ])("recognizes the requested planning artifact: %s", (input) => {
+    expect(classifyCurrentInboundInstruction(input)).toBe("planning_only");
+  });
+
+  it.each([
+    "Give me a Cleanup Crew production report only.",
+    "Give me the current Cleanup Crew production report only.",
+    "Send me a concise Cleanup Crew production status update only.",
+    "Could you show me the Cleanup Crew production status update only?",
+    "Please provide me a Cleanup Crew production report only.",
+    "Cleanup Crew report only. Do not continue.",
+    "Status update only; don't do anything else.",
+    "Cleanup Crew production repair: just report the current status.",
+    "Cleanup Crew production repair: status only and do not continue.",
+    "Cleanup Crew report only and then please don't continue.",
+    "Proceed with the Cleanup Crew status report only.",
+    "Start the Cleanup Crew report only.",
+    "Proceed with the Cleanup Crew production status report only because I don't authorize changes.",
+    "Proceed with the Cleanup Crew production report only since changes are not authorized.",
+    "Proceed with the Cleanup Crew production status report only because I will review it and execute the changes myself.",
+    "Proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "Could you proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself?",
+    "Could you, proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself?",
+    "Okay, proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+    "- Proceed with the Cleanup Crew production status report only and I will review it and execute the changes myself.",
+  ])("recognizes a report instruction: %s", (input) => {
+    expect(classifyCurrentInboundInstruction(input)).toBe("report_only");
+  });
+
+  it.each([
+    "Pause the Cleanup Crew production repair.",
+    "Cleanup Crew production repair: please pause here.",
+    "Cleanup Crew production repair: do not do any work, just answer.",
+    "Do not continue with the Cleanup Crew build.",
+    "Do not execute the production build.",
+    "Cleanup Crew production repair: do not continue all work.",
+    "Cleanup Crew production repair: do not execute work.",
+    "Cleanup Crew production repair: no execution of all work.",
+    "Cleanup Crew production repair: no execution of production work.",
+    "Cleanup Crew production repair: do not continue any work.",
+    "Cleanup Crew production repair: do not execute any work.",
+    "Cleanup Crew production repair: no execution of any work.",
+    "Cleanup Crew production repair: do not continue with this repair.",
+    "Do not continue with the active production mission.",
+    "Do not run the Cleanup Crew production build.",
+    "Do not resume with this Cleanup Crew repair.",
+    "Do not start this production work.",
+    "Do not proceed with the Cleanup Crew mission.",
+    "Do not continue with the Cleanup Crew build, please.",
+    "Do not continue with the Cleanup Crew build because I only want a status update.",
+    "Do not continue with the Cleanup Crew build for now.",
+    "Do not continue with the Cleanup Crew build for the moment, please.",
+    "Do not continue with the Cleanup Crew build, please, for now, because I only want status.",
+    "No execution of this Cleanup Crew production build.",
+    "Do not run the Cleanup Crew production build yet.",
+    "No execution of this Cleanup Crew production mission until the owner resumes it.",
+    "Stop after this Cleanup Crew report.",
+    "Stop.",
+    "Stop the execution.",
+    "Do not do any work on this production build.",
+    "Do not continue, please.",
+    "Don't run.",
+    "Do not resume.",
+    "Do not start.",
+    "Do not proceed.",
+    "Do not continue, please, for now, because I only want status.",
+    "Pause, please.",
+    "Stop for the moment, please.",
+    "Stop working on the Cleanup Crew production repair.",
+    "Stop all work on the Cleanup Crew production repair.",
+    "Cleanup Crew production repair: stop all work.",
+    "Cleanup Crew production repair: pause this production repair, please.",
+    "Do not proceed with work on the Cleanup Crew mission.",
+    "No execution until the owner resumes this build.",
+  ])("recognizes an actual hold: %s", (input) => {
+    expect(classifyCurrentInboundInstruction(input)).toBe("no_work");
+  });
+
+  it.each([
+    "Draft a Cleanup Crew production build plan and then execute it.",
+    "Cleanup Crew production repair: fix pause/resume handling and run its tests.",
+    "Cleanup Crew production repair: fix the paused task recovery.",
+    "Cleanup Crew production repair: fix status-only/report-only classification.",
+    "Give me a repair for Cleanup Crew status-only classification.",
+    "Cleanup Crew production repair: test no execution handling and run its tests.",
+    "Cleanup Crew production repair: fix the planning-only closeout regression.",
+    "Only write production code for a plan validator.",
+    "Perform a read-only system-wide inventory.",
+    "Cleanup Crew production repair: the broken input is 'pause now; report only'.",
+    "Cleanup Crew production repair:\n> Status only.\nThe quoted request is mishandled.",
+    "Cleanup Crew production repair: handle this example:\n```text\nPause now.\n```",
+    "Cleanup Crew production repair: fix the 'status only and do not continue' regression and run its tests.",
+    "Cleanup Crew production repair: fix report-only and pause classification.",
+    "Cleanup Crew production repair: fix status only and do not continue classification.",
+    "Cleanup Crew production repair: fix the parser and do not execute tests.",
+    "Cleanup Crew production repair: fix the parser, but do not execute tests.",
+    "Cleanup Crew production repair: fix the parser and do not run tests.",
+    "Cleanup Crew production repair: fix the parser and do not run the production build tests.",
+    "Cleanup Crew production repair: fix the parser and do not execute the production build tests.",
+    "Cleanup Crew production repair: fix the parser and do not continue the repair helper.",
+    "Cleanup Crew production repair: fix a build helper that says do not continue the repair helper, please.",
+    "Cleanup Crew production repair: fix the parser and do not continue the repair helper for now.",
+    "Cleanup Crew production repair: do not continue the repair helper, please.",
+    "Cleanup Crew production repair: stop the repair helper.",
+    "Cleanup Crew production repair: fix the parser and do not do any work on the repair helper.",
+    "Cleanup Crew production repair: pause this parser test and run the rest.",
+    "Cleanup Crew production repair: fix the parser and do not start the repair helper.",
+    "Cleanup Crew production repair: fix the parser and do not resume classification.",
+    "Cleanup Crew production repair: fix the parser; no execution of cleanup helper.",
+    "Cleanup Crew production repair: fix the parser; no execution of this mission classifier.",
+    "Cleanup Crew production repair: stop working on the parser unit test and run the rest.",
+    "Cleanup Crew production repair: fix the 'do not run the Cleanup Crew production build' regression.",
+    "Cleanup Crew production repair: handle this example:\n```text\nNo execution of this build.\n```",
+  ])("does not exempt execution or turn described instructions into holds: %s", (input) => {
+    expect(classifyCurrentInboundInstruction(input)).toBe("unrestricted");
+  });
+});
