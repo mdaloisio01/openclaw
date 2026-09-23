@@ -1,10 +1,12 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearAgentHarnesses } from "../../agents/harness/registry.js";
 import type { StructuredMissionCloseout } from "../../agents/mission-settlement-tail.js";
+import { loadSourceTurnDeliveryRegistry } from "../../agents/source-turn-delivery-store.js";
 import type { PluginHookReplyDispatchResult } from "../../plugins/hooks.js";
+import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { listTasksForFlowId, resetTaskRegistryForTests } from "../../tasks/runtime-internal.js";
 import {
   getTaskFlowActiveProductionContinuation,
@@ -40,15 +42,15 @@ let dispatchReplyFromConfig: typeof import("./dispatch-from-config.js").dispatch
 let resetInboundDedupe: typeof import("./inbound-dedupe.js").resetInboundDedupe;
 let sourceTurnDeliveryTempDir: string | undefined;
 let previousSourceTurnDeliveryRegistryPath: string | undefined;
-let previousWorkspaceOrchestratorDir: string | undefined;
+let previousStateDir: string | undefined;
 let previousFalseCloseoutAdmission: string | undefined;
 let previousFalseCloseoutAdmissionMode: string | undefined;
 
 const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH";
-const WORKSPACE_ORCHESTRATOR_DIR_ENV = "OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR";
+const STATE_DIR_ENV = "OPENCLAW_STATE_DIR";
 
 type SourceTurnDeliveryRegistryForTest = {
-  rows?: Array<{
+  rows: Array<{
     currentStage?: string;
     deliveryContext?: {
       accountId?: string;
@@ -126,16 +128,14 @@ const STRUCTURED_CLEANUP_CREW_CLOSEOUT: StructuredMissionCloseout = {
 
 async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
   sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-delivery-"));
-  const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
+  const registryPath = join(sourceTurnDeliveryTempDir, "openclaw.sqlite");
   process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV] = registryPath;
   return registryPath;
 }
 
 async function readSourceTurnDeliveryRows(registryPath: string) {
-  const registry = JSON.parse(
-    await readFile(registryPath, "utf8"),
-  ) as SourceTurnDeliveryRegistryForTest;
-  return registry.rows ?? [];
+  return (await loadSourceTurnDeliveryRegistry(registryPath))
+    .rows as SourceTurnDeliveryRegistryForTest["rows"];
 }
 
 async function withCleanupCrewDispatchState(run: () => Promise<void>): Promise<void> {
@@ -198,11 +198,11 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
 
   beforeEach(() => {
     previousSourceTurnDeliveryRegistryPath = process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
-    previousWorkspaceOrchestratorDir = process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
+    previousStateDir = process.env[STATE_DIR_ENV];
     previousFalseCloseoutAdmission = process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
     previousFalseCloseoutAdmissionMode = process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE;
     delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
-    delete process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
+    delete process.env[STATE_DIR_ENV];
     delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
     delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION_MODE;
     sourceTurnDeliveryTempDir = undefined;
@@ -270,15 +270,16 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
   });
 
   afterEach(async () => {
+    closeOpenClawStateDatabaseForTest();
     if (previousSourceTurnDeliveryRegistryPath === undefined) {
       delete process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV];
     } else {
       process.env[SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV] = previousSourceTurnDeliveryRegistryPath;
     }
-    if (previousWorkspaceOrchestratorDir === undefined) {
-      delete process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV];
+    if (previousStateDir === undefined) {
+      delete process.env[STATE_DIR_ENV];
     } else {
-      process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV] = previousWorkspaceOrchestratorDir;
+      process.env[STATE_DIR_ENV] = previousStateDir;
     }
     if (previousFalseCloseoutAdmission === undefined) {
       delete process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION;
@@ -771,9 +772,9 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
   });
 
-  it("uses the workspace source-turn delivery registry when env override is unset", async () => {
+  it("uses the shared state database when the source-delivery override is unset", async () => {
     sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-default-"));
-    process.env[WORKSPACE_ORCHESTRATOR_DIR_ENV] = sourceTurnDeliveryTempDir;
+    process.env[STATE_DIR_ENV] = sourceTurnDeliveryTempDir;
     hookMocks.runner.hasHooks.mockReturnValue(false);
 
     const result = await dispatchReplyFromConfig({
@@ -784,12 +785,7 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
 
     expect(result.queuedFinal).toBe(true);
-    const registryPath = join(
-      sourceTurnDeliveryTempDir,
-      "var",
-      "source_delivery_obligations",
-      "source_delivery_obligations.json",
-    );
+    const registryPath = join(sourceTurnDeliveryTempDir, "state", "openclaw.sqlite");
     const rows = await readSourceTurnDeliveryRows(registryPath);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({

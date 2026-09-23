@@ -754,6 +754,15 @@ export interface NodePairingPending {
   version: string | null;
 }
 
+export interface OwnerRequestIntakeRecords {
+  created_at: number;
+  governed: number;
+  record_json: string;
+  request_id: string;
+  status: string;
+  updated_at: number;
+}
+
 export interface PluginBindingApprovals {
   account_id: string;
   approved_at: number;
@@ -824,6 +833,19 @@ export interface SkillUploads {
   size_bytes: number;
   slug: string;
   upload_id: string;
+}
+
+export interface SourceTurnDeliveryObligations {
+  accepted_at_ms: number;
+  delivery_status: string;
+  final_delivery_delivered: number;
+  id: string;
+  idempotency_key: string;
+  obligation_stage: string;
+  row_json: string;
+  source_session_key: string | null;
+  source_turn_id: string;
+  updated_at_ms: number;
 }
 
 export interface StateLeases {
@@ -1050,12 +1072,14 @@ export interface DB {
   node_host_config: NodeHostConfig;
   node_pairing_paired: NodePairingPaired;
   node_pairing_pending: NodePairingPending;
+  owner_request_intake_records: OwnerRequestIntakeRecords;
   plugin_binding_approvals: PluginBindingApprovals;
   plugin_blob_entries: PluginBlobEntries;
   plugin_state_entries: PluginStateEntries;
   sandbox_registry_entries: SandboxRegistryEntries;
   schema_meta: SchemaMeta;
   skill_uploads: SkillUploads;
+  source_turn_delivery_obligations: SourceTurnDeliveryObligations;
   state_leases: StateLeases;
   subagent_runs: SubagentRuns;
   task_delivery_state: TaskDeliveryState;

@@ -1,14 +1,16 @@
-import { spawnSync } from "node:child_process";
-import fs, { chmod, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setTimeout } from "node:timers/promises";
-import { acquireFileLock } from "@openclaw/fs-safe/file-lock";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { requireNodeSqlite } from "../infra/node-sqlite.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
   buildSourceTurnDeliveryObligationKey,
   classifySourceTurnDeliveryWatchdogStatus,
   createSourceTurnDeliveryQueueOwnerReference,
+  importLegacySourceTurnDeliveryRegistry,
   inspectExternalSourceDeliveryQueueOwner,
   loadSourceTurnDeliveryRegistry,
   persistSourceTurnDeliveryState,
@@ -24,35 +26,23 @@ import {
 let tempDir: string;
 let registryPath: string;
 
-async function rawRows() {
-  return JSON.parse(await readFile(registryPath, "utf8")) as {
-    rows: Array<Record<string, unknown>>;
-  };
-}
-
 describe("source turn delivery storage adapter", () => {
   beforeEach(async () => {
     tempDir = await mkdtemp(join(tmpdir(), "openclaw-source-turn-store-"));
-    registryPath = join(tempDir, "source_delivery_obligations.json");
+    registryPath = join(tempDir, "openclaw.sqlite");
   });
 
   afterEach(async () => {
+    closeOpenClawStateDatabaseForTest();
     await rm(tempDir, { recursive: true, force: true });
     vi.unstubAllEnvs();
   });
 
-  it("keeps default registry writes inside the worker-local home", async () => {
-    vi.stubEnv("HOME", tempDir);
+  it("keeps default registry writes in the worker-local shared state database", async () => {
+    vi.stubEnv("OPENCLAW_STATE_DIR", tempDir);
     vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", undefined);
     vi.stubEnv("OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR", undefined);
-    const expectedPath = join(
-      tempDir,
-      ".openclaw",
-      "workspace-orchestrator",
-      "var",
-      "source_delivery_obligations",
-      "source_delivery_obligations.json",
-    );
+    const expectedPath = join(tempDir, "state", "openclaw.sqlite");
     const workerRegistryPath = resolveSourceTurnDeliveryRegistryPath();
     // Check isolation before any write, so a regression cannot touch host state.
     expect(workerRegistryPath).toBe(expectedPath);
@@ -85,6 +75,98 @@ describe("source turn delivery storage adapter", () => {
     });
     expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [row] });
   });
+
+  it("imports a verified legacy snapshot without a fallback reader", async () => {
+    const sourceDatabasePath = join(tempDir, "legacy-source.sqlite");
+    const row = await persistSourceTurnDeliveryState({
+      registryPath: sourceDatabasePath,
+      id: "source:legacy:one",
+      facts: { finalDeliveryRequired: true },
+      now: "2026-09-15T12:00:00.000Z",
+    });
+    const legacySnapshot = await loadSourceTurnDeliveryRegistry(sourceDatabasePath);
+
+    expect(
+      importLegacySourceTurnDeliveryRegistry({
+        databasePath: registryPath,
+        registry: legacySnapshot,
+      }),
+    ).toBe(1);
+    expect(
+      importLegacySourceTurnDeliveryRegistry({
+        databasePath: registryPath,
+        registry: legacySnapshot,
+      }),
+    ).toBe(0);
+    expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [row] });
+  });
+
+  it("normalizes pre-key legacy rows at the one-time import boundary", async () => {
+    const legacyRow = {
+      id: "source:legacy:pre-key",
+      kind: "openclaw.source-delivery-obligation",
+      acceptedAt: "2026-06-30T13:52:31.591Z",
+      updatedAt: "2026-06-30T14:12:35.240Z",
+      deliveryStatus: "archived_stale_or_orphaned",
+      finalDeliveryDelivered: false,
+      visibleDeliveryCount: 0,
+    };
+
+    expect(
+      importLegacySourceTurnDeliveryRegistry({
+        databasePath: registryPath,
+        registry: { rows: [legacyRow] },
+      }),
+    ).toBe(1);
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows[0]).toMatchObject({
+      id: legacyRow.id,
+      sourceTurnId: legacyRow.id,
+      idempotencyKey: `source:${legacyRow.id}`,
+      obligationStage: "settled_by_verified_later_delivery",
+      sourceTurnState: "settled_resolved_later",
+      deliveryDecision: { reason: "historical_debt_settled_not_delivered" },
+      durabilityDecision: { allowedToSettle: true },
+    });
+  });
+
+  it.each(["final_pending", "delivery_failed"])(
+    "keeps reconciliation-settled legacy %s rows non-blocking",
+    async (deliveryStatus) => {
+      const legacyRow = {
+        id: `source:legacy:reconciled:${deliveryStatus}`,
+        kind: "openclaw.source-delivery-obligation",
+        acceptedAt: "2026-06-30T13:52:31.591Z",
+        updatedAt: "2026-07-02T20:44:41.000Z",
+        deliveryStatus,
+        sourceTurnState: deliveryStatus,
+        finalDeliveryDelivered: false,
+        visibleDeliveryCount: 0,
+        watchdogReconciliation: {
+          status: "settled_resolved_later",
+          action: "settle-source-resolved-later",
+          proofPath: "/workspace/reconciliation.json",
+        },
+      };
+
+      expect(
+        importLegacySourceTurnDeliveryRegistry({
+          databasePath: registryPath,
+          registry: { rows: [legacyRow] },
+        }),
+      ).toBe(1);
+      const row = (await loadSourceTurnDeliveryRegistry(registryPath)).rows[0];
+      expect(row).toMatchObject({
+        obligationStage: "settled_by_verified_later_delivery",
+        sourceTurnState: "settled_resolved_later",
+        deliveryDecision: {
+          state: "settled_resolved_later",
+          reason: "historical_debt_settled_not_delivered",
+        },
+        durabilityDecision: { state: "settled", allowedToSettle: true },
+      });
+      expect(classifySourceTurnDeliveryWatchdogStatus(row)).toBe("non_blocking_settled");
+    },
+  );
 
   it("persists source route metadata for later watchdog repair", async () => {
     const row = await persistSourceTurnDeliveryState({
@@ -199,28 +281,27 @@ describe("source turn delivery storage adapter", () => {
     async (_label, replacement) => {
       const params = preparedFinalParams();
       await persistSourceTurnDeliveryState(params);
-      const originalBytes = await readFile(registryPath, "utf8");
+      const original = await loadSourceTurnDeliveryRegistry(registryPath);
       await expect(persistSourceTurnDeliveryState({ ...params, ...replacement })).rejects.toThrow(
         /Prepared source final .* cannot change/,
       );
-      expect(await readFile(registryPath, "utf8")).toBe(originalBytes);
+      expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual(original);
     },
   );
 
-  it("keeps failed preparation unpublished so its caller cannot start source delivery", async () => {
+  it("keeps invalid preparation unpublished so its caller cannot start source delivery", async () => {
     const params = preparedFinalParams();
     const accepted = await persistSourceTurnDeliveryState({
       ...params,
       preparedSourceFinal: undefined,
       facts: {},
     });
-    const failure = Object.assign(new Error("prepared final commit failed"), { code: "EIO" });
-    const rename = vi.spyOn(fs, "rename").mockRejectedValue(failure);
-    try {
-      await expect(persistSourceTurnDeliveryState(params)).rejects.toBe(failure);
-    } finally {
-      rename.mockRestore();
-    }
+    await expect(
+      persistSourceTurnDeliveryState({
+        ...params,
+        preparedSourceFinal: { ...params.preparedSourceFinal, parts: [{ text: "" }] },
+      }),
+    ).rejects.toThrow("Prepared source final requires a session and sendable payload");
     expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [accepted] });
   });
 
@@ -528,145 +609,87 @@ describe("source turn delivery storage adapter", () => {
     },
   );
 
-  it("preserves every obligation when deliveries update the registry concurrently", async () => {
-    const ids = Array.from({ length: 8 }, (_, index) => `source:main:concurrent-${index}`);
-    const written = await Promise.all(
-      ids.map((id) => persistSourceTurnDeliveryState({ registryPath, id, facts: {} })),
+  it("preserves both commits when a second SQLite connection waits on a writer", async () => {
+    const held = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: "source:main:held-writer",
+      facts: {},
+    });
+    const { DatabaseSync } = requireNodeSqlite();
+    const competingDb = new DatabaseSync(registryPath);
+    const heldUpdate = { ...held, currentStage: "committed by competing connection" };
+    competingDb.exec("PRAGMA busy_timeout = 30000; BEGIN IMMEDIATE;");
+    competingDb
+      .prepare(
+        "UPDATE source_turn_delivery_obligations SET row_json = ?, updated_at_ms = ? WHERE idempotency_key = ?",
+      )
+      .run(JSON.stringify(heldUpdate), Date.parse(heldUpdate.updatedAt), held.idempotencyKey);
+
+    const moduleUrl = new URL("./source-turn-delivery-store.ts", import.meta.url).href;
+    const childScript = `
+      const { persistSourceTurnDeliveryState } = await import(${JSON.stringify(moduleUrl)});
+      process.stdout.write("attempting\\n");
+      await persistSourceTurnDeliveryState({
+        registryPath: process.env.TEST_DATABASE_PATH,
+        id: "source:main:waiting-writer",
+        facts: {},
+      });
+      process.stdout.write("committed\\n");
+    `;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", childScript],
+      {
+        env: { ...process.env, TEST_DATABASE_PATH: registryPath },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
     );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    let transactionOpen = true;
+    try {
+      while (!stdout.includes("attempting\n") && child.exitCode === null) {
+        await Promise.race([once(child.stdout, "data"), once(child, "exit")]);
+      }
+      expect(stdout).toContain("attempting\n");
+      await new Promise((resolve) => {
+        setTimeout(resolve, 150);
+      });
+      expect(child.exitCode).toBeNull();
+
+      competingDb.exec("COMMIT;");
+      transactionOpen = false;
+    } finally {
+      if (transactionOpen) {
+        competingDb.exec("ROLLBACK;");
+        child.kill();
+      }
+      competingDb.close();
+    }
+    const [exitCode] = await once(child, "exit");
+    expect(stderr).toBe("");
+    expect(exitCode).toBe(0);
+    expect(stdout).toContain("committed\n");
 
     const registry = await loadSourceTurnDeliveryRegistry(registryPath);
-    expect(registry.rows.map((row) => row.id).toSorted()).toEqual(ids.toSorted());
-    expect(registry.rows).toEqual(expect.arrayContaining(written));
-  });
-
-  it.each(["EPERM", "EEXIST"])(
-    "preserves the existing registry when rename fails with %s",
-    async (code) => {
-      const original = await persistSourceTurnDeliveryState({
-        registryPath,
-        id: "existing-obligation",
-        facts: {},
-      });
-      const originalBytes = await readFile(registryPath, "utf8");
-      const failure = Object.assign(new Error("rename denied"), { code });
-      const rename = vi.spyOn(fs, "rename").mockRejectedValue(failure);
-      try {
-        await expect(
-          persistSourceTurnDeliveryState({ registryPath, id: "new-obligation", facts: {} }),
-        ).rejects.toBe(failure);
-      } finally {
-        rename.mockRestore();
-      }
-      expect(await readFile(registryPath, "utf8")).toBe(originalBytes);
-      expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [original] });
-    },
-  );
-
-  it("recovers one unchanged abandoned lock before serializing concurrent writers", async () => {
-    const owner = spawnSync(process.execPath, ["-e", ""], { timeout: 5_000 });
-    expect(owner.status).toBe(0);
-    expect(owner.pid).toBeGreaterThan(0);
-    const abandonedLock = JSON.stringify({ pid: owner.pid, createdAt: new Date().toISOString() });
-    await writeFile(`${registryPath}.lock`, abandonedLock);
-    const attempts = await Promise.allSettled(
-      Array.from({ length: 8 }, (_, index) =>
-        persistSourceTurnDeliveryState({ registryPath, id: `after-crash-${index}`, facts: {} }),
-      ),
+    expect(registry.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: held.id,
+          currentStage: "committed by competing connection",
+        }),
+        expect.objectContaining({ id: "source:main:waiting-writer" }),
+      ]),
     );
-
-    expect(attempts.every((attempt) => attempt.status === "fulfilled")).toBe(true);
-    await expect(readFile(`${registryPath}.lock`, "utf8")).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toHaveLength(8);
   });
-
-  it("recovers an old partial lock left by a crash during lock creation", async () => {
-    const lockPath = `${registryPath}.lock`;
-    await writeFile(lockPath, "{partial", "utf8");
-    const staleTime = new Date(Date.now() - 60_000);
-    await utimes(lockPath, staleTime, staleTime);
-
-    const row = await persistSourceTurnDeliveryState({
-      registryPath,
-      id: "after-partial-lock-crash",
-      facts: {},
-    });
-
-    expect(row.id).toBe("after-partial-lock-crash");
-    await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it.skipIf(process.platform === "win32").each([0o700, 0o1777, 0o2770])(
-    "preserves directory mode %o during atomic replacement",
-    async (mode) => {
-      await chmod(tempDir, mode);
-      expect((await stat(tempDir)).mode & 0o7777).toBe(mode);
-      const backupPath = join(tempDir, "previous-registry.json");
-      await writeFile(backupPath, "private delivery history", { mode: 0o664 });
-      await persistSourceTurnDeliveryState({ registryPath, id: "private-delivery", facts: {} });
-      expect((await stat(tempDir)).mode & 0o7777).toBe(mode);
-      expect(await readFile(backupPath, "utf8")).toBe("private delivery history");
-    },
-  );
-
-  it("waits for a live writer even when its lock timestamp is old", async () => {
-    const holder = await acquireFileLock(registryPath, {
-      managerKey: "source-delivery-test-holder",
-      payload: () => ({ pid: process.pid, createdAt: new Date(0).toISOString() }),
-    });
-    const update = persistSourceTurnDeliveryState({
-      registryPath,
-      id: "source:main:after-live-writer",
-      facts: {},
-    }).then(
-      (row) => ({ row }),
-      (error: unknown) => ({ error }),
-    );
-    try {
-      await setTimeout(25);
-      expect(JSON.parse(await readFile(holder.lockPath, "utf8"))).toMatchObject({
-        pid: process.pid,
-      });
-    } finally {
-      await holder.release();
-    }
-    expect(await update).toMatchObject({ row: { id: "source:main:after-live-writer" } });
-  });
-
-  it.skipIf(process.platform === "win32")(
-    "keeps protected I/O on the canonical target when a directory symlink is retargeted",
-    async () => {
-      const firstTarget = join(tempDir, "first-target");
-      const secondTarget = join(tempDir, "second-target");
-      const registryAlias = join(tempDir, "registry-alias");
-      await Promise.all([fs.mkdir(firstTarget), fs.mkdir(secondTarget)]);
-      await fs.symlink(firstTarget, registryAlias, "dir");
-      const firstRegistryPath = join(firstTarget, "delivery.json");
-      const secondRegistryPath = join(secondTarget, "delivery.json");
-      const aliasRegistryPath = join(registryAlias, "delivery.json");
-      const holder = await acquireFileLock(firstRegistryPath, {
-        managerKey: "source-delivery-canonical-path-test",
-        payload: () => ({ pid: process.pid, createdAt: new Date().toISOString() }),
-      });
-      const update = persistSourceTurnDeliveryState({
-        registryPath: aliasRegistryPath,
-        id: "canonical-target-write",
-        facts: {},
-      });
-      try {
-        await setTimeout(50);
-        await fs.unlink(registryAlias);
-        await fs.symlink(secondTarget, registryAlias, "dir");
-      } finally {
-        await holder.release();
-      }
-
-      const row = await update;
-      expect(await loadSourceTurnDeliveryRegistry(firstRegistryPath)).toEqual({ rows: [row] });
-      await expect(readFile(secondRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
-    },
-  );
 
   it("keys governed report delivery obligations by mission, run, report, delivery, and generation", async () => {
     const row = await persistSourceTurnDeliveryState({
@@ -1245,7 +1268,7 @@ describe("source turn delivery storage adapter", () => {
       facts: { deliveryToolFailed: true },
     });
 
-    expect((await rawRows()).rows).toHaveLength(2);
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows).toHaveLength(2);
     expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [first, second] });
   });
 });

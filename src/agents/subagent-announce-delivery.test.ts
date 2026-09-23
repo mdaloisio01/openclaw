@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +8,7 @@ import {
   registerSessionBindingAdapter,
 } from "../infra/outbound/session-binding-service.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import type {
   EmbeddedAgentQueueFailureReason,
@@ -15,6 +16,7 @@ import type {
   EmbeddedAgentQueueMessageOutcome,
 } from "./embedded-agent-runner/runs.js";
 import type { AgentInternalEvent } from "./internal-events.js";
+import { loadSourceTurnDeliveryRegistry } from "./source-turn-delivery-store.js";
 import {
   testing,
   deliverSubagentAnnouncement,
@@ -31,7 +33,7 @@ const SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV = "OPENCLAW_SOURCE_TURN_DELIVERY_RE
 let sourceTurnDeliveryTempDir: string | undefined;
 
 type SourceTurnDeliveryRegistryForTest = {
-  rows?: Array<{
+  rows: Array<{
     currentStage?: string;
     deliveryStatus?: string;
     finalDeliveryDelivered?: boolean;
@@ -49,6 +51,7 @@ afterEach(async () => {
   setActivePluginRegistry(createTestRegistry());
   testing.setDepsForTest();
   vi.unstubAllEnvs();
+  closeOpenClawStateDatabaseForTest();
   if (sourceTurnDeliveryTempDir) {
     await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
     sourceTurnDeliveryTempDir = undefined;
@@ -155,16 +158,14 @@ function asMock(fn: unknown) {
 
 async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
   sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-subagent-source-turn-"));
-  const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
+  const registryPath = join(sourceTurnDeliveryTempDir, "openclaw.sqlite");
   vi.stubEnv(SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV, registryPath);
   return registryPath;
 }
 
 async function readSourceTurnDeliveryRows(registryPath: string) {
-  const registry = JSON.parse(
-    await readFile(registryPath, "utf8"),
-  ) as SourceTurnDeliveryRegistryForTest;
-  return registry.rows ?? [];
+  return (await loadSourceTurnDeliveryRegistry(registryPath))
+    .rows as SourceTurnDeliveryRegistryForTest["rows"];
 }
 
 function registerDirectTargetTestChannel(channelId: string): void {

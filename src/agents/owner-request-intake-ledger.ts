@@ -1,16 +1,23 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { resolveStateDir } from "../config/paths.js";
+import type { DatabaseSync } from "node:sqlite";
+import type { Kysely } from "kysely";
 import { classifyCurrentInboundInstruction } from "../governance/current-inbound-instruction.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
+import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
+import {
+  openOpenClawStateDatabase,
+  runOpenClawStateWriteTransaction,
+} from "../state/openclaw-state-db.js";
 
 export const OWNER_REQUEST_INTAKE_KIND = "openclaw.owner-request-intake";
 export const OWNER_REQUEST_INTAKE_SCHEMA_VERSION = 1;
 export const OWNER_REQUEST_INTAKE_DEFAULT_GRACE_MS = 2 * 60_000;
 
-const LEDGER_DIR = "owner-request-intake-ledger";
-const LEDGER_FILE = "records.json";
 const MAX_SNIPPET_LENGTH = 160;
+
+type OwnerRequestIntakeDatabase = Pick<OpenClawStateKyselyDatabase, "owner_request_intake_records">;
 
 export type OwnerRequestIntakeStatus =
   | "client_send_attempt"
@@ -104,46 +111,74 @@ function normalizeRequiredString(value: unknown, fallback: string, maxLength = 5
   return normalizeOptionalString(value, maxLength) ?? fallback;
 }
 
-function ledgerPath(stateDir?: string): string {
-  return path.join(stateDir ?? resolveStateDir(process.env), LEDGER_DIR, LEDGER_FILE);
+function databaseOptions(stateDir?: string): { path: string } | undefined {
+  return stateDir ? { path: path.join(stateDir, "state", "openclaw.sqlite") } : undefined;
 }
 
 function readLedger(stateDir?: string): OwnerRequestIntakeLedger {
-  const file = ledgerPath(stateDir);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { records: [] };
-    }
-    throw error;
-  }
-  const records =
-    parsed && typeof parsed === "object" ? (parsed as { records?: unknown }).records : [];
+  const { db } = openOpenClawStateDatabase(databaseOptions(stateDir));
+  const stateDb = getNodeSqliteKysely<OwnerRequestIntakeDatabase>(db);
+  const rows = executeSqliteQuerySync(
+    db,
+    stateDb
+      .selectFrom("owner_request_intake_records")
+      .select("record_json")
+      .orderBy("created_at", "asc")
+      .orderBy("request_id", "asc"),
+  ).rows;
   return {
-    records: Array.isArray(records)
-      ? records.filter((record): record is OwnerRequestIntakeRecord =>
-          Boolean(
-            record &&
-            typeof record === "object" &&
-            (record as { kind?: unknown }).kind === OWNER_REQUEST_INTAKE_KIND &&
-            (record as { schemaVersion?: unknown }).schemaVersion ===
-              OWNER_REQUEST_INTAKE_SCHEMA_VERSION &&
-            typeof (record as { requestId?: unknown }).requestId === "string",
-          ),
-        )
-      : [],
+    records: rows.map((row) => {
+      let record: unknown;
+      try {
+        record = JSON.parse(row.record_json) as unknown;
+      } catch (error) {
+        throw new Error("Owner request intake row contains invalid JSON", { cause: error });
+      }
+      if (!isOwnerRequestIntakeRecord(record)) {
+        throw new Error("Owner request intake row violates its persisted contract");
+      }
+      return record;
+    }),
   };
 }
 
-function writeLedger(ledger: OwnerRequestIntakeLedger, stateDir?: string): void {
-  const file = ledgerPath(stateDir);
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const tmp = path.join(path.dirname(file), `.records.${process.pid}.${Date.now()}.tmp`);
-  fs.writeFileSync(tmp, `${JSON.stringify(ledger, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  fs.renameSync(tmp, file);
-  fs.chmodSync(file, 0o600);
+function isOwnerRequestIntakeRecord(record: unknown): record is OwnerRequestIntakeRecord {
+  return Boolean(
+    record &&
+    typeof record === "object" &&
+    (record as { kind?: unknown }).kind === OWNER_REQUEST_INTAKE_KIND &&
+    (record as { schemaVersion?: unknown }).schemaVersion === OWNER_REQUEST_INTAKE_SCHEMA_VERSION &&
+    typeof (record as { requestId?: unknown }).requestId === "string",
+  );
+}
+
+function persistRecord(
+  stateDb: Kysely<OwnerRequestIntakeDatabase>,
+  db: DatabaseSync,
+  record: OwnerRequestIntakeRecord,
+): void {
+  executeSqliteQuerySync(
+    db,
+    stateDb
+      .insertInto("owner_request_intake_records")
+      .values({
+        request_id: record.requestId,
+        status: record.status,
+        governed: record.governed ? 1 : 0,
+        created_at: record.createdAtMs,
+        updated_at: record.updatedAtMs,
+        record_json: JSON.stringify(record),
+      })
+      .onConflict((conflict) =>
+        conflict.column("request_id").doUpdateSet({
+          status: record.status,
+          governed: record.governed ? 1 : 0,
+          created_at: record.createdAtMs,
+          updated_at: record.updatedAtMs,
+          record_json: JSON.stringify(record),
+        }),
+      ),
+  );
 }
 
 function fingerprintMessage(message: string): string {
@@ -231,13 +266,9 @@ function upsertRecord(
   record: OwnerRequestIntakeRecord,
   stateDir?: string,
 ): OwnerRequestIntakeRecord {
-  const ledger = readLedger(stateDir);
-  const nextRecords = ledger.records.some((candidate) => candidate.requestId === record.requestId)
-    ? ledger.records.map((candidate) =>
-        candidate.requestId === record.requestId ? record : candidate,
-      )
-    : [...ledger.records, record];
-  writeLedger({ records: nextRecords }, stateDir);
+  runOpenClawStateWriteTransaction(({ db }) => {
+    persistRecord(getNodeSqliteKysely<OwnerRequestIntakeDatabase>(db), db, record);
+  }, databaseOptions(stateDir));
   return record;
 }
 
@@ -246,20 +277,31 @@ function updateRecord(
   updater: (record: OwnerRequestIntakeRecord) => OwnerRequestIntakeRecord,
   stateDir?: string,
 ): OwnerRequestIntakeRecord | undefined {
-  const ledger = readLedger(stateDir);
-  let updated: OwnerRequestIntakeRecord | undefined;
-  const nextRecords = ledger.records.map((record) => {
-    if (record.requestId !== requestId) {
-      return record;
+  return runOpenClawStateWriteTransaction(({ db }) => {
+    const stateDb = getNodeSqliteKysely<OwnerRequestIntakeDatabase>(db);
+    const row = executeSqliteQuerySync(
+      db,
+      stateDb
+        .selectFrom("owner_request_intake_records")
+        .select("record_json")
+        .where("request_id", "=", requestId),
+    ).rows[0];
+    if (!row) {
+      return undefined;
     }
-    updated = updater(record);
+    let record: unknown;
+    try {
+      record = JSON.parse(row.record_json) as unknown;
+    } catch (error) {
+      throw new Error("Owner request intake row contains invalid JSON", { cause: error });
+    }
+    if (!isOwnerRequestIntakeRecord(record)) {
+      throw new Error("Owner request intake row violates its persisted contract");
+    }
+    const updated = updater(record);
+    persistRecord(stateDb, db, updated);
     return updated;
-  });
-  if (!updated) {
-    return undefined;
-  }
-  writeLedger({ records: nextRecords }, stateDir);
-  return updated;
+  }, databaseOptions(stateDir));
 }
 
 export function createOwnerRequestIntakeRecord(params: {
@@ -545,5 +587,8 @@ export function classifyOwnerRequestIntakeGaps(
 }
 
 export function resetOwnerRequestIntakeLedgerForTests(params: { stateDir?: string } = {}): void {
-  fs.rmSync(path.dirname(ledgerPath(params.stateDir)), { recursive: true, force: true });
+  runOpenClawStateWriteTransaction(({ db }) => {
+    const stateDb = getNodeSqliteKysely<OwnerRequestIntakeDatabase>(db);
+    executeSqliteQuerySync(db, stateDb.deleteFrom("owner_request_intake_records"));
+  }, databaseOptions(params.stateDir));
 }

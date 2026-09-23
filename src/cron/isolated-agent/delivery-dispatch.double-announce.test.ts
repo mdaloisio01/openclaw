@@ -10,11 +10,13 @@
  * returning so the timer correctly skips the system-event fallback.
  */
 
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { loadSourceTurnDeliveryRegistry } from "../../agents/source-turn-delivery-store.js";
 import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
+import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 
 // --- Module mocks (must be hoisted before imports) ---
 
@@ -171,7 +173,7 @@ type ResolvedOutboundSessionRoute = NonNullable<
   Awaited<ReturnType<typeof resolveOutboundSessionRoute>>
 >;
 type SourceTurnDeliveryRegistryForTest = {
-  rows?: Array<{
+  rows: Array<{
     currentStage?: string;
     deliveryStatus?: string;
     finalDeliveryDelivered?: boolean;
@@ -276,16 +278,14 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
 
 async function useTempSourceTurnDeliveryRegistry(): Promise<string> {
   sourceTurnDeliveryTempDir = await mkdtemp(join(tmpdir(), "openclaw-cron-source-turn-"));
-  const registryPath = join(sourceTurnDeliveryTempDir, "source_delivery_obligations.json");
+  const registryPath = join(sourceTurnDeliveryTempDir, "openclaw.sqlite");
   vi.stubEnv(SOURCE_TURN_DELIVERY_REGISTRY_PATH_ENV, registryPath);
   return registryPath;
 }
 
 async function readSourceTurnDeliveryRows(registryPath: string) {
-  const registry = JSON.parse(
-    await readFile(registryPath, "utf8"),
-  ) as SourceTurnDeliveryRegistryForTest;
-  return registry.rows ?? [];
+  return (await loadSourceTurnDeliveryRegistry(registryPath))
+    .rows as SourceTurnDeliveryRegistryForTest["rows"];
 }
 
 function outboundDeliveryCall(callIndex = 0) {
@@ -354,6 +354,7 @@ describe("dispatchCronDelivery — double-announce guard", () => {
   afterEach(async () => {
     vi.useRealTimers();
     vi.unstubAllEnvs();
+    closeOpenClawStateDatabaseForTest();
     if (sourceTurnDeliveryTempDir) {
       await rm(sourceTurnDeliveryTempDir, { force: true, recursive: true });
       sourceTurnDeliveryTempDir = undefined;

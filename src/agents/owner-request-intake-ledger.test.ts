@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
   classifyOwnerRequestIntakeGaps,
   classifyOwnerRequestIntakeMessage,
@@ -21,6 +22,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  closeOpenClawStateDatabaseForTest();
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -352,21 +354,17 @@ describe("owner request intake ledger", () => {
       stateDir,
       nowMs: 1_000,
     });
-    const ledgerPath = path.join(stateDir, "owner-request-intake-ledger", "records.json");
-    const payload = JSON.parse(fs.readFileSync(ledgerPath, "utf8")) as {
-      records: Array<Record<string, unknown>>;
-    };
-    payload.records = payload.records.map((row) =>
-      row.requestId === record.requestId
-        ? {
-            ...row,
-            status: "owner_notified",
-            ownerNotificationId: "owner-notification-report-1",
-            reason: "historical intake gap surfaced to owner",
-          }
-        : row,
-    );
-    fs.writeFileSync(ledgerPath, `${JSON.stringify(payload, null, 2)}\n`);
+    const ownerNotificationProofPath = path.join(stateDir, "owner-notification-proof.json");
+    fs.writeFileSync(ownerNotificationProofPath, JSON.stringify({ schema: "proof" }));
+    markOwnerRequestOwnerNotified({
+      requestId: record.requestId,
+      ownerNotificationId: "owner-notification-report-1",
+      ownerNotificationProofPath,
+      reason: "historical intake gap surfaced to owner",
+      stateDir,
+      nowMs: 2_000,
+    });
+    fs.unlinkSync(ownerNotificationProofPath);
 
     expect(
       classifyOwnerRequestIntakeGaps({ stateDir, nowMs: 200_000, graceMs: 1 }).map(

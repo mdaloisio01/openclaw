@@ -983,6 +983,37 @@ CREATE INDEX IF NOT EXISTS idx_delivery_queue_target
   ON delivery_queue_entries(queue_name, status, channel, target, enqueued_at, id)
   WHERE channel IS NOT NULL AND target IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS owner_request_intake_records (
+  request_id TEXT NOT NULL PRIMARY KEY,
+  status TEXT NOT NULL,
+  governed INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  record_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_owner_request_intake_status_updated
+  ON owner_request_intake_records(status, updated_at, request_id);
+
+CREATE TABLE IF NOT EXISTS source_turn_delivery_obligations (
+  idempotency_key TEXT NOT NULL PRIMARY KEY,
+  id TEXT NOT NULL,
+  source_turn_id TEXT NOT NULL,
+  source_session_key TEXT,
+  obligation_stage TEXT NOT NULL,
+  delivery_status TEXT NOT NULL,
+  final_delivery_delivered INTEGER NOT NULL,
+  accepted_at_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  row_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_turn_delivery_id
+  ON source_turn_delivery_obligations(id, updated_at_ms, idempotency_key);
+
+CREATE INDEX IF NOT EXISTS idx_source_turn_delivery_watchdog
+  ON source_turn_delivery_obligations(final_delivery_delivered, obligation_stage, updated_at_ms);
+
 CREATE TABLE IF NOT EXISTS task_runs (
   task_id TEXT NOT NULL PRIMARY KEY,
   runtime TEXT NOT NULL,
