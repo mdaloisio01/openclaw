@@ -497,6 +497,7 @@ describe("QmdMemoryManager", () => {
 
     await vi.advanceTimersByTimeAsync(500);
     await expect(searchPromise).resolves.toStrictEqual([]);
+    await waitUntil(() => releaseUpdate !== null);
 
     (
       releaseUpdate ??
@@ -561,6 +562,9 @@ describe("QmdMemoryManager", () => {
     expect(manager.status().dirty).toBe(true);
 
     await vi.advanceTimersByTimeAsync(25);
+    await waitUntil(
+      () => spawnMock.mock.calls.filter((call) => call[1]?.[0] === "update").length === 1,
+    );
 
     const updateCalls = spawnMock.mock.calls.filter((call) => call[1]?.[0] === "update");
     expect(updateCalls).toHaveLength(1);
@@ -613,6 +617,9 @@ describe("QmdMemoryManager", () => {
     expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === "update")).toHaveLength(0);
 
     await vi.advanceTimersByTimeAsync(25);
+    await waitUntil(
+      () => spawnMock.mock.calls.filter((call) => call[1]?.[0] === "update").length === 1,
+    );
     expect(spawnMock.mock.calls.filter((call) => call[1]?.[0] === "update")).toHaveLength(1);
 
     await manager.close();
@@ -642,6 +649,7 @@ describe("QmdMemoryManager", () => {
     });
 
     const { manager } = await createManager({ mode: "full" });
+    await waitUntil(() => releaseUpdate !== null);
     (
       releaseUpdate ??
       (() => {
@@ -934,7 +942,9 @@ describe("QmdMemoryManager", () => {
       return nameIdx >= 0 && args[nameIdx + 1] === "workspace-main";
     });
     const workspaceAddCall = requireValue(addCall, "workspace collection add command missing");
-    expect(workspaceAddCall[2]).toBe(workspaceDir);
+    expect(workspaceAddCall[2]).toBe(
+      path.join(stateDir, "agents", agentId, "qmd", "collections", "workspace-main"),
+    );
     expect(workspaceAddCall).toContain("**/*.md");
   });
 
@@ -1590,6 +1600,7 @@ describe("QmdMemoryManager", () => {
     const manager = requireValue(trackManager(await createPromise), "manager missing");
     const syncPromise = manager.sync({ reason: "manual" });
     const rejected = expect(syncPromise).rejects.toThrow("qmd update timed out after 20ms");
+    await waitUntil(() => spawnMock.mock.calls.some((call) => call[1]?.[0] === "update"));
     await vi.advanceTimersByTimeAsync(20);
     await rejected;
     await manager.close();
@@ -3929,6 +3940,13 @@ describe("QmdMemoryManager", () => {
     expect(commandCallsBefore).toHaveLength(0);
 
     await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await waitUntil(
+      () =>
+        spawnMock.mock.calls.filter((call: unknown[]) => {
+          const args = call[1] as string[];
+          return args[0] === "update" || args[0] === "embed";
+        }).length === 2,
+    );
 
     const commandCalls = spawnMock.mock.calls
       .map((call: unknown[]) => call[1] as string[])
@@ -3961,6 +3979,13 @@ describe("QmdMemoryManager", () => {
     const { manager } = await createManager({ mode: "full" });
 
     await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await waitUntil(
+      () =>
+        spawnMock.mock.calls.filter((call: unknown[]) => {
+          const args = call[1] as string[];
+          return args[0] === "update" || args[0] === "embed";
+        }).length === 2,
+    );
 
     const commandCalls = spawnMock.mock.calls
       .map((call: unknown[]) => call[1] as string[])
@@ -3993,6 +4018,13 @@ describe("QmdMemoryManager", () => {
     const { manager } = await createManager({ mode: "full" });
 
     await vi.advanceTimersByTimeAsync(6 * 60_000);
+    await waitUntil(
+      () =>
+        spawnMock.mock.calls.filter((call: unknown[]) => {
+          const args = call[1] as string[];
+          return args[0] === "update" || args[0] === "embed";
+        }).length === 2,
+    );
 
     const commandCalls = spawnMock.mock.calls
       .map((call: unknown[]) => call[1] as string[])
@@ -4072,6 +4104,13 @@ describe("QmdMemoryManager", () => {
     expect(beforeCalls).toHaveLength(0);
 
     await vi.advanceTimersByTimeAsync(1);
+    await waitUntil(
+      () =>
+        spawnMock.mock.calls.filter((call: unknown[]) => {
+          const args = call[1] as string[];
+          return args[0] === "update" || args[0] === "embed";
+        }).length === 2,
+    );
     const commandCalls = spawnMock.mock.calls
       .map((call: unknown[]) => call[1] as string[])
       .filter((args: string[]) => args[0] === "update" || args[0] === "embed");
@@ -4107,7 +4146,7 @@ describe("QmdMemoryManager", () => {
     const first = await createManager({ mode: "status" });
     const second = await createManager({ mode: "status" });
     const firstSync = first.manager.sync({ reason: "manual", force: true });
-    await vi.advanceTimersByTimeAsync(0);
+    await waitUntil(() => embedChildren.length === 1);
     expect(embedChildren).toHaveLength(1);
     const [lockPath, lockOptions, lockTask] = firstEmbedLockCall();
     expect(lockPath.endsWith(path.join("qmd", "embed.lock"))).toBe(true);
@@ -4128,7 +4167,7 @@ describe("QmdMemoryManager", () => {
     expect(embedChildren).toHaveLength(1);
 
     embedChildren[0]?.closeWith(0);
-    await vi.advanceTimersByTimeAsync(0);
+    await waitUntil(() => embedChildren.length === 2);
     expect(embedChildren).toHaveLength(2);
 
     embedChildren[1]?.closeWith(0);

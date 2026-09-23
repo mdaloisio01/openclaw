@@ -7,6 +7,7 @@ export {
   ensureTaskRegistryReady,
   resetTaskRegistryControlRuntimeForTests,
   findLatestTaskForFlowId,
+  finalizeTaskRunById,
   finalizeTaskRunByRunId,
   getTaskById,
   hasActiveTaskForChildSessionKey,
@@ -28,7 +29,9 @@ export {
   setTaskRegistryControlRuntimeForTests,
   setTaskRegistryDeliveryRuntimeForTests,
   setTaskCleanupAfterById,
+  setTaskProgressById,
   setTaskRunDeliveryStatusByRunId,
   updateTaskNotifyPolicyById,
 } from "./task-registry.js";
 export type { TaskRecord } from "./task-registry.types.js";
+export type { TaskRecordCreateOptions } from "./task-registry.js";

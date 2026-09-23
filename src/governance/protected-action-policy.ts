@@ -132,6 +132,8 @@ export type ProtectedActionSignals = {
   childDelegation?: boolean;
   childRuntime?: string;
   externalSideEffect?: boolean;
+  finalOutput?: boolean;
+  clientHostedExecution?: boolean;
   projectDefinedHighAuthority?: boolean;
 };
 
@@ -200,6 +202,12 @@ export function classifyProtectedAction(
 
   if (signals.projectDefinedHighAuthority) {
     return "project_defined_high_authority";
+  }
+  if (signals.clientHostedExecution) {
+    return "external_side_effect";
+  }
+  if (signals.finalOutput) {
+    return "external_side_effect";
   }
   if (signals.externalSideEffect) {
     return "external_side_effect";

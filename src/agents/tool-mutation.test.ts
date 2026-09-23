@@ -73,6 +73,41 @@ describe("tool mutation helpers", () => {
     ).toBe(true);
   });
 
+  it("treats browser actions as mutating unless they are observational", () => {
+    expect(isMutatingToolCall("browser", { action: "act", request: { kind: "click" } })).toBe(true);
+    expect(isMutatingToolCall("browser", { action: "navigate", url: "https://example.com" })).toBe(
+      true,
+    );
+    expect(isMutatingToolCall("browser", { action: "snapshot" })).toBe(false);
+    expect(isMutatingToolCall("browser", { action: "status" })).toBe(false);
+  });
+
+  it("distinguishes observational node and process actions from runtime mutations", () => {
+    expect(isMutatingToolCall("nodes", { action: "status" })).toBe(false);
+    expect(isMutatingToolCall("nodes", { action: "device_info" })).toBe(false);
+    expect(isMutatingToolCall("nodes", { action: "notify" })).toBe(true);
+    expect(isMutatingToolCall("process", { action: "poll" })).toBe(false);
+    expect(isMutatingToolCall("process", { action: "write" })).toBe(true);
+  });
+
+  it("treats transcript capture and persistence as mutations but status as observational", () => {
+    for (const action of ["start", "stop", "import", "summarize"]) {
+      expect(isMutatingToolCall("transcripts", { action })).toBe(true);
+    }
+    expect(isMutatingToolCall("transcripts", { action: "status" })).toBe(false);
+    expect(isMutatingToolCall("transcripts", {})).toBe(true);
+  });
+
+  it("treats Skill Workshop writes and lifecycle actions as mutations", () => {
+    for (const action of ["create", "update", "revise", "apply", "reject", "quarantine"]) {
+      expect(isMutatingToolCall("skill_workshop", { action })).toBe(true);
+    }
+    for (const action of ["list", "inspect"]) {
+      expect(isMutatingToolCall("skill_workshop", { action })).toBe(false);
+    }
+    expect(isMutatingToolCall("skill_workshop", {})).toBe(true);
+  });
+
   it("matches tool actions by fingerprint and fails closed on asymmetric data", () => {
     expect(
       isSameToolMutationAction(

@@ -177,7 +177,7 @@ plugins.
     | `/stop` | Abort the current run |
     | `/session idle <duration\|off>` | Manage thread-binding idle expiry |
     | `/session max-age <duration\|off>` | Manage thread-binding max-age expiry |
-    | `/export-session [path]` | Export the current session to HTML. Alias: `/export` |
+    | `/export-session [path]` | Export visible session history to HTML; hidden entries and summaries derived from them are excluded. Alias: `/export` |
     | `/export-trajectory [path]` | Export a JSONL trajectory bundle for the current session. Alias: `/trajectory` |
 
     <Note>

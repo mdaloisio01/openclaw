@@ -72,6 +72,8 @@ const zeroTaskAuditCounts = {
   routed_to_owner_not_proven_active: 0,
   stale_queued: 0,
   stale_running: 0,
+  trb_gate_blocked_recovery_required: 0,
+  trb_gate_pending_recovery_required: 0,
 };
 
 async function withTaskCommandStateDir(

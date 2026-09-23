@@ -68,6 +68,7 @@ describe("build health", () => {
   it("passes when diffs and runtime asset proof are complete", () => {
     let call = 0;
     const result = collectBuildHealth({
+      gitStatus: () => "",
       spawnSync: () => {
         call += 1;
         if (call === 1) {

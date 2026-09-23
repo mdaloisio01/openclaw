@@ -78,6 +78,10 @@ vi.mock("../channels/plugins/bundled.js", () => {
   };
 });
 
+vi.mock("../plugins/doctor-contract-registry.js", () => ({
+  listPluginDoctorStateMigrationEntries: vi.fn(() => []),
+}));
+
 const tempDirs = createTrackedTempDirs();
 
 async function expectMissingPath(targetPath: string): Promise<void> {
@@ -118,6 +122,8 @@ function createEnv(stateDir: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     OPENCLAW_STATE_DIR: stateDir,
+    OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1",
+    OPENCLAW_DISABLE_PERSISTED_PLUGIN_REGISTRY: "1",
   };
 }
 
@@ -280,6 +286,175 @@ describe("state migrations", () => {
     ).resolves.toBe('["123","456"]\n');
     await expectMissingPath(resolveChannelAllowFromPath("chatapp", env, "default"));
     await expectMissingPath(resolveChannelAllowFromPath("chatapp", env, "beta"));
+  });
+
+  it("detects and migrates legacy governed receipts through doctor state repair", async () => {
+    const root = await createTempDir();
+    const stateDir = path.join(root, ".openclaw");
+    const workspaceDir = path.join(root, "workspace");
+    const decisionDir = path.join(workspaceDir, "var", "false_closeout_admission", "decisions");
+    const sourcePath = path.join(decisionDir, "decision.json");
+    const env = { ...createEnv(stateDir), OPENCLAW_WORKSPACE_DIR: workspaceDir };
+    await fs.mkdir(decisionDir, { recursive: true });
+    await fs.writeFile(
+      sourcePath,
+      `${JSON.stringify({
+        schema: "openclaw.false_closeout_admission_decision_receipt.v1",
+        decision: {
+          decisionId: "doctor-decision-1",
+          missionId: "doctor-mission-1",
+          state: "REJECTED",
+          allowed: false,
+          rejectionCodes: ["FCAC_ARTIFACT_MISSING"],
+          evaluatedAt: "2026-09-17T00:00:00.000Z",
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const detected = await detectLegacyStateMigrations({ cfg: createConfig(), env });
+    expect(detected.governedReceiptFiles).toEqual({
+      decisionDir,
+      hasLegacy: true,
+      fileCount: 1,
+    });
+    expect(detected.preview).toContain(
+      "- Governed false-closeout receipts: 1 JSON files → shared SQLite state",
+    );
+
+    const result = await runLegacyStateMigrations({ detected, now: () => 123 });
+
+    expect(result.warnings).toEqual([]);
+    expect(result.changes).toContain(
+      "Governed receipts: 1 imported, 0 already present in shared SQLite state.",
+    );
+    await expectMissingPath(sourcePath);
+    const database = openOpenClawStateDatabase({ env });
+    expect(
+      database.db
+        .prepare(
+          "SELECT mission_id, receipt_kind, reason_code FROM governed_mission_receipts WHERE idempotency_key = ?",
+        )
+        .get("legacy:false-closeout:doctor-decision-1"),
+    ).toMatchObject({
+      mission_id: "doctor-mission-1",
+      receipt_kind: "legacy_import",
+      reason_code: "FCAC_ARTIFACT_MISSING",
+    });
+  });
+
+  it("finds legacy governed receipts in the historical home workspace with a custom state dir", async () => {
+    const root = await createTempDir();
+    const homeDir = path.join(root, "home");
+    const stateDir = path.join(root, "custom-state");
+    const decisionDir = path.join(
+      homeDir,
+      ".openclaw",
+      "workspace-orchestrator",
+      "var",
+      "false_closeout_admission",
+      "decisions",
+    );
+    const env = createEnv(stateDir);
+    delete env.OPENCLAW_WORKSPACE_DIR;
+    await fs.mkdir(decisionDir, { recursive: true });
+    await fs.writeFile(
+      path.join(decisionDir, "decision.json"),
+      `${JSON.stringify({
+        schema: "openclaw.false_closeout_admission_decision_receipt.v1",
+        decision: {
+          decisionId: "historical-home-decision",
+          missionId: "historical-home-mission",
+          state: "REJECTED",
+          allowed: false,
+          rejectionCodes: ["FCAC_ARTIFACT_MISSING"],
+          evaluatedAt: "2026-09-17T00:00:00.000Z",
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const detected = await detectLegacyStateMigrations({
+      cfg: createConfig(),
+      env,
+      homedir: () => homeDir,
+    });
+
+    expect(detected.governedReceiptFiles).toEqual({
+      decisionDir,
+      hasLegacy: true,
+      fileCount: 1,
+    });
+  });
+
+  it("detects an interrupted governed receipt migration at its staging path", async () => {
+    const root = await createTempDir();
+    const stateDir = path.join(root, ".openclaw");
+    const workspaceDir = path.join(root, "workspace");
+    const decisionDir = path.join(workspaceDir, "var", "false_closeout_admission", "decisions");
+    const stagingDir = `${decisionDir}.openclaw-migrating`;
+    const env = { ...createEnv(stateDir), OPENCLAW_WORKSPACE_DIR: workspaceDir };
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.writeFile(
+      path.join(stagingDir, "decision.json"),
+      `${JSON.stringify({
+        schema: "openclaw.false_closeout_admission_decision_receipt.v1",
+        decision: {
+          decisionId: "interrupted-doctor-decision",
+          missionId: "interrupted-doctor-mission",
+          state: "REJECTED",
+          allowed: false,
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const detected = await detectLegacyStateMigrations({ cfg: createConfig(), env });
+
+    expect(detected.governedReceiptFiles).toEqual({
+      decisionDir,
+      hasLegacy: true,
+      fileCount: 1,
+    });
+  });
+
+  it("detects a recreated governed receipt source behind an empty staging directory", async () => {
+    const root = await createTempDir();
+    const stateDir = path.join(root, ".openclaw");
+    const workspaceDir = path.join(root, "workspace");
+    const decisionDir = path.join(workspaceDir, "var", "false_closeout_admission", "decisions");
+    const stagingDir = `${decisionDir}.openclaw-migrating`;
+    const env = { ...createEnv(stateDir), OPENCLAW_WORKSPACE_DIR: workspaceDir };
+    await fs.mkdir(stagingDir, { recursive: true });
+    await fs.mkdir(decisionDir, { recursive: true });
+    await fs.writeFile(
+      path.join(decisionDir, "decision.json"),
+      `${JSON.stringify({
+        schema: "openclaw.false_closeout_admission_decision_receipt.v1",
+        decision: {
+          decisionId: "recreated-doctor-decision",
+          missionId: "recreated-doctor-mission",
+          state: "REJECTED",
+          allowed: false,
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const detected = await detectLegacyStateMigrations({ cfg: createConfig(), env });
+
+    expect(detected.governedReceiptFiles).toEqual({
+      decisionDir,
+      hasLegacy: true,
+      fileCount: 1,
+    });
+    const result = await runLegacyStateMigrations({ detected, now: () => 123 });
+    expect(result.warnings).toEqual([]);
+    expect(result.changes).toContain(
+      "Governed receipts: 1 imported, 0 already present in shared SQLite state.",
+    );
+    await expectMissingPath(stagingDir);
+    await expectMissingPath(decisionDir);
   });
 
   it("migrates legacy delivery queue files into shared SQLite state", async () => {

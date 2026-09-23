@@ -40,6 +40,8 @@ export function guardSessionManager(
     suppressNextUserMessagePersistence?: boolean;
     suppressTranscriptOnlyAssistantPersistence?: boolean;
     suppressAssistantErrorPersistence?: boolean;
+    shouldBlockMessagePersistence?: (message: AgentMessage) => boolean;
+    shouldHideMessageFromDisplay?: (message: AgentMessage) => boolean;
     onUserMessagePersisted?: (
       message: Extract<AgentMessage, { role: "user" }>,
     ) => void | Promise<void>;
@@ -55,9 +57,17 @@ export function guardSessionManager(
 
   const hookRunner = getGlobalHookRunner();
   let pendingPreparedUserTurnMessage = opts?.preparedUserTurnMessage;
+  const hideFromDisplay = (message: AgentMessage): AgentMessage =>
+    ({ ...message, display: false }) as AgentMessage;
   const beforeMessageWrite = (event: { message: AgentMessage }) => {
     let message = event.message;
     let changed = false;
+    if (opts?.shouldHideMessageFromDisplay?.(message)) {
+      // Governed model context must survive across turns without reaching
+      // content hooks or public chat-history projection. Built-in transcript
+      // redaction still runs because display hiding is not persistence secrecy.
+      return { message: hideFromDisplay(redactTranscriptMessage(message, opts?.config)) };
+    }
     if (hookRunner?.hasHooks("before_message_write")) {
       const result = hookRunner.runBeforeMessageWrite(event, {
         agentId: opts?.agentId,
@@ -84,6 +94,12 @@ export function guardSessionManager(
         message: AgentMessage,
         meta: { toolCallId?: string; toolName?: string; isSynthetic?: boolean },
       ) => {
+        if (
+          opts?.shouldBlockMessagePersistence?.(message) ||
+          opts?.shouldHideMessageFromDisplay?.(message)
+        ) {
+          return message;
+        }
         const out = hookRunner.runToolResultPersist(
           {
             toolName: meta.toolName,
@@ -122,6 +138,7 @@ export function guardSessionManager(
     missingToolResultText: opts?.missingToolResultText,
     allowedToolNames: opts?.allowedToolNames,
     beforeMessageWriteHook: beforeMessageWrite,
+    shouldBlockMessagePersistence: opts?.shouldBlockMessagePersistence,
     redactLoggingConfig: opts?.config?.logging,
     maxToolResultChars:
       typeof opts?.contextWindowTokens === "number"

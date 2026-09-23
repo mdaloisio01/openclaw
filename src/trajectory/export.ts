@@ -3,6 +3,7 @@ import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { sanitizeDiagnosticPayload } from "../agents/payload-redaction.js";
 import type { AgentMessage } from "../agents/runtime/index.js";
+import { filterVisibleSessionEntries } from "../agents/sessions/session-export-visibility.js";
 import type { FileEntry, SessionEntry, SessionHeader } from "../agents/sessions/session-manager.js";
 import { resolveStateDir } from "../config/paths.js";
 import {
@@ -74,14 +75,26 @@ function isSessionFileEntry(value: unknown): value is FileEntry {
   return isRecord(message) && typeof message.role === "string";
 }
 
+function containsExplicitlyHiddenSessionContent(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (value.type === "message" && isRecord(value.message)) {
+    return "display" in value.message && !value.message.display;
+  }
+  return value.type === "custom_message" && !value.display;
+}
+
 function parseSessionEntries(content: string): {
   entries: FileEntry[];
   warnings: JsonlParseWarning[];
   rowByEntry: Map<FileEntry, number>;
+  hiddenContentSeen: boolean;
 } {
   const entries: FileEntry[] = [];
   const warnings: JsonlParseWarning[] = [];
   const rowByEntry = new Map<FileEntry, number>();
+  let hiddenContentSeen = false;
   const rows = content.split(/\r?\n/u);
   for (const [index, rawLine] of rows.entries()) {
     const line = rawLine.trim();
@@ -90,6 +103,7 @@ function parseSessionEntries(content: string): {
     }
     try {
       const parsed = JSON.parse(line) as unknown;
+      hiddenContentSeen ||= containsExplicitlyHiddenSessionContent(parsed);
       if (!isSessionFileEntry(parsed)) {
         warnings.push({
           source: "session",
@@ -110,7 +124,7 @@ function parseSessionEntries(content: string): {
       });
     }
   }
-  return { entries, warnings, rowByEntry };
+  return { entries, warnings, rowByEntry, hiddenContentSeen };
 }
 
 function migrateLegacySessionEntries(entries: FileEntry[]): void {
@@ -160,23 +174,27 @@ async function readSessionBranch(filePath: string): Promise<{
   header: SessionHeader | null;
   leafId: string | null;
   branchEntries: SessionEntry[];
+  hiddenContentOmitted: boolean;
   warnings: JsonlParseWarning[];
 }> {
   const {
     entries: fileEntries,
     warnings,
     rowByEntry,
+    hiddenContentSeen,
   } = parseSessionEntries(await fsp.readFile(filePath, "utf8"));
   migrateLegacySessionEntries(fileEntries);
   const header =
     fileEntries.find((entry): entry is SessionHeader => entry.type === "session") ?? null;
-  const entries = fileEntries.filter(
+  const sessionEntries = fileEntries.filter(
     (entry): entry is SessionEntry =>
       entry.type !== "session" &&
       typeof (entry as { id?: unknown }).id === "string" &&
       (typeof (entry as { timestamp?: unknown }).timestamp === "string" ||
         typeof (entry as { timestamp?: unknown }).timestamp === "number"),
   );
+  const entries = filterVisibleSessionEntries(sessionEntries);
+  const hiddenContentOmitted = hiddenContentSeen || entries.length !== sessionEntries.length;
   const byId = new Map(entries.map((entry) => [entry.id, entry]));
   const leafId = entries.at(-1)?.id ?? null;
   const branchEntries: SessionEntry[] = [];
@@ -217,7 +235,7 @@ async function readSessionBranch(filePath: string): Promise<{
     }
     currentId = parentId;
   }
-  return { header, leafId, branchEntries, warnings };
+  return { header, leafId, branchEntries, hiddenContentOmitted, warnings };
 }
 
 async function parseJsonlFile<T>(
@@ -891,6 +909,7 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
     header,
     leafId,
     branchEntries,
+    hiddenContentOmitted,
     warnings: sessionWarnings,
   } = await readSessionBranch(params.sessionFile);
   const runtimeFile = await resolveTrajectoryRuntimeFile({
@@ -898,14 +917,19 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
     sessionFile: params.sessionFile,
     sessionId: params.sessionId,
   });
-  const runtimeParse = runtimeFile
-    ? await parseJsonlFile<TrajectoryEvent>(runtimeFile, {
-        maxBytes: TRAJECTORY_RUNTIME_FILE_MAX_BYTES,
-        maxEvents: MAX_TRAJECTORY_RUNTIME_EVENTS,
-        include: (value) => value.sessionId === params.sessionId,
-        validate: isRuntimeTrajectoryEvent,
-      })
-    : { events: [], warnings: [] };
+  // Runtime events precede transcript visibility hooks and can contain hidden
+  // prompts or completions. Drop the whole runtime stream when any session
+  // content was hidden so derived captures cannot reintroduce it.
+  const omitRuntime = hiddenContentOmitted && Boolean(runtimeFile);
+  const runtimeParse =
+    runtimeFile && !omitRuntime
+      ? await parseJsonlFile<TrajectoryEvent>(runtimeFile, {
+          maxBytes: TRAJECTORY_RUNTIME_FILE_MAX_BYTES,
+          maxEvents: MAX_TRAJECTORY_RUNTIME_EVENTS,
+          include: (value) => value.sessionId === params.sessionId,
+          validate: isRuntimeTrajectoryEvent,
+        })
+      : { events: [], warnings: [] };
   const runtimeEvents = runtimeParse.events;
   const transcriptEvents = buildTranscriptEvents({
     entries: branchEntries,
@@ -938,12 +962,21 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
     sourceFiles: {
       session: maybeRedactPathString(params.sessionFile, redaction),
       runtime:
-        runtimeFile && (await isRegularNonSymlinkFile(runtimeFile))
+        runtimeFile && !omitRuntime && (await isRegularNonSymlinkFile(runtimeFile))
           ? maybeRedactPathString(runtimeFile, redaction)
           : undefined,
     },
   };
   const warnings = summarizeJsonlWarnings([...sessionWarnings, ...runtimeParse.warnings]);
+  if (omitRuntime) {
+    warnings.push({
+      source: "runtime",
+      code: "runtime-omitted-hidden-session-content",
+      count: 1,
+      rows: [],
+      message: "Omitted runtime events because the session contains hidden content.",
+    });
+  }
   if (warnings.length > 0) {
     manifest.warnings = warnings;
   }
@@ -1032,7 +1065,9 @@ export async function exportTrajectoryBundle(params: BuildTrajectoryBundleParams
     events,
     header,
     runtimeFile:
-      runtimeFile && (await isRegularNonSymlinkFile(runtimeFile)) ? runtimeFile : undefined,
+      runtimeFile && !omitRuntime && (await isRegularNonSymlinkFile(runtimeFile))
+        ? runtimeFile
+        : undefined,
     supplementalFiles,
   };
 }

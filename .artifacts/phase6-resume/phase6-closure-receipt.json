@@ -1,0 +1,68 @@
+{
+  "schema": "openclaw.phase6.closure-receipt.v1",
+  "recorded_at": "2026-09-23T16:03:33Z",
+  "phase": 6,
+  "status": "CLOSED",
+  "phase7_started": false,
+  "source_identity": {
+    "head": "9dd270a11fd0dff767485ca3d54b2320d4144674",
+    "tracked_diff_sha256": "df03ba8425a773b1438015439e69647b3b6f1b35e222e286f84a1b119e4b44b4",
+    "untracked_count": 24,
+    "untracked_manifest_sha256": "f9e370a7a3444828fec61f9e2f30b8639cd5317195be33a7c9c769dcab7d136e",
+    "dirty_entries": 185,
+    "staged_paths": 0
+  },
+  "controlling_exit_criteria": {
+    "clean_receipt_bounded_to_declared_coverage": true,
+    "malformed_state_is_suspicious_not_empty": true,
+    "durable_governed_claim_cannot_declassify_via_mutable_state_corruption": true
+  },
+  "closure_review": {
+    "thread_id": "01a0cef1-6abe-7af1-ab85-8268ade6a31b",
+    "result": "CLEAN",
+    "findings": 0,
+    "overall_correctness": "patch is correct",
+    "overall_confidence": 0.93,
+    "structured_result": ".artifacts/phase6-resume/final-structured-autoreview-continuation-10.json",
+    "human_log": ".artifacts/phase6-resume/final-structured-autoreview-continuation-10.log",
+    "disposition": ".artifacts/phase6-resume/phase6-continuation-10-review-disposition.json"
+  },
+  "fresh_latest_repair_proof": [
+    {
+      "command": "node scripts/run-vitest.mjs src/gateway/server-methods/tasks.test.ts",
+      "result": "35/35 passed"
+    },
+    {
+      "command": "node scripts/run-oxlint.mjs src/gateway/server-methods/tasks.ts src/gateway/server-methods/tasks.test.ts",
+      "result": "passed"
+    },
+    {
+      "command": "corepack pnpm tsgo:core",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "preserved_relevant_proof": [
+    "governed mission runtime 56/56 passed",
+    "build-issue controller 23/23 passed",
+    "Task Registry/TaskFlow 121/121 passed",
+    "source-turn delivery 45/45 passed",
+    "runtime import-cycle check reported 0 cycles"
+  ],
+  "dependency_contract_evidence": [
+    "../codex/codex-rs/app-server-protocol/src/protocol/v2/item.rs:1196",
+    "../codex/codex-rs/app-server-protocol/src/protocol/v2/item.rs:1266",
+    "../codex/codex-rs/protocol/src/protocol.rs:1818",
+    "../codex/codex-rs/app-server/src/request_processors/thread_enrichment.rs:45"
+  ],
+  "declared_non_proof": [
+    "Native Swift compilation was not proven and remains a product-scoped follow-up.",
+    "A broad full suite was not rerun after the final narrow repair.",
+    "Test typecheck still contains only the inventoried unrelated dirty-tree GIE errors.",
+    "Crabbox remote proof was not reopened under the accepted local-isolated substitute decision."
+  ],
+  "automatic_phase7_start": false
+}

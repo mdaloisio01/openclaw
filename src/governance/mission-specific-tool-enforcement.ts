@@ -76,11 +76,19 @@ export type MissionSpecificToolEnforcementDecision = {
     | "SUPERVISOR_UNAVAILABLE"
     | "SUPERVISOR_TIMEOUT"
     | "MISSING_CHILD_INHERITANCE"
+    | "CLIENT_HOSTED_EXECUTION_UNTRACKED"
     | "PROTECTED_TOOL_ALLOWED";
   obligations: string[];
   protectedActionDecision?: ProtectedActionDecision;
   policyDecision?: GovernedPolicyDecisionOutput;
   evaluatedAt: string;
+};
+
+export type MissionSpecificToolInvocation = {
+  invocationId: string;
+  toolName: string;
+  toolCallId?: string;
+  params: unknown;
 };
 
 export function evaluateMissionSpecificToolEnforcement(
@@ -97,6 +105,15 @@ export function evaluateMissionSpecificToolEnforcement(
       obligations: [],
       evaluatedAt: input.now,
     };
+  }
+
+  // The server cannot close its execution lease from a client-side completion.
+  // Governed work must use a server-tracked tool until that protocol exists.
+  if (input.signals.clientHostedExecution === true) {
+    return blocked(input, "CLIENT_HOSTED_EXECUTION_UNTRACKED", [
+      "route_through_server_tracked_tool",
+      "write_violation_receipt",
+    ]);
   }
 
   const missingAuthorityDecision = evaluateProtectedAction({
@@ -170,7 +187,7 @@ export function evaluateMissionSpecificToolEnforcement(
     missionState: authority.missionState,
     requestedAction: {
       actionId: input.actionId,
-      actionClass: centralActionClassForProtectedAction(actionClass),
+      actionClass: centralActionClassForProtectedAction(actionClass, input.signals),
       target: input.target,
       requiresApproval: authority.requiresApproval,
     },
@@ -181,6 +198,8 @@ export function evaluateMissionSpecificToolEnforcement(
     },
     evidenceState: {
       requiredEvidencePresent: authority.requiredEvidencePresent,
+      closeoutPassed: authority.missionState.currentGovernedState === "released",
+      releaseAllowed: authority.missionState.currentGovernedState === "released",
     },
     enforcementHealth: authority.enforcementHealth,
     ...(childInheritance?.decision === "ALLOW"
@@ -239,7 +258,11 @@ export function evaluateMissionSpecificToolEnforcement(
 
 function centralActionClassForProtectedAction(
   actionClass: ReturnType<typeof classifyProtectedAction>,
-): "tool_call" | "exec_call" | "child_delegation" {
+  signals: ProtectedActionSignals,
+): "tool_call" | "exec_call" | "child_delegation" | "final_output" {
+  if (signals.finalOutput === true) {
+    return "final_output";
+  }
   if (actionClass === "protected_exec_script") {
     return "exec_call";
   }
@@ -253,7 +276,10 @@ function requiresSupervisorWrapper(
   actionClass: ReturnType<typeof classifyProtectedAction>,
   signals: ProtectedActionSignals,
 ): boolean {
-  return actionClass === "protected_exec_script" && signals.supervisorWrapperRequired === true;
+  return (
+    signals.supervisorWrapperRequired === true &&
+    (actionClass === "protected_exec_script" || Boolean(signals.command?.trim()))
+  );
 }
 
 function evaluateRequiredSupervisor(
@@ -362,6 +388,7 @@ function deny(
 function blocked(
   input: MissionSpecificToolEnforcementInput,
   reasonCode:
+    | "CLIENT_HOSTED_EXECUTION_UNTRACKED"
     | "MISSING_SUPERVISOR_WRAPPER"
     | "MISSING_SUPERVISOR_RECEIPT"
     | "SUPERVISOR_UNAVAILABLE"

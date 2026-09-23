@@ -141,7 +141,7 @@ export function decideGovernedFinalizationRepair(
       input.record,
       updateGovernedMissionState(missionState, {
         expectedRevision: missionState.revision,
-        currentGovernedState: "GOVERNED_MISSION_WAITING",
+        currentGovernedState: "repair_required",
         currentStep: "before_agent_finalize_repair_attempt_1",
         now: input.now,
       }),
@@ -194,7 +194,7 @@ function terminalFailedContract(
       input.record,
       updateGovernedMissionState(missionState, {
         expectedRevision: missionState.revision,
-        currentGovernedState: "GOVERNED_MISSION_TERMINAL",
+        currentGovernedState: "failed",
         currentStep: "before_agent_finalize_failed_contract",
         terminalStatus: "failed",
         now: input.now,

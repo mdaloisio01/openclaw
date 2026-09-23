@@ -44,6 +44,7 @@ const GENERATED_SOURCE_DECLARATION_PATHSPEC = ":(glob)extensions/**/*.d.ts";
 const DECLARATION_EXTENSIONS = [".d.ts", ".d.mts", ".d.cts"];
 const SOURCE_DECLARATION_SOURCE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs"];
 const RUN_NODE_SKIP_DTS_BUILD_ENV = "OPENCLAW_RUN_NODE_SKIP_DTS_BUILD";
+const SERIAL_BUILD_ENV = "OPENCLAW_TSDOWN_SERIAL_BUILD";
 const BUILD_MODE_ENV = "OPENCLAW_BUILD_MODE";
 const TSDOWN_CONFIG_PATH = "tsdown.config.ts";
 
@@ -477,11 +478,11 @@ function parseMaxOldSpaceSizeMb(value, fallbackMb) {
   return Math.trunc(parsed);
 }
 
-function normalizeMaxOldSpaceSizeMb(value, maxOldSpaceMb) {
+function normalizeMaxOldSpaceSizeMb(value, maxOldSpaceMb, allowSmallerHeap = false) {
   // Build wrappers may inherit smaller runner-level caps; tsdown needs the
   // resolved build heap while still respecting cgroup-derived upper bounds.
   const parsed = parseMaxOldSpaceSizeMb(value, maxOldSpaceMb);
-  if (parsed < maxOldSpaceMb) {
+  if (parsed < maxOldSpaceMb && !allowSmallerHeap) {
     return maxOldSpaceMb;
   }
   return Math.min(parsed, maxOldSpaceMb);
@@ -489,6 +490,7 @@ function normalizeMaxOldSpaceSizeMb(value, maxOldSpaceMb) {
 
 function normalizeTsdownNodeOptions(nodeOptions, params = {}) {
   const maxOldSpaceMb = resolveTsdownMaxOldSpaceMb(params);
+  const allowSmallerHeap = params.allowSmallerHeap === true;
   const parts = nodeOptions.trim().split(/\s+/u).filter(Boolean);
   const normalized = [];
   let foundMaxOldSpaceSize = false;
@@ -498,7 +500,7 @@ function normalizeTsdownNodeOptions(nodeOptions, params = {}) {
     const inlineMatch = part.match(/^--max-old-space-size=(\d+)$/u);
     if (inlineMatch) {
       foundMaxOldSpaceSize = true;
-      const value = normalizeMaxOldSpaceSizeMb(inlineMatch[1], maxOldSpaceMb);
+      const value = normalizeMaxOldSpaceSizeMb(inlineMatch[1], maxOldSpaceMb, allowSmallerHeap);
       normalized.push(`--max-old-space-size=${value}`);
       continue;
     }
@@ -506,7 +508,7 @@ function normalizeTsdownNodeOptions(nodeOptions, params = {}) {
     if (part === "--max-old-space-size") {
       foundMaxOldSpaceSize = true;
       const next = parts[index + 1];
-      const value = normalizeMaxOldSpaceSizeMb(next, maxOldSpaceMb);
+      const value = normalizeMaxOldSpaceSizeMb(next, maxOldSpaceMb, allowSmallerHeap);
       normalized.push(`--max-old-space-size=${value}`);
       if (next !== undefined) {
         index += 1;
@@ -528,7 +530,10 @@ function resolveTsdownEnv(env, params = {}) {
   const nodeOptions = env.NODE_OPTIONS?.trim() ?? "";
   return {
     ...env,
-    NODE_OPTIONS: normalizeTsdownNodeOptions(nodeOptions, params),
+    NODE_OPTIONS: normalizeTsdownNodeOptions(nodeOptions, {
+      ...params,
+      allowSmallerHeap: env[SERIAL_BUILD_ENV] === "1",
+    }),
   };
 }
 
@@ -642,6 +647,24 @@ export function resolveTsdownBuildInvocation(params = {}) {
       env,
     },
   };
+}
+
+export function resolveTsdownBuildInvocations(params = {}) {
+  const env = params.env ?? process.env;
+  if (env[SERIAL_BUILD_ENV] !== "1") {
+    return [resolveTsdownBuildInvocation(params)];
+  }
+  const configCount = countTsdownConfigBlocks(params);
+  if (!configCount) {
+    throw new Error("Cannot run serial tsdown build without configured build entries");
+  }
+  // A separate process per config releases DTS graph memory before the next build.
+  return Array.from({ length: configCount }, (_, index) =>
+    resolveTsdownBuildInvocation({
+      ...params,
+      args: [...(params.args ?? []), "--filter", `openclaw-build-${index}`],
+    }),
+  );
 }
 
 export function parseTsdownBuildProcessRows(text, params = {}) {
@@ -903,9 +926,20 @@ if (isMainModule()) {
   pruneSourceCheckoutBundledPluginNodeModules();
   pruneUntrackedGeneratedSourceDeclarations();
   pruneStaleRuntimeSymlinks();
+  const invocations = resolveTsdownBuildInvocations({ args: args.forwardedArgs });
   cleanTsdownOutputRoots();
-  const invocation = resolveTsdownBuildInvocation({ args: args.forwardedArgs });
-  const result = await runTsdownBuildInvocation(invocation);
+  let result;
+  for (const invocation of invocations) {
+    result = await runTsdownBuildInvocation(invocation);
+    if (
+      result.status !== 0 ||
+      result.timedOut ||
+      result.hasIneffectiveDynamicImport ||
+      result.fatalUnresolvedImport
+    ) {
+      break;
+    }
+  }
 
   if (result.status === 0 && result.hasIneffectiveDynamicImport) {
     restoreRuntimeAfterRejectedBuild("rejected build");

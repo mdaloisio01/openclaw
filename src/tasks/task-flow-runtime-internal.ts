@@ -1,11 +1,16 @@
 export {
   BLIND_TEST_SLICE_CONTROLLER_ID,
+  attachProductionContinuationToStateJson,
+  buildProductionContinuationForLawfulStop,
   createBlindTestSliceFlow,
+  createStartedProductionContinuationState,
   createTaskFlowForTask,
   createNextBlindTestSliceFlow,
   getBlindTestProductionContinuation,
   getTaskFlowProductionContinuation,
+  isTaskFlowProductionParentScopeClosed,
   createManagedTaskFlow,
+  commitGovernedMissionLedger,
   deleteTaskFlowRecordById,
   failFlow,
   finishFlow,
@@ -16,8 +21,11 @@ export {
   listTaskFlowsForOwnerKey,
   recordFlowLawfulStop,
   recordFlowNextExecutableLaunch,
+  prepareFlowNextExecutableLaunch,
   recordBlindTestCloseoutFailure,
   requestFlowCancel,
+  requireManagedTaskFlowControllerId,
+  requireTaskFlowOwnerKey,
   resolveTaskFlowForLookupToken,
   resetTaskFlowRegistryForTests,
   recordBlindTestDraftReview,
@@ -29,4 +37,9 @@ export {
   updateFlowRecordByIdExpectedRevision,
 } from "./task-flow-registry.js";
 
-export type { TaskFlowSyncResult, TaskFlowUpdateResult } from "./task-flow-registry.js";
+export type {
+  ProductionContinuationState,
+  ProductionContinuationStopReason,
+  TaskFlowSyncResult,
+  TaskFlowUpdateResult,
+} from "./task-flow-registry.js";

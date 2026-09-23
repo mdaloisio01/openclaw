@@ -202,17 +202,6 @@ function buildToolStartKey(runId: string, toolCallId: string): string {
   return `${runId}:${toolCallId}`;
 }
 
-export function countActiveToolExecutions(runId: string): number {
-  const prefix = `${runId}:`;
-  let count = 0;
-  for (const key of toolStartData.keys()) {
-    if (key.startsWith(prefix)) {
-      count += 1;
-    }
-  }
-  return count;
-}
-
 function isCronAddAction(args: unknown): boolean {
   if (!args || typeof args !== "object") {
     return false;
@@ -263,6 +252,10 @@ function buildPatchItemTitle(meta?: string): string {
   return meta ? `patch ${meta}` : "apply patch";
 }
 
+function shouldSuppressOutwardToolOutput(ctx: ToolHandlerContext): boolean {
+  return ctx.params.shouldSuppressAssistantOutput?.() === true;
+}
+
 function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentItemEventData): void {
   if (itemData.phase === "start") {
     ctx.state.itemActiveIds.add(itemData.itemId);
@@ -270,6 +263,9 @@ function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentItemEventD
   } else if (itemData.phase === "end") {
     ctx.state.itemActiveIds.delete(itemData.itemId);
     ctx.state.itemCompletedCount += 1;
+  }
+  if (shouldSuppressOutwardToolOutput(ctx)) {
+    return;
   }
   emitAgentItemEvent({
     runId: ctx.params.runId,
@@ -803,6 +799,9 @@ async function checkpointRecoverableToolError(params: {
   lastToolError: ToolErrorSummary;
   resultText?: string;
 }) {
+  if (shouldSuppressOutwardToolOutput(params.ctx)) {
+    return;
+  }
   if (!shouldCheckpointRecoverableToolError(params.lastToolError, params.resultText)) {
     return;
   }
@@ -831,6 +830,9 @@ async function emitToolResultOutput(params: {
   sanitizedResult: unknown;
 }) {
   const { ctx, toolName, rawToolName, meta, isToolError, result, sanitizedResult } = params;
+  if (shouldSuppressOutwardToolOutput(ctx)) {
+    return;
+  }
   const hasStructuredMedia = Boolean(
     result &&
     typeof result === "object" &&
@@ -963,6 +965,7 @@ export function handleToolExecutionStart(
     const toolCallId = evt.toolCallId;
     const args = evt.args;
     const runId = ctx.params.runId;
+    const suppressOutwardToolOutput = shouldSuppressOutwardToolOutput(ctx);
     ctx.state.toolExecutionSinceLastBlockReply = true;
     ctx.params.onExecutionPhase?.({
       phase: "tool_execution_started",
@@ -974,9 +977,11 @@ export function handleToolExecutionStart(
     // Track start time and args for after_tool_call hook.
     const startedAt = Date.now();
     toolStartData.set(buildToolStartKey(runId, toolCallId), { startTime: startedAt, args });
-    traceToolExecutionStart({ ctx, toolName, toolCallId, args });
+    if (!suppressOutwardToolOutput) {
+      traceToolExecutionStart({ ctx, toolName, toolCallId, args });
+    }
 
-    if (toolName === "read") {
+    if (!suppressOutwardToolOutput && toolName === "read") {
       const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
       const filePathValue =
         typeof record.path === "string"
@@ -1046,16 +1051,18 @@ export function handleToolExecutionStart(
     );
 
     const shouldEmitToolEvents = ctx.shouldEmitToolResult();
-    emitAgentEvent({
-      runId: ctx.params.runId,
-      stream: "tool",
-      data: {
-        phase: "start",
-        name: toolName,
-        toolCallId,
-        args: sanitizeToolArgs(args) as Record<string, unknown>,
-      },
-    });
+    if (!suppressOutwardToolOutput) {
+      emitAgentEvent({
+        runId: ctx.params.runId,
+        stream: "tool",
+        data: {
+          phase: "start",
+          name: toolName,
+          toolCallId,
+          args: sanitizeToolArgs(args) as Record<string, unknown>,
+        },
+      });
+    }
     const itemData: AgentItemEventData = {
       itemId: buildToolItemId(toolCallId),
       phase: "start",
@@ -1069,15 +1076,17 @@ export function handleToolExecutionStart(
     };
     emitTrackedItemEvent(ctx, itemData);
     // Best-effort typing signal; do not block tool summaries on slow emitters.
-    void ctx.params.onAgentEvent?.({
-      stream: "tool",
-      data: {
-        phase: "start",
-        name: toolName,
-        toolCallId,
-        args: sanitizeToolArgs(args) as Record<string, unknown>,
-      },
-    });
+    if (!suppressOutwardToolOutput) {
+      void ctx.params.onAgentEvent?.({
+        stream: "tool",
+        data: {
+          phase: "start",
+          name: toolName,
+          toolCallId,
+          args: sanitizeToolArgs(args) as Record<string, unknown>,
+        },
+      });
+    }
 
     if (isExecToolName(toolName)) {
       emitTrackedItemEvent(ctx, {
@@ -1107,6 +1116,7 @@ export function handleToolExecutionStart(
 
     if (
       ctx.params.onToolResult &&
+      !suppressOutwardToolOutput &&
       shouldEmitToolEvents &&
       !ctx.state.toolSummaryById.has(toolCallId)
     ) {
@@ -1154,6 +1164,9 @@ export function handleToolExecutionUpdate(
     partialResult?: unknown;
   },
 ) {
+  if (shouldSuppressOutwardToolOutput(ctx)) {
+    return;
+  }
   const toolName = normalizeToolName(evt.toolName);
   const toolCallId = evt.toolCallId;
   const partial = evt.partialResult;
@@ -1392,18 +1405,21 @@ export async function handleToolExecutionEnd(
     }
   }
 
-  emitAgentEvent({
-    runId: ctx.params.runId,
-    stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      meta,
-      isError: isToolError,
-      result: eventResult,
-    },
-  });
+  const suppressOutwardToolOutput = shouldSuppressOutwardToolOutput(ctx);
+  if (!suppressOutwardToolOutput) {
+    emitAgentEvent({
+      runId: ctx.params.runId,
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        meta,
+        isError: isToolError,
+        result: eventResult,
+      },
+    });
+  }
   const endedAt = Date.now();
   const itemId = buildToolItemId(toolCallId);
   const itemData: AgentItemEventData = {
@@ -1422,16 +1438,18 @@ export async function handleToolExecutionEnd(
       : {}),
   };
   emitTrackedItemEvent(ctx, itemData);
-  void ctx.params.onAgentEvent?.({
-    stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      meta,
-      isError: isToolError,
-    },
-  });
+  if (!suppressOutwardToolOutput) {
+    void ctx.params.onAgentEvent?.({
+      stream: "tool",
+      data: {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        meta,
+        isError: isToolError,
+      },
+    });
+  }
 
   if (isExecToolName(toolName)) {
     // Use sanitizedResult so `aggregated` is redacted before reaching command_output.
@@ -1463,15 +1481,17 @@ export async function handleToolExecutionEnd(
         ...(execDetails.status === "approval-unavailable" ? { reason: execDetails.reason } : {}),
         message: execDetails.warningText,
       };
-      emitAgentApprovalEvent({
-        runId: ctx.params.runId,
-        ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
-        data: approvalData,
-      });
-      void ctx.params.onAgentEvent?.({
-        stream: "approval",
-        data: approvalData,
-      });
+      if (!suppressOutwardToolOutput) {
+        emitAgentApprovalEvent({
+          runId: ctx.params.runId,
+          ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
+          data: approvalData,
+        });
+        void ctx.params.onAgentEvent?.({
+          stream: "approval",
+          data: approvalData,
+        });
+      }
       emitTrackedItemEvent(ctx, {
         itemId: commandItemId,
         phase: "end",
@@ -1530,15 +1550,17 @@ export async function handleToolExecutionEnd(
           ? { cwd: execDetails.cwd }
           : {}),
       };
-      emitAgentCommandOutputEvent({
-        runId: ctx.params.runId,
-        ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
-        data: outputData,
-      });
-      void ctx.params.onAgentEvent?.({
-        stream: "command_output",
-        data: outputData,
-      });
+      if (!suppressOutwardToolOutput) {
+        emitAgentCommandOutputEvent({
+          runId: ctx.params.runId,
+          ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
+          data: outputData,
+        });
+        void ctx.params.onAgentEvent?.({
+          stream: "command_output",
+          data: outputData,
+        });
+      }
 
       if (typeof rawOutput === "string") {
         const parsedApprovalResult = parseExecApprovalResultText(rawOutput);
@@ -1556,15 +1578,17 @@ export async function handleToolExecutionEnd(
             toolCallId,
             message: parsedApprovalResult.body || parsedApprovalResult.raw,
           };
-          emitAgentApprovalEvent({
-            runId: ctx.params.runId,
-            ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
-            data: approvalData,
-          });
-          void ctx.params.onAgentEvent?.({
-            stream: "approval",
-            data: approvalData,
-          });
+          if (!suppressOutwardToolOutput) {
+            emitAgentApprovalEvent({
+              runId: ctx.params.runId,
+              ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
+              data: approvalData,
+            });
+            void ctx.params.onAgentEvent?.({
+              stream: "approval",
+              data: approvalData,
+            });
+          }
         }
       }
     }
@@ -1602,15 +1626,17 @@ export async function handleToolExecutionEnd(
         deleted: patchSummary.deleted,
         summary: summaryText ?? buildPatchSummaryText(patchSummary),
       };
-      emitAgentPatchSummaryEvent({
-        runId: ctx.params.runId,
-        ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
-        data: patchData,
-      });
-      void ctx.params.onAgentEvent?.({
-        stream: "patch",
-        data: patchData,
-      });
+      if (!suppressOutwardToolOutput) {
+        emitAgentPatchSummaryEvent({
+          runId: ctx.params.runId,
+          ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
+          data: patchData,
+        });
+        void ctx.params.onAgentEvent?.({
+          stream: "patch",
+          data: patchData,
+        });
+      }
     }
   }
 
@@ -1630,7 +1656,7 @@ export async function handleToolExecutionEnd(
 
   // Run after_tool_call plugin hook (fire-and-forget)
   const hookRunnerAfter = ctx.hookRunner ?? (await loadHookRunnerGlobal()).getGlobalHookRunner();
-  if (hookRunnerAfter?.hasHooks("after_tool_call")) {
+  if (!suppressOutwardToolOutput && hookRunnerAfter?.hasHooks("after_tool_call")) {
     const { consumeAdjustedParamsForToolCall } = await loadBeforeToolCall();
     const adjustedArgs = consumeAdjustedParamsForToolCall(toolCallId, runId);
     const afterToolCallArgs =

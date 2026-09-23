@@ -8,6 +8,7 @@ import {
   buildGovernedMissionTaskFlowStatePatch,
   buildGovernedMissionTaskFlowUpdatePatch,
   createGovernedMissionState,
+  governedMissionStateBlocksChildCreation,
   readGovernedMissionStateFromTaskFlow,
   requireGovernedMissionPinnedAuthority,
 } from "./governed-mission-state.js";
@@ -32,6 +33,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -41,8 +43,28 @@ const contract: GovernedMissionContract = {
 describe("governed mission state foundation", () => {
   it("includes governed waiting states required by Cleanup Crew and watchdog reconciliation", () => {
     expect(GOVERNED_MISSION_STATE_VALUES).toEqual(
-      expect.arrayContaining(["GOVERNED_MISSION_PENDING_OVERRIDE", "AWAITING_CLOSEOUT"]),
+      expect.arrayContaining(["pending_override", "closeout_ready"]),
     );
+  });
+
+  it("closes child creation while pinned authority requires readmission", () => {
+    const state = createGovernedMissionState({
+      contract,
+      authorityRef,
+      currentStep: "lawful_readmission_required",
+      ownerCorrelation: { owner: "Cleanup Crew" },
+      now: "2026-08-22T04:07:00Z",
+    });
+
+    expect(
+      governedMissionStateBlocksChildCreation({
+        governedMissionState: {
+          ...state,
+          currentGovernedState: "readmission_required",
+          blockedStatus: "stale_authority_hash",
+        },
+      }),
+    ).toBe(true);
   });
 
   it("creates the minimum authoritative state for later policy decisions", () => {
@@ -63,7 +85,7 @@ describe("governed mission state foundation", () => {
     });
 
     expect(state).toMatchObject({
-      schema: "openclaw.governed_mission_state.v1",
+      schema: "openclaw.governed_mission_state.v2",
       missionId: "sop-enf-04",
       contractId: "sop-enf-contract",
       contractVersion: "2026-08-22T0407Z",
@@ -71,7 +93,7 @@ describe("governed mission state foundation", () => {
       authorityHash: "authority-hash",
       authorityRef,
       parentMissionRef: "sop-enforcement-build",
-      currentGovernedState: "GOVERNED_MISSION_ACTIVE",
+      currentGovernedState: "admitted",
       currentStep: "minimum_durable_state",
       overrideRef: { status: "none" },
       terminalStatus: "not_terminal",
@@ -205,6 +227,32 @@ describe("governed mission state foundation", () => {
     ).toThrow("governed mission state must be correlated to the TaskFlow record");
   });
 
+  it("ignores malformed persisted governed state instead of exposing a partial object", () => {
+    expect(
+      readGovernedMissionStateFromTaskFlow({
+        flowId: "flow-1",
+        revision: 1,
+        stateJson: {
+          governedMissionState: {
+            schema: "openclaw.governed_mission_state.v2",
+            missionId: "mission-without-owner-or-proofs",
+            contractId: "contract-1",
+            contractVersion: "1",
+            contractHash: "contract-hash",
+            authorityHash: "authority-hash",
+            planRevisionId: "plan-1",
+            sourceRevision: "source-1",
+            runtimeBuildSha256: "build-1",
+            policyVersion: "policy-1",
+            skillSha256: "skill-1",
+            currentGovernedState: "admitted",
+            revision: 1,
+          },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
   it("keeps active missions on pinned authority when hashes still match", () => {
     const state = createGovernedMissionState({
       contract,
@@ -251,7 +299,7 @@ describe("governed mission state foundation", () => {
       state: {
         authorityRef,
         readmissionAuthorityRef: { ...authorityRef, sha256: "changed-authority" },
-        currentGovernedState: "GOVERNED_MISSION_BLOCKED",
+        currentGovernedState: "readmission_required",
         blockedStatus: "stale_authority_hash",
         currentStep: "lawful_readmission_required",
         revision: 2,
@@ -273,7 +321,7 @@ describe("governed mission state foundation", () => {
       state: {
         authorityRef,
         readmissionAuthorityRef: authorityRef,
-        currentGovernedState: "GOVERNED_MISSION_BLOCKED",
+        currentGovernedState: "readmission_required",
         blockedStatus: "contract_hash_mismatch",
         currentStep: "lawful_readmission_required",
       },

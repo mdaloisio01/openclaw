@@ -189,6 +189,184 @@ afterAll(() => {
 });
 
 describe("exportTrajectoryBundle", () => {
+  it("excludes hidden transcript content and derived summaries from bundle files", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const timestamp = "2026-04-01T05:46:40.000Z";
+    const entries = [
+      { type: "session", version: 3, id: "session-1", timestamp, cwd: tmpDir },
+      {
+        type: "message",
+        id: "user-1",
+        parentId: null,
+        timestamp,
+        message: userMessage("visible start"),
+      },
+      {
+        type: "message",
+        id: "hidden-assistant",
+        parentId: "user-1",
+        timestamp,
+        message: {
+          ...assistantMessage([{ type: "text", text: "withheld answer" }]),
+          display: false,
+        },
+      },
+      {
+        type: "compaction",
+        id: "hidden-compaction",
+        parentId: "hidden-assistant",
+        timestamp,
+        summary: "withheld summary",
+        firstKeptEntryId: "hidden-assistant",
+        tokensBefore: 100,
+      },
+      {
+        type: "branch_summary",
+        id: "hidden-branch-summary",
+        parentId: "hidden-compaction",
+        timestamp,
+        fromId: "hidden-assistant",
+        summary: "withheld branch result",
+      },
+      {
+        type: "message",
+        id: "user-2",
+        parentId: "hidden-branch-summary",
+        timestamp,
+        message: userMessage("visible continuation"),
+      },
+    ];
+    fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+    const runtimeEvents = [
+      { type: "prompt.submitted", data: { prompt: "withheld prompt" } },
+      { type: "model.completed", data: { assistantTexts: ["withheld answer"] } },
+      { type: "trace.artifacts", data: { finalPromptText: "withheld artifact" } },
+    ];
+    fs.writeFileSync(
+      runtimeFile,
+      `${runtimeEvents
+        .map((event, index) =>
+          JSON.stringify({
+            traceSchema: "openclaw-trajectory",
+            schemaVersion: 1,
+            traceId: "session-1",
+            source: "runtime",
+            ts: timestamp,
+            seq: index + 1,
+            sourceSeq: index + 1,
+            sessionId: "session-1",
+            ...event,
+          }),
+        )
+        .join("\n")}\n`,
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+      runtimeFile,
+    });
+
+    const branch = JSON.parse(
+      fs.readFileSync(path.join(outputDir, "session-branch.json"), "utf8"),
+    ) as {
+      leafId: string;
+      entries: Array<{ id: string; parentId: string | null }>;
+    };
+    expect(branch.leafId).toBe("user-2");
+    expect(branch.entries.map(({ id, parentId }) => ({ id, parentId }))).toEqual([
+      { id: "user-1", parentId: null },
+      { id: "user-2", parentId: "user-1" },
+    ]);
+    expect(bundle.events.map((event) => event.entryId)).toEqual(["user-1", "user-2"]);
+    expect(bundle.manifest.runtimeEventCount).toBe(0);
+    expect(bundle.runtimeFile).toBeUndefined();
+    expect(bundle.manifest.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "runtime-omitted-hidden-session-content" }),
+      ]),
+    );
+    expect(bundle.supplementalFiles).toEqual([]);
+    for (const name of fs.readdirSync(outputDir)) {
+      expect(fs.readFileSync(path.join(outputDir, name), "utf8")).not.toContain("withheld");
+    }
+    expect(JSON.stringify(branch)).not.toContain("withheld");
+  });
+
+  it("omits runtime when an explicitly hidden session row has malformed metadata", async () => {
+    const tmpDir = makeTempDir();
+    const sessionFile = path.join(tmpDir, "session.jsonl");
+    const runtimeFile = path.join(tmpDir, "session.trajectory.jsonl");
+    const outputDir = path.join(tmpDir, "bundle");
+    const timestamp = "2026-04-01T05:46:40.000Z";
+    const entries = [
+      { type: "session", version: 3, id: "session-1", timestamp, cwd: tmpDir },
+      {
+        type: "message",
+        id: "visible-user",
+        parentId: null,
+        timestamp,
+        message: userMessage("visible start"),
+      },
+      {
+        type: "message",
+        id: "hidden-without-timestamp",
+        parentId: "visible-user",
+        message: {
+          ...assistantMessage([{ type: "text", text: "withheld malformed row" }]),
+          display: false,
+        },
+      },
+      {
+        type: "message",
+        id: "visible-assistant",
+        parentId: "visible-user",
+        timestamp,
+        message: assistantMessage([{ type: "text", text: "visible result" }]),
+      },
+    ];
+    fs.writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+    fs.writeFileSync(
+      runtimeFile,
+      `${JSON.stringify({
+        traceSchema: "openclaw-trajectory",
+        schemaVersion: 1,
+        traceId: "session-1",
+        source: "runtime",
+        type: "model.completed",
+        ts: timestamp,
+        seq: 1,
+        sourceSeq: 1,
+        sessionId: "session-1",
+        data: { assistantTexts: ["withheld runtime result"] },
+      })}\n`,
+    );
+
+    const bundle = await exportTrajectoryBundle({
+      outputDir,
+      sessionFile,
+      sessionId: "session-1",
+      workspaceDir: tmpDir,
+      runtimeFile,
+    });
+
+    expect(bundle.manifest.runtimeEventCount).toBe(0);
+    expect(bundle.runtimeFile).toBeUndefined();
+    expect(bundle.manifest.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "runtime-omitted-hidden-session-content" }),
+      ]),
+    );
+    for (const name of fs.readdirSync(outputDir)) {
+      expect(fs.readFileSync(path.join(outputDir, name), "utf8")).not.toContain("withheld");
+    }
+  });
+
   it("sanitizes session ids in default export directory names", () => {
     const outputDir = resolveDefaultTrajectoryExportDir({
       workspaceDir: "/tmp/workspace",

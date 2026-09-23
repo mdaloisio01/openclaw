@@ -7,12 +7,16 @@ import type {
   GovernedAuthorityRef,
   GovernedMissionContract,
 } from "./governed-mission-contract.js";
-import { missingGovernedContractFoundationFields } from "./governed-mission-contract.js";
+import {
+  isGovernedAuthorityRefPinnedToContract,
+  missingGovernedContractFoundationFields,
+} from "./governed-mission-contract.js";
 import {
   createGovernedMissionState,
   requireGovernedMissionPinnedAuthority,
   updateGovernedMissionState,
   type GovernedMissionOwnerCorrelation,
+  type GovernedMissionProofState,
   type GovernedMissionState,
 } from "./governed-mission-state.js";
 import {
@@ -33,6 +37,7 @@ export type GovernedMissionAdmissionObservedAuthority = {
   sourceRevision: string;
   runtimeBuildSha256: string;
   policyVersion: string;
+  skillSha256: string;
 };
 
 export type GovernedMissionAdmissionInput = {
@@ -48,6 +53,7 @@ export type GovernedMissionAdmissionInput = {
   existingState?: GovernedMissionState;
   observedAuthority?: GovernedMissionAdmissionObservedAuthority;
   ownerCorrelation: GovernedMissionOwnerCorrelation;
+  requiredProofs?: Partial<Record<keyof GovernedMissionProofState, boolean>>;
   enforcementCapabilities: readonly EnforcementHealthCapabilityRecord[];
   hostAuthority: {
     openclawAllows: boolean;
@@ -201,6 +207,9 @@ function firstAuthorityMismatch(
   if (contract.authorityHash !== observed.authorityHash) {
     return "STALE_AUTHORITY_HASH";
   }
+  if (!isGovernedAuthorityRefPinnedToContract(contract, observed.authorityRef)) {
+    return "AUTHORITY_REFERENCE_MISMATCH";
+  }
   if (contract.planRevisionId !== observed.planRevisionId) {
     return "PLAN_REVISION_MISMATCH";
   }
@@ -212,6 +221,9 @@ function firstAuthorityMismatch(
   }
   if (contract.policyVersion !== observed.policyVersion) {
     return "POLICY_VERSION_MISMATCH";
+  }
+  if (contract.skillSha256 !== observed.skillSha256) {
+    return "SKILL_HASH_MISMATCH";
   }
   return undefined;
 }
@@ -240,7 +252,7 @@ function bindMissionState(
         reason: identityMismatch,
         state: updateGovernedMissionState(input.existingState, {
           expectedRevision: input.existingState.revision,
-          currentGovernedState: "GOVERNED_MISSION_BLOCKED",
+          currentGovernedState: "readmission_required",
           blockedStatus: "readmission_required",
           currentStep: "lawful_readmission_required",
           now: input.now,
@@ -256,6 +268,14 @@ function bindMissionState(
       authorityRef: observed.authorityRef,
       currentStep: "before_agent_run_admission",
       ownerCorrelation: input.ownerCorrelation,
+      requiredProofs: input.requiredProofs,
+      // Only the trusted admission boundary can establish these host facts. Persist
+      // them with canonical mission state so later agent runs never reconstruct them.
+      trustedHostPolicy: {
+        trustedHost: true,
+        ...input.hostAuthority,
+        reason: "verified by governed mission admission",
+      },
       now: input.now,
     }),
   };

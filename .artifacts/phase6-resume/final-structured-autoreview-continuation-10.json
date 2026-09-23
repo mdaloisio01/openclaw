@@ -1,0 +1,6 @@
+{
+  "findings": [],
+  "overall_correctness": "patch is correct",
+  "overall_explanation": "No actionable correctness, security, durability, concurrency, authorization, idempotency, or regression defect was found in the reviewed change bundle. The governed-progress path now authenticates the paired producer, validates the exact persisted assignment and current governed attempt, and rejects terminal or abandoned children before mutation or notification. The surrounding durable ledger, child-completion, release, output-withholding, migration, lookup, and fail-closed paths are consistent with that boundary, and the inspected Codex lifecycle contract supports the terminal-state handling used here. The result remains bounded by the stated verification; native Swift compilation and broader full-suite execution were not independently proven in this review.",
+  "overall_confidence": 0.93
+}

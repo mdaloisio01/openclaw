@@ -75,9 +75,19 @@ export type EmbeddedRunAttemptParams = EmbeddedRunAttemptBase & {
   modelRegistry: ModelRegistry;
   thinkLevel: ThinkLevel;
   beforeAgentStartResult?: PluginHookBeforeAgentStartResult;
+  /** Prepared outer-run classification that prevents governed bytes reaching plugin hooks. */
+  governedMissionContentHooksSuppressed?: boolean;
+  /** The outer run closes a governed lease after deciding the terminal payload. */
+  deferGovernedMissionLeaseClose?: boolean;
 };
 
 export type EmbeddedRunAttemptResult = {
+  /** Canonical Task Flow whose output remains subject to governed final-release gating. */
+  governedMissionFlowId?: string;
+  /** Durable lease-open receipt binding governed output to this exact execution attempt. */
+  governedMissionAttemptReceiptId?: string;
+  /** Exact lease owner needed by the outer run when close is deferred. */
+  governedMissionExecutionRunId?: string;
   aborted: boolean;
   /** True when the abort originated from the caller-provided abortSignal. */
   externalAbort: boolean;

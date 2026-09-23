@@ -1718,18 +1718,12 @@ export const agentHandlers: GatewayRequestHandlers = {
         cfg,
         sessionKey: requestedSessionKeyRaw,
       });
+      // Global aliases lose their agent owner when canonicalized. ACP keys keep
+      // their harness identity and must not turn it into a native agent override.
       const inferredAgentId =
-        requestedCanonicalKey === "global"
-          ? parsed
-            ? normalizeAgentId(parsed.agentId)
-            : undefined
-          : parsed && isAcpSessionKey(requestedCanonicalKey)
-            ? resolveAgentIdFromSessionKey(requestedCanonicalKey)
-            : undefined;
+        requestedCanonicalKey === "global" && parsed ? normalizeAgentId(parsed.agentId) : undefined;
       if (inferredAgentId) {
-        const inferredFromAcpSessionKey =
-          requestedCanonicalKey !== "global" && isAcpSessionKey(requestedCanonicalKey);
-        if (!inferredFromAcpSessionKey && !knownAgents.includes(inferredAgentId)) {
+        if (!knownAgents.includes(inferredAgentId)) {
           respond(
             false,
             undefined,

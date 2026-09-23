@@ -47,7 +47,7 @@ describe("openclaw-production-monitor", () => {
       inodes: { usedPercent: 100, mountedOn: "/", total: 100, used: 100, free: 0 },
       previousBackupCount: 804,
       gatewayFailed: true,
-      systemd: { isFailedOutput: "failed" },
+      systemd: { isFailedStatus: 0, isFailedOutput: "failed" },
       journal: scanGatewayJournal(
         [
           "Start request repeated too quickly.",

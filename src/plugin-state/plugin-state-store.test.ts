@@ -1,4 +1,4 @@
-import { rmSync, statSync } from "node:fs";
+import { existsSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 import { MAX_DATE_TIMESTAMP_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -68,6 +68,20 @@ async function expectPluginStateStoreError(
 }
 
 describe("plugin state keyed store", () => {
+  it("treats a missing read-only database as empty without creating state", async () => {
+    resetPluginStateStoreForTests();
+    const databasePath = resolveOpenClawStateSqlitePath();
+    rmSync(path.dirname(databasePath), { recursive: true, force: true });
+    const store = createPluginStateKeyedStore("discord", {
+      namespace: "fresh-install",
+      maxEntries: 10,
+    });
+
+    await expect(store.lookup("missing")).resolves.toBeUndefined();
+    await expect(store.entries()).resolves.toEqual([]);
+    expect(existsSync(databasePath)).toBe(false);
+  });
+
   it("registers and looks up values across store instances", async () => {
     await withPluginStateTestState(async () => {
       const store = createPluginStateKeyedStore<{ count: number }>("discord", {

@@ -634,6 +634,40 @@ describe("source turn delivery storage adapter", () => {
     expect(await update).toMatchObject({ row: { id: "source:main:after-live-writer" } });
   });
 
+  it.skipIf(process.platform === "win32")(
+    "keeps protected I/O on the canonical target when a directory symlink is retargeted",
+    async () => {
+      const firstTarget = join(tempDir, "first-target");
+      const secondTarget = join(tempDir, "second-target");
+      const registryAlias = join(tempDir, "registry-alias");
+      await Promise.all([fs.mkdir(firstTarget), fs.mkdir(secondTarget)]);
+      await fs.symlink(firstTarget, registryAlias, "dir");
+      const firstRegistryPath = join(firstTarget, "delivery.json");
+      const secondRegistryPath = join(secondTarget, "delivery.json");
+      const aliasRegistryPath = join(registryAlias, "delivery.json");
+      const holder = await acquireFileLock(firstRegistryPath, {
+        managerKey: "source-delivery-canonical-path-test",
+        payload: () => ({ pid: process.pid, createdAt: new Date().toISOString() }),
+      });
+      const update = persistSourceTurnDeliveryState({
+        registryPath: aliasRegistryPath,
+        id: "canonical-target-write",
+        facts: {},
+      });
+      try {
+        await setTimeout(50);
+        await fs.unlink(registryAlias);
+        await fs.symlink(secondTarget, registryAlias, "dir");
+      } finally {
+        await holder.release();
+      }
+
+      const row = await update;
+      expect(await loadSourceTurnDeliveryRegistry(firstRegistryPath)).toEqual({ rows: [row] });
+      await expect(readFile(secondRegistryPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
   it("keys governed report delivery obligations by mission, run, report, delivery, and generation", async () => {
     const row = await persistSourceTurnDeliveryState({
       registryPath,

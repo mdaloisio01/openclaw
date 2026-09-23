@@ -71,6 +71,9 @@ openclaw sessions export-trajectory --session-key "agent:main:telegram:direct:12
 This is the command path used by the `/export-trajectory` slash command after
 the owner approves the exec request. The output directory is always resolved
 inside `.openclaw/trajectory-exports/` under the selected workspace.
+If the session contains hidden messages, the bundle includes visible transcript
+entries but omits runtime events and their derived prompt and artifact files.
+The manifest records a warning when a runtime file was omitted.
 
 `openclaw sessions --all-agents` reads configured agent stores. Gateway and ACP
 session discovery are broader: they also include disk-only stores found under

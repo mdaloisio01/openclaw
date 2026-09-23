@@ -405,20 +405,42 @@ export function validateTrbRecoveryRecord(
 function missingFieldsFromErrors(errors: string[]): string[] {
   const fields = new Set<string>();
   for (const error of errors) {
-    if (error.includes("classification")) fields.add("classification");
+    if (error.includes("classification")) {
+      fields.add("classification");
+    }
     if (error.includes("what_was_happening_before_misfire")) {
       fields.add("what_was_happening_before_misfire");
     }
-    if (error.includes("actual_issue_identified")) fields.add("actual_issue_identified");
-    if (error.includes("root_cause")) fields.add("root_cause");
-    if (error.includes("missing_proof")) fields.add("missing_proof");
-    if (error.includes("exact_next_action")) fields.add("exact_next_action");
-    if (error.includes("recovery_artifact_path")) fields.add("recovery_artifact_path");
-    if (error.includes("issue_list_action")) fields.add("issue_list_action");
-    if (error.includes("lawful_no_update_reason")) fields.add("lawful_no_update_reason");
-    if (error.includes("proof_checked")) fields.add("proof_checked");
-    if (error.includes("session/tool-log")) fields.add("session_tool_log_proof");
-    if (error.includes("oversized output")) fields.add("oversized_output");
+    if (error.includes("actual_issue_identified")) {
+      fields.add("actual_issue_identified");
+    }
+    if (error.includes("root_cause")) {
+      fields.add("root_cause");
+    }
+    if (error.includes("missing_proof")) {
+      fields.add("missing_proof");
+    }
+    if (error.includes("exact_next_action")) {
+      fields.add("exact_next_action");
+    }
+    if (error.includes("recovery_artifact_path")) {
+      fields.add("recovery_artifact_path");
+    }
+    if (error.includes("issue_list_action")) {
+      fields.add("issue_list_action");
+    }
+    if (error.includes("lawful_no_update_reason")) {
+      fields.add("lawful_no_update_reason");
+    }
+    if (error.includes("proof_checked")) {
+      fields.add("proof_checked");
+    }
+    if (error.includes("session/tool-log")) {
+      fields.add("session_tool_log_proof");
+    }
+    if (error.includes("oversized output")) {
+      fields.add("oversized_output");
+    }
   }
   return [...fields];
 }

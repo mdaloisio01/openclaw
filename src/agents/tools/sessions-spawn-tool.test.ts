@@ -171,10 +171,11 @@ describe("sessions_spawn tool", () => {
     expect(streamTo.description).toContain('ignored for runtime="subagent"');
   });
 
-  it("hides ACP runtime affordances when the ACP backend is unhealthy", () => {
+  it("exposes ACP on a newly constructed tool after backend health recovers", () => {
+    let healthy = false;
     acpRuntimeRegistry.registerAcpRuntimeBackend({
       id: "acpx",
-      healthy: () => false,
+      healthy: () => healthy,
       runtime: {
         ensureSession: vi.fn(async () => ({
           sessionKey: "agent:codex:acp:1",
@@ -192,6 +193,14 @@ describe("sessions_spawn tool", () => {
 
     expect(tool.description).not.toContain("ACP");
     expect(schema.properties?.runtime?.enum).toEqual(["subagent"]);
+
+    healthy = true;
+    const recoveredTool = createSessionsSpawnTool();
+    const recoveredSchema = recoveredTool.parameters as {
+      properties?: { runtime?: { enum?: string[] } };
+    };
+    expect(recoveredTool.description).toContain('runtime="acp"');
+    expect(recoveredSchema.properties?.runtime?.enum).toEqual(["subagent", "acp"]);
   });
 
   it("rejects stale ACP runtime calls when no ACP backend is loaded", async () => {

@@ -252,7 +252,7 @@ describe("native hook relay registry", () => {
     );
     expect(relay.commandForEvent("pre_tool_use")).toBe(
       "nice -n 10 /usr/local/bin/node '/opt/Open Claw/openclaw.mjs' hooks relay --provider codex --relay-id " +
-        `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --timeout 1234`,
+        `${relay.relayId} --generation ${relay.generation} --event pre_tool_use --pre-tool-use-unavailable noop --timeout 1234`,
     );
   });
 

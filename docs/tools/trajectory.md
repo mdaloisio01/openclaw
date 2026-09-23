@@ -100,6 +100,9 @@ Transcript events are also reconstructed from the active session branch:
 - model changes
 - labels and custom session entries
 
+Hidden transcript entries and summaries that may contain their content are
+excluded from exported bundles.
+
 Events are written as JSON Lines with this schema marker:
 
 ```json

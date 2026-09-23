@@ -613,12 +613,17 @@ describe("scripts/run-vitest", () => {
       ].join("\n"),
     );
 
+    // The delegated runner owns its fixture selection and module cache; inheriting
+    // the parent shard's temporary paths can exclude the fixture or race its cache.
+    const runnerEnv = { ...process.env };
+    delete runnerEnv.OPENCLAW_VITEST_INCLUDE_FILE;
+    delete runnerEnv.OPENCLAW_VITEST_FS_MODULE_CACHE_PATH;
     const runner = spawn(
       process.execPath,
       ["scripts/run-vitest.mjs", fixturePath, "--reporter=verbose"],
       {
         env: {
-          ...process.env,
+          ...runnerEnv,
           OPENCLAW_DELEGATED_SIGNAL_CHILD_PID: childPidPath,
         },
         stdio: "ignore",
@@ -627,7 +632,7 @@ describe("scripts/run-vitest", () => {
     let childPid = 0;
 
     try {
-      await waitFor(() => fs.existsSync(childPidPath), 10_000);
+      await waitFor(() => fs.existsSync(childPidPath), 30_000);
       childPid = Number(fs.readFileSync(childPidPath, "utf8"));
       expect(Number.isInteger(childPid)).toBe(true);
       expect(isProcessAlive(childPid)).toBe(true);

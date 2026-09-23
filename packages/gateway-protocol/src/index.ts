@@ -354,6 +354,18 @@ import {
   TasksGetParamsSchema,
   type TasksGetResult,
   TasksGetResultSchema,
+  type TasksGovernanceApplyParams,
+  TasksGovernanceApplyParamsSchema,
+  type TasksGovernanceApplyResult,
+  TasksGovernanceApplyResultSchema,
+  type TasksGovernancePreviewParams,
+  TasksGovernancePreviewParamsSchema,
+  type TasksGovernancePreviewResult,
+  TasksGovernancePreviewResultSchema,
+  type TasksGovernanceStatusParams,
+  TasksGovernanceStatusParamsSchema,
+  type TasksGovernanceStatusResult,
+  TasksGovernanceStatusResultSchema,
   type TasksListParams,
   TasksListParamsSchema,
   type TasksListResult,
@@ -649,6 +661,24 @@ export const validateSessionsUsageParams =
 export const validateTasksListParams = lazyCompile<TasksListParams>(TasksListParamsSchema);
 export const validateTasksGetParams = lazyCompile<TasksGetParams>(TasksGetParamsSchema);
 export const validateTasksCancelParams = lazyCompile<TasksCancelParams>(TasksCancelParamsSchema);
+export const validateTasksGovernanceApplyParams = lazyCompile<TasksGovernanceApplyParams>(
+  TasksGovernanceApplyParamsSchema,
+);
+export const validateTasksGovernanceApplyResult = lazyCompile<TasksGovernanceApplyResult>(
+  TasksGovernanceApplyResultSchema,
+);
+export const validateTasksGovernanceStatusParams = lazyCompile<TasksGovernanceStatusParams>(
+  TasksGovernanceStatusParamsSchema,
+);
+export const validateTasksGovernanceStatusResult = lazyCompile<TasksGovernanceStatusResult>(
+  TasksGovernanceStatusResultSchema,
+);
+export const validateTasksGovernancePreviewParams = lazyCompile<TasksGovernancePreviewParams>(
+  TasksGovernancePreviewParamsSchema,
+);
+export const validateTasksGovernancePreviewResult = lazyCompile<TasksGovernancePreviewResult>(
+  TasksGovernancePreviewResultSchema,
+);
 export const validateConfigGetParams = lazyCompile<ConfigGetParams>(ConfigGetParamsSchema);
 export const validateConfigSetParams = lazyCompile<ConfigSetParams>(ConfigSetParamsSchema);
 export const validateConfigApplyParams = lazyCompile<ConfigApplyParams>(ConfigApplyParamsSchema);
@@ -997,6 +1027,12 @@ export {
   TasksListResultSchema,
   TasksGetParamsSchema,
   TasksGetResultSchema,
+  TasksGovernanceApplyParamsSchema,
+  TasksGovernanceApplyResultSchema,
+  TasksGovernanceStatusParamsSchema,
+  TasksGovernanceStatusResultSchema,
+  TasksGovernancePreviewParamsSchema,
+  TasksGovernancePreviewResultSchema,
   TasksCancelParamsSchema,
   TasksCancelResultSchema,
   ConfigGetParamsSchema,
@@ -1297,6 +1333,12 @@ export type {
   TasksListResult,
   TasksGetParams,
   TasksGetResult,
+  TasksGovernanceApplyParams,
+  TasksGovernanceApplyResult,
+  TasksGovernanceStatusParams,
+  TasksGovernanceStatusResult,
+  TasksGovernancePreviewParams,
+  TasksGovernancePreviewResult,
   TasksCancelParams,
   TasksCancelResult,
   CronJob,

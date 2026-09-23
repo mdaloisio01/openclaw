@@ -36,6 +36,8 @@ export type SubscribeEmbeddedAgentSessionParams = {
   toolProgressDetail?: ToolProgressDetailMode;
   shouldEmitToolResult?: () => boolean;
   shouldEmitToolOutput?: () => boolean;
+  /** Dynamically suppress every outward assistant/reasoning stream for governed runs. */
+  shouldSuppressAssistantOutput?: () => boolean;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   onToolResult?: (payload: ReplyPayload) => void | Promise<void>;
   onReasoningStream?: (payload: {

@@ -10,12 +10,17 @@ import {
 } from "../continuity/continuity-gate-v2.js";
 import { triageBuildDiscoveredIssue } from "../governance/build-discovered-issue-triage.js";
 import {
+  recordGovernedBuildIssueAction,
+  recordGovernedBuildIssueBoundary,
+} from "../governance/governed-mission-runtime.js";
+import {
   getProductionExecutorAssignment,
   productionExecutorCapabilitySchema,
   productionExecutorRoleSchema,
 } from "./production-executor-assignment.js";
 import { evaluateProductionOwnerLaneGuard } from "./production-owner-lane-guard.js";
 import { getTaskById } from "./runtime-internal.js";
+import { hasGovernedMissionClaimForFlow } from "./task-flow-registry.store.sqlite.js";
 import type { JsonValue, TaskFlowRecord } from "./task-flow-registry.types.js";
 import {
   getTaskFlowById,
@@ -151,6 +156,10 @@ function receipts(flow: TaskFlowRecord): Receipt[] {
   return value === undefined ? [] : z.array(receiptSchema).parse(value);
 }
 
+function isGovernedBuildIssueFlow(flow: TaskFlowRecord): boolean {
+  return hasGovernedMissionClaimForFlow(flow);
+}
+
 function persistReceipt(flowId: string, receipt: Receipt): Receipt {
   const flow = getTaskFlowById(flowId);
   if (!flow) {
@@ -161,14 +170,23 @@ function persistReceipt(flowId: string, receipt: Receipt): Receipt {
     ...previous.filter((entry) => entry.input.actionId !== receipt.input.actionId),
     receipt,
   ];
-  const saved = updateFlowRecordByIdExpectedRevision({
-    flowId,
-    expectedRevision: flow.revision,
-    patch: {
-      stateJson: { ...flowState(flow), buildIssueActions: next },
-      updatedAt: receipt.updatedAt,
-    },
-  });
+  const saved = isGovernedBuildIssueFlow(flow)
+    ? recordGovernedBuildIssueAction({
+        flowId,
+        expectedFlowRevision: flow.revision,
+        actionId: receipt.input.actionId,
+        occurrenceId: receipt.input.occurrenceId,
+        actions: JSON.parse(stableStringify(next)) as JsonValue[],
+        updatedAt: receipt.updatedAt,
+      })
+    : updateFlowRecordByIdExpectedRevision({
+        flowId,
+        expectedRevision: flow.revision,
+        patch: {
+          stateJson: { ...flowState(flow), buildIssueActions: next },
+          updatedAt: receipt.updatedAt,
+        },
+      });
   if (!saved.applied) {
     throw new Error(`build_issue_receipt_write_failed:${saved.reason}`);
   }
@@ -350,13 +368,26 @@ function recordDecisionBoundary(receipt: Receipt): void {
       : impact === "unsafe" || receipt.decision === "policy_denial_requires_authorized_resolution"
         ? "safety_stop"
         : "blocker";
-  const saved = recordFlowLawfulStop({
-    flowId: flow.flowId,
-    expectedRevision: flow.revision,
-    reason,
-    currentStep: "build_issue_resolution_required",
-    detail: `build_issue:${receipt.input.issueId}:${receipt.input.actionId}:${receipt.decision}`,
-  });
+  const detail = `build_issue:${receipt.input.issueId}:${receipt.input.actionId}:${receipt.decision}`;
+  const updatedAt = Date.now();
+  const saved = isGovernedBuildIssueFlow(flow)
+    ? recordGovernedBuildIssueBoundary({
+        flowId: flow.flowId,
+        expectedFlowRevision: flow.revision,
+        actionId: receipt.input.actionId,
+        issueId: receipt.input.issueId,
+        reason,
+        detail,
+        updatedAt,
+      })
+    : recordFlowLawfulStop({
+        flowId: flow.flowId,
+        expectedRevision: flow.revision,
+        reason,
+        currentStep: "build_issue_resolution_required",
+        detail,
+        updatedAt,
+      });
   if (!saved.applied) {
     throw new Error(`build_issue_boundary_write_failed:${saved.reason}`);
   }

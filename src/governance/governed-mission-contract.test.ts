@@ -4,6 +4,7 @@ import {
   GOVERNED_MISSION_FAILURE_STATES,
   GOVERNED_MISSION_LOCK_STATES,
   GOVERNED_REQUIRED_RECEIPT_KINDS,
+  GOVERNED_RUNTIME_RECEIPT_KINDS,
   missingGovernedContractFoundationFields,
   type GovernedMissionContract,
 } from "./governed-mission-contract.js";
@@ -28,6 +29,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "runtime-sha",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -39,16 +41,60 @@ describe("governed mission contract foundation", () => {
     expect(GOVERNED_REQUIRED_RECEIPT_KINDS).toEqual([
       "admission",
       "policy_decision",
-      "tool_call",
-      "exec_call",
       "evidence",
-      "violation",
       "supervisor",
       "closeout",
       "release",
-      "override",
+    ]);
+    expect(GOVERNED_RUNTIME_RECEIPT_KINDS).toEqual([
+      ...GOVERNED_REQUIRED_RECEIPT_KINDS,
       "rollback",
     ]);
+  });
+
+  it("rejects receipt requirements the canonical runtime cannot emit", () => {
+    expect(
+      missingGovernedContractFoundationFields({
+        ...contract,
+        requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS, "override"],
+      }),
+    ).toEqual(["requiredReceiptKinds.unsupported.override"]);
+  });
+
+  it("rejects completion owners the canonical release runtime does not implement", () => {
+    expect(
+      missingGovernedContractFoundationFields({
+        ...contract,
+        authoritativeCompletionOwner: "task_flow",
+      } as unknown as GovernedMissionContract),
+    ).toContain("authoritativeCompletionOwner.unsupported");
+  });
+
+  it("rejects proof-producer device IDs that cannot match authenticated callers", () => {
+    expect(
+      missingGovernedContractFoundationFields({
+        ...contract,
+        proofProducers: {
+          implementation: { deviceId: " implementation-device " },
+          validation: { deviceId: "validation-device" },
+          review: { deviceId: "review-device" },
+          delivery: { deviceId: "delivery-device" },
+        },
+      }),
+    ).toContain("proofProducers.invalid");
+  });
+
+  it("rejects unknown schemas, modes, and malformed authority references", () => {
+    expect(
+      missingGovernedContractFoundationFields({
+        ...contract,
+        schema: "openclaw.governed_mission_contract.v2",
+        mode: "observe",
+        authorityRefs: [null],
+      } as unknown as GovernedMissionContract),
+    ).toEqual(
+      expect.arrayContaining(["schema.unsupported", "mode.unsupported", "authorityRefs.0.invalid"]),
+    );
   });
 
   it("defines the required failure and governed wait states", () => {
@@ -69,8 +115,11 @@ describe("governed mission contract foundation", () => {
       ]),
     );
     expect(GOVERNED_MISSION_LOCK_STATES).toEqual([
-      "GOVERNED_MISSION_PENDING_OVERRIDE",
-      "AWAITING_CLOSEOUT",
+      "pending_override",
+      "closeout_ready",
+      "artifact_verified",
+      "terminal_pending_watchdog",
+      "released",
     ]);
   });
 
@@ -89,15 +138,10 @@ describe("governed mission contract foundation", () => {
         "missionId",
         "authorityRefs",
         "requiredReceiptKinds.policy_decision",
-        "requiredReceiptKinds.tool_call",
-        "requiredReceiptKinds.exec_call",
         "requiredReceiptKinds.evidence",
-        "requiredReceiptKinds.violation",
         "requiredReceiptKinds.supervisor",
         "requiredReceiptKinds.closeout",
         "requiredReceiptKinds.release",
-        "requiredReceiptKinds.override",
-        "requiredReceiptKinds.rollback",
       ]),
     );
   });

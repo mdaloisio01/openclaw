@@ -2,9 +2,11 @@ import { createHash } from "node:crypto";
 import { logDebug, logError } from "../logger.js";
 import { redactToolDetail } from "../logging/redact.js";
 import { isPlainObject } from "../utils.js";
+import { beginActiveToolExecution } from "./active-tool-execution-tracker.js";
 import type { HookContext } from "./agent-tools.before-tool-call.js";
 import {
   buildBlockedToolResult,
+  isExternalAgentTool,
   isToolWrappedWithBeforeToolCallHook,
   isBeforeToolCallBlockedError,
   recordAdjustedParamsForToolCall,
@@ -328,6 +330,9 @@ export function toToolDefinitions(
       parameters: tool.parameters,
       execute: async (...args: ToolExecuteArgs): Promise<AgentToolResult<unknown>> => {
         const { toolCallId, params, onUpdate, signal } = splitToolExecuteArgs(args);
+        const finishActiveExecution = beforeHookWrapped
+          ? undefined
+          : beginActiveToolExecution(hookContext?.runId, toolCallId);
         let executeParams = params;
         try {
           if (!beforeHookWrapped) {
@@ -339,6 +344,7 @@ export function toToolDefinitions(
               ...hookMetadata,
               toolCallId,
               ctx: hookContext,
+              externalTool: isExternalAgentTool(tool),
             });
             if (hookOutcome.blocked) {
               if (hookOutcome.kind === "veto") {
@@ -388,6 +394,8 @@ export function toToolDefinitions(
             toolName: normalizedName,
             message: described.message,
           });
+        } finally {
+          finishActiveExecution?.();
         }
       },
     } satisfies ToolDefinition;
@@ -452,6 +460,7 @@ export function toClientToolDefinitions(
             params: initialParamsRecord,
             toolCallId,
             ctx: hookContext,
+            clientHostedExecution: true,
           });
           if (outcome.blocked) {
             if (onClientToolCall && typeof onClientToolCall !== "function") {

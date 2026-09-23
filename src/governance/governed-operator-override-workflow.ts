@@ -24,6 +24,22 @@ export const GOVERNED_OPERATOR_OVERRIDE_WORKFLOW_VERSION = "governed-operator-ov
 
 export type GovernedOperatorOverrideWorkflowDecisionStatus = "pending" | "approved" | "denied";
 
+const OVERRIDE_ELIGIBLE_STATES = new Set<GovernedMissionState["currentGovernedState"]>([
+  "executing",
+  "waiting",
+  "blocked",
+  "repair_required",
+]);
+
+type PendingOverrideState = {
+  schema: "openclaw.governed_operator_override_workflow_state.v1";
+  overrideId: string;
+  decision: "pending";
+  resumeState: GovernedMissionState["currentGovernedState"];
+  resumeStep: string;
+  updatedAt: string;
+};
+
 export type GovernedOperatorOverrideWorkflowInput = {
   record: GovernedMissionTaskFlowRecord;
   contract: GovernedMissionContract;
@@ -70,6 +86,8 @@ export type GovernedOperatorOverrideWorkflowDecision =
         | "operator_approval_denied"
         | "missing_approver_ref"
         | "contract_state_mismatch"
+        | "override_state_not_eligible"
+        | "override_not_pending"
         | "invalid_operator_override";
       override?: GovernedOperatorOverrideRecord;
       receipt: OverrideReceipt;
@@ -87,9 +105,21 @@ export function decideGovernedOperatorOverrideWorkflow(
   }
 
   if (input.decisionStatus === "pending") {
+    if (!OVERRIDE_ELIGIBLE_STATES.has(missionState.currentGovernedState)) {
+      const receipt = buildOverrideReceipt(input, false, missionState);
+      return denied(input, missionState, receipt, "override_state_not_eligible");
+    }
+    const pendingWorkflow: PendingOverrideState = {
+      schema: "openclaw.governed_operator_override_workflow_state.v1",
+      overrideId: input.overrideId,
+      decision: "pending",
+      resumeState: missionState.currentGovernedState,
+      resumeStep: missionState.currentStep,
+      updatedAt: input.now,
+    };
     const pendingState = updateGovernedMissionState(missionState, {
       expectedRevision: missionState.revision,
-      currentGovernedState: "GOVERNED_MISSION_PENDING_OVERRIDE",
+      currentGovernedState: "pending_override",
       currentStep: "operator_override_pending",
       overrideRef: {
         overrideId: input.overrideId,
@@ -102,17 +132,25 @@ export function decideGovernedOperatorOverrideWorkflow(
       workflowVersion: GOVERNED_OPERATOR_OVERRIDE_WORKFLOW_VERSION,
       decision: "pending",
       reason: "operator_approval_pending",
-      patch: buildPatch(input.record, pendingState),
+      patch: buildPatch(input.record, pendingState, {
+        governedOperatorOverrideWorkflow: pendingWorkflow,
+      }),
     };
+  }
+
+  const pendingWorkflow = readPendingOverrideState(input.record, input.overrideId);
+  if (missionState.currentGovernedState !== "pending_override" || !pendingWorkflow) {
+    const receipt = buildOverrideReceipt(input, false, missionState);
+    return denied(input, missionState, receipt, "override_not_pending");
   }
 
   const approved = input.decisionStatus === "approved";
   const receipt = buildOverrideReceipt(input, approved, missionState);
   if (!approved) {
-    return denied(input, missionState, receipt, "operator_approval_denied");
+    return denied(input, missionState, receipt, "operator_approval_denied", {}, pendingWorkflow);
   }
   if (!input.approverRef) {
-    return denied(input, missionState, receipt, "missing_approver_ref");
+    return denied(input, missionState, receipt, "missing_approver_ref", {}, pendingWorkflow);
   }
 
   const override = buildOverrideRecord(input, receipt, missionState);
@@ -125,16 +163,23 @@ export function decideGovernedOperatorOverrideWorkflow(
     now: input.now,
   });
   if (!evaluatorDecision.valid) {
-    return denied(input, missionState, receipt, "invalid_operator_override", {
-      override,
-      evaluatorReason: evaluatorDecision.reason,
-    });
+    return denied(
+      input,
+      missionState,
+      receipt,
+      "invalid_operator_override",
+      {
+        override,
+        evaluatorReason: evaluatorDecision.reason,
+      },
+      pendingWorkflow,
+    );
   }
 
   const approvedState = updateGovernedMissionState(missionState, {
     expectedRevision: missionState.revision,
-    currentGovernedState: "GOVERNED_MISSION_ACTIVE",
-    currentStep: "operator_override_approved",
+    currentGovernedState: pendingWorkflow.resumeState,
+    currentStep: pendingWorkflow.resumeStep,
     overrideRef: {
       overrideId: input.overrideId,
       status: "approved",
@@ -169,17 +214,20 @@ function denied(
     override?: GovernedOperatorOverrideRecord;
     evaluatorReason?: string;
   } = {},
+  pendingWorkflow?: PendingOverrideState,
 ): GovernedOperatorOverrideWorkflowDecision {
-  const deniedState = updateGovernedMissionState(missionState, {
-    expectedRevision: missionState.revision,
-    currentGovernedState: "GOVERNED_MISSION_ACTIVE",
-    currentStep: "operator_override_denied",
-    overrideRef: {
-      overrideId: input.overrideId,
-      status: "denied",
-    },
-    now: input.now,
-  });
+  const deniedState = pendingWorkflow
+    ? updateGovernedMissionState(missionState, {
+        expectedRevision: missionState.revision,
+        currentGovernedState: pendingWorkflow.resumeState,
+        currentStep: pendingWorkflow.resumeStep,
+        overrideRef: {
+          overrideId: input.overrideId,
+          status: "denied",
+        },
+        now: input.now,
+      })
+    : missionState;
   return {
     schema: "openclaw.governed_operator_override_workflow_decision.v1",
     workflowVersion: GOVERNED_OPERATOR_OVERRIDE_WORKFLOW_VERSION,
@@ -199,6 +247,34 @@ function denied(
       },
     }),
   };
+}
+
+function readPendingOverrideState(
+  record: GovernedMissionTaskFlowRecord,
+  overrideId: string,
+): PendingOverrideState | null {
+  const stateJson = record.stateJson;
+  if (!stateJson || typeof stateJson !== "object" || Array.isArray(stateJson)) {
+    return null;
+  }
+  const value = stateJson.governedOperatorOverrideWorkflow;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  if (
+    value.schema !== "openclaw.governed_operator_override_workflow_state.v1" ||
+    value.overrideId !== overrideId ||
+    value.decision !== "pending" ||
+    typeof value.resumeState !== "string" ||
+    !OVERRIDE_ELIGIBLE_STATES.has(
+      value.resumeState as GovernedMissionState["currentGovernedState"],
+    ) ||
+    typeof value.resumeStep !== "string" ||
+    typeof value.updatedAt !== "string"
+  ) {
+    return null;
+  }
+  return value as PendingOverrideState;
 }
 
 function buildOverrideRecord(

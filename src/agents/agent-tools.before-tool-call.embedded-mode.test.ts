@@ -5,7 +5,10 @@ import type { HookRunner } from "../plugins/hooks.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { PluginApprovalResolutions } from "../plugins/types.js";
-import { runBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
+import {
+  runBeforeToolCallHook,
+  setDirtyTreeHygieneStatusReaderForTest,
+} from "./agent-tools.before-tool-call.js";
 import { callGatewayTool } from "./tools/gateway.js";
 
 vi.mock("../plugins/hook-runner-global.js", async () => {
@@ -64,6 +67,7 @@ describe("runBeforeToolCallHook — embedded mode approvals", () => {
   let runBeforeToolCallMock: ReturnType<typeof vi.fn<HookRunner["runBeforeToolCall"]>>;
 
   beforeEach(() => {
+    setDirtyTreeHygieneStatusReaderForTest(async () => "");
     runBeforeToolCallMock = vi.fn<HookRunner["runBeforeToolCall"]>();
     hookRunner = {
       hasHooks: vi.fn<HookRunner["hasHooks"]>().mockReturnValue(true),
@@ -75,6 +79,7 @@ describe("runBeforeToolCallHook — embedded mode approvals", () => {
   });
 
   afterEach(() => {
+    setDirtyTreeHygieneStatusReaderForTest();
     setEmbeddedMode(false);
     setActivePluginRegistry(createEmptyPluginRegistry());
   });
@@ -392,6 +397,122 @@ describe("runBeforeToolCallHook — embedded mode approvals", () => {
       expect(adjustedApprovalCall.request.toolCallId).toBe("call-skill-hook-apply");
       expect(runBeforeToolCallMock).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("vetoes governed skill_workshop mutation before requesting approval", async () => {
+    mockCallGatewayTool.mockResolvedValueOnce({
+      id: "unreachable-governed-approval",
+      decision: PluginApprovalResolutions.ALLOW_ONCE,
+    });
+
+    const result = await runBeforeToolCallHook({
+      toolName: "skill_workshop",
+      params: { action: "apply", proposal_id: "weather-20260530-a1b2c3d4e5" },
+      toolCallId: "call-governed-skill-apply",
+      ctx: {
+        agentId: "main",
+        sessionKey: "agent:main:governed-skill-workshop",
+        runId: "run-governed-skill-workshop",
+        config: { skills: { workshop: { approvalPolicy: "pending" } } },
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "execute",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+      params: { action: "apply", proposal_id: "weather-20260530-a1b2c3d4e5" },
+    });
+    expect(mockCallGatewayTool).not.toHaveBeenCalled();
+    expect(runBeforeToolCallMock).not.toHaveBeenCalled();
+  });
+
+  it("records governed authorization only after trusted approval succeeds", async () => {
+    const registry = createEmptyPluginRegistry();
+    registry.trustedToolPolicies = [
+      {
+        pluginId: "trusted-policy",
+        pluginName: "Trusted Policy",
+        source: "test",
+        policy: {
+          id: "governed-approval-policy",
+          description: "Require approval for a governed safe call",
+          evaluate: () => ({
+            requireApproval: {
+              pluginId: "trusted-policy",
+              title: "Governed tool approval",
+              description: "Approve the governed safe call",
+            },
+          }),
+        },
+      },
+    ];
+    setActivePluginRegistry(registry);
+    (hookRunner.hasHooks as ReturnType<typeof vi.fn>).mockReturnValue(false);
+    const onDecision = vi.fn();
+    const ctx = {
+      agentId: "main",
+      sessionKey: "agent:main:governed-approval",
+      runId: "run-governed-approval",
+      governedMissionToolEnforcement: {
+        active: true,
+        conversationClassification: "governed" as const,
+        expectedCurrentStep: "execute",
+        trustedHostPolicy: {
+          trustedHost: true,
+          openclawAllows: true,
+          osAllows: true,
+          hostAllows: true,
+        },
+        onDecision,
+      },
+    };
+
+    mockCallGatewayTool.mockResolvedValueOnce({
+      id: "governed-approval-denied",
+      decision: PluginApprovalResolutions.DENY,
+    });
+    const denied = await runBeforeToolCallHook({
+      toolName: "nodes",
+      params: { action: "status" },
+      toolCallId: "call-governed-approval-denied",
+      ctx,
+    });
+    expect(denied).toMatchObject({ blocked: true, deniedReason: "plugin-approval" });
+    expect(onDecision).not.toHaveBeenCalled();
+
+    mockCallGatewayTool.mockResolvedValueOnce({
+      id: "governed-approval-allowed",
+      decision: PluginApprovalResolutions.ALLOW_ONCE,
+    });
+    const allowed = await runBeforeToolCallHook({
+      toolName: "nodes",
+      params: { action: "status" },
+      toolCallId: "call-governed-approval-allowed",
+      ctx,
+    });
+    expect(allowed).toMatchObject({ blocked: false });
+    expect(onDecision).toHaveBeenCalledTimes(1);
+    expect(onDecision).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: "ALLOW" }),
+      expect.objectContaining({
+        toolCallId: "call-governed-approval-allowed",
+        toolName: "nodes",
+        params: { action: "status" },
+      }),
+    );
+    expect(runBeforeToolCallMock).not.toHaveBeenCalled();
   });
 
   it("runs trusted policies before skill_workshop lifecycle approval", async () => {

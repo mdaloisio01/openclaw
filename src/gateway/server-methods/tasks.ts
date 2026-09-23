@@ -9,11 +9,21 @@ import {
   validateTasksGetParams,
   validateTasksListParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { waitForAgentRun } from "../../agents/run-wait.js";
 import {
   createActiveProductionDispatchReceipt,
   evaluateActiveProductionFinality,
 } from "../../continuity/active-production-continuation-controller.js";
+import { readGovernedWorkspaceSkillSha256 } from "../../governance/governed-mission-identity.js";
+import { admitGovernedProductionFlow } from "../../governance/governed-mission-production-admission.js";
+import {
+  commitGovernedMissionChildCompletion,
+  isGovernedMissionFlowClaimed,
+  isGovernedMissionStateCanonicallyPersisted,
+  readPinnedGovernedMissionContract,
+} from "../../governance/governed-mission-runtime.js";
+import { readGovernedMissionStateFromTaskFlow } from "../../governance/governed-mission-state.js";
 import { runRuntimeAssetGuardPreflight } from "../../infra/runtime-asset-guard-preflight.js";
 import { parseAgentSessionKey } from "../../routing/session-key.js";
 import {
@@ -24,8 +34,12 @@ import {
 import { handleBuildIssueAction } from "../../tasks/build-issue-controller.js";
 import { cancelDetachedTaskRunById } from "../../tasks/detached-task-runtime.js";
 import {
+  computeProductionExecutorAssignmentSha256,
+  getProductionExecutorAssignment,
+  isProductionExecutorAssignmentCurrentGovernedAttempt,
   parseProductionExecutorAssignmentAuthority,
   recordProductionExecutorAssignment,
+  productionProofPurposeSchema,
 } from "../../tasks/production-executor-assignment.js";
 import {
   evaluateProductionOwnerLaneGuard,
@@ -38,13 +52,12 @@ import {
   listTasksForFlowId,
 } from "../../tasks/runtime-internal.js";
 import {
-  completeTaskRunByRunId,
-  failTaskRunByRunId,
-  finalizeTaskRunByRunId,
-  recordTaskRunProgressByRunId,
+  finalizeTaskRunById,
+  recordTaskRunProgressById,
   runTaskInFlowForOwner,
 } from "../../tasks/task-executor.js";
 import type { ProductionContinuationStopReason } from "../../tasks/task-flow-registry.js";
+import type { TaskFlowRecord } from "../../tasks/task-flow-registry.types.js";
 import {
   createManagedTaskFlow,
   finishFlow,
@@ -57,6 +70,7 @@ import {
   resumeFlow,
 } from "../../tasks/task-flow-runtime-internal.js";
 import type {
+  TaskDeliveryState,
   TaskDeliveryStatus,
   TaskNotifyPolicy,
   TaskRecord,
@@ -69,6 +83,7 @@ import {
   sanitizeTaskStatusText,
 } from "../../tasks/task-status.js";
 import { invokeGatewayTool } from "../tools-invoke-shared.js";
+import { governedTasksHandlers } from "./tasks-governance.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 
 const DEFAULT_TASKS_LIST_LIMIT = 100;
@@ -385,6 +400,12 @@ function resolveProductionChildTaskForMutation(input: Record<string, unknown>):
   if (!runId.ok) {
     return { ok: false, message: runId.message };
   }
+  const taskId = optionalStringField(input.taskId);
+  const runtime = input.runtime === undefined ? undefined : readTaskRuntime(input.runtime);
+  if (input.runtime !== undefined && !runtime) {
+    return { ok: false, message: "child_task_scope_invalid: valid runtime is required" };
+  }
+  const sessionKey = optionalStringField(input.sessionKey);
   const flow = resolveTaskFlowForLookupToken(lookup.value);
   if (!flow) {
     return {
@@ -399,11 +420,34 @@ function resolveProductionChildTaskForMutation(input: Record<string, unknown>):
       message: `child_task_parent_flow_invalid: TaskFlow is not a managed production TaskFlow: ${flow.flowId}`,
     };
   }
-  const task = listTasksForFlowId(flow.flowId).find((candidate) => candidate.runId === runId.value);
+  let task: TaskRecord | undefined;
+  let ambiguous = false;
+  for (const candidate of listTasksForFlowId(flow.flowId)) {
+    if (
+      candidate.runId !== runId.value ||
+      (taskId && candidate.taskId !== taskId) ||
+      (runtime && candidate.runtime !== runtime) ||
+      (sessionKey && candidate.childSessionKey !== sessionKey)
+    ) {
+      continue;
+    }
+    if (task) {
+      ambiguous = true;
+      break;
+    }
+    task = candidate;
+  }
   if (!task) {
     return {
       ok: false,
       message: `child_task_not_found_for_parent_flow: ${runId.value}`,
+    };
+  }
+  if (ambiguous) {
+    return {
+      ok: false,
+      message:
+        "child_task_scope_ambiguous: more than one child matches this run scope; taskId is required",
     };
   }
   return { ok: true, flow, runId: runId.value, task };
@@ -489,6 +533,7 @@ function parseCursor(cursor: string | undefined): number | null {
 // Control UI task methods expose the stable gateway protocol shape; helpers
 // above keep runtime registry details out of the wire result.
 export const tasksHandlers: GatewayRequestHandlers = {
+  ...governedTasksHandlers,
   "tasks.handleBuildIssue": async ({ params, respond, context }) => {
     const cfg = context.getRuntimeConfig();
     try {
@@ -607,7 +652,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
       ...(result.task ? { task: mapTaskSummary(result.task) } : {}),
     });
   },
-  "tasks.startProductionFlow": ({ params, respond }) => {
+  "tasks.startProductionFlow": ({ params, respond, context }) => {
     const input = params && typeof params === "object" ? params : {};
     const required = [
       "ownerKey",
@@ -654,32 +699,100 @@ export const tasksHandlers: GatewayRequestHandlers = {
       return;
     }
     const now = Date.now();
+    const stateJson = {
+      kind: PRODUCTION_FLOW_KIND,
+      sliceId: fields.sliceId,
+      sliceOwner: fields.sliceOwner,
+      authorityPath: fields.authorityPath,
+      authorityBasis: fields.authorityBasis,
+      buildItem: fields.buildItem,
+      requiredOwnerLane: fields.requiredOwnerLane,
+      attemptedOwnerLane: fields.attemptedOwnerLane,
+      attemptedExecutor: fields.attemptedExecutor,
+      executorRole: fields.executorRole,
+      lawfulRouteRequired: fields.lawfulRouteRequired,
+      ownerLaneGuard: ownerLaneGuard.details,
+      blockers: readStringArrayParam(input.blockers),
+    };
+    const currentStep = optionalStringField(input.currentStep) ?? "production_slice_started";
+    if (input.governedMission !== undefined) {
+      const cfg = context.getRuntimeConfig();
+      const agentId = parseAgentSessionKey(fields.ownerKey)?.agentId ?? resolveDefaultAgentId(cfg);
+      const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+      const admission = admitGovernedProductionFlow(
+        {
+          ownerKey: fields.ownerKey,
+          controllerId: fields.controllerId,
+          goal: fields.goal,
+          authorityPath: fields.authorityPath,
+          artifactRoot: workspaceDir,
+          currentStep,
+          stateJson,
+          governedMission: input.governedMission,
+          observedSkillSha256: readGovernedWorkspaceSkillSha256({
+            workspaceDir,
+            config: cfg,
+            agentId,
+          }),
+          now,
+        },
+        context.governedRuntimeIdentity,
+      );
+      if (admission.status === "admitted") {
+        respond(true, {
+          flow: admission.flow,
+          governedAdmissionReceipt: admission.receipt,
+        });
+        return;
+      }
+      if (admission.status === "already_applied" && admission.flow) {
+        respond(true, {
+          flow: admission.flow,
+          governedAdmissionReceipt: admission.receipt,
+        });
+        return;
+      }
+      if (admission.status === "already_applied") {
+        if (admission.receipt.decision === "denied") {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.INVALID_REQUEST,
+              `governed admission denied: ${admission.receipt.reasonCode ?? "GOVERNED_ADMISSION_DENIED"}`,
+            ),
+          );
+          return;
+        }
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.UNAVAILABLE, "governed admission flow is unavailable"),
+        );
+        return;
+      }
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          `governed admission denied: ${admission.reasonCode}`,
+        ),
+      );
+      return;
+    }
     const flow = createManagedTaskFlow({
       ownerKey: fields.ownerKey,
       controllerId: fields.controllerId,
       goal: fields.goal,
       status: "running",
       notifyPolicy: "done_only",
-      currentStep: optionalStringField(input.currentStep) ?? "production_slice_started",
+      currentStep,
       continuation: {
         activeProductionRun: true,
         parentRunOpen: true,
       },
-      stateJson: {
-        kind: PRODUCTION_FLOW_KIND,
-        sliceId: fields.sliceId,
-        sliceOwner: fields.sliceOwner,
-        authorityPath: fields.authorityPath,
-        authorityBasis: fields.authorityBasis,
-        buildItem: fields.buildItem,
-        requiredOwnerLane: fields.requiredOwnerLane,
-        attemptedOwnerLane: fields.attemptedOwnerLane,
-        attemptedExecutor: fields.attemptedExecutor,
-        executorRole: fields.executorRole,
-        lawfulRouteRequired: fields.lawfulRouteRequired,
-        ownerLaneGuard: ownerLaneGuard.details,
-        blockers: readStringArrayParam(input.blockers),
-      },
+      stateJson,
       createdAt: now,
       updatedAt: now,
     });
@@ -761,7 +874,7 @@ export const tasksHandlers: GatewayRequestHandlers = {
     }
     respond(true, { flow: resumed.flow });
   },
-  "tasks.runTaskInFlow": ({ params, respond }) => {
+  "tasks.runTaskInFlow": ({ params, respond, client }) => {
     const input = params && typeof params === "object" ? params : {};
     const required = [
       "lookup",
@@ -821,6 +934,21 @@ export const tasksHandlers: GatewayRequestHandlers = {
         errorShape(
           ErrorCodes.INVALID_REQUEST,
           `child_task_parent_flow_invalid: parent TaskFlow must be managed and running: ${flow.flowId}`,
+        ),
+      );
+      return;
+    }
+    const governedMission = readGovernedMissionStateFromTaskFlow(flow);
+    if (
+      isGovernedMissionFlowClaimed(flow) &&
+      (!governedMission || !isGovernedMissionStateCanonicallyPersisted(flow, governedMission))
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "governed_child_task_flow_untrusted: repair the canonical governed mission state before dispatch",
         ),
       );
       return;
@@ -893,6 +1021,45 @@ export const tasksHandlers: GatewayRequestHandlers = {
       return;
     }
     const now = Date.now();
+    const producerDeviceId = client?.connect.device?.id?.trim();
+    if (governedMission && (!client?.isDeviceTokenAuth || !producerDeviceId)) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "governed_child_task_requires_authenticated_device: governed proof work must be dispatched by a paired device token",
+        ),
+      );
+      return;
+    }
+    const proofPurpose = productionProofPurposeSchema.safeParse(input.proofPurpose);
+    if (governedMission && !proofPurpose.success) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "governed_child_task_proof_purpose_invalid: choose implementation, validation, review, or delivery",
+        ),
+      );
+      return;
+    }
+    if (governedMission && proofPurpose.success) {
+      const designatedDeviceId =
+        readPinnedGovernedMissionContract(flow)?.proofProducers?.[proofPurpose.data].deviceId;
+      if (!designatedDeviceId || producerDeviceId !== designatedDeviceId) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "governed_child_task_producer_unauthorized: paired device does not match the contract-pinned proof producer",
+          ),
+        );
+        return;
+      }
+    }
     const runId =
       optionalStringField(input.runId) ?? `${flow.flowId}:${fields.attemptedExecutor}:${now}`;
     const childSessionKey = optionalStringField(input.childSessionKey);
@@ -923,6 +1090,27 @@ export const tasksHandlers: GatewayRequestHandlers = {
       );
       return;
     }
+    const recordAssignment = (
+      task: TaskRecord,
+      taskDeliveryState?: TaskDeliveryState,
+    ): ReturnType<typeof recordProductionExecutorAssignment> =>
+      recordProductionExecutorAssignment({
+        flowId: flow.flowId,
+        taskId: task.taskId,
+        expectedRunId: runId,
+        executorId: fields.attemptedExecutor,
+        ...(producerDeviceId ? { producerDeviceId } : {}),
+        ownerLane: fields.attemptedOwnerLane,
+        ...(proofPurpose.success ? { proofPurpose: proofPurpose.data } : {}),
+        role: assignmentAuthority.role,
+        permitted: assignmentAuthority.permitted,
+        prohibited: assignmentAuthority.prohibited,
+        evidenceRefs: [fields.workPacketRef, fields.handoffRef],
+        assignedAt: now,
+        ...(governedMission ? { taskUpdate: task } : {}),
+        ...(governedMission && taskDeliveryState ? { taskDeliveryState } : {}),
+      });
+    let assignment: ReturnType<typeof recordProductionExecutorAssignment> | undefined;
     const child = runTaskInFlowForOwner({
       callerOwnerKey: flow.ownerKey,
       flowId: flow.flowId,
@@ -935,41 +1123,93 @@ export const tasksHandlers: GatewayRequestHandlers = {
       label: optionalStringField(input.label) ?? fields.buildItem,
       task: fields.task,
       notifyPolicy: readTaskNotifyPolicy(input.notifyPolicy),
-      deliveryStatus: readTaskDeliveryStatus(input.deliveryStatus) ?? "pending",
+      // Governed proof delivery is server-observed evidence. Never let the
+      // dispatching producer preseed a successful delivery assertion.
+      deliveryStatus: governedMission
+        ? "pending"
+        : (readTaskDeliveryStatus(input.deliveryStatus) ?? "pending"),
       status: input.status === "running" ? "running" : "queued",
       startedAt: input.status === "running" ? now : undefined,
       lastEventAt: now,
       progressSummary: optionalStringField(input.progressSummary),
       preferMetadata: input.preferMetadata === true,
+      ...(governedMission
+        ? {
+            persistTask: (task: TaskRecord, taskDeliveryState?: TaskDeliveryState) => {
+              assignment = recordAssignment(task, taskDeliveryState);
+              return assignment.applied;
+            },
+          }
+        : {}),
     });
     if (!child.created || !child.task) {
+      const assignmentFailure = assignment && !assignment.applied ? assignment.reason : undefined;
       respond(
         false,
         undefined,
-        errorShape(ErrorCodes.UNAVAILABLE, `child_task_dispatch_not_authorized: ${child.reason}`),
+        errorShape(
+          ErrorCodes.UNAVAILABLE,
+          assignmentFailure
+            ? `child_task_assignment_persist_failed: ${assignmentFailure}`
+            : `child_task_dispatch_not_authorized: ${child.reason}`,
+        ),
       );
       return;
     }
+    const governedChildCreatedByRequest = Boolean(governedMission && assignment);
     const backingSession = validateProductionChildBackingSession(child.task);
     if (!backingSession.ok) {
-      deleteTaskRecordById(child.task.taskId);
+      if (!governedMission || governedChildCreatedByRequest) {
+        deleteTaskRecordById(child.task.taskId);
+      }
       respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, backingSession.message));
       return;
     }
+    if (governedMission && !assignment) {
+      const persistedFlow = getTaskFlowById(flow.flowId);
+      const persistedAssignment = persistedFlow
+        ? getProductionExecutorAssignment(persistedFlow, child.task.taskId)
+        : undefined;
+      const matchesRequest = Boolean(
+        persistedFlow &&
+        persistedAssignment &&
+        persistedAssignment.expectedRunId === runId &&
+        persistedAssignment.executorId === fields.attemptedExecutor &&
+        persistedAssignment.producerDeviceId === producerDeviceId &&
+        persistedAssignment.ownerLane === fields.attemptedOwnerLane &&
+        persistedAssignment.proofPurpose === proofPurpose.data &&
+        persistedAssignment.role === assignmentAuthority.role &&
+        JSON.stringify(persistedAssignment.permitted) ===
+          JSON.stringify(assignmentAuthority.permitted) &&
+        JSON.stringify(persistedAssignment.prohibited) ===
+          JSON.stringify(assignmentAuthority.prohibited) &&
+        JSON.stringify(persistedAssignment.evidenceRefs) ===
+          JSON.stringify([fields.workPacketRef, fields.handoffRef]) &&
+        child.task.task === fields.task &&
+        child.task.label === (optionalStringField(input.label) ?? fields.buildItem) &&
+        isProductionExecutorAssignmentCurrentGovernedAttempt({
+          flow: persistedFlow,
+          assignment: persistedAssignment,
+        }),
+      );
+      if (!persistedFlow || !persistedAssignment || !matchesRequest) {
+        // A deduplicated task belongs to the original request. Never rewrite its
+        // immutable authority receipt or compensate work this retry did not create.
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "governed_child_task_idempotency_conflict: the existing run has different or stale executor authority",
+          ),
+        );
+        return;
+      }
+      assignment = { applied: true, assignment: persistedAssignment, flow: persistedFlow };
+    }
     // Child assignment is the authority boundary. Commit it to flow state before
     // returning execution proof so later routing never trusts request assertions.
-    const assignment = recordProductionExecutorAssignment({
-      flowId: flow.flowId,
-      taskId: child.task.taskId,
-      expectedRunId: runId,
-      executorId: fields.attemptedExecutor,
-      ownerLane: fields.attemptedOwnerLane,
-      role: assignmentAuthority.role,
-      permitted: assignmentAuthority.permitted,
-      prohibited: assignmentAuthority.prohibited,
-      evidenceRefs: [fields.workPacketRef, fields.handoffRef],
-      assignedAt: now,
-    });
+    assignment ??= recordAssignment(child.task);
     if (!assignment.applied) {
       // Registration is not complete without its authority record. Remove the
       // exact child so a retry cannot leave or duplicate unassigned execution.
@@ -1007,12 +1247,69 @@ export const tasksHandlers: GatewayRequestHandlers = {
       executorIdentityProof: proof,
     });
   },
-  "tasks.recordTaskInFlowProgress": ({ params, respond }) => {
+  "tasks.recordTaskInFlowProgress": ({ params, respond, client }) => {
     const input = params && typeof params === "object" ? params : {};
     const resolved = resolveProductionChildTaskForMutation(input);
     if (!resolved.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, resolved.message));
       return;
+    }
+    const governedState = readGovernedMissionStateFromTaskFlow(resolved.flow);
+    if (
+      isGovernedMissionFlowClaimed(resolved.flow) &&
+      (!governedState || !isGovernedMissionStateCanonicallyPersisted(resolved.flow, governedState))
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "governed_child_task_flow_untrusted: repair the canonical governed mission state before recording progress",
+        ),
+      );
+      return;
+    }
+    if (governedState) {
+      const governedAssignment = getProductionExecutorAssignment(
+        resolved.flow,
+        resolved.task.taskId,
+      );
+      const callerDeviceId = client?.connect.device?.id?.trim();
+      if (
+        !client?.isDeviceTokenAuth ||
+        !callerDeviceId ||
+        !governedAssignment ||
+        governedAssignment.producerDeviceId !== callerDeviceId ||
+        !governedAssignment.governedAttemptReceiptId ||
+        !isProductionExecutorAssignmentCurrentGovernedAttempt({
+          flow: resolved.flow,
+          assignment: governedAssignment,
+        })
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "governed_child_task_progress_owner_mismatch: progress requires the current assigned paired device token",
+          ),
+        );
+        return;
+      }
+      if (
+        (resolved.task.status !== "queued" && resolved.task.status !== "running") ||
+        resolved.task.missionState === "abandoned"
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "governed_child_task_progress_not_active: progress requires an active governed child",
+          ),
+        );
+        return;
+      }
     }
     const backingSession = validateProductionChildBackingSession(resolved.task);
     if (!backingSession.ok) {
@@ -1020,17 +1317,12 @@ export const tasksHandlers: GatewayRequestHandlers = {
       return;
     }
     const now = Date.now();
-    const updated = recordTaskRunProgressByRunId({
-      runId: resolved.runId,
-      runtime: readTaskRuntime(input.runtime),
-      sessionKey: optionalStringField(input.sessionKey) ?? backingSession.childSessionKey,
+    const task = recordTaskRunProgressById({
+      taskId: resolved.task.taskId,
       lastEventAt: now,
       progressSummary: optionalStringField(input.progressSummary),
       eventSummary: optionalStringField(input.eventSummary),
     });
-    const task =
-      updated.find((candidate) => candidate.taskId === resolved.task.taskId) ??
-      getTaskById(resolved.task.taskId);
     if (!task) {
       respond(
         false,
@@ -1044,14 +1336,57 @@ export const tasksHandlers: GatewayRequestHandlers = {
       task: mapTaskSummary(task),
     });
   },
-  "tasks.completeTaskInFlow": ({ params, respond }) => {
+  "tasks.completeTaskInFlow": ({ params, respond, client }) => {
     const input = params && typeof params === "object" ? params : {};
     const resolved = resolveProductionChildTaskForMutation(input);
     if (!resolved.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, resolved.message));
       return;
     }
+    const governedState = readGovernedMissionStateFromTaskFlow(resolved.flow);
+    if (
+      isGovernedMissionFlowClaimed(resolved.flow) &&
+      (!governedState || !isGovernedMissionStateCanonicallyPersisted(resolved.flow, governedState))
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.INVALID_REQUEST,
+          "governed_child_task_flow_untrusted: repair the canonical governed mission state before completion",
+        ),
+      );
+      return;
+    }
+    const governedAssignment = governedState
+      ? getProductionExecutorAssignment(resolved.flow, resolved.task.taskId)
+      : undefined;
+    const governedAttemptReceiptId = governedAssignment?.governedAttemptReceiptId;
+    const callerDeviceId = client?.connect.device?.id?.trim();
     const status = optionalStringField(input.status) ?? "succeeded";
+    if (governedState) {
+      if (
+        !client?.isDeviceTokenAuth ||
+        !callerDeviceId ||
+        governedAssignment?.producerDeviceId !== callerDeviceId ||
+        (status === "succeeded" &&
+          (!governedAttemptReceiptId ||
+            !isProductionExecutorAssignmentCurrentGovernedAttempt({
+              flow: resolved.flow,
+              assignment: governedAssignment,
+            })))
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "governed_child_task_completion_owner_mismatch: completion requires the dispatching paired device token",
+          ),
+        );
+        return;
+      }
+    }
     const backingSession = validateProductionChildBackingSession(resolved.task);
     if (status === "succeeded" && !backingSession.ok) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, backingSession.message));
@@ -1093,34 +1428,109 @@ export const tasksHandlers: GatewayRequestHandlers = {
       }
     }
     const common = {
-      runId: resolved.runId,
-      runtime: readTaskRuntime(input.runtime),
-      sessionKey:
-        optionalStringField(input.sessionKey) ??
-        (backingSession.ok ? backingSession.childSessionKey : undefined),
+      taskId: resolved.task.taskId,
       endedAt: now,
       lastEventAt: now,
+      // The contract-pinned paired device was authenticated above. Its successful
+      // completion is the server-observed delivery acknowledgment for this exact proof.
+      ...(status === "succeeded" && governedState ? { deliveryStatus: "delivered" as const } : {}),
       progressSummary: optionalStringField(input.progressSummary),
       terminalSummary: optionalStringField(input.terminalSummary),
     };
-    const updated =
+    let governedContinuationFlow: TaskFlowRecord | undefined;
+    let governedCompletionReplayFlow: TaskFlowRecord | undefined;
+    let governedContinuationFailure: string | undefined;
+    const terminalStatus =
       status === "succeeded"
-        ? completeTaskRunByRunId(common)
-        : status === "blocked" || status === "rejected"
-          ? finalizeTaskRunByRunId({
-              ...common,
-              status: "failed",
-              error: optionalStringField(input.error) ?? status,
-              terminalOutcome: "blocked",
-            })
-          : status === "failed" || status === "timed_out" || status === "cancelled"
-            ? failTaskRunByRunId({
-                ...common,
-                status,
-                error: optionalStringField(input.error),
-              })
+        ? "succeeded"
+        : status === "blocked" || status === "rejected" || status === "failed"
+          ? "failed"
+          : status === "timed_out" || status === "cancelled"
+            ? status
             : null;
-    if (!updated) {
+    const task = terminalStatus
+      ? finalizeTaskRunById(
+          {
+            ...common,
+            status: terminalStatus,
+            ...(status === "blocked" || status === "rejected"
+              ? {
+                  error: optionalStringField(input.error) ?? status,
+                  terminalOutcome: "blocked" as const,
+                }
+              : status === "failed" || status === "timed_out" || status === "cancelled"
+                ? { error: optionalStringField(input.error) }
+                : {}),
+          },
+          status === "succeeded" &&
+            governedState &&
+            governedAssignment &&
+            governedAttemptReceiptId &&
+            callerDeviceId
+            ? {
+                persist: (taskUpdate) => {
+                  const launched = commitGovernedMissionChildCompletion({
+                    flowId: resolved.flow.flowId,
+                    expectedFlowRevision: resolved.flow.revision,
+                    producerDeviceId: callerDeviceId,
+                    governedAttemptReceiptId,
+                    assignmentSha256: computeProductionExecutorAssignmentSha256(governedAssignment),
+                    ...(nextExecutableLaunch
+                      ? {
+                          nextExecutableLaunch: {
+                            detail: nextExecutableLaunch.detail,
+                            currentStep:
+                              nextExecutableLaunch.currentStep ?? resolved.flow.currentStep,
+                          },
+                        }
+                      : {}),
+                    occurredAt: now,
+                    taskUpdate,
+                  });
+                  if (!launched.applied) {
+                    if (launched.reason === "already_applied") {
+                      governedCompletionReplayFlow = launched.current;
+                      return false;
+                    }
+                    governedContinuationFailure = launched.reason;
+                    return false;
+                  }
+                  governedContinuationFlow = launched.flow;
+                  return true;
+                },
+                syncParentFlow: false,
+              }
+            : undefined,
+        )
+      : null;
+    if (governedCompletionReplayFlow) {
+      const canonicalTask = getTaskById(resolved.task.taskId);
+      if (canonicalTask?.status === "succeeded" && canonicalTask.deliveryStatus === "delivered") {
+        respond(true, {
+          flow: governedCompletionReplayFlow,
+          task: mapTaskSummary(canonicalTask),
+        });
+        return;
+      }
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.UNAVAILABLE, "child_task_completion_canonical_task_missing"),
+      );
+      return;
+    }
+    if (governedContinuationFailure) {
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.UNAVAILABLE,
+          `child_task_completion_continuation_launch_failed: ${governedContinuationFailure}`,
+        ),
+      );
+      return;
+    }
+    if (!terminalStatus) {
       respond(
         false,
         undefined,
@@ -1131,9 +1541,6 @@ export const tasksHandlers: GatewayRequestHandlers = {
       );
       return;
     }
-    const task =
-      updated.find((candidate) => candidate.taskId === resolved.task.taskId) ??
-      getTaskById(resolved.task.taskId);
     if (!task) {
       respond(
         false,
@@ -1144,25 +1551,29 @@ export const tasksHandlers: GatewayRequestHandlers = {
     }
     let flow = getTaskFlowById(resolved.flow.flowId) ?? resolved.flow;
     if (status === "succeeded" && nextExecutableLaunch) {
-      const launched = recordFlowNextExecutableLaunch({
-        flowId: flow.flowId,
-        expectedRevision: flow.revision,
-        detail: nextExecutableLaunch.detail,
-        currentStep: nextExecutableLaunch.currentStep ?? flow.currentStep,
-        updatedAt: now,
-      });
-      if (!launched.applied) {
-        respond(
-          false,
-          undefined,
-          errorShape(
-            ErrorCodes.UNAVAILABLE,
-            `child_task_completion_continuation_launch_failed: ${launched.reason}`,
-          ),
-        );
-        return;
+      if (governedContinuationFlow) {
+        flow = governedContinuationFlow;
+      } else {
+        const launched = recordFlowNextExecutableLaunch({
+          flowId: flow.flowId,
+          expectedRevision: flow.revision,
+          detail: nextExecutableLaunch.detail,
+          currentStep: nextExecutableLaunch.currentStep ?? flow.currentStep,
+          updatedAt: now,
+        });
+        if (!launched.applied) {
+          respond(
+            false,
+            undefined,
+            errorShape(
+              ErrorCodes.UNAVAILABLE,
+              `child_task_completion_continuation_launch_failed: ${launched.reason}`,
+            ),
+          );
+          return;
+        }
+        flow = launched.flow;
       }
-      flow = launched.flow;
     }
     respond(true, {
       flow,

@@ -1,4 +1,7 @@
-import type { GovernedMissionContract } from "./governed-mission-contract.js";
+import {
+  GOVERNED_MISSION_LOCK_STATES,
+  type GovernedMissionContract,
+} from "./governed-mission-contract.js";
 import type { GovernedMissionState } from "./governed-mission-state.js";
 import {
   evaluateGovernedOperatorOverride,
@@ -119,13 +122,29 @@ export function evaluateGovernedAction(
       context.enforcementHealth.reason ?? "repair_enforcement_health",
     ]);
   }
-  if (context.missionState.currentGovernedState === "GOVERNED_MISSION_BLOCKED") {
+  if (
+    context.missionState.currentGovernedState === "blocked" ||
+    context.missionState.currentGovernedState === "readmission_required" ||
+    context.missionState.currentGovernedState === "repair_required"
+  ) {
     return decision(base, "BLOCKED", context.missionState.blockedStatus, [
       "resolve_governed_mission_block",
     ]);
   }
   if (
-    context.missionState.currentGovernedState === "GOVERNED_MISSION_TERMINAL" &&
+    (GOVERNED_MISSION_LOCK_STATES as readonly string[]).includes(
+      context.missionState.currentGovernedState,
+    )
+  ) {
+    return decision(base, "BLOCKED", "GOVERNED_MISSION_LOCKED", [
+      "complete_current_governed_lock_step",
+    ]);
+  }
+  if (
+    (context.missionState.currentGovernedState === "failed" ||
+      context.missionState.currentGovernedState === "cancelled" ||
+      context.missionState.currentGovernedState === "lost" ||
+      context.missionState.currentGovernedState === "operator_stopped") &&
     context.missionState.terminalStatus !== "succeeded"
   ) {
     return decision(base, "BLOCKED", "TERMINAL_MISSION_NOT_EXECUTABLE", [

@@ -1,9 +1,15 @@
+import { readGovernedMissionStateFromTaskFlow } from "../governance/governed-mission-state.js";
 import { listTasksForFlowId } from "./runtime-internal.js";
 import {
   getTaskFlowProductionContinuation,
   getTaskFlowRegistryRestoreFailure,
   listTaskFlowRecords,
 } from "./task-flow-registry.js";
+import {
+  hasCanonicalGovernedMissionProvenanceFromSqlite,
+  hasGovernedMissionClaimForFlow,
+  hasGovernedMissionRepairReceiptFromSqlite,
+} from "./task-flow-registry.store.sqlite.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
 import type { TaskRecord } from "./task-registry.types.js";
 
@@ -18,7 +24,13 @@ export type TaskFlowAuditCode =
   | "missing_linked_tasks"
   | "blocked_task_missing"
   | "inconsistent_timestamps"
-  | "continuation_required_not_launched";
+  | "continuation_required_not_launched"
+  | "governed_admission_receipt_missing"
+  | "governed_state_malformed"
+  | "governed_flow_identity_mismatch"
+  | "governed_repair_required"
+  | "governed_terminal_proof_missing"
+  | "governed_release_inconsistent";
 
 export type TaskFlowAuditFinding = {
   severity: TaskFlowAuditSeverity;
@@ -142,6 +154,12 @@ export function createEmptyTaskFlowAuditSummary(): TaskFlowAuditSummary {
       blocked_task_missing: 0,
       inconsistent_timestamps: 0,
       continuation_required_not_launched: 0,
+      governed_admission_receipt_missing: 0,
+      governed_state_malformed: 0,
+      governed_flow_identity_mismatch: 0,
+      governed_repair_required: 0,
+      governed_terminal_proof_missing: 0,
+      governed_release_inconsistent: 0,
     },
   };
 }
@@ -307,6 +325,93 @@ export function listTaskFlowAuditFindings(
             "active production continuation requires the next executable unit to launch before this flow can pause or close",
         }),
       );
+    }
+
+    const governedState = readGovernedMissionStateFromTaskFlow(flow);
+    if (!governedState && hasGovernedMissionClaimForFlow(flow)) {
+      findings.push(
+        createFinding({
+          severity: "error",
+          code: "governed_state_malformed",
+          flow,
+          detail: "governed mission state is present but malformed and requires repair",
+        }),
+      );
+    }
+    if (governedState) {
+      if (governedState.ownerCorrelation.taskFlowId !== flow.flowId) {
+        findings.push(
+          createFinding({
+            severity: "error",
+            code: "governed_flow_identity_mismatch",
+            flow,
+            detail: "governed mission state is bound to a different TaskFlow identity",
+          }),
+        );
+      }
+      if (
+        !hasCanonicalGovernedMissionProvenanceFromSqlite({
+          flow,
+          missionId: governedState.missionId,
+        })
+      ) {
+        findings.push(
+          createFinding({
+            severity: "error",
+            code: "governed_admission_receipt_missing",
+            flow,
+            detail:
+              "governed mission state has no canonical SQLite admission and current-state provenance",
+          }),
+        );
+      }
+      const hasOpenRepairReceipt = hasGovernedMissionRepairReceiptFromSqlite({
+        flowId: flow.flowId,
+        resultingRevision: governedState.revision,
+      });
+      const canonicalRepairState =
+        governedState.currentGovernedState === "repair_required" ||
+        governedState.currentGovernedState === "readmission_required";
+      if (canonicalRepairState || hasOpenRepairReceipt) {
+        const detail = canonicalRepairState
+          ? `${governedState.currentGovernedState}: ${governedState.blockedStatus}`
+          : "current revision has an unresolved repair-required decision";
+        findings.push(
+          createFinding({
+            severity: "warn",
+            code: "governed_repair_required",
+            flow,
+            detail: `governed transition requires repair: ${detail}`,
+          }),
+        );
+      }
+      if (
+        governedState.currentGovernedState === "terminal_pending_watchdog" &&
+        governedState.proofs.postTerminalWatchdog !== "passed"
+      ) {
+        findings.push(
+          createFinding({
+            severity: "error",
+            code: "governed_terminal_proof_missing",
+            flow,
+            detail: "terminal-pending governed mission lacks fresh bound post-terminal proof",
+          }),
+        );
+      }
+      const governedReleaseComplete =
+        governedState.currentGovernedState === "released" &&
+        governedState.proofs.delivery !== "pending" &&
+        governedState.proofs.delivery !== "failed";
+      if (governedReleaseComplete !== (flow.status === "succeeded")) {
+        findings.push(
+          createFinding({
+            severity: "error",
+            code: "governed_release_inconsistent",
+            flow,
+            detail: "governed release state and TaskFlow terminal state disagree",
+          }),
+        );
+      }
     }
 
     const inconsistency = findTimestampInconsistency(flow);

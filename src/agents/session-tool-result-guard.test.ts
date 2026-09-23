@@ -80,6 +80,34 @@ function getToolResultText(messages: AgentMessage[]): string {
 }
 
 describe("installSessionToolResultGuard", () => {
+  it("blocks persistence when a runtime ownership gate claims the output", () => {
+    const sm = SessionManager.inMemory();
+    let governed = false;
+    installSessionToolResultGuard(sm, {
+      shouldBlockMessagePersistence: (message) => governed && message.role !== "user",
+    });
+
+    sm.appendMessage(asAppendMessage({ role: "user", content: "run governed work" }));
+    governed = true;
+    sm.appendMessage(
+      asAppendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "private final" }],
+      }),
+    );
+    sm.appendMessage(
+      asAppendMessage({
+        role: "toolResult",
+        toolCallId: "governed-call",
+        toolName: "read",
+        content: [{ type: "text", text: "private tool output" }],
+        isError: false,
+      }),
+    );
+
+    expectPersistedRoles(sm, ["user"]);
+  });
+
   it("inserts synthetic toolResult before non-tool message when pending", () => {
     const sm = SessionManager.inMemory();
     installSessionToolResultGuard(sm);
@@ -387,9 +415,7 @@ describe("installSessionToolResultGuard", () => {
     );
 
     const messages = expectPersistedRoles(sm, ["assistant", "assistant", "toolResult"]);
-    expect((messages[2] as { toolCallId?: string; isError?: boolean }).toolCallId).toBe(
-      "call_1",
-    );
+    expect((messages[2] as { toolCallId?: string; isError?: boolean }).toolCallId).toBe("call_1");
     expect((messages[2] as { isError?: boolean }).isError).toBe(false);
     expect(JSON.stringify(messages)).not.toContain("missing tool result");
     expect(guard.getPendingIds()).toStrictEqual(["call_2"]);

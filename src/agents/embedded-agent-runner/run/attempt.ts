@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { performance } from "node:perf_hooks";
@@ -24,6 +25,13 @@ import {
 } from "../../../context-engine/host-compat.js";
 import { resolveContextEngineOwnerPluginId } from "../../../context-engine/registry.js";
 import type { AssembleResult } from "../../../context-engine/types.js";
+import {
+  assertGovernedMissionAgentRunBinding,
+  closeGovernedMissionExecutionLease,
+  hasGovernedMissionClaimForOwnerKey,
+  prepareGovernedMissionAgentRun,
+} from "../../../governance/governed-mission-agent-runtime.js";
+import { readGovernedSkillSnapshotSha256 } from "../../../governance/governed-mission-identity.js";
 import { emitTrustedDiagnosticEvent } from "../../../infra/diagnostic-events.js";
 import { resolveDiagnosticModelContentCapturePolicy } from "../../../infra/diagnostic-llm-content.js";
 import {
@@ -76,6 +84,10 @@ import {
 import { resolveUserPath } from "../../../utils.js";
 import { normalizeMessageChannel } from "../../../utils/message-channel.js";
 import { isReasoningTagProvider } from "../../../utils/provider-utils.js";
+import {
+  countActiveToolExecutions,
+  waitForActiveToolExecutionsToDrain,
+} from "../../active-tool-execution-tracker.js";
 import { createBundleLspToolRuntime } from "../../agent-bundle-lsp-runtime.js";
 import {
   getOrCreateSessionMcpRuntime,
@@ -94,6 +106,7 @@ import {
   findClientToolNameConflicts,
   toClientToolDefinitions,
 } from "../../agent-tool-definition-adapter.js";
+import type { HookContext } from "../../agent-tools.before-tool-call.js";
 import {
   createOpenClawCodingTools,
   resolveProcessToolScopeKey,
@@ -145,7 +158,6 @@ import {
   resolveBootstrapPromptTruncationWarningMode,
   resolveBootstrapTotalMaxChars,
 } from "../../embedded-agent-helpers.js";
-import { countActiveToolExecutions } from "../../embedded-agent-subscribe.handlers.tools.js";
 import { subscribeEmbeddedAgentSession } from "../../embedded-agent-subscribe.js";
 import { isTimeoutError } from "../../failover-error.js";
 import { runAgentEndSideEffects } from "../../harness/agent-end-side-effects.js";
@@ -231,6 +243,7 @@ import {
   resolvePreparedExtraParams,
 } from "../extra-params.js";
 import { prepareGooglePromptCacheStreamFn } from "../google-prompt-cache.js";
+import { closeGovernedExecutionLeaseWithRetry } from "../governed-lease-close.js";
 import { getHistoryLimitFromSessionKey, limitHistoryTurns } from "../history.js";
 import { log } from "../logger.js";
 import { buildEmbeddedMessageActionDiscoveryInput } from "../message-action-discovery-input.js";
@@ -822,6 +835,56 @@ export async function runEmbeddedAttempt(
 
   const sandboxSessionKey =
     params.sandboxSessionKey?.trim() || params.sessionKey?.trim() || params.sessionId;
+  const governedMissionOwnerKey = params.sessionKey?.trim() || params.sessionId;
+  let governedMissionFlowId: string | undefined;
+  let governedMissionAttemptReceiptId: string | undefined;
+  let governedExecutionAttemptId: string | undefined;
+  const closeGovernedExecutionLease = async (lease: { flowId: string; runId: string }) => {
+    await closeGovernedExecutionLeaseWithRetry({
+      close: () =>
+        closeGovernedMissionExecutionLease({
+          ...lease,
+          observedSkillSha256: readCurrentGovernedSkillSha256(),
+        }),
+      onRetry: ({ attempt, maxAttempts, err }) => {
+        log.warn(
+          `governed execution lease close failed; retrying ` +
+            `attempt=${attempt}/${maxAttempts} flowId=${lease.flowId} ` +
+            `runId=${lease.runId}: ${formatErrorMessage(err)}`,
+        );
+      },
+    });
+  };
+  let attemptReturned = false;
+  let governedMissionContentObserved = params.governedMissionContentHooksSuppressed === true;
+  const shouldSuppressGovernedMissionContent = (): boolean => {
+    governedMissionContentObserved =
+      governedMissionContentObserved ||
+      Boolean(governedMissionFlowId) ||
+      hasGovernedMissionClaimForOwnerKey(governedMissionOwnerKey);
+    return governedMissionContentObserved;
+  };
+  // Provider-hosted tools bypass OpenClaw's before-tool-call enforcement. Governed
+  // runs keep the managed web_search tool and disable native provider injection.
+  const providerRuntimeConfig = params.governedMissionContentHooksSuppressed
+    ? {
+        ...params.config,
+        tools: {
+          ...params.config?.tools,
+          web: {
+            ...params.config?.tools?.web,
+            search: {
+              ...params.config?.tools?.web?.search,
+              enabled: false,
+            },
+          },
+        },
+      }
+    : params.config;
+  // Keep the resolved skill list stable for this run, but rehash its files at
+  // each governed boundary so an in-run edit cannot retain old authority.
+  const readCurrentGovernedSkillSha256 = () =>
+    readGovernedSkillSnapshotSha256(params.skillsSnapshot);
   const sandbox = await resolveSandboxContext({
     config: params.config,
     sessionKey: sandboxSessionKey,
@@ -1052,7 +1115,8 @@ export async function runEmbeddedAttempt(
         `raw model run enabled: modelRun=${params.modelRun === true} promptMode=${params.promptMode ?? "unset"}`,
       );
     }
-    const activeContextEngine = isRawModelRun ? undefined : params.contextEngine;
+    const activeContextEngine =
+      isRawModelRun || shouldSuppressGovernedMissionContent() ? undefined : params.contextEngine;
     if (activeContextEngine && activeContextEngine.info.id !== "legacy") {
       assertContextEngineHostSupport({
         contextEngine: activeContextEngine,
@@ -1154,6 +1218,25 @@ export async function runEmbeddedAttempt(
         ? createToolSearchCatalogRef()
         : undefined;
     const toolSearchTargetTranscriptProjections: ToolSearchTargetTranscriptProjection[] = [];
+    const stopContract = extractLatestStopContract(params.internalEvents);
+    const catalogToolHookContext: HookContext = {
+      agentId: sessionAgentId,
+      config: params.config,
+      cwd: effectiveCwd,
+      workspaceDir: effectiveWorkspace,
+      sessionKey: sandboxSessionKey,
+      sessionId: params.sessionId,
+      runId: params.runId,
+      sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
+      stopContract,
+      channelId: params.currentChannelId,
+      trace: runTrace,
+      loopDetection: resolveToolLoopDetectionConfig({
+        cfg: params.config,
+        agentId: sessionAgentId,
+      }),
+      onToolOutcome: params.onToolOutcome,
+    };
     const toolsRaw = !shouldConstructTools
       ? []
       : (() => {
@@ -1211,6 +1294,7 @@ export async function runEmbeddedAttempt(
             modelCompat: extractModelCompat(params.model),
             modelApi: params.model.api,
             modelContextWindowTokens: params.model.contextWindow,
+            suppressManagedWebSearch: !params.governedMissionContentHooksSuppressed,
             modelAuthMode: resolveModelAuthMode(params.model.provider, params.config, undefined, {
               workspaceDir: effectiveWorkspace,
             }),
@@ -1239,6 +1323,7 @@ export async function runEmbeddedAttempt(
             forceHeartbeatTool: params.forceHeartbeatTool,
             runtimeToolAllowlist: effectiveToolsAllow,
             authProfileStore: params.authProfileStore,
+            beforeToolCallHookContext: catalogToolHookContext,
             recordToolPrepStage: (name) => corePluginToolStages.mark(name),
             onToolOutcome: params.onToolOutcome,
             skillsSnapshot: skillsSnapshotForRun,
@@ -1567,24 +1652,6 @@ export async function runEmbeddedAttempt(
     });
     const uncompactedEffectiveTools = [...uncompactedToolSchemaProjection.tools];
     let effectiveTools = uncompactedEffectiveTools;
-    const stopContract = extractLatestStopContract(params.internalEvents);
-    const catalogToolHookContext = {
-      agentId: sessionAgentId,
-      config: params.config,
-      cwd: effectiveCwd,
-      sessionKey: sandboxSessionKey,
-      sessionId: params.sessionId,
-      runId: params.runId,
-      sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
-      stopContract,
-      channelId: params.currentChannelId,
-      trace: runTrace,
-      loopDetection: resolveToolLoopDetectionConfig({
-        cfg: params.config,
-        agentId: sessionAgentId,
-      }),
-      onToolOutcome: params.onToolOutcome,
-    };
     const codeModeTools = codeModeControlsEnabledForRun
       ? createCodeModeTools({
           config: params.config,
@@ -2010,6 +2077,10 @@ export async function runEmbeddedAttempt(
         suppressTranscriptOnlyAssistantPersistence:
           params.suppressTranscriptOnlyAssistantPersistence,
         suppressAssistantErrorPersistence: params.suppressAssistantErrorPersistence,
+        // Preserve private model context for later governed turns. Public history
+        // drops display-hidden rows, and content-observing hooks are bypassed.
+        shouldHideMessageFromDisplay: (message) =>
+          shouldSuppressGovernedMissionContent() && message.role !== "user",
         onMessagePersisted: () => {
           sessionLockController.refreshAfterOwnedSessionWrite();
         },
@@ -2201,15 +2272,7 @@ export async function runEmbeddedAttempt(
                 }
               },
             },
-            {
-              agentId: sessionAgentId,
-              sessionKey: sandboxSessionKey,
-              config: params.config,
-              sessionId: params.sessionId,
-              runId: params.runId,
-              loopDetection: clientToolLoopDetection,
-              onToolOutcome: params.onToolOutcome,
-            },
+            catalogToolHookContext,
           )
         : [];
       const clientToolSearch = codeModeControlsEnabledForRun
@@ -2386,6 +2449,9 @@ export async function runEmbeddedAttempt(
           onAfterTurnCheckpoint: (messageCount) => {
             contextEngineAfterTurnCheckpoint = messageCount;
           },
+          // Governed output must remain inside the attempt until its release gate.
+          // Bypass plugin-owned turn ingestion/assembly once governance binds.
+          shouldProcessTurn: () => !governedMissionFlowId,
           getRuntimeContext: ({ messages, prePromptMessageCount: loopPrePromptMessageCount }) =>
             buildAfterTurnRuntimeContext({
               attempt: params,
@@ -2430,17 +2496,21 @@ export async function runEmbeddedAttempt(
         removeHistoryImagePruneContextTransform();
         removeLoopContextGuard?.();
       };
-      const cacheTrace = createCacheTrace({
-        cfg: params.config,
-        env: process.env,
-        runId: params.runId,
-        sessionId: activeSession.sessionId,
-        sessionKey: params.sessionKey,
-        provider: params.provider,
-        modelId: params.modelId,
-        modelApi: params.model.api,
-        workspaceDir: params.workspaceDir,
-      });
+      let cacheTrace = shouldSuppressGovernedMissionContent()
+        ? undefined
+        : createCacheTrace({
+            cfg: params.config,
+            env: process.env,
+            runId: params.runId,
+            sessionId: activeSession.sessionId,
+            sessionKey: params.sessionKey,
+            provider: params.provider,
+            modelId: params.modelId,
+            modelApi: params.model.api,
+            workspaceDir: params.workspaceDir,
+          });
+      const currentCacheTrace = () =>
+        shouldSuppressGovernedMissionContent() ? undefined : cacheTrace;
       const anthropicPayloadLogger = createAnthropicPayloadLogger({
         env: process.env,
         runId: params.runId,
@@ -2451,19 +2521,28 @@ export async function runEmbeddedAttempt(
         modelApi: params.model.api,
         workspaceDir: params.workspaceDir,
       });
-      trajectoryRecorder = createTrajectoryRuntimeRecorder({
-        cfg: params.config,
-        env: process.env,
-        runId: params.runId,
-        sessionId: activeSession.sessionId,
-        sessionKey: params.sessionKey,
-        sessionFile: params.sessionFile,
-        provider: params.provider,
-        modelId: params.modelId,
-        modelApi: params.model.api,
-        workspaceDir: params.workspaceDir,
-      });
-      trajectoryRecorder?.recordEvent("session.started", {
+      trajectoryRecorder = shouldSuppressGovernedMissionContent()
+        ? null
+        : createTrajectoryRuntimeRecorder({
+            cfg: params.config,
+            env: process.env,
+            runId: params.runId,
+            sessionId: activeSession.sessionId,
+            sessionKey: params.sessionKey,
+            sessionFile: params.sessionFile,
+            provider: params.provider,
+            modelId: params.modelId,
+            modelApi: params.model.api,
+            workspaceDir: params.workspaceDir,
+          });
+      const recordTrajectoryEvent = (
+        ...args: Parameters<NonNullable<typeof trajectoryRecorder>["recordEvent"]>
+      ) => {
+        if (!shouldSuppressGovernedMissionContent()) {
+          trajectoryRecorder?.recordEvent(...args);
+        }
+      };
+      recordTrajectoryEvent("session.started", {
         trigger: params.trigger,
         sessionFile: params.sessionFile,
         workspaceDir: effectiveWorkspace,
@@ -2477,7 +2556,7 @@ export async function runEmbeddedAttempt(
         toolCount: effectiveTools.length,
         clientToolCount: clientToolDefs.length,
       });
-      trajectoryRecorder?.recordEvent(
+      recordTrajectoryEvent(
         "trace.metadata",
         buildTrajectoryRunMetadata({
           env: process.env,
@@ -2548,7 +2627,7 @@ export async function runEmbeddedAttempt(
         });
       const providerStreamFn = registerProviderStreamForModel({
         model: params.model,
-        cfg: params.config,
+        cfg: providerRuntimeConfig,
         agentDir,
         workspaceDir: effectiveWorkspace,
       });
@@ -2586,7 +2665,7 @@ export async function runEmbeddedAttempt(
 
       applyExtraParamsToAgent(
         activeSession.agent,
-        params.config,
+        providerRuntimeConfig,
         params.provider,
         params.modelId,
         streamExtraParamsOverride,
@@ -2602,7 +2681,7 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn = createCodexNativeWebSearchWrapper(
           activeSession.agent.streamFn,
           {
-            config: params.config,
+            config: providerRuntimeConfig,
             agentDir,
             codeModeToolSurfaceEnabled: true,
           },
@@ -2635,13 +2714,19 @@ export async function runEmbeddedAttempt(
       );
       let promptCacheChangesForTurn: PromptCacheChange[] | null = null;
 
-      if (cacheTrace) {
-        cacheTrace.recordStage("session:loaded", {
+      const initialCacheTrace = currentCacheTrace();
+      if (initialCacheTrace) {
+        initialCacheTrace.recordStage("session:loaded", {
           messages: activeSession.messages,
           system: systemPromptText,
           note: "after session create",
         });
-        activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
+        const untracedStreamFn = activeSession.agent.streamFn;
+        const tracedStreamFn = initialCacheTrace.wrapStreamFn(untracedStreamFn);
+        activeSession.agent.streamFn = (model, context, options) =>
+          shouldSuppressGovernedMissionContent()
+            ? untracedStreamFn(model, context, options)
+            : tracedStreamFn(model, context, options);
       }
 
       // Anthropic Claude endpoints can reject replayed `thinking` blocks on
@@ -2766,9 +2851,12 @@ export async function runEmbeddedAttempt(
       }
 
       if (anthropicPayloadLogger) {
-        activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
-          activeSession.agent.streamFn,
-        );
+        const unloggedStreamFn = activeSession.agent.streamFn;
+        const loggedStreamFn = anthropicPayloadLogger.wrapStreamFn(unloggedStreamFn);
+        activeSession.agent.streamFn = (model, context, options) =>
+          governedMissionFlowId
+            ? unloggedStreamFn(model, context, options)
+            : loggedStreamFn(model, context, options);
       }
       // Anthropic-compatible providers can add new stop reasons before shared model runtime maps them.
       // Recover the known "sensitive" stop reason here so a model refusal does not
@@ -2825,7 +2913,10 @@ export async function runEmbeddedAttempt(
             ? { contextWindowReferenceTokens: params.contextWindowInfo.referenceTokens }
             : {}),
           trace: runTrace,
-          contentCapture: resolveDiagnosticModelContentCapturePolicy(params.config),
+          contentCapture: shouldSuppressGovernedMissionContent()
+            ? undefined
+            : resolveDiagnosticModelContentCapturePolicy(params.config),
+          shouldCaptureContent: () => !shouldSuppressGovernedMissionContent(),
           nextCallId: () => `${params.runId}:model:${(diagnosticModelCallSeq += 1)}`,
           onStarted: () => {
             params.onExecutionPhase?.({
@@ -2842,7 +2933,7 @@ export async function runEmbeddedAttempt(
         if (isRawModelRun) {
           activeSession.agent.reset();
           setActiveSessionSystemPrompt("");
-          cacheTrace?.recordStage("session:raw-model-run", {
+          currentCacheTrace()?.recordStage("session:raw-model-run", {
             messages: activeSession.messages,
             system: systemPromptText,
           });
@@ -2861,7 +2952,7 @@ export async function runEmbeddedAttempt(
             sessionId: params.sessionId,
             policy: transcriptPolicy,
           });
-          cacheTrace?.recordStage("session:sanitized", { messages: prior });
+          currentCacheTrace()?.recordStage("session:sanitized", { messages: prior });
           const validated = await validateReplayTurns({
             messages: prior,
             modelApi: params.model.api,
@@ -2951,7 +3042,7 @@ export async function runEmbeddedAttempt(
                 ...(isOpenAIResponsesApi ? { missingToolResultText: "aborted" } : {}),
               })
             : truncated;
-          cacheTrace?.recordStage("session:limited", { messages: limited });
+          currentCacheTrace()?.recordStage("session:limited", { messages: limited });
           if (limited.length > 0 || prior.length > 0) {
             activeSession.agent.state.messages = limited;
           }
@@ -3081,14 +3172,44 @@ export async function runEmbeddedAttempt(
         prompt: string,
         options?: Parameters<typeof activeSession.prompt>[1],
       ): Promise<void> =>
-        withOwnedSessionTranscriptWrites(ownedTranscriptWriteContext, async () =>
-          abortable(trackPromptSettlePromise(activeSession.prompt(prompt, options))),
-        );
+        withOwnedSessionTranscriptWrites(ownedTranscriptWriteContext, async () => {
+          if (
+            governedMissionFlowId &&
+            governedExecutionAttemptId &&
+            governedMissionAttemptReceiptId
+          ) {
+            assertGovernedMissionAgentRunBinding({
+              ownerKey: governedMissionOwnerKey,
+              flowId: governedMissionFlowId,
+              runId: governedExecutionAttemptId,
+              attemptReceiptId: governedMissionAttemptReceiptId,
+              observedSkillSha256: readCurrentGovernedSkillSha256(),
+            });
+          } else if (shouldSuppressGovernedMissionContent()) {
+            throw new Error(
+              "Governed mission classification changed before provider dispatch; prompt submission blocked.",
+            );
+          }
+          return abortable(trackPromptSettlePromise(activeSession.prompt(prompt, options)));
+        });
       const onBlockReply = params.onBlockReply
-        ? bindOwnedSessionTranscriptWrites(ownedTranscriptWriteContext, params.onBlockReply)
+        ? bindOwnedSessionTranscriptWrites(
+            ownedTranscriptWriteContext,
+            (payload: Parameters<NonNullable<typeof params.onBlockReply>>[0]) =>
+              governedMissionFlowId ? undefined : params.onBlockReply?.(payload),
+          )
         : undefined;
       const onBlockReplyFlush = params.onBlockReplyFlush
-        ? bindOwnedSessionTranscriptWrites(ownedTranscriptWriteContext, params.onBlockReplyFlush)
+        ? bindOwnedSessionTranscriptWrites(ownedTranscriptWriteContext, () =>
+            governedMissionFlowId ? undefined : params.onBlockReplyFlush?.(),
+          )
+        : undefined;
+      const onPartialReply = params.onPartialReply
+        ? (payload: Parameters<NonNullable<typeof params.onPartialReply>>[0]) =>
+            governedMissionFlowId ? undefined : params.onPartialReply?.(payload)
+        : undefined;
+      const onAssistantMessageStart = params.onAssistantMessageStart
+        ? () => (governedMissionFlowId ? undefined : params.onAssistantMessageStart?.())
         : undefined;
 
       let toolMetasForTerminal: readonly AsyncStartedToolMeta[] = [];
@@ -3105,6 +3226,7 @@ export async function runEmbeddedAttempt(
           toolResultFormat: params.toolResultFormat,
           shouldEmitToolResult: params.shouldEmitToolResult,
           shouldEmitToolOutput: params.shouldEmitToolOutput,
+          shouldSuppressAssistantOutput: () => Boolean(governedMissionFlowId),
           sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
           onToolResult: params.onToolResult,
           onReasoningStream: params.onReasoningStream,
@@ -3113,8 +3235,8 @@ export async function runEmbeddedAttempt(
           onBlockReplyFlush,
           blockReplyBreak: params.blockReplyBreak,
           blockReplyChunking: params.blockReplyChunking,
-          onPartialReply: params.onPartialReply,
-          onAssistantMessageStart: params.onAssistantMessageStart,
+          onPartialReply,
+          onAssistantMessageStart,
           onExecutionPhase: params.onExecutionPhase,
           onAgentEvent: params.onAgentEvent,
           terminalLifecyclePhase: params.deferTerminalLifecycleEnd ? "finishing" : "end",
@@ -3454,16 +3576,17 @@ export async function runEmbeddedAttempt(
         };
         const promptBuildMessages =
           pruneProcessedHistoryImages(activeSession.messages) ?? activeSession.messages;
-        const hookResult = isRawModelRun
-          ? undefined
-          : await resolvePromptBuildHookResult({
-              config: params.config ?? getRuntimeConfig(),
-              prompt: params.prompt,
-              messages: promptBuildMessages,
-              hookCtx,
-              hookRunner,
-              beforeAgentStartResult: params.beforeAgentStartResult,
-            });
+        const hookResult =
+          isRawModelRun || shouldSuppressGovernedMissionContent()
+            ? undefined
+            : await resolvePromptBuildHookResult({
+                config: params.config ?? getRuntimeConfig(),
+                prompt: params.prompt,
+                messages: promptBuildMessages,
+                hookCtx,
+                hookRunner,
+                beforeAgentStartResult: params.beforeAgentStartResult,
+              });
         const promptBeforePromptBuildHooks = effectivePrompt;
         const promptBuildPrependContext = hookResult?.prependContext;
         const promptBuildAppendContext = hookResult?.appendContext;
@@ -3544,7 +3667,7 @@ export async function runEmbeddedAttempt(
             toolNames: promptCacheToolNames,
           });
           promptCacheChangesForTurn = cacheObservation.changes;
-          cacheTrace?.recordStage("cache:state", {
+          currentCacheTrace()?.recordStage("cache:state", {
             options: {
               snapshot: cacheObservation.snapshot,
               previousCacheRead: cacheObservation.previousCacheRead ?? undefined,
@@ -3797,7 +3920,98 @@ export async function runEmbeddedAttempt(
             }
           };
 
-          if (hookRunner?.hasHooks("before_agent_run")) {
+          if (!skipPromptSubmission) {
+            const executionAttemptId = `${params.runId}:attempt:${randomUUID()}`;
+            let governedPreparation: ReturnType<typeof prepareGovernedMissionAgentRun>;
+            try {
+              governedPreparation = prepareGovernedMissionAgentRun({
+                ownerKey: governedMissionOwnerKey,
+                runId: executionAttemptId,
+                observedSkillSha256: readCurrentGovernedSkillSha256(),
+                readObservedSkillSha256: readCurrentGovernedSkillSha256,
+              });
+            } catch (err) {
+              log.warn(
+                `governed mission before-agent-run preparation failed: ${formatErrorMessage(err)}`,
+              );
+              governedPreparation = {
+                status: "blocked" as const,
+                reasonCode: "GOVERNED_PREPARATION_FAILED",
+                message: "Governed mission preparation failed closed before model execution.",
+              };
+            }
+            if (
+              governedPreparation.status === "bound" &&
+              !params.governedMissionContentHooksSuppressed
+            ) {
+              await closeGovernedExecutionLease({
+                flowId: governedPreparation.flowId,
+                runId: executionAttemptId,
+              });
+              governedPreparation = {
+                status: "blocked",
+                reasonCode: "GOVERNED_CLASSIFICATION_CHANGED",
+                message:
+                  "Governed mission state appeared after run classification; retry through a fresh governed run.",
+              };
+            }
+            if (
+              governedPreparation.status === "irrelevant" &&
+              params.governedMissionContentHooksSuppressed
+            ) {
+              governedPreparation = {
+                status: "blocked",
+                reasonCode: "GOVERNED_CLASSIFICATION_CHANGED",
+                message:
+                  "Governed mission state changed after run classification; retry through a fresh run.",
+              };
+            }
+            if (governedPreparation.status !== "irrelevant") {
+              // Classification can change during async setup. Disarm content recorders
+              // before any governed prompt bytes can reach provider-adjacent diagnostics.
+              cacheTrace = undefined;
+              if (trajectoryRecorder) {
+                if (governedPreparation.status === "bound") {
+                  trajectoryRecorder.recordEvent("governance.bound", {
+                    contentCapture: "disabled",
+                  });
+                }
+                try {
+                  await trajectoryRecorder.flush();
+                } catch (err) {
+                  log.warn(`governed trajectory shutdown failed: ${formatErrorMessage(err)}`);
+                }
+                trajectoryRecorder = null;
+              }
+            }
+            if (governedPreparation.status === "bound") {
+              // Tool wrappers retain this context object, so binding here protects every
+              // model-selected tool without rebuilding the already prepared tool catalog.
+              catalogToolHookContext.governedMissionToolEnforcement =
+                governedPreparation.toolEnforcement;
+              governedMissionFlowId = governedPreparation.flowId;
+              governedMissionAttemptReceiptId = governedPreparation.attemptReceiptId;
+              governedExecutionAttemptId = executionAttemptId;
+            } else if (governedPreparation.status === "blocked") {
+              const blockedBy = "governed_mission";
+              const blockMessage = `${governedPreparation.message} Reason: ${governedPreparation.reasonCode}.`;
+              beforeAgentRunBlocked = true;
+              beforeAgentRunBlockedBy = blockedBy;
+              log.warn(
+                `before_agent_run blocked by ${blockedBy}: ${governedPreparation.reasonCode}`,
+              );
+              await persistBlockedBeforeAgentRun({ message: blockMessage, pluginId: blockedBy });
+              promptError = new Error(blockMessage);
+              promptErrorSource = "hook:before_agent_run";
+              skipPromptSubmission = true;
+            }
+          }
+
+          if (
+            !skipPromptSubmission &&
+            !shouldSuppressGovernedMissionContent() &&
+            hookRunner?.hasHooks("before_agent_run")
+          ) {
             const beforeRunMessages = cloneHookMessages(hookMessagesForCurrentPrompt);
             let beforeRunResult:
               | Awaited<ReturnType<NonNullable<typeof hookRunner>["runBeforeAgentRun"]>>
@@ -3919,17 +4133,19 @@ export async function runEmbeddedAttempt(
               });
 
           if (!skipPromptSubmission) {
-            cacheTrace?.recordStage("prompt:before", {
-              prompt: promptForModel,
-              messages: activeSession.messages,
-            });
-            cacheTrace?.recordStage("prompt:images", {
-              prompt: promptForModel,
-              messages: activeSession.messages,
-              note: `images: prompt=${imageResult.images.length}`,
-            });
+            if (!governedMissionFlowId) {
+              currentCacheTrace()?.recordStage("prompt:before", {
+                prompt: promptForModel,
+                messages: activeSession.messages,
+              });
+              currentCacheTrace()?.recordStage("prompt:images", {
+                prompt: promptForModel,
+                messages: activeSession.messages,
+                note: `images: prompt=${imageResult.images.length}`,
+              });
+            }
             const trajectoryProviderVisibleTools = toTrajectoryToolDefinitions(effectiveTools);
-            trajectoryRecorder?.recordEvent("context.compiled", {
+            recordTrajectoryEvent("context.compiled", {
               systemPrompt: systemPromptForHook,
               prompt: promptForModel,
               messages: activeSession.messages,
@@ -3964,7 +4180,7 @@ export async function runEmbeddedAttempt(
             } else {
               log.info(`embedded run prompt skipped: empty prompt/history/images ${skipContext}`);
             }
-            trajectoryRecorder?.recordEvent("prompt.skipped", {
+            recordTrajectoryEvent("prompt.skipped", {
               reason: promptSkipReason,
               prompt: promptForModel,
               messages: activeSession.messages,
@@ -4019,7 +4235,12 @@ export async function runEmbeddedAttempt(
             );
           }
 
-          if (!skipPromptSubmission && !isRawModelRun && hookRunner?.hasHooks("llm_input")) {
+          if (
+            !skipPromptSubmission &&
+            !shouldSuppressGovernedMissionContent() &&
+            !isRawModelRun &&
+            hookRunner?.hasHooks("llm_input")
+          ) {
             hookRunner
               .runLlmInput(
                 {
@@ -4193,18 +4414,26 @@ export async function runEmbeddedAttempt(
               };
             };
             finalPromptText = promptForSession;
-            trajectoryRecorder?.recordEvent("prompt.submitted", {
+            recordTrajectoryEvent("prompt.submitted", {
               prompt: promptForModel,
               systemPrompt: systemPromptForHook,
               messages: activeSession.messages,
               imagesCount: imageResult.images.length,
             });
-            const btwSnapshotMessages = normalizedReplayMessages.slice(-MAX_BTW_SNAPSHOT_MESSAGES);
-            updateActiveEmbeddedRunSnapshot(params.sessionId, {
-              transcriptLeafId,
-              messages: btwSnapshotMessages,
-              inFlightPrompt: promptForSession,
-            });
+            const governedSnapshotSuppressed = shouldSuppressGovernedMissionContent();
+            const btwSnapshotMessages = governedSnapshotSuppressed
+              ? []
+              : normalizedReplayMessages.slice(-MAX_BTW_SNAPSHOT_MESSAGES);
+            updateActiveEmbeddedRunSnapshot(
+              params.sessionId,
+              governedSnapshotSuppressed
+                ? { transcriptLeafId, messages: [] }
+                : {
+                    transcriptLeafId,
+                    messages: btwSnapshotMessages,
+                    inFlightPrompt: promptForSession,
+                  },
+            );
             let captureCurrentPromptForModel = false;
             const cleanupModelPromptTransform = installModelPromptTransform({
               session: activeSession,
@@ -4547,7 +4776,7 @@ export async function runEmbeddedAttempt(
         // Let the active context engine run its post-turn lifecycle. These hooks
         // may call runtime LLM capabilities, so only their transcript rewrite
         // helper reacquires the session write lock.
-        if (activeContextEngine) {
+        if (activeContextEngine && !governedMissionFlowId) {
           const afterTurnRuntimeContext = buildAfterTurnRuntimeContextFromUsage({
             attempt: params,
             workspaceDir: effectiveWorkspace,
@@ -4643,36 +4872,38 @@ export async function runEmbeddedAttempt(
           }
         });
 
-        cacheTrace?.recordStage("session:after", {
-          messages: messagesSnapshot,
-          note: timedOutDuringCompaction
-            ? "compaction timeout"
-            : promptError
-              ? "prompt error"
-              : undefined,
-        });
-        anthropicPayloadLogger?.recordUsage(messagesSnapshot, promptError);
-
-        runAgentEndSideEffects({
-          event: {
+        if (!shouldSuppressGovernedMissionContent()) {
+          currentCacheTrace()?.recordStage("session:after", {
             messages: messagesSnapshot,
-            success: !aborted && !promptError,
-            error: promptError ? formatErrorMessage(promptError) : undefined,
-            durationMs: Date.now() - promptStartedAt,
-          },
-          ctx: {
-            runId: params.runId,
-            trace: freezeDiagnosticTraceContext(diagnosticTrace),
-            agentId: hookAgentId,
-            sessionKey: params.sessionKey,
-            sessionId: params.sessionId,
-            workspaceDir: params.workspaceDir,
-            trigger: params.trigger,
-            ...(params.config ? { config: params.config } : {}),
-            ...buildAgentHookContextChannelFields(params),
-          },
-          hookRunner,
-        });
+            note: timedOutDuringCompaction
+              ? "compaction timeout"
+              : promptError
+                ? "prompt error"
+                : undefined,
+          });
+          anthropicPayloadLogger?.recordUsage(messagesSnapshot, promptError);
+
+          runAgentEndSideEffects({
+            event: {
+              messages: messagesSnapshot,
+              success: !aborted && !promptError,
+              error: promptError ? formatErrorMessage(promptError) : undefined,
+              durationMs: Date.now() - promptStartedAt,
+            },
+            ctx: {
+              runId: params.runId,
+              trace: freezeDiagnosticTraceContext(diagnosticTrace),
+              agentId: hookAgentId,
+              sessionKey: params.sessionKey,
+              sessionId: params.sessionId,
+              workspaceDir: params.workspaceDir,
+              trigger: params.trigger,
+              ...(params.config ? { config: params.config } : {}),
+              ...buildAgentHookContextChannelFields(params),
+            },
+            hookRunner,
+          });
+        }
       } finally {
         clearTimeout(abortTimer);
         if (abortWarnTimer) {
@@ -4750,7 +4981,7 @@ export async function runEmbeddedAttempt(
             `[prompt-cache] cache read dropped ${cacheBreakForLog.previousCacheRead} -> ${cacheBreakForLog.cacheRead} ` +
               `for ${params.provider}/${params.modelId} via ${streamStrategy}; ${changeSummary}`,
           );
-          cacheTrace?.recordStage("cache:result", {
+          currentCacheTrace()?.recordStage("cache:result", {
             options: {
               previousCacheRead: cacheBreakForLog.previousCacheRead,
               cacheRead: cacheBreakForLog.cacheRead,
@@ -4761,8 +4992,8 @@ export async function runEmbeddedAttempt(
                 })) ?? undefined,
             },
           });
-        } else if (cacheTrace && promptCacheChangesForTurn) {
-          cacheTrace.recordStage("cache:result", {
+        } else if (currentCacheTrace() && promptCacheChangesForTurn) {
+          currentCacheTrace()?.recordStage("cache:result", {
             note: "state changed without a cache-read break",
             options: {
               cacheRead: attemptUsage?.cacheRead ?? 0,
@@ -4772,8 +5003,8 @@ export async function runEmbeddedAttempt(
               })),
             },
           });
-        } else if (cacheTrace) {
-          cacheTrace.recordStage("cache:result", {
+        } else if (currentCacheTrace()) {
+          currentCacheTrace()?.recordStage("cache:result", {
             note: "stable cache inputs",
             options: {
               cacheRead: attemptUsage?.cacheRead ?? 0,
@@ -4783,6 +5014,7 @@ export async function runEmbeddedAttempt(
       }
 
       if (
+        !shouldSuppressGovernedMissionContent() &&
         hookRunner?.hasHooks("llm_output") &&
         shouldRunLlmOutputHooksForAttempt({ promptErrorSource })
       ) {
@@ -4942,7 +5174,7 @@ export async function runEmbeddedAttempt(
         emptyAssistantReplyIsSilent,
         lastAssistantStopReason: lastAssistant?.stopReason,
       });
-      trajectoryRecorder?.recordEvent("model.completed", {
+      recordTrajectoryEvent("model.completed", {
         aborted,
         externalAbort,
         timedOut,
@@ -4959,7 +5191,7 @@ export async function runEmbeddedAttempt(
         finalPromptText,
         messagesSnapshot,
       });
-      trajectoryRecorder?.recordEvent(
+      recordTrajectoryEvent(
         "trace.artifacts",
         buildTrajectoryArtifacts({
           status: attemptTrajectoryTerminal.status,
@@ -4987,7 +5219,7 @@ export async function runEmbeddedAttempt(
           lastToolError,
         }),
       );
-      trajectoryRecorder?.recordEvent("session.ended", {
+      recordTrajectoryEvent("session.ended", {
         status: attemptTrajectoryTerminal.status,
         aborted,
         externalAbort,
@@ -5000,7 +5232,13 @@ export async function runEmbeddedAttempt(
       });
       trajectoryEndRecorded = true;
 
+      attemptReturned = true;
       return {
+        ...(governedMissionFlowId ? { governedMissionFlowId } : {}),
+        ...(governedMissionAttemptReceiptId ? { governedMissionAttemptReceiptId } : {}),
+        ...(governedExecutionAttemptId
+          ? { governedMissionExecutionRunId: governedExecutionAttemptId }
+          : {}),
         replayMetadata,
         itemLifecycle: getItemLifecycle(),
         setTerminalLifecycleMeta,
@@ -5115,6 +5353,43 @@ export async function runEmbeddedAttempt(
         });
       } catch (err) {
         cleanupError = err;
+      }
+      if (governedMissionFlowId && governedExecutionAttemptId) {
+        const governedFlowId = governedMissionFlowId;
+        const executionAttemptId = governedExecutionAttemptId;
+        if (countActiveToolExecutions(params.runId) > 0) {
+          // The tool can outlive timeout cleanup. Close only after its execution-end
+          // event removes the final tracker entry; until then the durable lease stays fenced.
+          void waitForActiveToolExecutionsToDrain(params.runId)
+            .then(async () => {
+              await closeGovernedExecutionLease({
+                flowId: governedFlowId,
+                runId: executionAttemptId,
+              });
+            })
+            .catch((err: unknown) => {
+              log.error(
+                `governed execution lease deferred close failed: ${formatErrorMessage(err)}`,
+              );
+            });
+          cleanupError ??= new Error(
+            "governed execution lease remains open while tool executions are active",
+          );
+        } else if (
+          !params.deferGovernedMissionLeaseClose ||
+          !attemptReturned ||
+          cleanupError ||
+          (promptError && sessionLockController.hasSessionTakeover())
+        ) {
+          try {
+            await closeGovernedExecutionLease({
+              flowId: governedFlowId,
+              runId: executionAttemptId,
+            });
+          } catch (err) {
+            cleanupError ??= err;
+          }
+        }
       }
       const synthesizedCleanupTakeoverError =
         !cleanupError && promptError && sessionLockController.hasSessionTakeover()

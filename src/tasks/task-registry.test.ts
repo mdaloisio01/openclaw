@@ -3701,6 +3701,8 @@ describe("task-registry", () => {
           parent_review_state_without_active_executor: 0,
           rework_follow_through_violation: 0,
           routed_to_owner_not_proven_active: 0,
+          trb_gate_blocked_recovery_required: 0,
+          trb_gate_pending_recovery_required: 0,
         },
       });
     });
@@ -3985,6 +3987,66 @@ describe("task-registry", () => {
           content: "Background task cancelled: ACP background task (run run-canc).",
         }),
       );
+    });
+  });
+
+  it("preserves a task that completes while ACP cancellation is waiting", async () => {
+    await withTaskRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      let releaseCancellation!: () => void;
+      const cancellationReleased = new Promise<void>((resolve) => {
+        releaseCancellation = resolve;
+      });
+      let cancellationStarted!: () => void;
+      const cancellationEntered = new Promise<void>((resolve) => {
+        cancellationStarted = resolve;
+      });
+      hoisted.cancelSessionMock.mockImplementation(async () => {
+        cancellationStarted();
+        await cancellationReleased;
+      });
+
+      const task = createTaskRecord({
+        runtime: "acp",
+        ownerKey: "agent:main:main",
+        scopeKind: "session",
+        childSessionKey: "agent:codex:acp:child",
+        runId: "run-cancel-completion-race",
+        task: "Finish governed evidence",
+        status: "running",
+        deliveryStatus: "pending",
+      });
+
+      const cancellation = cancelTaskById({
+        cfg: {} as never,
+        taskId: task.taskId,
+      });
+      await cancellationEntered;
+      expect(
+        markTaskTerminalById({
+          taskId: task.taskId,
+          status: "succeeded",
+          endedAt: Date.now(),
+          terminalSummary: "Governed evidence completed.",
+        }),
+      ).toMatchObject({ taskId: task.taskId, status: "succeeded" });
+      releaseCancellation();
+
+      await expect(cancellation).resolves.toMatchObject({
+        found: true,
+        cancelled: false,
+        reason: "Task became terminal while cancellation was in progress.",
+        task: {
+          taskId: task.taskId,
+          status: "succeeded",
+          terminalSummary: "Governed evidence completed.",
+        },
+      });
+      expect(getTaskById(task.taskId)).toMatchObject({
+        taskId: task.taskId,
+        status: "succeeded",
+        terminalSummary: "Governed evidence completed.",
+      });
     });
   });
 

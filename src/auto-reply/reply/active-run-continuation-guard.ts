@@ -1,6 +1,4 @@
 import crypto from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
-import path from "node:path";
 import { resolveCleanupCrewReportCloseoutAcceptance } from "../../agents/report-delivery-guard.js";
 import { persistCleanupCrewContinuityGateDecision } from "../../commands/cleanup-plan.js";
 import type {
@@ -18,6 +16,7 @@ import {
 } from "../../governance/governed-run-durability-contract.js";
 import type { CompletionDecision, MissionMode } from "../../governance/mission-manifest.types.js";
 import { isSystemwideDepartmentFlowAcknowledgementText } from "../../governance/systemwide-department-flow-acknowledgement.js";
+import { commitGovernedMissionLedgerToSqlite } from "../../tasks/task-flow-registry.store.sqlite.js";
 import { getReplyPayloadMetadata, type ReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
 import { buildRuntimeCloseoutAdmissionInput } from "./false-closeout-admission-producer.js";
@@ -539,7 +538,7 @@ function persistFalseCloseoutAdmissionDecision(
   decision: CompletionDecision,
 ): string | undefined {
   try {
-    return writeFalseCloseoutAdmissionDecisionReceipt({ input, decision }).path;
+    return writeFalseCloseoutAdmissionDecisionReceipt({ input, decision }).receiptId;
   } catch {
     return undefined;
   }
@@ -607,32 +606,37 @@ async function persistActiveRunDurabilityObligation(
     return;
   }
   const idempotencyKey = buildActiveRunDurabilityIdempotencyKey(state, params.reason);
-  const outputDir = path.join(state.persistence.outputDir, "durability_obligations");
-  const filePath = path.join(outputDir, `${idempotencyKey}.json`);
   const now = state.persistence.now ?? new Date().toISOString();
-  const record = {
-    kind: "openclaw.governed-run-durability-obligation",
-    schemaVersion: 1,
-    idempotencyKey,
-    status: "open",
-    createdAt: now,
-    updatedAt: now,
-    sourceSurface: state.persistence.sourceSurface ?? "active-run-continuation-guard",
-    activeMission: state.persistence.activeMission,
+  const payload = {
     eventKind: params.kind,
     reason: params.reason,
-    obligatedOwner: "active_run_controller",
     watchdogVisible: params.decision.watchdogVisible,
-    requiredActions: params.decision.requiredActions,
-    durabilityDecision: params.decision,
-    lastNonTerminalDetail: state.lastNonTerminalDetail ?? null,
-    ownerBoundaryHandoffDetail: state.ownerBoundaryHandoffDetail ?? null,
-    proofRefs: state.persistence.proofRefs ?? [],
-    authoritySources: state.persistence.authoritySources,
+    requiredActions: [...params.decision.requiredActions].toSorted(),
+    sourceSurface: state.persistence.sourceSurface ?? "active-run-continuation-guard",
   };
-  await mkdir(outputDir, { recursive: true });
-  await writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
-  recordEvent(state, "GOVERNED_RUN_DURABILITY_OBLIGATION_WRITTEN", filePath);
+  const payloadSha256 = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  const committed = commitGovernedMissionLedgerToSqlite({
+    receipt: {
+      receiptId: `durability:${idempotencyKey}`,
+      missionId: state.persistence.activeMission,
+      operation: "recordDurabilityObligation",
+      receiptKind: "durability_obligation",
+      decision: "repair_required",
+      reasonCode: params.decision.state,
+      payloadSha256,
+      producer: "openclaw.active_run_continuation_guard",
+      idempotencyKey,
+      details: payload,
+      createdAt: Date.parse(now),
+    },
+  });
+  if (committed.status === "idempotency_conflict") {
+    throw new Error("durability obligation idempotency key was reused with changed input");
+  }
+  if (committed.status === "revision_conflict") {
+    throw new Error("durability obligation unexpectedly encountered a flow revision conflict");
+  }
+  recordEvent(state, "GOVERNED_RUN_DURABILITY_OBLIGATION_WRITTEN", committed.receipt.receiptId);
 }
 
 function persistContinuityGateDecision(
@@ -857,25 +861,25 @@ export function allowTerminalCloseout(
       });
     if (falseCloseoutAdmission) {
       const decision = evaluateFalseCloseoutAdmission(falseCloseoutAdmission);
-      const receiptPath = persistFalseCloseoutAdmissionDecision(falseCloseoutAdmission, decision);
+      const receiptId = persistFalseCloseoutAdmissionDecision(falseCloseoutAdmission, decision);
       if (decision.mode === "off") {
         recordEvent(
           state,
           "FALSE_CLOSEOUT_ADMISSION_OFF_BYPASSED",
-          `${decision.state}:${decision.rejectionCodes.join(",")}${receiptPath ? `:${receiptPath}` : ""}`,
+          `${decision.state}:${decision.rejectionCodes.join(",")}${receiptId ? `:${receiptId}` : ""}`,
         );
       } else if (decision.allowed) {
         recordEvent(
           state,
           "FALSE_CLOSEOUT_ADMISSION_ALLOWED",
-          `${decision.mode}:${decision.state}${receiptPath ? `:${receiptPath}` : ""}`,
+          `${decision.mode}:${decision.state}${receiptId ? `:${receiptId}` : ""}`,
         );
       } else if (decision.mode === "enforce") {
         const violationReason = `False-closeout admission controller rejected terminal closeout: ${decision.rejectionCodes.join(", ")}`;
         recordEvent(
           state,
           "FALSE_CLOSEOUT_ADMISSION_ENFORCED_REJECTED",
-          `${violationReason}${receiptPath ? ` receipt=${receiptPath}` : ""}`,
+          `${violationReason}${receiptId ? ` receipt=${receiptId}` : ""}`,
         );
         recordEvent(state, "ACTIVE_RUN_CONTINUITY_VIOLATION", violationReason);
         persistContinuityGateDecision(state, {
@@ -888,7 +892,7 @@ export function allowTerminalCloseout(
         recordEvent(
           state,
           "FALSE_CLOSEOUT_ADMISSION_SHADOW_REJECTED",
-          `${decision.rejectionCodes.join(",")}${receiptPath ? `:${receiptPath}` : ""}`,
+          `${decision.rejectionCodes.join(",")}${receiptId ? `:${receiptId}` : ""}`,
         );
         dispatcher.sendToolResult(buildFalseCloseoutShadowPayload(decision));
       }

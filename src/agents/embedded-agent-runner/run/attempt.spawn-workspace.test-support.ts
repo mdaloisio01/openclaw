@@ -61,13 +61,21 @@ type AttemptSpawnWorkspaceHoisted = {
   spawnSubagentDirectMock: UnknownMock;
   createAgentSessionMock: UnknownMock;
   sessionManagerOpenMock: UnknownMock;
+  guardSessionManagerMock: UnknownMock;
   defaultResourceLoaderInitMock: UnknownMock;
   resolveSandboxContextMock: UnknownMock;
+  prepareGovernedMissionAgentRunMock: UnknownMock;
+  closeGovernedMissionExecutionLeaseMock: UnknownMock;
+  createCacheTraceMock: UnknownMock;
+  updateActiveEmbeddedRunSnapshotMock: UnknownMock;
   ensureGlobalUndiciEnvProxyDispatcherMock: UnknownMock;
   ensureGlobalUndiciDispatcherStreamTimeoutsMock: UnknownMock;
   ensureGlobalUndiciStreamTimeoutsMock: UnknownMock;
   buildEmbeddedMessageActionDiscoveryInputMock: UnknownMock;
   createOpenClawCodingToolsMock: UnknownMock;
+  applyExtraParamsToAgentMock: UnknownMock;
+  registerProviderStreamForModelMock: UnknownMock;
+  splitSdkToolsMock: UnknownMock;
   subscribeEmbeddedAgentSessionMock: Mock<SubscribeEmbeddedAgentSessionFn>;
   acquireSessionWriteLockMock: Mock<AcquireSessionWriteLockFn>;
   installToolResultContextGuardMock: UnknownMock;
@@ -133,13 +141,24 @@ const hoisted = vi.hoisted((): AttemptSpawnWorkspaceHoisted => {
   const spawnSubagentDirectMock = vi.fn();
   const createAgentSessionMock = vi.fn();
   const sessionManagerOpenMock = vi.fn();
+  const guardSessionManagerMock = vi.fn((sessionManager: unknown) => sessionManager);
   const defaultResourceLoaderInitMock = vi.fn();
   const resolveSandboxContextMock = vi.fn();
+  const prepareGovernedMissionAgentRunMock = vi.fn(() => ({ status: "irrelevant" }));
+  const closeGovernedMissionExecutionLeaseMock = vi.fn();
+  const createCacheTraceMock = vi.fn(() => undefined);
+  const updateActiveEmbeddedRunSnapshotMock = vi.fn();
   const ensureGlobalUndiciEnvProxyDispatcherMock = vi.fn();
   const ensureGlobalUndiciDispatcherStreamTimeoutsMock = vi.fn();
   const ensureGlobalUndiciStreamTimeoutsMock = vi.fn();
   const buildEmbeddedMessageActionDiscoveryInputMock = vi.fn((params: unknown) => params);
   const createOpenClawCodingToolsMock = vi.fn(() => []);
+  const applyExtraParamsToAgentMock = vi.fn(() => ({ effectiveExtraParams: {} }));
+  const registerProviderStreamForModelMock = vi.fn();
+  const splitSdkToolsMock = vi.fn((...args: unknown[]) => {
+    const options = args[0] as { tools: unknown[] };
+    return { customTools: options.tools };
+  });
   const installToolResultContextGuardMock = vi.fn(() => () => {});
   const installContextEngineLoopHookMock = vi.fn(() => () => {});
   const flushPendingToolResultsAfterIdleMock = vi.fn(async () => {});
@@ -203,13 +222,21 @@ const hoisted = vi.hoisted((): AttemptSpawnWorkspaceHoisted => {
     spawnSubagentDirectMock,
     createAgentSessionMock,
     sessionManagerOpenMock,
+    guardSessionManagerMock,
     defaultResourceLoaderInitMock,
     resolveSandboxContextMock,
+    prepareGovernedMissionAgentRunMock,
+    closeGovernedMissionExecutionLeaseMock,
+    createCacheTraceMock,
+    updateActiveEmbeddedRunSnapshotMock,
     ensureGlobalUndiciEnvProxyDispatcherMock,
     ensureGlobalUndiciDispatcherStreamTimeoutsMock,
     ensureGlobalUndiciStreamTimeoutsMock,
     buildEmbeddedMessageActionDiscoveryInputMock,
     createOpenClawCodingToolsMock,
+    applyExtraParamsToAgentMock,
+    registerProviderStreamForModelMock,
+    splitSdkToolsMock,
     subscribeEmbeddedAgentSessionMock,
     acquireSessionWriteLockMock,
     installToolResultContextGuardMock,
@@ -325,8 +352,17 @@ vi.mock("../../sandbox.js", () => ({
   resolveSandboxContext: (...args: unknown[]) => hoisted.resolveSandboxContextMock(...args),
 }));
 
+vi.mock("../../../governance/governed-mission-agent-runtime.js", () => ({
+  assertGovernedMissionAgentRunBinding: vi.fn(),
+  closeGovernedMissionExecutionLease: (...args: unknown[]) =>
+    hoisted.closeGovernedMissionExecutionLeaseMock(...args),
+  hasGovernedMissionClaimForOwnerKey: vi.fn(() => false),
+  prepareGovernedMissionAgentRun: (...args: unknown[]) =>
+    hoisted.prepareGovernedMissionAgentRunMock(...args),
+}));
+
 vi.mock("../../session-tool-result-guard-wrapper.js", () => ({
-  guardSessionManager: (sessionManager: unknown) => sessionManager,
+  guardSessionManager: (...args: unknown[]) => hoisted.guardSessionManagerMock(...args),
 }));
 
 vi.mock("../../embedded-agent-subscribe.js", () => ({
@@ -501,7 +537,8 @@ vi.mock("../wait-for-idle-before-flush.js", () => ({
 vi.mock("../runs.js", () => ({
   setActiveEmbeddedRun: () => {},
   clearActiveEmbeddedRun: () => {},
-  updateActiveEmbeddedRunSnapshot: () => {},
+  updateActiveEmbeddedRunSnapshot: (...args: unknown[]) =>
+    hoisted.updateActiveEmbeddedRunSnapshotMock(...args),
 }));
 
 vi.mock("./images.js", () => ({
@@ -541,7 +578,7 @@ vi.mock("../extra-params.js", async () => {
   const actual = await vi.importActual<typeof import("../extra-params.js")>("../extra-params.js");
   return {
     ...actual,
-    applyExtraParamsToAgent: () => ({ effectiveExtraParams: {} }),
+    applyExtraParamsToAgent: (...args: unknown[]) => hoisted.applyExtraParamsToAgentMock(...args),
     resolvePreparedExtraParams: (params: {
       cfg?: unknown;
       provider: string;
@@ -572,7 +609,7 @@ vi.mock("../../anthropic-payload-log.js", () => ({
 }));
 
 vi.mock("../../cache-trace.js", () => ({
-  createCacheTrace: () => undefined,
+  createCacheTrace: (...args: unknown[]) => hoisted.createCacheTraceMock(...args),
 }));
 
 vi.mock("../../agent-tools.js", () => ({
@@ -642,7 +679,8 @@ vi.mock("../../model-tool-support.js", () => ({
 }));
 
 vi.mock("../../provider-stream.js", () => ({
-  registerProviderStreamForModel: vi.fn(),
+  registerProviderStreamForModel: (...args: unknown[]) =>
+    hoisted.registerProviderStreamForModelMock(...args),
 }));
 
 vi.mock("../../owner-display.js", () => ({
@@ -796,9 +834,7 @@ vi.mock("../tool-name-allowlist.js", async (importOriginal) => {
 });
 
 vi.mock("../tool-split.js", () => ({
-  splitSdkTools: ({ tools }: { tools: unknown[] }) => ({
-    customTools: tools,
-  }),
+  splitSdkTools: (...args: unknown[]) => hoisted.splitSdkToolsMock(...args),
 }));
 
 vi.mock("../utils.js", () => ({
@@ -932,8 +968,15 @@ export function resetEmbeddedAttemptHarness(
   }
   hoisted.createAgentSessionMock.mockReset();
   hoisted.sessionManagerOpenMock.mockReset().mockReturnValue(hoisted.sessionManager);
+  hoisted.guardSessionManagerMock
+    .mockReset()
+    .mockImplementation((sessionManager: unknown) => sessionManager);
   hoisted.defaultResourceLoaderInitMock.mockReset();
   hoisted.resolveSandboxContextMock.mockReset();
+  hoisted.prepareGovernedMissionAgentRunMock.mockReset().mockReturnValue({ status: "irrelevant" });
+  hoisted.closeGovernedMissionExecutionLeaseMock.mockReset();
+  hoisted.createCacheTraceMock.mockReset().mockReturnValue(undefined);
+  hoisted.updateActiveEmbeddedRunSnapshotMock.mockReset();
   hoisted.ensureGlobalUndiciEnvProxyDispatcherMock.mockReset();
   hoisted.ensureGlobalUndiciDispatcherStreamTimeoutsMock.mockReset();
   hoisted.ensureGlobalUndiciStreamTimeoutsMock.mockReset();
@@ -967,6 +1010,12 @@ export function resetEmbeddedAttemptHarness(
           ),
       },
     ];
+  });
+  hoisted.applyExtraParamsToAgentMock.mockReset().mockReturnValue({ effectiveExtraParams: {} });
+  hoisted.registerProviderStreamForModelMock.mockReset().mockReturnValue(undefined);
+  hoisted.splitSdkToolsMock.mockReset().mockImplementation((...args: unknown[]) => {
+    const options = args[0] as { tools: unknown[] };
+    return { customTools: options.tools };
   });
   hoisted.subscribeEmbeddedAgentSessionMock
     .mockReset()

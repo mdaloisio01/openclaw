@@ -258,7 +258,7 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     payload: Parameters<NonNullable<SubscribeEmbeddedAgentSessionParams["onBlockReply"]>>[0],
     options?: { assistantMessageIndex?: number },
   ): boolean => {
-    if (!params.onBlockReply) {
+    if (!params.onBlockReply || params.shouldSuppressAssistantOutput?.()) {
       return false;
     }
     try {
@@ -1018,7 +1018,9 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
     assistantMessageIndex?: number;
     final?: boolean;
   }): void | Promise<void> => {
-    if (!params.onBlockReply) {
+    if (!params.onBlockReply || params.shouldSuppressAssistantOutput?.()) {
+      blockChunker?.reset();
+      state.blockBuffer = "";
       return;
     }
     if (blockChunker?.hasBuffered()) {
@@ -1065,7 +1067,11 @@ export function subscribeEmbeddedAgentSession(params: SubscribeEmbeddedAgentSess
   };
 
   const emitReasoningStream = (text: string) => {
-    if (params.silentExpected) {
+    const suppressAssistantOutput = params.shouldSuppressAssistantOutput;
+    if (
+      params.silentExpected ||
+      (typeof suppressAssistantOutput === "function" && suppressAssistantOutput())
+    ) {
       return;
     }
     if (!state.streamReasoning || !params.onReasoningStream) {

@@ -326,6 +326,7 @@ export function installContextEngineLoopHook(params: {
   modelId: string;
   getPrePromptMessageCount?: () => number;
   onAfterTurnCheckpoint?: (messageCount: number) => void;
+  shouldProcessTurn?: () => boolean;
   getRuntimeContext?: (params: {
     messages: AgentMessage[];
     prePromptMessageCount: number;
@@ -349,6 +350,9 @@ export function installContextEngineLoopHook(params: {
       transcriptProjectionCache,
     );
     const providerMessages = stripTranscriptPromptMarkers(sourceMessages);
+    if (params.shouldProcessTurn?.() === false) {
+      return providerMessages;
+    }
     const checkedPrefixLength =
       lastSeenLength == null ? 0 : Math.min(lastSeenLength, transcriptMessages.length);
     const sourceHistoryChanged =

@@ -51,6 +51,7 @@ describe("readPostCompactionContext", () => {
     cfg?: OpenClawConfig;
     agentId?: string;
     nowMs?: number;
+    sessionKey?: string;
   }) {
     const cfg = {
       ...defaultPostCompactionCfg,
@@ -163,7 +164,9 @@ Ignore this.
       deliveryStatus: "pending",
     });
 
-    const result = await readDefaultPostCompactionContext();
+    const result = await readDefaultPostCompactionContext({
+      sessionKey: "agent:main:webchat:mission",
+    });
 
     expect(result).toContain("[Active mission refresh]");
     expect(result).toContain("<active_mission>");

@@ -22,6 +22,11 @@ import { canonicalizeMainSessionAlias } from "../config/sessions/main-session.js
 import { resolveAllAgentSessionStoreTargetsSync } from "../config/sessions/targets.js";
 import type { SessionScope } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  inspectLegacyFalseCloseoutReceipts,
+  legacyFalseCloseoutReceiptStagingDirectory,
+  migrateLegacyFalseCloseoutReceipts,
+} from "../governance/governed-mission-legacy-migration.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
   countPluginStateLiveEntries,
@@ -56,6 +61,7 @@ import {
 import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { expandHomePrefix } from "./home-dir.js";
 import {
   executeSqliteQuerySync,
@@ -113,6 +119,11 @@ export type LegacyStateDetection = {
     taskRunsPath: string;
     flowRunsPath: string;
     hasLegacy: boolean;
+  };
+  governedReceiptFiles?: {
+    decisionDir: string;
+    hasLegacy: boolean;
+    fileCount: number;
   };
   deliveryQueues: {
     outboundPath: string;
@@ -2563,6 +2574,28 @@ export async function detectLegacyStateMigrations(params: {
   const taskRunsSidecarPath = resolveLegacyTaskRunsSidecarPath(stateDir);
   const flowRunsSidecarPath = resolveLegacyFlowRunsSidecarPath(stateDir);
   const hasTaskStateSidecars = fileExists(taskRunsSidecarPath) || fileExists(flowRunsSidecarPath);
+  const governedReceiptDecisionDir = path.join(
+    env.OPENCLAW_WORKSPACE_DIR?.trim() ||
+      path.join(homedir(), ".openclaw", "workspace-orchestrator"),
+    "var",
+    "false_closeout_admission",
+    "decisions",
+  );
+  const governedReceiptStagingDir = legacyFalseCloseoutReceiptStagingDirectory(
+    governedReceiptDecisionDir,
+  );
+  const governedReceiptStagingExists = fs.existsSync(governedReceiptStagingDir);
+  const governedReceiptStagingFiles = inspectLegacyFalseCloseoutReceipts(governedReceiptStagingDir);
+  const governedReceiptSourceFiles = inspectLegacyFalseCloseoutReceipts(governedReceiptDecisionDir);
+  // Staging itself is recovery work, even when a crash left it empty. Inspect the source too
+  // because a legacy writer may have recreated it after the interrupted rename.
+  const governedReceiptFiles = {
+    present:
+      governedReceiptStagingExists ||
+      governedReceiptStagingFiles.present ||
+      governedReceiptSourceFiles.present,
+    fileCount: governedReceiptStagingFiles.fileCount + governedReceiptSourceFiles.fileCount,
+  };
   const deliveryQueuePaths = {
     outboundPath: resolveLegacyDeliveryQueuePath(stateDir, "delivery-queue"),
     sessionPath: resolveLegacyDeliveryQueuePath(stateDir, "session-delivery-queue"),
@@ -2610,6 +2643,11 @@ export async function detectLegacyStateMigrations(params: {
   if (hasDeliveryQueues) {
     preview.push("- Delivery queues: legacy JSON queue files → shared SQLite state");
   }
+  if (governedReceiptFiles.present) {
+    preview.push(
+      `- Governed false-closeout receipts: ${governedReceiptFiles.fileCount} JSON files → shared SQLite state`,
+    );
+  }
   if (channelPlans.length > 0) {
     preview.push(...channelPlans.map(buildLegacyMigrationPreview));
   }
@@ -2656,6 +2694,11 @@ export async function detectLegacyStateMigrations(params: {
       taskRunsPath: taskRunsSidecarPath,
       flowRunsPath: flowRunsSidecarPath,
       hasLegacy: hasTaskStateSidecars,
+    },
+    governedReceiptFiles: {
+      decisionDir: governedReceiptDecisionDir,
+      hasLegacy: governedReceiptFiles.present,
+      fileCount: governedReceiptFiles.fileCount,
     },
     deliveryQueues: {
       ...deliveryQueuePaths,
@@ -2919,6 +2962,17 @@ export async function runLegacyStateMigrations(params: {
   const taskStateSidecars = await migrateLegacyTaskStateSidecars({
     stateDir: detected.stateDir,
   });
+  const governedReceiptFiles = detected.governedReceiptFiles?.hasLegacy
+    ? await migrateLegacyFalseCloseoutReceipts({
+        directory: detected.governedReceiptFiles.decisionDir,
+        stateDbPath: resolveOpenClawStateSqlitePath({
+          ...process.env,
+          OPENCLAW_STATE_DIR: detected.stateDir,
+        }),
+        removeSource: true,
+        now: now(),
+      })
+    : { changes: [], warnings: [] };
   const deliveryQueues = await migrateLegacyDeliveryQueues({
     stateDir: detected.stateDir,
   });
@@ -2946,6 +3000,7 @@ export async function runLegacyStateMigrations(params: {
       ...pluginStateSidecar.changes,
       ...pluginInstallIndex.changes,
       ...taskStateSidecars.changes,
+      ...governedReceiptFiles.changes,
       ...deliveryQueues.changes,
       ...preSessionChannelPlans.changes,
       ...pluginPlans.changes,
@@ -2958,6 +3013,7 @@ export async function runLegacyStateMigrations(params: {
       ...pluginStateSidecar.warnings,
       ...pluginInstallIndex.warnings,
       ...taskStateSidecars.warnings,
+      ...governedReceiptFiles.warnings,
       ...deliveryQueues.warnings,
       ...preSessionChannelPlans.warnings,
       ...pluginPlans.warnings,

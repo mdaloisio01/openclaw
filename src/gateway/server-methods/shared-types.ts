@@ -8,6 +8,7 @@ import type { CliDeps } from "../../cli/deps.types.js";
 import type { HealthSummary } from "../../commands/health.types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import type { CronServiceContract } from "../../cron/service-contract.js";
+import type { GovernedRuntimeIdentity } from "../../governance/governed-mission-production-admission.js";
 import type { PluginApprovalRequestPayload } from "../../infra/plugin-approvals.js";
 import type { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { WizardSession } from "../../wizard/session.js";
@@ -52,6 +53,8 @@ export type GatewayRequestContext = {
   cron: CronServiceContract;
   cronStorePath: string;
   getRuntimeConfig: () => OpenClawConfig;
+  /** Host-measured runtime identity; tests may inject an equivalent trusted fixture. */
+  governedRuntimeIdentity?: GovernedRuntimeIdentity;
   execApprovalManager?: ExecApprovalManager;
   pluginApprovalManager?: ExecApprovalManager<PluginApprovalRequestPayload>;
   loadGatewayModelCatalog: (params?: { readOnly?: boolean }) => Promise<ModelCatalogEntry[]>;

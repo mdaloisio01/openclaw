@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { resolveExpiresAtMsFromDurationMs } from "@openclaw/normalization-core/number-coercion";
 import type { Insertable, Selectable } from "kysely";
@@ -374,6 +375,10 @@ function readOnlyEnvOptions(env?: NodeJS.ProcessEnv): OpenClawStateDatabaseOptio
   return { ...envOptions(env), readOnly: true };
 }
 
+function hasPluginStateDatabase(env?: NodeJS.ProcessEnv): boolean {
+  return existsSync(resolveOpenClawStateSqlitePath(env ?? process.env));
+}
+
 function runWriteTransaction<T>(
   operation: PluginStateStoreOperation,
   write: (store: PluginStateDatabase) => T,
@@ -638,6 +643,9 @@ export function pluginStateLookup(params: {
   env?: NodeJS.ProcessEnv;
 }): unknown {
   try {
+    if (!hasPluginStateDatabase(params.env)) {
+      return undefined;
+    }
     const { db } = openPluginStateDatabase("lookup", readOnlyEnvOptions(params.env));
     const row = selectPluginStateEntry(db, {
       pluginId: params.pluginId,
@@ -720,6 +728,9 @@ export function pluginStateEntries(params: {
   env?: NodeJS.ProcessEnv;
 }): PluginStateEntry<unknown>[] {
   try {
+    if (!hasPluginStateDatabase(params.env)) {
+      return [];
+    }
     const { db } = openPluginStateDatabase("entries", readOnlyEnvOptions(params.env));
     const rows = selectPluginStateEntries(db, {
       pluginId: params.pluginId,

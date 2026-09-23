@@ -37,6 +37,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -122,7 +123,7 @@ describe("governed finalization repair", () => {
           lastCloseoutReceiptRef: expect.stringMatching(/^closeout:/u),
         },
         [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
-          currentGovernedState: "GOVERNED_MISSION_WAITING",
+          currentGovernedState: "repair_required",
           currentStep: "before_agent_finalize_repair_attempt_1",
           revision: 2,
         },
@@ -167,7 +168,7 @@ describe("governed finalization repair", () => {
         expectedFlowRevision: 8,
         stateJson: {
           [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
-            currentGovernedState: "GOVERNED_MISSION_TERMINAL",
+            currentGovernedState: "failed",
             currentStep: "before_agent_finalize_failed_contract",
             terminalStatus: "failed",
           },

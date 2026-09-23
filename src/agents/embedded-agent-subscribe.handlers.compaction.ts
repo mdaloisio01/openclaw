@@ -35,6 +35,10 @@ function compactionLogKind(reason: CompactionReason): string {
   return reason === "manual" ? "manual compaction" : "auto-compaction";
 }
 
+function shouldSuppressContentSideEffects(ctx: EmbeddedAgentSubscribeContext): boolean {
+  return ctx.params.shouldSuppressAssistantOutput?.() === true;
+}
+
 export function handleCompactionStart(
   ctx: EmbeddedAgentSubscribeContext,
   evt: CompactionStartEvent,
@@ -62,7 +66,7 @@ export function handleCompactionStart(
 
   // Run before_compaction plugin hook (fire-and-forget)
   const hookRunner = getGlobalHookRunner();
-  if (hookRunner?.hasHooks("before_compaction")) {
+  if (!shouldSuppressContentSideEffects(ctx) && hookRunner?.hasHooks("before_compaction")) {
     void hookRunner
       .runBeforeCompaction(
         {
@@ -150,7 +154,7 @@ export function handleCompactionEnd(ctx: EmbeddedAgentSubscribeContext, evt: Com
   });
 
   // Run after_compaction plugin hook (fire-and-forget)
-  if (!willRetry) {
+  if (!willRetry && !shouldSuppressContentSideEffects(ctx)) {
     const hookRunnerEnd = getGlobalHookRunner();
     if (hookRunnerEnd?.hasHooks("after_compaction")) {
       void hookRunnerEnd

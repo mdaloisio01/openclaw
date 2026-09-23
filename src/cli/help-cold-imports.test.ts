@@ -125,6 +125,9 @@ vi.mock("../commands/flows.js", () => {
   loaded.mark("flows-command");
   return {
     flowsCancelCommand: vi.fn(async () => {}),
+    flowsGovernancePreviewCommand: vi.fn(async () => {}),
+    flowsGovernanceReceiptsCommand: vi.fn(async () => {}),
+    flowsGovernanceShowCommand: vi.fn(async () => {}),
     flowsListCommand: vi.fn(async () => {}),
     flowsShowCommand: vi.fn(async () => {}),
   };

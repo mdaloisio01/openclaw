@@ -117,7 +117,7 @@ function listNormalFullSuiteTestFiles(): string[] {
     .sync(["**/*.{test,spec}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}"], {
       cwd: process.cwd(),
       dot: false,
-      ignore: ["**/.*/**", "**/dist/**", "**/node_modules/**", "**/vendor/**"],
+      ignore: ["**/.*/**", "**/dist/**", "**/node_modules{,.*}/**", "**/vendor/**"],
     })
     .map(normalizeRepoPath)
     .filter(

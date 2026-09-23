@@ -345,7 +345,7 @@ function collectArtifactsFromMessage(params: {
   downloadArtifactId?: string;
 }): void {
   const msg = asOptionalRecord(params.message);
-  if (!msg) {
+  if (!msg || msg.display === false) {
     return;
   }
   const messageSeq = resolveMessageSeq(msg, params.messageFallbackSeq);

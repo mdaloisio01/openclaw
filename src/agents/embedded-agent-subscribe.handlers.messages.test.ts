@@ -20,6 +20,12 @@ import {
   createOpenAiResponsesTextEvent as createTextUpdateEvent,
 } from "./embedded-agent-subscribe.openai-responses.test-helpers.js";
 
+const { appendRawStreamMock } = vi.hoisted(() => ({ appendRawStreamMock: vi.fn() }));
+
+vi.mock("./embedded-agent-subscribe.raw-stream.js", () => ({
+  appendRawStream: appendRawStreamMock,
+}));
+
 function createMessageUpdateContext(
   params: {
     onAgentEvent?: ReturnType<typeof vi.fn>;
@@ -30,6 +36,7 @@ function createMessageUpdateContext(
     shouldEmitPartialReplies?: boolean;
     consumePartialReplyDirectives?: ReturnType<typeof vi.fn>;
     stripBlockTags?: ReturnType<typeof vi.fn>;
+    shouldSuppressAssistantOutput?: () => boolean;
     state?: Record<string, unknown>;
   } = {},
 ) {
@@ -40,6 +47,7 @@ function createMessageUpdateContext(
       session: { id: "session-1" },
       ...(params.onAgentEvent ? { onAgentEvent: params.onAgentEvent } : {}),
       ...(params.onPartialReply ? { onPartialReply: params.onPartialReply } : {}),
+      shouldSuppressAssistantOutput: params.shouldSuppressAssistantOutput,
     },
     state: {
       deterministicApprovalPromptPending: false,
@@ -91,6 +99,7 @@ function createMessageEndContext(
     warn?: ReturnType<typeof vi.fn>;
     builtinToolNames?: ReadonlySet<string>;
     sourceReplyDeliveryMode?: "automatic" | "message_tool_only";
+    shouldSuppressAssistantOutput?: () => boolean;
     blockChunker?: { hasBuffered: () => boolean; reset: () => void };
     state?: Record<string, unknown>;
   } = {},
@@ -104,6 +113,7 @@ function createMessageEndContext(
         : {}),
       ...(params.onAgentEvent ? { onAgentEvent: params.onAgentEvent } : {}),
       ...(params.onBlockReply ? { onBlockReply: params.onBlockReply } : { onBlockReply: vi.fn() }),
+      shouldSuppressAssistantOutput: params.shouldSuppressAssistantOutput,
     },
     state: {
       assistantTexts: [],
@@ -297,6 +307,45 @@ describe("pending assistant reply directives", () => {
 });
 
 describe("handleMessageUpdate text signatures", () => {
+  it("does not write governed reasoning or assistant text to the raw stream", async () => {
+    appendRawStreamMock.mockClear();
+    const shouldSuppressAssistantOutput = () => true;
+    const updateContext = createMessageUpdateContext({ shouldSuppressAssistantOutput });
+    const endContext = createMessageEndContext({ shouldSuppressAssistantOutput });
+
+    handleMessageUpdate(updateContext, {
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "private governed reasoning" }],
+      },
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        delta: "private governed reasoning",
+      },
+    } as never);
+    handleMessageUpdate(updateContext, {
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "private governed final" }],
+      },
+      assistantMessageEvent: {
+        type: "text_delta",
+        delta: "private governed final",
+      },
+    } as never);
+    await handleMessageEnd(endContext, {
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "private governed final" }],
+      },
+    } as never);
+
+    expect(appendRawStreamMock).not.toHaveBeenCalled();
+  });
+
   it("uses incremental text deltas for non-phase streams", () => {
     const onAgentEvent = vi.fn();
     const stripBlockTags = vi.fn((text: string) => text);

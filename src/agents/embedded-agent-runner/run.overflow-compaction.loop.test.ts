@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE } from "../../governance/governed-final-release-decision.js";
 import {
   makeAttemptResult,
   makeCompactionSuccess,
@@ -713,6 +714,27 @@ describe("overflow compaction in run loop", () => {
         mediaUrl: undefined,
         mediaUrls: undefined,
       },
+    ]);
+  });
+
+  it("persists tool-only media in the governed withheld payload", async () => {
+    mockedRunEmbeddedAttempt.mockResolvedValue(
+      makeAttemptResult({
+        governedMissionFlowId: "governed-media-flow",
+        governedMissionAttemptReceiptId: "governed-media-attempt",
+        assistantTexts: [],
+        toolMediaUrls: ["https://example.test/governed-tool-output.png"],
+      }),
+    );
+
+    const result = await runEmbeddedAgent({ ...baseParams, runId: "governed-media-run" });
+
+    expectLogIncludes(
+      mockedLog.warn,
+      "governed final payload identity was not persisted: flowId=governed-media-flow reason=not_found",
+    );
+    expect(result.payloads).toEqual([
+      { text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE, isStatusNotice: true },
     ]);
   });
 

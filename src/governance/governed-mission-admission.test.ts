@@ -5,7 +5,7 @@ import {
   type GovernedMissionAdmissionInput,
 } from "./governed-mission-admission.js";
 import {
-  GOVERNED_RECEIPT_KINDS,
+  GOVERNED_RUNTIME_RECEIPT_KINDS,
   type GovernedAuthorityRef,
   type GovernedMissionContract,
 } from "./governed-mission-contract.js";
@@ -17,7 +17,7 @@ const authorityRef: GovernedAuthorityRef = {
   refId: "sop-enf-08-plan",
   kind: "work_order",
   uri: "/home/will/.openclaw/workspace-orchestrator/file_hub/exports/sop_enforcement_master_build_plan_2026-08-21T1905Z.md#SOP-ENF-08",
-  sha256: "authority-sha",
+  sha256: "authority-hash",
 };
 
 const contract: GovernedMissionContract = {
@@ -33,9 +33,10 @@ const contract: GovernedMissionContract = {
   sourceRevision: "source-revision-1",
   runtimeBuildSha256: "runtime-build-sha",
   policyVersion: "policy-v1",
+  skillSha256: "skill-sha",
   mode: "enforce",
   authoritativeCompletionOwner: "governed_mission_state",
-  requiredReceiptKinds: [...GOVERNED_RECEIPT_KINDS],
+  requiredReceiptKinds: [...GOVERNED_RUNTIME_RECEIPT_KINDS],
   createdAt: "2026-08-22T04:50:00Z",
 };
 
@@ -56,6 +57,7 @@ const baseInput: GovernedMissionAdmissionInput = {
     sourceRevision: contract.sourceRevision,
     runtimeBuildSha256: contract.runtimeBuildSha256,
     policyVersion: contract.policyVersion,
+    skillSha256: contract.skillSha256,
   },
   ownerCorrelation: {
     owner: "Cleanup Crew",
@@ -92,13 +94,13 @@ describe("governed mission admission foundation", () => {
       obligations: ["write_admission_receipt", "persist_governed_mission_state"],
     });
     expect(result.missionState).toMatchObject({
-      schema: "openclaw.governed_mission_state.v1",
+      schema: "openclaw.governed_mission_state.v2",
       missionId: contract.missionId,
       contractId: contract.contractId,
       contractHash: contract.contractHash,
       authorityHash: contract.authorityHash,
       currentStep: "before_agent_run_admission",
-      currentGovernedState: "GOVERNED_MISSION_ACTIVE",
+      currentGovernedState: "admitted",
     });
     expect(result.policyDecision).toMatchObject({
       decision: "ALLOW",
@@ -159,6 +161,28 @@ describe("governed mission admission foundation", () => {
     });
   });
 
+  it("fails closed without throwing on malformed contract discriminants and references", () => {
+    expect(
+      admitGovernedMission({
+        ...baseInput,
+        contract: {
+          ...contract,
+          schema: "openclaw.governed_mission_contract.v2",
+          mode: "observe",
+          authorityRefs: [null],
+        } as unknown as GovernedMissionContract,
+      }),
+    ).toMatchObject({
+      decision: "DENY",
+      reasonCode: "MALFORMED_CONTRACT_STATE",
+      obligations: expect.arrayContaining([
+        "missing:schema.unsupported",
+        "missing:mode.unsupported",
+        "missing:authorityRefs.0.invalid",
+      ]),
+    });
+  });
+
   it("fails closed when observed authority no longer matches the contract snapshot", () => {
     expect(
       admitGovernedMission({
@@ -171,6 +195,26 @@ describe("governed mission admission foundation", () => {
     ).toMatchObject({
       decision: "DENY",
       reasonCode: "SOURCE_REVISION_MISMATCH",
+      obligations: ["lawful_readmission_required"],
+    });
+  });
+
+  it("rejects an authority reference that is not pinned by the contract", () => {
+    expect(
+      admitGovernedMission({
+        ...baseInput,
+        observedAuthority: {
+          ...baseInput.observedAuthority!,
+          authorityRef: {
+            ...authorityRef,
+            refId: "unrelated-authority",
+            uri: "/safe/unrelated-authority.json",
+          },
+        },
+      }),
+    ).toMatchObject({
+      decision: "DENY",
+      reasonCode: "AUTHORITY_REFERENCE_MISMATCH",
       obligations: ["lawful_readmission_required"],
     });
   });
@@ -215,7 +259,7 @@ describe("governed mission admission foundation", () => {
       decision: "DENY",
       reasonCode: "contract_hash_mismatch",
       missionState: {
-        currentGovernedState: "GOVERNED_MISSION_BLOCKED",
+        currentGovernedState: "readmission_required",
         blockedStatus: "contract_hash_mismatch",
         currentStep: "lawful_readmission_required",
       },
@@ -235,7 +279,7 @@ describe("governed mission admission foundation", () => {
       decision: "DENY",
       reasonCode: "mission_identity_mismatch",
       missionState: {
-        currentGovernedState: "GOVERNED_MISSION_BLOCKED",
+        currentGovernedState: "readmission_required",
         blockedStatus: "readmission_required",
         currentStep: "lawful_readmission_required",
       },

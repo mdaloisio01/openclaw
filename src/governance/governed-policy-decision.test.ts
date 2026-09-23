@@ -27,6 +27,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -143,7 +144,7 @@ describe("governed policy decision foundation", () => {
     expect(
       evaluateGovernedAction({
         ...baseContext,
-        missionState: { ...missionState, currentGovernedState: "GOVERNED_MISSION_BLOCKED" },
+        missionState: { ...missionState, currentGovernedState: "blocked" },
       }),
     ).toMatchObject({ decision: "BLOCKED", reasonCode: "not_blocked" });
     expect(
@@ -167,6 +168,28 @@ describe("governed policy decision foundation", () => {
       }),
     ).toMatchObject({ decision: "BLOCKED", reasonCode: "FINAL_OUTPUT_RELEASE_NOT_READY" });
   });
+
+  it.each([
+    "pending_override",
+    "closeout_ready",
+    "artifact_verified",
+    "terminal_pending_watchdog",
+    "released",
+  ] as const)(
+    "blocks protected actions while the mission is locked in %s",
+    (currentGovernedState) => {
+      expect(
+        evaluateGovernedAction({
+          ...baseContext,
+          missionState: { ...missionState, currentGovernedState },
+        }),
+      ).toMatchObject({
+        decision: "BLOCKED",
+        reasonCode: "GOVERNED_MISSION_LOCKED",
+        obligations: ["complete_current_governed_lock_step"],
+      });
+    },
+  );
 
   it("denies host authority and child delegation failures", () => {
     expect(

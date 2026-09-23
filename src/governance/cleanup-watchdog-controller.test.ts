@@ -166,7 +166,7 @@ describe("cleanup-watchdog-controller", () => {
         executorCount: 0,
       },
       governedMissionState: {
-        state: "GOVERNED_MISSION_PENDING_OVERRIDE",
+        state: "pending_override",
         proofCurrent: true,
       },
     });
@@ -191,7 +191,7 @@ describe("cleanup-watchdog-controller", () => {
         executorLeaseCurrent: true,
       },
       governedMissionState: {
-        state: "GOVERNED_MISSION_PENDING_OVERRIDE",
+        state: "pending_override",
         proofCurrent: false,
       },
     });
@@ -222,7 +222,7 @@ describe("cleanup-watchdog-controller", () => {
         executorCount: 0,
       },
       governedMissionState: {
-        state: "AWAITING_CLOSEOUT",
+        state: "closeout_ready",
         proofCurrent: true,
         authoritativeCloseoutPassed: false,
       },
@@ -251,7 +251,7 @@ describe("cleanup-watchdog-controller", () => {
         executorLeaseCurrent: true,
       },
       governedMissionState: {
-        state: "GOVERNED_MISSION_ACTIVE",
+        state: "executing",
         proofCurrent: true,
         enforcementHealthOk: false,
       },

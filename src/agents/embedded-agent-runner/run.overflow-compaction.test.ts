@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE } from "../../governance/governed-final-release-decision.js";
 import type { AgentHarness } from "../harness/types.js";
 import type { AgentInternalEvent } from "../internal-events.js";
 import type { AgentRuntimePlan } from "../runtime-plan/types.js";
@@ -17,6 +18,7 @@ import {
   mockedBuildAgentRuntimePlan,
   mockedBuildEmbeddedRunPayloads,
   mockedCoerceToFailoverError,
+  mockedCloseGovernedMissionExecutionLease,
   mockedCompactDirect,
   mockedContextEngine,
   mockedDescribeFailoverError,
@@ -26,8 +28,10 @@ import {
   mockedExtractObservedOverflowTokenCount,
   mockedGlobalHookRunner,
   mockedGetApiKeyForModel,
+  mockedHasActiveGovernedMissionForOwnerKey,
   mockedIsLikelyContextOverflowError,
   mockedMarkAuthProfileSuccess,
+  mockedRecordGovernedMissionWithheldPayload,
   mockedPickFallbackThinkingLevel,
   mockedResolveAuthProfileOrder,
   mockedResolveContextWindowInfo,
@@ -678,6 +682,35 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     expect(
       (pluginParams as { toolAuthProfileStore?: unknown }).toolAuthProfileStore,
     ).toBeUndefined();
+  });
+
+  it("rejects governed turns before dispatching to a plugin harness", async () => {
+    const { clearAgentHarnesses, registerAgentHarness } = await import("../harness/registry.js");
+    const pluginRunAttempt = vi.fn<AgentHarness["runAttempt"]>(async () =>
+      makeAttemptResult({ assistantTexts: ["must not run"] }),
+    );
+    clearAgentHarnesses();
+    registerAgentHarness({
+      id: "governance-unaware-harness",
+      label: "Governance-unaware harness",
+      supports: () => ({ supported: true, priority: 200 }),
+      runAttempt: pluginRunAttempt,
+    });
+    mockedHasActiveGovernedMissionForOwnerKey.mockReturnValue(true);
+
+    try {
+      await expect(
+        runEmbeddedAgent({
+          ...overflowBaseRunParams,
+          agentHarnessId: "governance-unaware-harness",
+          runId: "governed-plugin-harness-block",
+        }),
+      ).rejects.toThrow("Governed mission execution requires the OpenClaw harness");
+    } finally {
+      clearAgentHarnesses();
+    }
+
+    expect(pluginRunAttempt).not.toHaveBeenCalled();
   });
 
   it("forwards unscoped tool auth profiles to Copilot plugin harnesses", async () => {
@@ -2066,6 +2099,90 @@ describe("runEmbeddedAgent overflow compaction trigger routing", () => {
     expect(result.meta.livenessState).toBe("blocked");
     expect(result.meta.finalAssistantVisibleText).toBe(result.payloads?.[0]?.text);
     expect(terminalLifecycleMeta.at(-1)).toMatchObject({ livenessState: "blocked" });
+  });
+
+  it("withholds every governed model payload before canonical final release", async () => {
+    mockedBuildEmbeddedRunPayloads.mockReturnValue([
+      { text: "secret model final" },
+      { mediaUrl: "https://example.test/secret.png" },
+    ]);
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+      makeAttemptResult({
+        governedMissionFlowId: "governed-flow-1",
+        governedMissionAttemptReceiptId: "governed-attempt-1",
+        governedMissionExecutionRunId: "governed-run-1",
+      }),
+    );
+
+    const result = await runEmbeddedAgent(overflowBaseRunParams);
+
+    expect(result.payloads).toEqual([
+      {
+        text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE,
+        isStatusNotice: true,
+      },
+    ]);
+    expect(mockedRecordGovernedMissionWithheldPayload).toHaveBeenCalledWith({
+      flowId: "governed-flow-1",
+      attemptReceiptId: "governed-attempt-1",
+      payload: [{ text: "secret model final" }, { mediaUrl: "https://example.test/secret.png" }],
+    });
+    expect(mockedCloseGovernedMissionExecutionLease).toHaveBeenCalledWith({
+      flowId: "governed-flow-1",
+      runId: "governed-run-1",
+    });
+    expect(mockedCloseGovernedMissionExecutionLease).toHaveBeenCalledTimes(1);
+    expect(mockedRecordGovernedMissionWithheldPayload.mock.invocationCallOrder[0]).toBeLessThan(
+      mockedCloseGovernedMissionExecutionLease.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("retries the exact governed lease close before clearing the pending handle", async () => {
+    mockedBuildEmbeddedRunPayloads.mockReturnValue([{ text: "secret model final" }]);
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+      makeAttemptResult({
+        governedMissionFlowId: "governed-flow-retry",
+        governedMissionAttemptReceiptId: "governed-attempt-retry",
+        governedMissionExecutionRunId: "governed-run-retry",
+      }),
+    );
+    mockedCloseGovernedMissionExecutionLease
+      .mockImplementationOnce(() => {
+        throw new Error("transient lease persistence failure");
+      })
+      .mockImplementationOnce(() => undefined);
+
+    await expect(runEmbeddedAgent(overflowBaseRunParams)).resolves.toMatchObject({
+      payloads: [{ text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE }],
+    });
+
+    expect(mockedCloseGovernedMissionExecutionLease.mock.calls).toEqual([
+      [{ flowId: "governed-flow-retry", runId: "governed-run-retry" }],
+      [{ flowId: "governed-flow-retry", runId: "governed-run-retry" }],
+    ]);
+  });
+
+  it("keeps governed overflow recovery out of the outer context engine", async () => {
+    mockedHasActiveGovernedMissionForOwnerKey.mockReturnValue(true);
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+      makeAttemptResult({
+        governedMissionFlowId: "governed-flow-overflow",
+        governedMissionAttemptReceiptId: "governed-attempt-overflow",
+        promptError: makeOverflowError(),
+        promptErrorSource: "prompt",
+      }),
+    );
+
+    const result = await runEmbeddedAgent(overflowBaseRunParams);
+
+    expect(mockedCompactDirect).not.toHaveBeenCalled();
+    expect(mockedTruncateOversizedToolResultsInSession).not.toHaveBeenCalled();
+    expect(mockedRunContextEngineMaintenance).not.toHaveBeenCalled();
+    expect(mockedGlobalHookRunner.runBeforeCompaction).not.toHaveBeenCalled();
+    expect(mockedGlobalHookRunner.runAfterCompaction).not.toHaveBeenCalled();
+    expect(result.payloads).toEqual([
+      { text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE, isStatusNotice: true },
+    ]);
   });
 
   it("does not reset compaction attempt budget after successful tool-result truncation", async () => {

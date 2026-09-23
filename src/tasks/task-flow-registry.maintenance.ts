@@ -1,3 +1,9 @@
+import {
+  cancelGovernedMissionTaskFlow,
+  isGovernedMissionFlowClaimed,
+  isGovernedMissionCancellationComplete,
+} from "../governance/governed-mission-runtime.js";
+import { readGovernedMissionStateFromTaskFlow } from "../governance/governed-mission-state.js";
 import { listTasksForFlowId } from "./runtime-internal.js";
 import {
   listTaskFlowAuditFindings,
@@ -25,6 +31,14 @@ export type TaskFlowRegistryMaintenanceSummary = {
 };
 
 function isTerminalFlow(flow: TaskFlowRecord): boolean {
+  if (isGovernedMissionFlowClaimed(flow)) {
+    return (
+      flow.status === "succeeded" ||
+      flow.status === "failed" ||
+      flow.status === "cancelled" ||
+      flow.status === "lost"
+    );
+  }
   return (
     flow.status === "succeeded" ||
     flow.status === "blocked" ||
@@ -45,6 +59,11 @@ function resolveTerminalAt(flow: TaskFlowRecord): number {
 }
 
 function shouldPruneFlow(flow: TaskFlowRecord, now: number): boolean {
+  // Governed terminal rows are durable owner-claim tombstones. Deleting one lets
+  // the same conversation escape its terminal release boundary on a later run.
+  if (isGovernedMissionFlowClaimed(flow)) {
+    return false;
+  }
   if (!isTerminalFlow(flow)) {
     return false;
   }
@@ -66,6 +85,9 @@ function shouldFinalizeCancelledFlow(flow: TaskFlowRecord): boolean {
 
 function shouldFinalizeOrphanedQueuedFlow(flow: TaskFlowRecord, now: number): boolean {
   if (flow.syncMode !== "managed" || flow.status !== "queued") {
+    return false;
+  }
+  if (isGovernedMissionFlowClaimed(flow)) {
     return false;
   }
   if (flow.waitJson != null || flow.blockedTaskId?.trim() || flow.blockedSummary?.trim()) {
@@ -114,6 +136,25 @@ function finalizeCancelledFlow(flow: TaskFlowRecord, now: number): boolean {
   let current = flow;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const endedAt = Math.max(now, current.updatedAt, current.cancelRequestedAt ?? now);
+    const governedMission = readGovernedMissionStateFromTaskFlow(current);
+    if (isGovernedMissionFlowClaimed(current)) {
+      if (!governedMission) {
+        return false;
+      }
+      const result = cancelGovernedMissionTaskFlow({
+        flowId: current.flowId,
+        occurredAt: endedAt,
+      });
+      if (isGovernedMissionCancellationComplete(result)) {
+        return true;
+      }
+      const refreshed = getTaskFlowById(current.flowId);
+      if (!refreshed || !shouldFinalizeCancelledFlow(refreshed)) {
+        return false;
+      }
+      current = refreshed;
+      continue;
+    }
     const result =
       getTaskFlowProductionContinuation(current)?.activeProductionRun === true
         ? recordFlowLawfulStop({

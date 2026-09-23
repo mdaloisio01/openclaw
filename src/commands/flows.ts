@@ -2,10 +2,31 @@ import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coer
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
 import { isRich, theme } from "../../packages/terminal-core/src/theme.js";
+import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import { getRuntimeConfig } from "../config/config.js";
 import { info } from "../globals.js";
+import {
+  observeGovernedMissionIdentity,
+  readGovernedWorkspaceSkillSha256,
+  type GovernedRuntimeIdentity,
+} from "../governance/governed-mission-identity.js";
+import {
+  isGovernedMissionFlowClaimed,
+  isGovernedMissionStateCanonicallyPersisted,
+  listGovernedMissionReceipts,
+  previewGovernedMissionOperation,
+  resolveGovernedMissionFlowForLookupToken,
+} from "../governance/governed-mission-runtime.js";
+import { readGovernedMissionStateFromTaskFlow } from "../governance/governed-mission-state.js";
+import {
+  GOVERNED_MISSION_PUBLIC_OPERATIONS,
+  type GovernedMissionIdentityBindings,
+  type GovernedMissionOperation,
+  type GovernedMissionPublicOperationName,
+} from "../governance/governed-mission-transition.js";
 import { runRuntimeAssetGuardPreflight } from "../infra/runtime-asset-guard-preflight.js";
+import { parseAgentSessionKey } from "../routing/session-key.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { writeRuntimeJson } from "../runtime.js";
 import {
@@ -33,6 +54,101 @@ const MODE_PAD = 14;
 const REV_PAD = 6;
 const CTRL_PAD = 20;
 const BLOCKED_CLASS_PAD = 32;
+
+function governedMissionProjection(flow: TaskFlowRecord) {
+  const state = readGovernedMissionStateFromTaskFlow(flow);
+  if (!state || !flow.controllerId) {
+    return null;
+  }
+  return {
+    schema: state.schema,
+    missionId: state.missionId,
+    contractId: state.contractId,
+    contractVersion: state.contractVersion,
+    contractHash: state.contractHash,
+    authorityHash: state.authorityHash,
+    authorityRef: {
+      refId: state.authorityRef.refId,
+      kind: state.authorityRef.kind,
+      sha256: state.authorityRef.sha256 ?? null,
+    },
+    planRevisionId: state.planRevisionId,
+    sourceRevision: state.sourceRevision,
+    runtimeBuildSha256: state.runtimeBuildSha256,
+    policyVersion: state.policyVersion,
+    skillSha256: state.skillSha256,
+    currentGovernedState: state.currentGovernedState,
+    currentStep: state.currentStep,
+    owner: state.ownerCorrelation.owner,
+    taskFlowId: state.ownerCorrelation.taskFlowId ?? null,
+    overrideRef: state.overrideRef,
+    terminalStatus: state.terminalStatus,
+    blockedStatus: state.blockedStatus,
+    proofs: state.proofs,
+    revision: state.revision,
+    stateVersion: state.stateVersion,
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt,
+  };
+}
+
+function buildCliGovernedPreviewOperation(
+  flow: TaskFlowRecord,
+  operation: GovernedMissionPublicOperationName,
+  bindings: GovernedMissionIdentityBindings,
+): GovernedMissionOperation | null {
+  const state = readGovernedMissionStateFromTaskFlow(flow);
+  if (!state || !flow.controllerId) {
+    return null;
+  }
+  const base = {
+    operation,
+    expectedRevision: state.revision,
+    idempotencyKey: `preview:${operation}:${state.revision}`,
+    owner: state.ownerCorrelation.owner,
+    controllerId: flow.controllerId,
+    bindings,
+    occurredAt: state.updatedAt,
+  };
+  switch (operation) {
+    case "startWorkOrder":
+    case "requestCloseout":
+    case "requestReadmission":
+      return base as GovernedMissionOperation;
+    case "recordImplementationResult":
+    case "recordValidationResult":
+    case "recordReviewResult":
+    case "verifyRequiredArtifacts":
+    case "recordDeliveryResult":
+      return { ...base, passed: false } as GovernedMissionOperation;
+    case "admitTerminalPendingWatchdog":
+      return {
+        ...base,
+        parentScopeClosed: false,
+        openWorkCount: 1,
+      } as GovernedMissionOperation;
+    case "recordPostTerminalWatchdog":
+      return {
+        ...base,
+        passed: false,
+        boundRevision: state.revision,
+        boundRuntimeBuildSha256: state.runtimeBuildSha256,
+      } as GovernedMissionOperation;
+    case "releaseFinalResult":
+      return base as GovernedMissionOperation;
+    case "blockForRepair":
+      return {
+        ...base,
+        reasonCode: "PREVIEW_REPAIR_REQUIRED",
+        nextAction: "Repair the named governed mission issue.",
+      } as GovernedMissionOperation;
+    case "cancelMission":
+    case "stopMission":
+      return base as GovernedMissionOperation;
+  }
+  const unreachableOperation: never = operation;
+  return unreachableOperation;
+}
 
 type BlockedFlowClassification =
   | "current_lawful_blocker"
@@ -323,6 +439,209 @@ export async function flowsListCommand(
   const rich = isRich();
   for (const line of formatFlowRows(flows, rich)) {
     runtime.log(line);
+  }
+}
+
+export async function flowsGovernanceShowCommand(
+  opts: { json?: boolean; lookup: string },
+  runtime: RuntimeEnv,
+) {
+  const flow = resolveGovernedMissionFlowForLookupToken(opts.lookup);
+  if (!flow) {
+    failCommand(runtime, formatFlowLookupMiss(opts.lookup));
+    return;
+  }
+  const mission = governedMissionProjection(flow);
+  if (!mission) {
+    failCommand(
+      runtime,
+      isGovernedMissionFlowClaimed(flow)
+        ? `TaskFlow has untrusted governed state: ${flow.flowId}`
+        : `TaskFlow is not governed: ${flow.flowId}`,
+    );
+    return;
+  }
+  if (!isGovernedMissionStateCanonicallyPersisted(flow)) {
+    failCommand(runtime, `TaskFlow has untrusted governed state: ${flow.flowId}`);
+    return;
+  }
+  const output = {
+    flowId: flow.flowId,
+    flowRevision: flow.revision,
+    flowStatus: flow.status,
+    mission,
+  };
+  if (opts.json) {
+    writeRuntimeJson(runtime, output);
+    return;
+  }
+  for (const line of [
+    "Governed TaskFlow:",
+    `flowId: ${flow.flowId}`,
+    `flowRevision: ${flow.revision}`,
+    `flowStatus: ${flow.status}`,
+    `missionId: ${mission.missionId}`,
+    `state: ${mission.currentGovernedState}`,
+    `missionRevision: ${mission.revision}`,
+    `currentStep: ${safeFlowDisplayText(mission.currentStep)}`,
+    `contractHash: ${mission.contractHash}`,
+    `authorityHash: ${mission.authorityHash}`,
+    `planRevisionId: ${mission.planRevisionId}`,
+    `sourceRevision: ${mission.sourceRevision}`,
+    `runtimeBuildSha256: ${mission.runtimeBuildSha256}`,
+    `skillSha256: ${mission.skillSha256}`,
+    `proofs: ${Object.entries(mission.proofs)
+      .map(([name, status]) => `${name}=${status}`)
+      .join(", ")}`,
+  ]) {
+    runtime.log(line);
+  }
+}
+
+export async function flowsGovernancePreviewCommand(
+  opts: { json?: boolean; lookup: string; operation: string },
+  runtime: RuntimeEnv,
+  trustedRuntimeIdentity?: GovernedRuntimeIdentity,
+) {
+  const flow = resolveGovernedMissionFlowForLookupToken(opts.lookup);
+  if (!flow) {
+    failCommand(runtime, formatFlowLookupMiss(opts.lookup));
+    return;
+  }
+  if (!(GOVERNED_MISSION_PUBLIC_OPERATIONS as readonly string[]).includes(opts.operation)) {
+    failCommand(runtime, `Unknown governed mission operation: ${opts.operation}`);
+    return;
+  }
+  const mission = readGovernedMissionStateFromTaskFlow(flow);
+  if (!mission) {
+    failCommand(
+      runtime,
+      isGovernedMissionFlowClaimed(flow)
+        ? `TaskFlow has untrusted governed state: ${flow.flowId}`
+        : `TaskFlow is not governed: ${flow.flowId}`,
+    );
+    return;
+  }
+  if (!isGovernedMissionStateCanonicallyPersisted(flow, mission)) {
+    failCommand(runtime, `TaskFlow has untrusted governed state: ${flow.flowId}`);
+    return;
+  }
+  const config = getRuntimeConfig();
+  const agentId = parseAgentSessionKey(flow.ownerKey)?.agentId ?? resolveDefaultAgentId(config);
+  const bindings = observeGovernedMissionIdentity({
+    mission,
+    trustedRuntimeIdentity,
+    observedSkillSha256: readGovernedWorkspaceSkillSha256({
+      workspaceDir: resolveAgentWorkspaceDir(config, agentId),
+      config,
+      agentId,
+    }),
+  });
+  if (!bindings) {
+    failCommand(runtime, "Governed mission identity could not be remeasured.");
+    return;
+  }
+  const operation = buildCliGovernedPreviewOperation(
+    flow,
+    opts.operation as GovernedMissionPublicOperationName,
+    bindings,
+  );
+  if (!operation) {
+    failCommand(runtime, `TaskFlow is not governed: ${flow.flowId}`);
+    return;
+  }
+  const preview = previewGovernedMissionOperation({ lookup: flow.flowId, request: operation });
+  if (preview.status !== "preview") {
+    failCommand(runtime, `Unable to preview governed TaskFlow: ${preview.status}`);
+    return;
+  }
+  const output = {
+    flowId: flow.flowId,
+    flowRevision: flow.revision,
+    operation: opts.operation,
+    decision: {
+      status: preview.decision.status,
+      reasonCode: preview.decision.reasonCode,
+      currentState: preview.decision.previousState.currentGovernedState,
+      proposedState: preview.decision.nextState.currentGovernedState,
+      stateChanged: preview.decision.stateChanged,
+      missingProof: preview.decision.missingProof,
+      nextAction: preview.decision.nextAction,
+    },
+  };
+  if (opts.json) {
+    writeRuntimeJson(runtime, output);
+    return;
+  }
+  for (const line of [
+    "Governed transition preview (read-only):",
+    `flowId: ${flow.flowId}`,
+    `flowRevision: ${flow.revision}`,
+    `operation: ${opts.operation}`,
+    `decision: ${output.decision.status}`,
+    `reasonCode: ${output.decision.reasonCode}`,
+    `currentState: ${output.decision.currentState}`,
+    `proposedState: ${output.decision.proposedState}`,
+    `missingProof: ${output.decision.missingProof.join(", ") || "none"}`,
+    `nextAction: ${output.decision.nextAction}`,
+  ]) {
+    runtime.log(line);
+  }
+}
+
+export async function flowsGovernanceReceiptsCommand(
+  opts: { json?: boolean; lookup: string; limit?: number },
+  runtime: RuntimeEnv,
+) {
+  const flow = resolveGovernedMissionFlowForLookupToken(opts.lookup);
+  if (!flow) {
+    failCommand(runtime, formatFlowLookupMiss(opts.lookup));
+    return;
+  }
+  const mission = readGovernedMissionStateFromTaskFlow(flow);
+  if (!mission) {
+    failCommand(
+      runtime,
+      isGovernedMissionFlowClaimed(flow)
+        ? `TaskFlow has untrusted governed state: ${flow.flowId}`
+        : `TaskFlow is not governed: ${flow.flowId}`,
+    );
+    return;
+  }
+  if (!isGovernedMissionStateCanonicallyPersisted(flow, mission)) {
+    failCommand(runtime, `TaskFlow has untrusted governed state: ${flow.flowId}`);
+    return;
+  }
+  const requestedLimit = opts.limit;
+  const limit =
+    typeof requestedLimit === "number" && Number.isSafeInteger(requestedLimit)
+      ? Math.max(1, Math.min(requestedLimit, 500))
+      : 50;
+  const receipts = listGovernedMissionReceipts({ flowId: flow.flowId, limit }).map((receipt) => ({
+    receiptId: receipt.receiptId,
+    receiptKind: receipt.receiptKind,
+    operation: receipt.operation,
+    fromState: receipt.fromState ?? null,
+    toState: receipt.toState ?? null,
+    decision: receipt.decision,
+    reasonCode: receipt.reasonCode,
+    expectedRevision: receipt.expectedRevision ?? null,
+    resultingRevision: receipt.resultingRevision ?? null,
+    payloadSha256: receipt.payloadSha256,
+    producer: receipt.producer,
+    createdAt: receipt.createdAt,
+  }));
+  if (opts.json) {
+    writeRuntimeJson(runtime, { flowId: flow.flowId, count: receipts.length, limit, receipts });
+    return;
+  }
+  runtime.log(`Governed receipts: ${receipts.length}`);
+  for (const receipt of receipts) {
+    runtime.log(
+      sanitizeTerminalText(
+        `${formatFlowTimestamp(receipt.createdAt)} ${receipt.operation} ${receipt.decision} ${receipt.reasonCode} ${receipt.receiptId}`,
+      ),
+    );
   }
 }
 

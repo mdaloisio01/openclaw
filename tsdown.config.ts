@@ -39,6 +39,7 @@ const env = {
 };
 const OUTPUT_SOURCE_MAPS = process.env.OUTPUT_SOURCE_MAPS === "1";
 const RUN_NODE_SKIP_DTS_BUILD = process.env.OPENCLAW_RUN_NODE_SKIP_DTS_BUILD === "1";
+const SERIAL_BUILD = process.env.OPENCLAW_TSDOWN_SERIAL_BUILD === "1";
 
 const SUPPRESSED_EVAL_WARNING_PATHS = [
   "@protobufjs/inquire/index.js",
@@ -668,7 +669,7 @@ function buildUnifiedDistEntries(): Record<string, string> {
   };
 }
 
-export default defineConfig([
+const buildConfigs: UserConfig[] = [
   nodeBuildConfig({
     clean: true,
     dts: RUN_NODE_SKIP_DTS_BUILD ? false : undefined,
@@ -803,4 +804,10 @@ export default defineConfig([
       neverBundle: shouldNeverBundleDependency,
     },
   }),
-]);
+];
+
+export default defineConfig(
+  SERIAL_BUILD
+    ? buildConfigs.map((config, index) => ({ ...config, name: `openclaw-build-${index}` }))
+    : buildConfigs,
+);

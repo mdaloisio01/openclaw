@@ -441,6 +441,9 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
     methods: [
       "tasks.list",
       "tasks.get",
+      "tasks.governance.status",
+      "tasks.governance.preview",
+      "tasks.governance.apply",
       "tasks.cancel",
       "tasks.startProductionFlow",
       "tasks.resumeProductionFlow",

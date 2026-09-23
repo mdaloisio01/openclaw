@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  closeTaskFlowRegistryDatabase,
+  findGovernedMissionReceiptByIdempotencyFromSqlite,
+} from "../tasks/task-flow-registry.store.sqlite.js";
 import { evaluateFalseCloseoutAdmission } from "./false-closeout-admission-controller.js";
 import {
   buildRuntimeCloseoutAdmissionInput,
@@ -29,6 +33,19 @@ const BOUND_IDENTITY: MissionIdentity = {
   skillSha256: "skill-sha",
 };
 
+let stateDir: string;
+
+beforeEach(() => {
+  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "fcac-runtime-evidence-state-"));
+  vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
+});
+
+afterEach(() => {
+  closeTaskFlowRegistryDatabase();
+  vi.unstubAllEnvs();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
+
 describe("false-closeout runtime evidence", () => {
   it("builds deterministic runtime closeout input and writes a durable decision receipt", () => {
     const input = buildRuntimeCloseoutAdmissionInput({
@@ -55,23 +72,47 @@ describe("false-closeout runtime evidence", () => {
       expect.arrayContaining(["FCAC_PARENT_RUNNING", "FCAC_NEXT_EXECUTABLE_STEP_EXISTS"]),
     );
 
-    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "fcac-runtime-evidence-"));
     const receipt = writeFalseCloseoutAdmissionDecisionReceipt({
       input: input!,
       decision,
-      workspaceDir,
     });
-    const body = JSON.parse(fs.readFileSync(receipt.path, "utf8")) as {
-      schema: string;
-      decision: { decisionId: string };
-      input: { manifest: { missionId: string } };
-    };
+    const stored = findGovernedMissionReceiptByIdempotencyFromSqlite({
+      missionId: decision.missionId,
+      idempotencyKey: decision.decisionId,
+    });
 
-    expect(receipt.path).toContain("var/false_closeout_admission/decisions");
+    expect(receipt.receiptId).toMatch(/^false-closeout:/u);
     expect(receipt.sha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(body.schema).toBe("openclaw.false_closeout_admission_decision_receipt.v1");
-    expect(body.decision.decisionId).toBe(decision.decisionId);
-    expect(body.input.manifest.missionId).toBe(input?.manifest.missionId);
+    expect(stored).toMatchObject({
+      receiptId: receipt.receiptId,
+      missionId: decision.missionId,
+      operation: "falseCloseoutAdmission",
+      receiptKind: "false_closeout",
+      decision: "denied",
+      idempotencyKey: decision.decisionId,
+      details: {
+        auditReceipt: {
+          input: {
+            completionRequest: {
+              closeoutText: {
+                redacted: true,
+                sha256: input?.completionRequest.closeoutSha256,
+                byteLength: 4,
+              },
+            },
+          },
+          decision: {
+            decisionId: decision.decisionId,
+            rejectionCodes: expect.arrayContaining(["FCAC_PARENT_RUNNING"]),
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(stored?.details)).not.toContain('"closeoutText":"done"');
+
+    expect(writeFalseCloseoutAdmissionDecisionReceipt({ input: input!, decision })).toEqual(
+      receipt,
+    );
   });
 
   it("maps live delivery, executor, watchdog, repair, and next-step snapshots into rejection evidence", () => {

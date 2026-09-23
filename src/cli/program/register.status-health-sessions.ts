@@ -87,9 +87,15 @@ function collectOptionValue(value: string, previous: string[]): string[] {
 }
 
 function hasJsonOption(opts: { json?: boolean }, command?: Command): boolean {
-  return Boolean(
-    opts.json || command?.parent?.opts()?.json || command?.parent?.parent?.opts()?.json,
-  );
+  if (opts.json) {
+    return true;
+  }
+  for (let current = command; current; current = current.parent ?? undefined) {
+    if (current.opts()?.json) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function parseTasksAuditLimit(limit: unknown): number | null | undefined {
@@ -501,7 +507,7 @@ export function registerStatusHealthSessionsCommands(program: Command) {
     .option("--severity <level>", "Filter by severity (warn, error)")
     .option(
       "--code <name>",
-      "Filter by finding code (stale_queued, stale_running, lost, delivery_failed, missing_cleanup, inconsistent_timestamps, restore_failed, stale_waiting, stale_blocked, cancel_stuck, missing_linked_tasks, blocked_task_missing)",
+      "Filter by task or Task Flow finding code, including governed mission receipt, repair, terminal-proof, and release findings",
     )
     .option("--limit <n>", "Limit displayed findings")
     .action(async (opts, command) => {
@@ -529,6 +535,11 @@ export function registerStatusHealthSessionsCommands(program: Command) {
               | "cancel_stuck"
               | "missing_linked_tasks"
               | "blocked_task_missing"
+              | "governed_admission_receipt_missing"
+              | "governed_flow_identity_mismatch"
+              | "governed_repair_required"
+              | "governed_terminal_proof_missing"
+              | "governed_release_inconsistent"
               | undefined,
             limit,
           },
@@ -612,6 +623,65 @@ export function registerStatusHealthSessionsCommands(program: Command) {
   const tasksFlowCmd = tasksCmd
     .command("flow")
     .description("Inspect durable TaskFlow state under tasks");
+
+  const tasksFlowGovernanceCmd = tasksFlowCmd
+    .command("governance")
+    .description("Inspect governed mission state without changing it");
+
+  tasksFlowGovernanceCmd
+    .command("show")
+    .description("Show canonical governed mission identity, state, revision, and proof gates")
+    .argument("<lookup>", "Flow id or owner key")
+    .option("--json", "Output as JSON", false)
+    .action(async (lookup, opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsGovernanceShowCommand } = await loadFlowsCommands();
+        await flowsGovernanceShowCommand(
+          { lookup, json: hasJsonOption(opts, command) },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowGovernanceCmd
+    .command("preview")
+    .description("Preview one named governed mission operation without writing state")
+    .argument("<lookup>", "Flow id or owner key")
+    .requiredOption("--operation <name>", "Named governed mission operation")
+    .option("--json", "Output as JSON", false)
+    .action(async (lookup, opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsGovernancePreviewCommand } = await loadFlowsCommands();
+        await flowsGovernancePreviewCommand(
+          {
+            lookup,
+            operation: opts.operation as string,
+            json: hasJsonOption(opts, command),
+          },
+          defaultRuntime,
+        );
+      });
+    });
+
+  tasksFlowGovernanceCmd
+    .command("receipts")
+    .description("List recent governed mission receipts without changing state")
+    .argument("<lookup>", "Flow id or owner key")
+    .option("--limit <n>", "Maximum receipts", (value) => Number.parseInt(value, 10), 50)
+    .option("--json", "Output as JSON", false)
+    .action(async (lookup, opts, command) => {
+      await runCommandWithRuntime(defaultRuntime, async () => {
+        const { flowsGovernanceReceiptsCommand } = await loadFlowsCommands();
+        await flowsGovernanceReceiptsCommand(
+          {
+            lookup,
+            limit: opts.limit as number,
+            json: hasJsonOption(opts, command),
+          },
+          defaultRuntime,
+        );
+      });
+    });
 
   tasksFlowCmd
     .command("start-production")

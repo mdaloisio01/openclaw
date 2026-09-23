@@ -903,7 +903,7 @@ describe("createCodexDynamicToolBridge", () => {
       callId: "call-1",
       namespace: null,
       tool: "exec",
-      arguments: { command: "false" },
+      arguments: { command: "git status" },
     });
 
     expect(result).toEqual({
@@ -1320,7 +1320,7 @@ describe("createCodexDynamicToolBridge", () => {
     });
     expectExecuteCall(execute, {
       callId: "call-memory-write",
-      args: { path: "memory/2026-06-28.md" },
+      args: { path: "memory/2026-06-28.md", content: "durable note" },
     });
   });
 
@@ -1392,7 +1392,7 @@ describe("createCodexDynamicToolBridge", () => {
     const afterToolCall = vi.fn(async (event) => {
       events.push("after_tool_call");
       const record = requireRecord(event, "after_tool_call event");
-      expect(record.params).toEqual({ command: "status", mode: "safe" });
+      expect(record.params).toEqual({ command: "git status", mode: "safe" });
       expectToolResult(record.result, {
         content: [{ type: "text", text: "compacted output" }],
         details: { stage: "middleware" },
@@ -1408,7 +1408,7 @@ describe("createCodexDynamicToolBridge", () => {
     const handler = vi.fn(
       async (event: { args: Record<string, unknown>; result: AgentToolResult<unknown> }) => {
         events.push("middleware");
-        expect(event.args).toEqual({ command: "status" });
+        expect(event.args).toEqual({ command: "git status" });
         return {
           result: {
             ...event.result,
@@ -1443,7 +1443,7 @@ describe("createCodexDynamicToolBridge", () => {
       callId: "call-1",
       namespace: null,
       tool: "exec",
-      arguments: { command: "status" },
+      arguments: { command: "git status" },
     });
 
     expect(result).toEqual(expectInputText("compacted output"));
@@ -1476,7 +1476,7 @@ describe("createCodexDynamicToolBridge", () => {
       callId: "call-err",
       namespace: null,
       tool: "exec",
-      arguments: { command: "false" },
+      arguments: { command: "git status" },
     });
 
     expect(result).toEqual({
@@ -1485,7 +1485,7 @@ describe("createCodexDynamicToolBridge", () => {
     });
     expectExecuteCall(execute, {
       callId: "call-err",
-      args: { command: "false", timeoutSec: 1 },
+      args: { command: "git status", timeoutSec: 1 },
     });
     await vi.waitFor(() => {
       expect(afterToolCall).toHaveBeenCalledTimes(1);
@@ -1493,7 +1493,7 @@ describe("createCodexDynamicToolBridge", () => {
     const event = requireRecord(callArg(afterToolCall, 0, 0, "after_tool_call event"), "event");
     expect(event.toolName).toBe("exec");
     expect(event.toolCallId).toBe("call-err");
-    expect(event.params).toEqual({ command: "false", timeoutSec: 1 });
+    expect(event.params).toEqual({ command: "git status", timeoutSec: 1 });
     expect(event.error).toBe("tool failed");
     expectContextFields(callArg(afterToolCall, 0, 1, "after_tool_call context"), {
       runId: "run-error",
@@ -1525,7 +1525,7 @@ describe("createCodexDynamicToolBridge", () => {
         callId: "call-signal",
         namespace: null,
         tool: "exec",
-        arguments: { command: "sleep" },
+        arguments: { command: "git status" },
       },
       { signal: callController.signal },
     );

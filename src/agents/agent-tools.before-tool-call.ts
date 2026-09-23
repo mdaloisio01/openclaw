@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -18,8 +19,14 @@ import {
 import {
   evaluateMissionSpecificToolEnforcement,
   type MissionSpecificToolEnforcementAuthority,
+  type MissionSpecificToolEnforcementDecision,
+  type MissionSpecificToolInvocation,
 } from "../governance/mission-specific-tool-enforcement.js";
-import type { TrustedHostPolicy } from "../governance/protected-action-policy.js";
+import {
+  classifyProtectedAction,
+  type ProtectedActionSignals,
+  type TrustedHostPolicy,
+} from "../governance/protected-action-policy.js";
 import {
   diagnosticErrorCategory,
   diagnosticHttpStatusCode,
@@ -73,6 +80,7 @@ import {
 import type { SkillSnapshot, SkillTelemetrySource } from "../skills/types.js";
 import { resolveSkillWorkshopToolApproval } from "../skills/workshop/policy.js";
 import { isPlainObject } from "../utils.js";
+import { beginActiveToolExecution } from "./active-tool-execution-tracker.js";
 import { writeActiveWorkCheckpoint, type ActiveWorkCheckpoint } from "./active-work-checkpoint.js";
 import { adjustedParamsByToolCallId } from "./agent-tools.before-tool-call.state.js";
 import { copyChannelAgentToolMeta, getChannelAgentToolMeta } from "./channel-tools.js";
@@ -83,8 +91,10 @@ import {
   normalizeCodeModeExecBeforeHookParamsForToolKind,
   reconcileCodeModeExecBeforeHookParams,
 } from "./code-mode-control-tools.js";
+import { isMessagingTool } from "./embedded-agent-messaging.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 import { applyStopContractToSingleText, type EmbeddedRunStopContract } from "./stop-contract.js";
+import { isMutatingToolCall } from "./tool-mutation.js";
 import { normalizeToolName } from "./tool-policy.js";
 import type { AnyAgentTool } from "./tools/common.js";
 import { callGatewayTool } from "./tools/gateway.js";
@@ -163,6 +173,11 @@ export type HookContext = {
     supervisorWrapperRequired?: boolean;
     supervisorWrapperActive?: boolean;
     authority?: MissionSpecificToolEnforcementAuthority;
+    resolveAuthority?: () => MissionSpecificToolEnforcementAuthority | undefined;
+    onDecision?: (
+      decision: MissionSpecificToolEnforcementDecision,
+      invocation?: MissionSpecificToolInvocation,
+    ) => void;
   };
   sandbox?: {
     root: string;
@@ -253,6 +268,29 @@ const BEFORE_TOOL_CALL_SOURCE_TOOL = Symbol("beforeToolCallSourceTool");
 const BEFORE_TOOL_CALL_HOOK_CONTEXT = Symbol("beforeToolCallHookContext");
 const BEFORE_TOOL_CALL_HOOK_FAILURE_REASON =
   "Tool call blocked because before_tool_call hook failed";
+const GOVERNED_EXTERNALLY_VISIBLE_CORE_TOOL_NAMES = new Set([
+  "image",
+  "image_generate",
+  "music_generate",
+  "pdf",
+  "tts",
+  "video_generate",
+  "web_fetch",
+  "web_search",
+]);
+const GOVERNED_SAFE_BROWSER_READ_ACTIONS = new Set(["doctor", "status"]);
+const GOVERNED_SAFE_NODE_READ_ACTIONS = new Set([
+  "device_health",
+  "device_status",
+  "pending",
+  "status",
+]);
+const GOVERNED_GATEWAY_DELIVERY_ACTIONS = new Set([
+  "config.apply",
+  "config.patch",
+  "restart",
+  "update.run",
+]);
 const MAX_TRACKED_ADJUSTED_PARAMS = 1024;
 const LOOP_WARNING_BUCKET_SIZE = 10;
 const MAX_LOOP_WARNING_KEYS = 256;
@@ -358,6 +396,41 @@ function matchesToolName(toolName: string, candidates: string[]): boolean {
   );
 }
 
+function isGovernedCronMutation(toolName: string, gatewayMethod: string | undefined): boolean {
+  return (
+    matchesToolName(normalizeToolName(toolName), ["cron"]) &&
+    ["add", "update", "remove", "run"].includes(gatewayMethod?.trim().toLowerCase() ?? "")
+  );
+}
+
+function isGovernedSensitiveCoreRead(toolName: string, params: unknown): boolean {
+  if (isMutatingToolCall(toolName, params)) {
+    return false;
+  }
+  const action = getStringParam(params, ["action"])?.trim().toLowerCase();
+  const normalizedToolName = normalizeToolName(toolName);
+  if (matchesToolName(normalizedToolName, ["browser"])) {
+    return !action || !GOVERNED_SAFE_BROWSER_READ_ACTIONS.has(action);
+  }
+  if (matchesToolName(normalizedToolName, ["nodes"])) {
+    return !action || !GOVERNED_SAFE_NODE_READ_ACTIONS.has(action);
+  }
+  return false;
+}
+
+function isGovernedGatewayDelivery(params: {
+  toolName: string;
+  gatewayMethod: string | undefined;
+}): boolean {
+  if (!matchesToolName(normalizeToolName(params.toolName), ["gateway"])) {
+    return false;
+  }
+  const action = params.gatewayMethod?.trim().toLowerCase();
+  // These actions can replace the running process or its policy. Optional
+  // prose cannot decide whether the governed release fence applies.
+  return action !== undefined && GOVERNED_GATEWAY_DELIVERY_ACTIONS.has(action);
+}
+
 function isReadOnlyDiagnosticShellCommand(command: string): boolean {
   const trimmed = command.trim();
   if (!trimmed) {
@@ -378,6 +451,10 @@ function isReadOnlyDiagnosticToolCall(toolName: string, params: unknown): boolea
   }
   const command = getStringParam(params, ["cmd", "command", "script", "input"]);
   return command ? isReadOnlyDiagnosticShellCommand(command) : false;
+}
+
+function isReadToolName(toolName: string): boolean {
+  return matchesToolName(normalizeToolName(toolName), ["read", "read_file"]);
 }
 
 export type GatewaySelfRestartCommand =
@@ -589,11 +666,15 @@ function resolveProtectedActionTargetPath(params: unknown, ctx?: HookContext): s
   return firstPath.replace(/\\/gu, "/");
 }
 
-function resolveGovernedMissionToolEnforcementBlock(args: {
+async function resolveGovernedMissionToolEnforcementBlock(args: {
   toolName: string;
+  toolCallId?: string;
   params: unknown;
   ctx?: HookContext;
-}): HookOutcome | undefined {
+  clientHostedExecution?: boolean;
+  externalTool?: boolean;
+  recordAllowedDecision?: boolean;
+}): Promise<HookOutcome | undefined> {
   const enforcement = args.ctx?.governedMissionToolEnforcement;
   if (enforcement?.active !== true) {
     return undefined;
@@ -604,11 +685,79 @@ function resolveGovernedMissionToolEnforcementBlock(args: {
     : undefined;
   const childRuntime = getStringParam(args.params, ["runtime", "childRuntime"]);
   const targetPath = resolveProtectedActionTargetPath(args.params, args.ctx);
+  // Even a remote read transmits model-controlled selectors before final release.
+  const messagingTool = isMessagingTool(args.toolName);
+  const browserMutation =
+    matchesToolName(normalizeToolName(args.toolName), ["browser"]) &&
+    isMutatingToolCall(args.toolName, args.params);
+  const coreRuntimeMutation =
+    matchesToolName(normalizeToolName(args.toolName), ["nodes", "process", "transcripts"]) &&
+    isMutatingToolCall(args.toolName, args.params);
+  const sensitiveCoreRead = isGovernedSensitiveCoreRead(args.toolName, args.params);
+  const gatewayDelivery = isGovernedGatewayDelivery({
+    toolName: args.toolName,
+    gatewayMethod,
+  });
+  const externallyVisibleCoreTool = GOVERNED_EXTERNALLY_VISIBLE_CORE_TOOL_NAMES.has(
+    normalizeToolName(args.toolName),
+  );
+  // Shells and ordinary read tools do not provide this hook with a root-pinned file
+  // descriptor. Treat both as external until a capability can prove safe execution.
+  const arbitraryShellExecution = isShellTool(args.toolName);
+  const unsafeCoreRead = isReadToolName(args.toolName);
+  // Plugin, channel, and MCP tools have no trusted read-only declaration today.
+  // External provenance must dominate argument-shaped mutation classifications so
+  // model-controlled data cannot leave the governed run before final release.
+  const externalTool = args.externalTool === true;
+  const externallyVisibleSideEffect =
+    externalTool ||
+    messagingTool ||
+    browserMutation ||
+    coreRuntimeMutation ||
+    sensitiveCoreRead ||
+    arbitraryShellExecution ||
+    unsafeCoreRead ||
+    externallyVisibleCoreTool;
+  const finalOutput =
+    externallyVisibleCoreTool ||
+    gatewayDelivery ||
+    (isPlainObject(args.params) &&
+      (externallyVisibleSideEffect || isGovernedCronMutation(args.toolName, gatewayMethod)));
+  const invocation: MissionSpecificToolInvocation = {
+    invocationId: randomUUID(),
+    toolName: args.toolName,
+    ...(args.toolCallId ? { toolCallId: args.toolCallId } : {}),
+    params: args.params,
+  };
+  const signals: ProtectedActionSignals = {
+    toolName: args.toolName,
+    ...(targetPath ? { targetPath } : {}),
+    ...(gatewayMethod ? { gatewayMethod } : {}),
+    ...(command ? { command } : {}),
+    ...(hasInterpreterCommand(command) ? { commandInterpreter: true } : {}),
+    ...(hasElevatedExecMode(args.params) ? { elevatedMode: true } : {}),
+    ...(isChildDelegationToolCall(args.toolName, args.params)
+      ? { childDelegation: true, ...(childRuntime ? { childRuntime } : {}) }
+      : {}),
+    ...(enforcement.supervisorWrapperRequired === true ? { supervisorWrapperRequired: true } : {}),
+    ...(enforcement.supervisorWrapperActive === true ? { supervisorWrapperPresent: true } : {}),
+    ...(args.clientHostedExecution === true ? { clientHostedExecution: true } : {}),
+    ...(externallyVisibleSideEffect ? { externalSideEffect: true } : {}),
+    ...(finalOutput ? { finalOutput: true } : {}),
+  };
+  // Governed execution fails closed for known mutations even when a new tool
+  // has not yet been assigned a narrower protected-action class.
+  if (!classifyProtectedAction(signals) && isMutatingToolCall(args.toolName, args.params)) {
+    signals.projectDefinedHighAuthority = true;
+  }
+  const authority = enforcement.resolveAuthority
+    ? enforcement.resolveAuthority()
+    : enforcement.authority;
   const decision = evaluateMissionSpecificToolEnforcement({
     actionId:
       args.ctx?.runId && args.ctx?.sessionKey
-        ? `${args.ctx.sessionKey}:${args.ctx.runId}:${args.toolName}`
-        : args.toolName,
+        ? `${args.ctx.sessionKey}:${args.ctx.runId}:${args.toolCallId ?? args.toolName}:${invocation.invocationId}`
+        : `${args.toolName}:${invocation.invocationId}`,
     actor: {
       actorId: args.ctx?.agentId ?? "unknown",
       ...(args.ctx?.sessionKey ? { sessionKey: args.ctx.sessionKey } : {}),
@@ -616,31 +765,21 @@ function resolveGovernedMissionToolEnforcementBlock(args: {
     },
     toolName: args.toolName,
     target: `tool:${args.toolName}`,
-    signals: {
-      toolName: args.toolName,
-      ...(targetPath ? { targetPath } : {}),
-      ...(gatewayMethod ? { gatewayMethod } : {}),
-      ...(command ? { command } : {}),
-      ...(hasInterpreterCommand(command) ? { commandInterpreter: true } : {}),
-      ...(hasElevatedExecMode(args.params) ? { elevatedMode: true } : {}),
-      ...(isChildDelegationToolCall(args.toolName, args.params)
-        ? { childDelegation: true, ...(childRuntime ? { childRuntime } : {}) }
-        : {}),
-      ...(enforcement.supervisorWrapperRequired === true
-        ? { supervisorWrapperRequired: true }
-        : {}),
-      ...(enforcement.supervisorWrapperActive === true ? { supervisorWrapperPresent: true } : {}),
-    },
+    signals,
     conversationClassification: enforcement.conversationClassification ?? "ordinary",
     trustedHostPolicy: enforcement.trustedHostPolicy,
-    authority: enforcement.authority
-      ? { ...enforcement.authority, expectedCurrentStep: enforcement.expectedCurrentStep }
+    authority: authority
+      ? { ...authority, expectedCurrentStep: enforcement.expectedCurrentStep }
       : undefined,
     now: new Date().toISOString(),
   });
   if (decision.decision === "ALLOW") {
+    if (args.recordAllowedDecision !== false) {
+      enforcement.onDecision?.(decision, invocation);
+    }
     return undefined;
   }
+  enforcement.onDecision?.(decision, invocation);
   return {
     blocked: true,
     kind: "veto",
@@ -810,6 +949,18 @@ async function resolveGovernedBuildWorkspaceContext(
   return metadata ? buildRootMutationGuardContextFromMetadata(metadata) : undefined;
 }
 
+async function resolveGovernedBuildWorkspacePolicyBlock(args: {
+  toolName: string;
+  params: unknown;
+  ctx?: HookContext;
+}): Promise<HookOutcome | undefined> {
+  const governedBuildWorkspace = await resolveGovernedBuildWorkspaceContext(args.ctx);
+  return resolveGovernedBuildWorkspaceRootMutationBlock({
+    ...args,
+    governedBuildWorkspace,
+  });
+}
+
 function formatDirtyTreeHygieneBlockMessage(report: DirtyTreeHygieneReport): string {
   const groups = report.groups.map((group) => `${group.group} (${group.paths.length})`).join(", ");
   return [
@@ -956,6 +1107,34 @@ async function resolveDirtyTreeHygieneBlock(args: {
     reason: formatDirtyTreeHygieneBlockMessage(report),
     params: args.params,
   };
+}
+
+async function resolveFinalToolPolicyOutcome(args: {
+  toolName: string;
+  toolCallId?: string;
+  params: unknown;
+  ctx?: HookContext;
+  clientHostedExecution?: boolean;
+  externalTool?: boolean;
+}): Promise<HookOutcome> {
+  const governedMissionToolBlock = await resolveGovernedMissionToolEnforcementBlock(args);
+  if (governedMissionToolBlock) {
+    return governedMissionToolBlock;
+  }
+
+  const governedBuildWorkspaceBlock = await resolveGovernedBuildWorkspacePolicyBlock(args);
+  if (governedBuildWorkspaceBlock) {
+    return governedBuildWorkspaceBlock;
+  }
+
+  const gatewayRestartCheckpoint = await resolveGatewaySelfRestartCheckpoint(args);
+  const params = gatewayRestartCheckpoint?.params ?? args.params;
+  const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({
+    toolName: args.toolName,
+    params,
+    ctx: args.ctx,
+  });
+  return dirtyTreeHygieneBlock ?? { blocked: false, params };
 }
 
 function normalizeMemoryFlushRelativePath(value: unknown): string | undefined {
@@ -1133,6 +1312,10 @@ function resolveToolDiagnosticIdentity(tool: AnyAgentTool): ToolDiagnosticIdenti
     return { toolSource: "channel", toolOwner: channelMeta.channelId };
   }
   return { toolSource: "core" };
+}
+
+export function isExternalAgentTool(tool: AnyAgentTool): boolean {
+  return resolveToolDiagnosticIdentity(tool).toolSource !== "core";
 }
 
 type SkillUsageMatch = {
@@ -1648,9 +1831,11 @@ export async function runBeforeToolCallHook(args: {
   ctx?: HookContext;
   signal?: AbortSignal;
   approvalMode?: "request" | "report" | "defer";
+  clientHostedExecution?: boolean;
+  externalTool?: boolean;
 }): Promise<HookOutcome> {
   const toolName = normalizeToolName(args.toolName || "tool");
-  let params = applySourceReplyStopContractToToolParams(toolName, args.params, args.ctx);
+  const params = applySourceReplyStopContractToToolParams(toolName, args.params, args.ctx);
 
   if (args.ctx?.sessionKey) {
     const { getDiagnosticSessionState, logToolLoopAction, detectToolCallLoop, recordToolCall } =
@@ -1739,47 +1924,13 @@ export async function runBeforeToolCallHook(args: {
     return cleanupCrewRuntimePreflightBlock;
   }
 
-  const governedMissionToolBlock = resolveGovernedMissionToolEnforcementBlock({
-    toolName,
-    params,
-    ctx: args.ctx,
-  });
-  if (governedMissionToolBlock) {
-    return governedMissionToolBlock;
-  }
-
-  const governedBuildWorkspace = await resolveGovernedBuildWorkspaceContext(args.ctx);
-  const governedBuildWorkspaceBlock = resolveGovernedBuildWorkspaceRootMutationBlock({
-    toolName,
-    params,
-    ctx: args.ctx,
-    governedBuildWorkspace,
-  });
-  if (governedBuildWorkspaceBlock) {
-    return governedBuildWorkspaceBlock;
-  }
-
-  const gatewayRestartCheckpoint = await resolveGatewaySelfRestartCheckpoint({
-    toolName,
-    params,
-    ctx: args.ctx,
-  });
-  if (gatewayRestartCheckpoint) {
-    params = gatewayRestartCheckpoint.params;
-  }
-
-  const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({
-    toolName,
-    params,
-    ctx: args.ctx,
-  });
-  if (dirtyTreeHygieneBlock) {
-    return dirtyTreeHygieneBlock;
-  }
-
   const hookRunner = getGlobalHookRunner();
   try {
-    const hasBeforeToolCallHooks = hookRunner?.hasHooks("before_tool_call") === true;
+    const suppressPluginContentHooks = args.ctx?.governedMissionToolEnforcement?.active === true;
+    const hasBeforeToolCallHooks =
+      !suppressPluginContentHooks && hookRunner?.hasHooks("before_tool_call") === true;
+    // Governed runs suppress content-observing hooks, not bundled trusted policy.
+    // Skipping trusted policy here would let governed admission bypass host authorization.
     const shouldRunTrustedPolicies = hasTrustedToolPolicies();
     const normalizedParams = isPlainObject(params) ? params : {};
     const initialCorePolicyResult = resolveSkillWorkshopToolApproval({
@@ -1788,7 +1939,14 @@ export async function runBeforeToolCallHook(args: {
       ...(args.ctx?.config ? { config: args.ctx.config } : {}),
     });
     if (!initialCorePolicyResult && !shouldRunTrustedPolicies && !hasBeforeToolCallHooks) {
-      return { blocked: false, params };
+      return await resolveFinalToolPolicyOutcome({
+        toolName,
+        toolCallId: args.toolCallId,
+        params,
+        ctx: args.ctx,
+        clientHostedExecution: args.clientHostedExecution,
+        externalTool: args.externalTool,
+      });
     }
     const deriveOptions =
       args.ctx?.cwd || args.ctx?.sandbox
@@ -1869,6 +2027,45 @@ export async function runBeforeToolCallHook(args: {
         params,
       };
     }
+    const governedPreApprovalParams = normalizeCodeModeExecBeforeHookParamsForToolKind({
+      toolKind: args.toolKind,
+      params: trustedPolicyResult?.params ?? params,
+    });
+    const preApprovalParams = applySourceReplyStopContractToToolParams(
+      toolName,
+      governedPreApprovalParams,
+      args.ctx,
+    );
+    // Trusted policy vetoes keep precedence, but governed vetoes must run before
+    // approval I/O. The final pass repeats this after approval and hook rewrites.
+    const governedPreApprovalBlock = await resolveGovernedMissionToolEnforcementBlock({
+      toolName,
+      toolCallId: args.toolCallId,
+      params: preApprovalParams,
+      ctx: args.ctx,
+      clientHostedExecution: args.clientHostedExecution,
+      externalTool: args.externalTool,
+      recordAllowedDecision: false,
+    });
+    if (governedPreApprovalBlock) {
+      return governedPreApprovalBlock;
+    }
+    const governedBuildWorkspaceBlock = await resolveGovernedBuildWorkspacePolicyBlock({
+      toolName,
+      params: preApprovalParams,
+      ctx: args.ctx,
+    });
+    if (governedBuildWorkspaceBlock) {
+      return governedBuildWorkspaceBlock;
+    }
+    const dirtyTreeHygieneBlock = await resolveDirtyTreeHygieneBlock({
+      toolName,
+      params: preApprovalParams,
+      ctx: args.ctx,
+    });
+    if (dirtyTreeHygieneBlock) {
+      return dirtyTreeHygieneBlock;
+    }
     let trustedApprovalParams: unknown;
     let trustedApprovalResolution: PluginApprovalResolution | undefined;
     if (trustedPolicyResult?.requireApproval) {
@@ -1917,12 +2114,29 @@ export async function runBeforeToolCallHook(args: {
         signal: args.signal,
       });
       if (finalApprovalOutcome) {
-        return finalApprovalOutcome;
+        if (finalApprovalOutcome.blocked || finalApprovalOutcome.deferredApproval) {
+          return finalApprovalOutcome;
+        }
+        trustedApprovalParams = finalApprovalOutcome.params;
+        trustedApprovalResolution =
+          finalApprovalOutcome.approvalResolution ?? trustedApprovalResolution;
       }
-      const allowed: HookOutcome = {
-        blocked: false as const,
-        params: applySourceReplyStopContractToToolParams(toolName, policyAdjustedParams, args.ctx),
-      };
+      const executionParams = applySourceReplyStopContractToToolParams(
+        toolName,
+        trustedApprovalParams ?? policyAdjustedParams,
+        args.ctx,
+      );
+      const allowed = await resolveFinalToolPolicyOutcome({
+        toolName,
+        toolCallId: args.toolCallId,
+        params: executionParams,
+        ctx: args.ctx,
+        clientHostedExecution: args.clientHostedExecution,
+        externalTool: args.externalTool,
+      });
+      if (allowed.blocked) {
+        return allowed;
+      }
       if (trustedApprovalResolution) {
         allowed.approvalResolution = trustedApprovalResolution;
       }
@@ -1989,12 +2203,28 @@ export async function runBeforeToolCallHook(args: {
       signal: args.signal,
     });
     if (finalApprovalOutcome) {
-      return finalApprovalOutcome;
+      if (finalApprovalOutcome.blocked || finalApprovalOutcome.deferredApproval) {
+        return finalApprovalOutcome;
+      }
+      finalParams = finalApprovalOutcome.params;
+      finalApprovalResolution = finalApprovalOutcome.approvalResolution ?? finalApprovalResolution;
     }
-    const allowed: HookOutcome = {
-      blocked: false as const,
-      params: applySourceReplyStopContractToToolParams(toolName, finalParams, args.ctx),
-    };
+    const executionParams = applySourceReplyStopContractToToolParams(
+      toolName,
+      finalParams,
+      args.ctx,
+    );
+    const allowed = await resolveFinalToolPolicyOutcome({
+      toolName,
+      toolCallId: args.toolCallId,
+      params: executionParams,
+      ctx: args.ctx,
+      clientHostedExecution: args.clientHostedExecution,
+      externalTool: args.externalTool,
+    });
+    if (allowed.blocked) {
+      return allowed;
+    }
     if (finalApprovalResolution) {
       allowed.approvalResolution = finalApprovalResolution;
     }
@@ -2031,21 +2261,66 @@ export function wrapToolWithBeforeToolCallHook(
   const wrappedTool: AnyAgentTool = {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate) => {
-      const hookParams = normalizeCodeModeExecBeforeHookParams({ tool, params });
-      const hookMetadata = getCodeModeExecBeforeHookMetadata({ tool, params });
-      const outcome = await runBeforeToolCallHook({
-        toolName,
-        params: hookParams,
-        ...hookMetadata,
-        toolCallId,
-        ctx,
-        signal,
-        approvalMode: hookOptions.approvalMode,
-      });
-      if (outcome.blocked) {
-        if (outcome.kind !== "veto") {
-          throw new Error(outcome.reason);
+      const finishActiveExecution = beginActiveToolExecution(ctx?.runId, toolCallId);
+      try {
+        const hookParams = normalizeCodeModeExecBeforeHookParams({ tool, params });
+        const hookMetadata = getCodeModeExecBeforeHookMetadata({ tool, params });
+        const outcome = await runBeforeToolCallHook({
+          toolName,
+          params: hookParams,
+          ...hookMetadata,
+          toolCallId,
+          ctx,
+          externalTool: isExternalAgentTool(tool),
+          signal,
+          approvalMode: hookOptions.approvalMode,
+        });
+        if (outcome.blocked) {
+          if (outcome.kind !== "veto") {
+            throw new Error(outcome.reason);
+          }
+          const normalizedToolName = normalizeToolName(toolName || "tool");
+          const trace = ctx?.trace
+            ? freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(ctx.trace))
+            : undefined;
+          const eventBase = {
+            ...(ctx?.runId && { runId: ctx.runId }),
+            ...(ctx?.sessionKey && { sessionKey: ctx.sessionKey }),
+            ...(ctx?.sessionId && { sessionId: ctx.sessionId }),
+            ...(trace && { trace }),
+            toolName: normalizedToolName,
+            ...diagnosticIdentity,
+            ...(toolCallId && { toolCallId }),
+            paramsSummary: summarizeToolParams(outcome.params ?? hookParams),
+          };
+          if (hookOptions.emitDiagnostics) {
+            emitTrustedDiagnosticEvent({
+              type: "tool.execution.blocked",
+              ...eventBase,
+              reason: outcome.reason,
+              deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
+            });
+          }
+          const blockedResult = buildBlockedToolResult({
+            reason: outcome.reason,
+            deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
+          });
+          await recordLoopOutcome({
+            ctx,
+            toolName: normalizedToolName,
+            toolParams: outcome.params ?? hookParams,
+            toolCallId,
+            result: blockedResult,
+          });
+          return blockedResult;
         }
+        const executeParams = reconcileCodeModeExecBeforeHookParams({
+          tool,
+          originalParams: params,
+          hookParams,
+          adjustedParams: outcome.params,
+        });
+        recordAdjustedParamsForToolCall(toolCallId, executeParams, ctx?.runId);
         const normalizedToolName = normalizeToolName(toolName || "tool");
         const trace = ctx?.trace
           ? freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(ctx.trace))
@@ -2058,108 +2333,69 @@ export function wrapToolWithBeforeToolCallHook(
           toolName: normalizedToolName,
           ...diagnosticIdentity,
           ...(toolCallId && { toolCallId }),
-          paramsSummary: summarizeToolParams(outcome.params ?? hookParams),
+          paramsSummary: summarizeToolParams(executeParams),
         };
         if (hookOptions.emitDiagnostics) {
           emitTrustedDiagnosticEvent({
-            type: "tool.execution.blocked",
+            type: "tool.execution.started",
             ...eventBase,
-            reason: outcome.reason,
-            deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
           });
         }
-        const blockedResult = buildBlockedToolResult({
-          reason: outcome.reason,
-          deniedReason: outcome.deniedReason ?? "plugin-before-tool-call",
-        });
-        await recordLoopOutcome({
-          ctx,
-          toolName: normalizedToolName,
-          toolParams: outcome.params ?? hookParams,
-          toolCallId,
-          result: blockedResult,
-        });
-        return blockedResult;
-      }
-      const executeParams = reconcileCodeModeExecBeforeHookParams({
-        tool,
-        originalParams: params,
-        hookParams,
-        adjustedParams: outcome.params,
-      });
-      recordAdjustedParamsForToolCall(toolCallId, executeParams, ctx?.runId);
-      const normalizedToolName = normalizeToolName(toolName || "tool");
-      const trace = ctx?.trace
-        ? freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(ctx.trace))
-        : undefined;
-      const eventBase = {
-        ...(ctx?.runId && { runId: ctx.runId }),
-        ...(ctx?.sessionKey && { sessionKey: ctx.sessionKey }),
-        ...(ctx?.sessionId && { sessionId: ctx.sessionId }),
-        ...(trace && { trace }),
-        toolName: normalizedToolName,
-        ...diagnosticIdentity,
-        ...(toolCallId && { toolCallId }),
-        paramsSummary: summarizeToolParams(executeParams),
-      };
-      if (hookOptions.emitDiagnostics) {
-        emitTrustedDiagnosticEvent({
-          type: "tool.execution.started",
-          ...eventBase,
-        });
-      }
-      const startedAt = Date.now();
-      try {
-        const result = await execute(toolCallId, executeParams, signal, onUpdate);
-        const durationMs = Date.now() - startedAt;
-        await recordLoopOutcome({
-          ctx,
-          toolName: normalizedToolName,
-          toolParams: executeParams,
-          toolCallId,
-          result,
-        });
-        const skillMatch = findSkillUsageMatch({
-          toolName: normalizedToolName,
-          toolParams: executeParams,
-          ctx,
-        });
-        if (hookOptions.emitDiagnostics) {
-          if (skillMatch) {
-            emitSkillUsedDiagnostic({
-              ctx,
-              match: skillMatch,
-              toolName: normalizedToolName,
-              toolCallId,
+        const startedAt = Date.now();
+        try {
+          const result = await execute(toolCallId, executeParams, signal, onUpdate);
+          const durationMs = Date.now() - startedAt;
+          await recordLoopOutcome({
+            ctx,
+            toolName: normalizedToolName,
+            toolParams: executeParams,
+            toolCallId,
+            result,
+          });
+          const skillMatch = findSkillUsageMatch({
+            toolName: normalizedToolName,
+            toolParams: executeParams,
+            ctx,
+          });
+          if (hookOptions.emitDiagnostics) {
+            if (skillMatch) {
+              emitSkillUsedDiagnostic({
+                ctx,
+                match: skillMatch,
+                toolName: normalizedToolName,
+                toolCallId,
+              });
+            }
+            emitTrustedDiagnosticEvent({
+              type: "tool.execution.completed",
+              ...eventBase,
+              durationMs,
             });
           }
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.completed",
-            ...eventBase,
-            durationMs,
+          return result;
+        } catch (err) {
+          const cause = unwrapErrorCause(err);
+          const errorCode = diagnosticHttpStatusCode(cause);
+          if (hookOptions.emitDiagnostics) {
+            emitTrustedDiagnosticEvent({
+              type: "tool.execution.error",
+              ...eventBase,
+              durationMs: Date.now() - startedAt,
+              errorCategory: diagnosticErrorCategory(cause),
+              ...(errorCode ? { errorCode } : {}),
+            });
+          }
+          await recordLoopOutcome({
+            ctx,
+            toolName: normalizedToolName,
+            toolParams: executeParams,
+            toolCallId,
+            error: err,
           });
+          throw err;
         }
-        return result;
-      } catch (err) {
-        const cause = unwrapErrorCause(err);
-        const errorCode = diagnosticHttpStatusCode(cause);
-        if (hookOptions.emitDiagnostics) {
-          emitTrustedDiagnosticEvent({
-            type: "tool.execution.error",
-            ...eventBase,
-            durationMs: Date.now() - startedAt,
-            errorCategory: diagnosticErrorCategory(cause),
-            ...(errorCode ? { errorCode } : {}),
-          });
-        }
-        await recordLoopOutcome({
-          ctx,
-          toolName: normalizedToolName,
-          toolParams: executeParams,
-          toolCallId,
-          error: err,
-        });
-        throw err;
+      } finally {
+        finishActiveExecution();
       }
     },
   };

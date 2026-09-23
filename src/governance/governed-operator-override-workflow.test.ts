@@ -7,6 +7,7 @@ import {
 import {
   GOVERNED_MISSION_TASKFLOW_STATE_KEY,
   createGovernedMissionState,
+  updateGovernedMissionState,
   type GovernedMissionTaskFlowRecord,
 } from "./governed-mission-state.js";
 import { decideGovernedOperatorOverrideWorkflow } from "./governed-operator-override-workflow.js";
@@ -31,18 +32,25 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
   createdAt: "2026-08-24T01:31:00Z",
 };
 
-const missionState = createGovernedMissionState({
+const admittedMissionState = createGovernedMissionState({
   contract,
   authorityRef: contract.authorityRefs[0],
   currentStep: "operator_override_workflow",
   ownerCorrelation: { owner: "Cleanup Crew", taskFlowId: "flow-override-1" },
   now: "2026-08-24T01:31:00Z",
+});
+const missionState = updateGovernedMissionState(admittedMissionState, {
+  expectedRevision: admittedMissionState.revision,
+  currentGovernedState: "executing",
+  currentStep: "execute_governed_work",
+  now: "2026-08-24T01:31:30Z",
 });
 
 const record: GovernedMissionTaskFlowRecord = {
@@ -79,6 +87,26 @@ const baseInput = {
   producer: "sop-enf-19-test",
 };
 
+function resolutionInput(decisionStatus: "approved" | "denied") {
+  const pending = decideGovernedOperatorOverrideWorkflow({
+    ...baseInput,
+    decisionStatus: "pending",
+    approverRef: undefined,
+  });
+  if (pending.decision !== "pending") {
+    throw new Error(`expected pending override, got ${pending.decision}`);
+  }
+  return {
+    ...baseInput,
+    decisionStatus,
+    record: {
+      flowId: record.flowId,
+      revision: record.revision + 1,
+      stateJson: pending.patch.stateJson,
+    },
+  };
+}
+
 describe("governed operator override workflow", () => {
   it("moves a mission into pending override without creating an override bypass", () => {
     const decision = decideGovernedOperatorOverrideWorkflow({
@@ -97,7 +125,7 @@ describe("governed operator override workflow", () => {
     });
     expect(decision.patch.stateJson).toMatchObject({
       [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
-        currentGovernedState: "GOVERNED_MISSION_PENDING_OVERRIDE",
+        currentGovernedState: "pending_override",
         currentStep: "operator_override_pending",
         overrideRef: { overrideId: "override-19-1", status: "pending" },
       },
@@ -105,7 +133,7 @@ describe("governed operator override workflow", () => {
   });
 
   it("creates a bounded approved override receipt, record, and state patch", () => {
-    const decision = decideGovernedOperatorOverrideWorkflow(baseInput);
+    const decision = decideGovernedOperatorOverrideWorkflow(resolutionInput("approved"));
 
     expect(decision).toMatchObject({
       decision: "approved",
@@ -144,8 +172,8 @@ describe("governed operator override workflow", () => {
     );
     expect(decision.patch.stateJson).toMatchObject({
       [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
-        currentGovernedState: "GOVERNED_MISSION_ACTIVE",
-        currentStep: "operator_override_approved",
+        currentGovernedState: "executing",
+        currentStep: "execute_governed_work",
         overrideRef: { overrideId: "override-19-1", status: "approved" },
       },
       governedOperatorOverrideWorkflow: {
@@ -157,7 +185,7 @@ describe("governed operator override workflow", () => {
 
   it("denies approved-looking overrides that would expand host authority", () => {
     const decision = decideGovernedOperatorOverrideWorkflow({
-      ...baseInput,
+      ...resolutionInput("approved"),
       hostAuthority: {
         openclawAllows: true,
         osAllows: false,
@@ -176,8 +204,8 @@ describe("governed operator override workflow", () => {
     });
     expect(decision.patch.stateJson).toMatchObject({
       [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
-        currentGovernedState: "GOVERNED_MISSION_ACTIVE",
-        currentStep: "operator_override_denied",
+        currentGovernedState: "executing",
+        currentStep: "execute_governed_work",
         overrideRef: { overrideId: "override-19-1", status: "denied" },
       },
     });
@@ -185,8 +213,7 @@ describe("governed operator override workflow", () => {
 
   it("denies explicit operator denial with an auditable receipt and no override record", () => {
     const decision = decideGovernedOperatorOverrideWorkflow({
-      ...baseInput,
-      decisionStatus: "denied",
+      ...resolutionInput("denied"),
     });
 
     expect(decision).toMatchObject({
@@ -215,6 +242,75 @@ describe("governed operator override workflow", () => {
       receipt: {
         approved: false,
         scopeHash: "authority-hash",
+      },
+    });
+  });
+
+  it("rejects override entry from admitted and closeout states without reopening them", () => {
+    for (const state of [
+      admittedMissionState,
+      {
+        ...missionState,
+        currentGovernedState: "closeout_ready" as const,
+        currentStep: "verify_closeout",
+      },
+    ]) {
+      const decision = decideGovernedOperatorOverrideWorkflow({
+        ...baseInput,
+        record: {
+          ...record,
+          stateJson: { [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: state },
+        },
+        decisionStatus: "pending",
+      });
+      expect(decision).toMatchObject({
+        decision: "denied",
+        reason: "override_state_not_eligible",
+        patch: {
+          stateJson: {
+            [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
+              currentGovernedState: state.currentGovernedState,
+              currentStep: state.currentStep,
+            },
+          },
+        },
+      });
+    }
+  });
+
+  it("restores the exact waiting state after approval", () => {
+    const waitingState = updateGovernedMissionState(admittedMissionState, {
+      expectedRevision: admittedMissionState.revision,
+      currentGovernedState: "waiting",
+      currentStep: "wait_for_external_evidence",
+      now: "2026-08-24T01:31:30Z",
+    });
+    const waitingRecord = {
+      ...record,
+      stateJson: { [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: waitingState },
+    };
+    const pending = decideGovernedOperatorOverrideWorkflow({
+      ...baseInput,
+      record: waitingRecord,
+      decisionStatus: "pending",
+    });
+    if (pending.decision !== "pending") {
+      throw new Error(`expected pending override, got ${pending.decision}`);
+    }
+    const approved = decideGovernedOperatorOverrideWorkflow({
+      ...baseInput,
+      record: {
+        ...waitingRecord,
+        revision: waitingRecord.revision + 1,
+        stateJson: pending.patch.stateJson,
+      },
+      decisionStatus: "approved",
+    });
+    expect(approved.patch.stateJson).toMatchObject({
+      [GOVERNED_MISSION_TASKFLOW_STATE_KEY]: {
+        currentGovernedState: "waiting",
+        currentStep: "wait_for_external_evidence",
+        overrideRef: { status: "approved" },
       },
     });
   });

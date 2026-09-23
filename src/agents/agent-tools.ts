@@ -26,6 +26,7 @@ import { resolveGatewayMessageChannel } from "../utils/message-channel.js";
 import { resolveAgentConfig } from "./agent-scope.js";
 import { wrapToolWithAbortSignal } from "./agent-tools.abort.js";
 import {
+  type HookContext,
   type ToolOutcomeObserver,
   wrapToolWithBeforeToolCallHook,
 } from "./agent-tools.before-tool-call.js";
@@ -517,6 +518,8 @@ export function createOpenClawCodingTools(options?: {
   toolPolicyAuditLogLevel?: "info" | "debug";
   /** Live observer called after wrapped tool outcomes are recorded. */
   onToolOutcome?: ToolOutcomeObserver;
+  /** Shared mutable hook context for callers that bind run policy after tool construction. */
+  beforeToolCallHookContext?: HookContext;
   /** Runtime-only resolved skill paths that the read tool may load under workspaceOnly. */
   skillsSnapshot?: SkillSnapshot;
 }): AnyAgentTool[] {
@@ -1133,32 +1136,35 @@ export function createOpenClawCodingTools(options?: {
     }),
   );
   options?.recordToolPrepStage?.("schema-normalization");
+  // Embedded runs bind governed authority immediately before prompt submission.
+  // Retain their shared context object so already-wrapped core tools observe that binding.
+  const toolHookContext =
+    options?.beforeToolCallHookContext ??
+    ({
+      agentId,
+      ...(options?.config ? { config: options.config } : {}),
+      cwd: codingRoot,
+      workspaceDir: workspaceRoot,
+      ...(options?.skillsSnapshot ? { skillsSnapshot: options.skillsSnapshot } : {}),
+      ...(sandboxRoot && allowWorkspaceWrites
+        ? { sandbox: { root: sandboxRoot, bridge: sandboxFsBridge! } }
+        : {}),
+      sessionKey: options?.sessionKey,
+      sessionId: options?.sessionId,
+      runId: options?.runId,
+      trigger: options?.trigger,
+      ...(options?.memoryFlushWritePath
+        ? { memoryFlushWritePath: options.memoryFlushWritePath }
+        : {}),
+      channelId: options?.hookChannelId ?? options?.currentChannelId,
+      ...(options?.trace ? { trace: options.trace } : {}),
+      loopDetection: resolveToolLoopDetectionConfig({ cfg: options?.config, agentId }),
+      onToolOutcome: options?.onToolOutcome,
+    } satisfies HookContext);
   const withHooks = normalized.map((tool) =>
-    wrapToolWithBeforeToolCallHook(
-      tool,
-      {
-        agentId,
-        ...(options?.config ? { config: options.config } : {}),
-        cwd: codingRoot,
-        workspaceDir: workspaceRoot,
-        ...(options?.skillsSnapshot ? { skillsSnapshot: options.skillsSnapshot } : {}),
-        ...(sandboxRoot && allowWorkspaceWrites
-          ? { sandbox: { root: sandboxRoot, bridge: sandboxFsBridge! } }
-          : {}),
-        sessionKey: options?.sessionKey,
-        sessionId: options?.sessionId,
-        runId: options?.runId,
-        trigger: options?.trigger,
-        ...(options?.memoryFlushWritePath
-          ? { memoryFlushWritePath: options.memoryFlushWritePath }
-          : {}),
-        channelId: options?.hookChannelId ?? options?.currentChannelId,
-        ...(options?.trace ? { trace: options.trace } : {}),
-        loopDetection: resolveToolLoopDetectionConfig({ cfg: options?.config, agentId }),
-        onToolOutcome: options?.onToolOutcome,
-      },
-      { emitDiagnostics: options?.emitBeforeToolCallDiagnostics },
-    ),
+    wrapToolWithBeforeToolCallHook(tool, toolHookContext, {
+      emitDiagnostics: options?.emitBeforeToolCallDiagnostics,
+    }),
   );
   options?.recordToolPrepStage?.("tool-hooks");
   const withAbort = options?.abortSignal

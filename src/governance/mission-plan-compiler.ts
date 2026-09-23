@@ -11,6 +11,14 @@ export type CompiledMissionPlan = {
   gates: AcceptanceGate[];
 };
 
+/** The plan digest covers every executable gate and authorization field, excluding only itself. */
+export function computeCompiledMissionPlanSha256(plan: CompiledMissionPlan): string {
+  const { planSha256: _planSha256, ...manifest } = plan.manifest;
+  return createHash("sha256")
+    .update(stableStringify({ manifest, requirements: plan.requirements, gates: plan.gates }))
+    .digest("hex");
+}
+
 export function compileMissionPlan(params: {
   manifest: MissionManifest;
   requirements: readonly Omit<RequirementManifestItem, "gateIds">[];
@@ -41,3 +49,5 @@ export function compileMissionPlan(params: {
     gates,
   };
 }
+import { createHash } from "node:crypto";
+import { stableStringify } from "../agents/stable-stringify.js";

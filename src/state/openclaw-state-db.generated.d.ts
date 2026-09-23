@@ -538,6 +538,63 @@ export interface GatewayRestartSentinel {
   version: number;
 }
 
+export interface GovernedMissionArtifacts {
+  artifact_kind: string;
+  computed_sha256: string | null;
+  expected_labels_json: string;
+  expected_sha256: string | null;
+  failure_code: string | null;
+  flow_id: string | null;
+  gate_id: string | null;
+  identity_bindings_json: string;
+  locator: string;
+  logical_artifact_id: string;
+  mission_id: string;
+  receipt_id: string;
+  size_bytes: number | null;
+  status: string;
+  verification_id: string;
+  verified_at: number;
+  verifier_version: string;
+  work_order_id: string | null;
+}
+
+export interface GovernedMissionReceipts {
+  attempt_id: string | null;
+  authority_hash: string | null;
+  contract_hash: string | null;
+  contract_id: string | null;
+  contract_receipt_kinds_json: string | null;
+  created_at: number;
+  decision: string;
+  details_json: string;
+  expected_revision: number | null;
+  flow_id: string | null;
+  from_state: string | null;
+  gate_id: string | null;
+  governed_package_sha256: string | null;
+  idempotency_key: string;
+  ledger_sequence: number | null;
+  mission_id: string;
+  operation: string;
+  payload_sha256: string;
+  plan_revision_id: string | null;
+  policy_version: string | null;
+  previous_receipt_sha256: string | null;
+  producer: string;
+  reason_code: string;
+  receipt_id: string;
+  receipt_kind: string;
+  receipt_sha256: string | null;
+  resulting_revision: number | null;
+  run_id: string | null;
+  runtime_build_sha256: string | null;
+  skill_sha256: string | null;
+  source_revision: string | null;
+  to_state: string | null;
+  work_order_id: string | null;
+}
+
 export interface InstalledPluginIndex {
   compat_registry_version: string;
   diagnostics_json: string;
@@ -980,6 +1037,8 @@ export interface DB {
   gateway_restart_handoff: GatewayRestartHandoff;
   gateway_restart_intent: GatewayRestartIntent;
   gateway_restart_sentinel: GatewayRestartSentinel;
+  governed_mission_artifacts: GovernedMissionArtifacts;
+  governed_mission_receipts: GovernedMissionReceipts;
   installed_plugin_index: InstalledPluginIndex;
   macos_port_guardian_records: MacosPortGuardianRecords;
   managed_outgoing_image_records: ManagedOutgoingImageRecords;

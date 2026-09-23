@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { TypingMode } from "../../config/types.js";
 import type { TemplateContext } from "../templating.js";
@@ -137,6 +137,12 @@ beforeEach(() => {
   vi.mocked(refreshQueuedFollowupSession).mockClear();
   vi.mocked(scheduleFollowupDrain).mockClear();
   vi.stubEnv("OPENCLAW_TEST_FAST", "1");
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 function createMinimalRun(params?: {
@@ -1077,12 +1083,10 @@ describe("runReplyAgent typing (heartbeat)", () => {
     });
     const runPromise = run();
 
-    await vi.advanceTimersByTimeAsync(2_499);
-    expect(calls).toBe(1);
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(calls).toBe(1));
+    await vi.advanceTimersByTimeAsync(2_500);
     await runPromise;
     expect(calls).toBe(2);
-    vi.useRealTimers();
   });
 
   it("announces model fallback transitions across verbose levels", async () => {

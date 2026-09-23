@@ -2,17 +2,20 @@ export type MissionMode = "shadow" | "enforce" | "off";
 
 export type RequirementStatus = "pending" | "passed" | "failed" | "not_applicable";
 
-export type GateKind =
-  | "requirement"
-  | "test"
-  | "rollback"
-  | "restoration"
-  | "grant_review"
-  | "export"
-  | "watchdog"
-  | "terminal_state"
-  | "contradiction"
-  | "next_step";
+export const MISSION_GATE_KINDS = [
+  "requirement",
+  "test",
+  "rollback",
+  "restoration",
+  "grant_review",
+  "export",
+  "watchdog",
+  "terminal_state",
+  "contradiction",
+  "next_step",
+] as const;
+
+export type GateKind = (typeof MISSION_GATE_KINDS)[number];
 
 export type MissionIdentity = {
   missionId: string;

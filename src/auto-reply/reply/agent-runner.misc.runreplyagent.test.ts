@@ -807,6 +807,7 @@ describe("runReplyAgent block streaming", () => {
       typingMode: "instant",
     });
 
+    await vi.waitFor(() => expect(onBlockReply).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(5);
     const result = await resultPromise;
 
@@ -2530,7 +2531,7 @@ describe("runReplyAgent fallback reasoning tags", () => {
       reserveTokensFloor: 20_000,
       prompt: "Pre-compaction memory flush.",
       systemPrompt: "Flush memory into the configured memory file.",
-      relativePath: "memory/active.md",
+      relativePath: "memory/2026-09-18.md",
     }));
     runEmbeddedAgentMock.mockImplementation(async (params: EmbeddedAgentParams) => {
       if (params.prompt?.includes("Pre-compaction memory flush.")) {
@@ -2820,6 +2821,7 @@ describe("runReplyAgent transient HTTP retry", () => {
       typingMode: "instant",
     });
 
+    await vi.waitFor(() => expect(runtimeErrorMock).toHaveBeenCalledTimes(1));
     await vi.advanceTimersByTimeAsync(2_500);
     const result = await runPromise;
 

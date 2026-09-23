@@ -19,8 +19,10 @@ const MUTATING_TOOL_NAMES = new Set([
   "canvas",
   "nodes",
   "session_status",
+  "skill_workshop",
   "create_goal",
   "update_goal",
+  "transcripts",
 ]);
 
 // File-mutation tools that operate on the same `path` target identity.
@@ -57,6 +59,20 @@ const READ_ONLY_ACTIONS = new Set([
 
 const PROCESS_MUTATING_ACTIONS = new Set(["write", "send_keys", "submit", "paste", "kill"]);
 
+const NODES_READ_ONLY_ACTIONS = new Set([
+  "camera_list",
+  "describe",
+  "device_health",
+  "device_info",
+  "device_permissions",
+  "device_status",
+  "location_get",
+  "notifications_list",
+  "pending",
+  "photos_latest",
+  "status",
+]);
+
 const MESSAGE_MUTATING_ACTIONS = new Set([
   "send",
   "reply",
@@ -68,6 +84,20 @@ const MESSAGE_MUTATING_ACTIONS = new Set([
   "pin",
   "unpin",
 ]);
+
+const BROWSER_READ_ONLY_ACTIONS = new Set([
+  "doctor",
+  "list",
+  "status",
+  "profiles",
+  "tabs",
+  "snapshot",
+  "screenshot",
+  "console",
+  "pdf",
+]);
+
+const SKILL_WORKSHOP_READ_ONLY_ACTIONS = new Set(["inspect", "list"]);
 
 // Structured file-target identity for cross-tool same-target recovery.
 // Carried alongside `actionFingerprint` so comparison does not have to
@@ -154,6 +184,8 @@ export function isMutatingToolCall(toolName: string, args: unknown): boolean {
     case "create_goal":
     case "update_goal":
       return true;
+    case "transcripts":
+      return action == null || action !== "status";
     case "process":
       return action != null && PROCESS_MUTATING_ACTIONS.has(action);
     case "message":
@@ -166,12 +198,16 @@ export function isMutatingToolCall(toolName: string, args: unknown): boolean {
       return action === "kill" || action === "steer";
     case "session_status":
       return typeof record?.model === "string" && record.model.trim().length > 0;
+    case "browser":
+      return action == null || !BROWSER_READ_ONLY_ACTIONS.has(action);
+    case "skill_workshop":
+      return action == null || !SKILL_WORKSHOP_READ_ONLY_ACTIONS.has(action);
     default: {
       if (normalized === "cron" || normalized === "gateway" || normalized === "canvas") {
         return action == null || !READ_ONLY_ACTIONS.has(action);
       }
       if (normalized === "nodes") {
-        return action == null || action !== "list";
+        return action == null || !NODES_READ_ONLY_ACTIONS.has(action);
       }
       if (normalized.endsWith("_actions")) {
         return action == null || !READ_ONLY_ACTIONS.has(action);

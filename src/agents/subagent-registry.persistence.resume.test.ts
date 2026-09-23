@@ -186,7 +186,7 @@ describe("subagent registry persistence resume", () => {
     expect(run.requesterOrigin?.channel).toBe("whatsapp");
     expect(run?.requesterOrigin?.accountId).toBe("acct-main");
 
-    mod.initSubagentRegistry();
+    void mod.initSubagentRegistry();
 
     await vi.waitFor(() => expect(announceSpy).toHaveBeenCalled(), {
       timeout: 1_000,

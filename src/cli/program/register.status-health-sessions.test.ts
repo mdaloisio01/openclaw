@@ -18,6 +18,9 @@ const mocks = vi.hoisted(() => ({
   tasksNotifyCommand: vi.fn(),
   tasksCancelCommand: vi.fn(),
   flowsListCommand: vi.fn(),
+  flowsGovernanceShowCommand: vi.fn(),
+  flowsGovernancePreviewCommand: vi.fn(),
+  flowsGovernanceReceiptsCommand: vi.fn(),
   flowsBlockedRowsCommand: vi.fn(),
   flowsShowCommand: vi.fn(),
   flowsCancelCommand: vi.fn(),
@@ -48,6 +51,9 @@ const tasksShowCommand = mocks.tasksShowCommand;
 const tasksNotifyCommand = mocks.tasksNotifyCommand;
 const tasksCancelCommand = mocks.tasksCancelCommand;
 const flowsListCommand = mocks.flowsListCommand;
+const flowsGovernanceShowCommand = mocks.flowsGovernanceShowCommand;
+const flowsGovernancePreviewCommand = mocks.flowsGovernancePreviewCommand;
+const flowsGovernanceReceiptsCommand = mocks.flowsGovernanceReceiptsCommand;
 const flowsBlockedRowsCommand = mocks.flowsBlockedRowsCommand;
 const flowsShowCommand = mocks.flowsShowCommand;
 const flowsCancelCommand = mocks.flowsCancelCommand;
@@ -125,6 +131,9 @@ vi.mock("../../commands/tasks.js", () => ({
 
 vi.mock("../../commands/flows.js", () => ({
   flowsListCommand: mocks.flowsListCommand,
+  flowsGovernanceShowCommand: mocks.flowsGovernanceShowCommand,
+  flowsGovernancePreviewCommand: mocks.flowsGovernancePreviewCommand,
+  flowsGovernanceReceiptsCommand: mocks.flowsGovernanceReceiptsCommand,
   flowsBlockedRowsCommand: mocks.flowsBlockedRowsCommand,
   flowsShowCommand: mocks.flowsShowCommand,
   flowsCancelCommand: mocks.flowsCancelCommand,
@@ -168,6 +177,9 @@ describe("registerStatusHealthSessionsCommands", () => {
     tasksNotifyCommand.mockResolvedValue(undefined);
     tasksCancelCommand.mockResolvedValue(undefined);
     flowsListCommand.mockResolvedValue(undefined);
+    flowsGovernanceShowCommand.mockResolvedValue(undefined);
+    flowsGovernancePreviewCommand.mockResolvedValue(undefined);
+    flowsGovernanceReceiptsCommand.mockResolvedValue(undefined);
     flowsShowCommand.mockResolvedValue(undefined);
     flowsCancelCommand.mockResolvedValue(undefined);
     flowsStartProductionCommand.mockResolvedValue(undefined);
@@ -496,6 +508,41 @@ describe("registerStatusHealthSessionsCommands", () => {
   });
 
   it("routes tasks flow commands through the TaskFlow handlers", async () => {
+    await runCli(["tasks", "flow", "governance", "show", "flow-123", "--json"]);
+    expectCommandOptions(flowsGovernanceShowCommand, { lookup: "flow-123", json: true });
+
+    await runCli([
+      "tasks",
+      "flow",
+      "governance",
+      "preview",
+      "flow-123",
+      "--operation",
+      "requestCloseout",
+      "--json",
+    ]);
+    expectCommandOptions(flowsGovernancePreviewCommand, {
+      lookup: "flow-123",
+      operation: "requestCloseout",
+      json: true,
+    });
+
+    await runCli([
+      "tasks",
+      "flow",
+      "governance",
+      "receipts",
+      "flow-123",
+      "--limit",
+      "12",
+      "--json",
+    ]);
+    expectCommandOptions(flowsGovernanceReceiptsCommand, {
+      lookup: "flow-123",
+      limit: 12,
+      json: true,
+    });
+
     await runCli(["tasks", "flow", "list", "--json", "--status", "blocked"]);
     expectCommandOptions(flowsListCommand, {});
 

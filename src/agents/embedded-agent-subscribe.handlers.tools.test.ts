@@ -818,6 +818,32 @@ describe("handleToolExecutionEnd timeout metadata", () => {
     expect(checkpoints[0]?.nextValidationStep).toContain("Resume from the failed command boundary");
   });
 
+  it("does not persist governed tool failures as active-work checkpoints", async () => {
+    const stateDir = await useTempStateDir();
+    const { ctx } = createTestContext();
+    ctx.params.shouldSuppressAssistantOutput = () => true;
+    ctx.state.toolMetaById.set("tool-governed-private", {
+      mutatingAction: true,
+      meta: "private governed command",
+    });
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "exec",
+        toolCallId: "tool-governed-private",
+        isError: true,
+        result: {
+          content: [{ type: "text", text: "private governed failure output" }],
+          details: { status: "failed", exitCode: 1 },
+        },
+      } as never,
+    );
+
+    expect(await listActiveWorkCheckpoints({ stateDir })).toHaveLength(0);
+  });
+
   it("does not checkpoint harmless search misses", async () => {
     const stateDir = await useTempStateDir();
     const { ctx } = createTestContext();
@@ -2051,6 +2077,32 @@ describe("control UI credential redaction (issue #72283)", () => {
     const serialized = JSON.stringify(resultEvent.data?.result);
     expect(serialized).not.toContain("sk-1234567890abcdefXYZ");
     expect(serialized).toContain("gpt-4");
+  });
+
+  it("does not expose governed tool arguments or results to after-tool hooks", async () => {
+    const runAfterToolCall = vi.fn(async () => {});
+    const { ctx } = createTestContext();
+    ctx.params.shouldSuppressAssistantOutput = () => true;
+    ctx.hookRunner = {
+      hasHooks: vi.fn((name: string) => name === "after_tool_call"),
+      runAfterToolCall,
+    } as never;
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "read",
+      toolCallId: "governed-tool-hook",
+      args: { path: "/private/governed-input" },
+    } as never);
+    await handleToolExecutionEnd(ctx, {
+      type: "tool_execution_end",
+      toolName: "read",
+      toolCallId: "governed-tool-hook",
+      isError: false,
+      result: { content: [{ type: "text", text: "private governed result" }] },
+    } as never);
+
+    expect(runAfterToolCall).not.toHaveBeenCalled();
   });
 
   it("redacts primitive string results before emitting the tool result event", async () => {

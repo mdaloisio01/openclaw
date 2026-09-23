@@ -441,7 +441,7 @@ export function reconcileCleanupWatchdogMission(
   const governedPausedStateOk = isCurrentGovernedPausedState(input.governedMissionState);
   const staleGovernedPausedStateProof = isStaleGovernedPausedStateProof(input.governedMissionState);
   const awaitingCloseout =
-    input.governedMissionState?.state === "AWAITING_CLOSEOUT" &&
+    input.governedMissionState?.state === "closeout_ready" &&
     input.governedMissionState.proofCurrent;
   const releasePending =
     input.governedMissionState?.requiredReleaseDecisionPassed === false &&
@@ -496,7 +496,7 @@ export function reconcileCleanupWatchdogMission(
           category: "pending_report_delivery",
           entityType: "mission",
           entityId: input.missionCoverage.missionId,
-          evidence: ["AWAITING_CLOSEOUT"],
+          evidence: ["closeout_ready"],
           reason: "governed mission is awaiting authoritative closeout proof",
           priority: getCleanupWatchdogPriority("pending_report_delivery"),
           repairTaskRequired: true,
@@ -637,7 +637,7 @@ function isCurrentGovernedPausedState(
 ): boolean {
   return (
     state?.proofCurrent === true &&
-    (state.state === "GOVERNED_MISSION_PENDING_OVERRIDE" || state.state === "AWAITING_CLOSEOUT")
+    (state.state === "pending_override" || state.state === "closeout_ready")
   );
 }
 
@@ -647,6 +647,6 @@ function isStaleGovernedPausedStateProof(
   return Boolean(
     state &&
     !state.proofCurrent &&
-    (state.state === "GOVERNED_MISSION_PENDING_OVERRIDE" || state.state === "AWAITING_CLOSEOUT"),
+    (state.state === "pending_override" || state.state === "closeout_ready"),
   );
 }

@@ -438,4 +438,30 @@ describe("task-flow-registry audit", () => {
       ).toBe(false);
     });
   });
+
+  it("reports a malformed governed state key as repair-required corruption", () => {
+    const flow: TaskFlowRecord = {
+      flowId: "malformed-governed-audit",
+      syncMode: "managed",
+      ownerKey: "agent:main:main",
+      controllerId: "tests/malformed-governed-audit",
+      revision: 0,
+      status: "blocked",
+      notifyPolicy: "done_only",
+      goal: "Audit malformed governed state",
+      stateJson: { governedMissionState: { schema: "invalid" } },
+      createdAt: 1,
+      updatedAt: 1,
+    };
+
+    expect(listTaskFlowAuditFindings({ flows: [flow], now: 1 })).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "governed_state_malformed",
+          severity: "error",
+          flow,
+        }),
+      ]),
+    );
+  });
 });

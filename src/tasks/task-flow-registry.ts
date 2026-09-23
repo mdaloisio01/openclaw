@@ -1,6 +1,15 @@
 import crypto from "node:crypto";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { MissionSettlementDecision } from "../agents/mission-settlement-tail.js";
+import {
+  GOVERNED_MISSION_RUNTIME_PRODUCER,
+  type GovernedMissionLedgerCommit,
+  type GovernedMissionLedgerCommitResult,
+} from "../governance/governed-mission-ledger.types.js";
+import {
+  hasGovernedMissionStateValue,
+  readGovernedMissionStateFromTaskFlow,
+} from "../governance/governed-mission-state.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import {
@@ -9,6 +18,7 @@ import {
   resetTaskFlowRegistryRuntimeForTests,
   type TaskFlowRegistryObserverEvent,
 } from "./task-flow-registry.store.js";
+import { hasGovernedMissionClaimForFlow } from "./task-flow-registry.store.sqlite.js";
 import type {
   ActiveProductionBoundary,
   ActiveProductionContinuationReceipt,
@@ -241,7 +251,7 @@ function normalizeRestoredFlowRecord(record: TaskFlowRecord): TaskFlowRecord {
   return {
     ...record,
     syncMode,
-    ownerKey: assertFlowOwnerKey(record.ownerKey),
+    ownerKey: requireTaskFlowOwnerKey(record.ownerKey),
     ...(record.requesterOrigin
       ? { requesterOrigin: cloneStructuredValue(record.requesterOrigin)! }
       : {}),
@@ -560,7 +570,7 @@ function createProductionContinuationState(params: {
   return state;
 }
 
-function createStartedProductionContinuationState(params: {
+export function createStartedProductionContinuationState(params: {
   continuation: Partial<ProductionContinuationState>;
   at: number;
 }): ProductionContinuationState {
@@ -811,7 +821,7 @@ function getManagedControllerState(flow: TaskFlowRecord): ManagedControllerState
   return flow.stateJson as ManagedControllerState;
 }
 
-function attachProductionContinuationToStateJson(params: {
+export function attachProductionContinuationToStateJson(params: {
   flow: TaskFlowRecord;
   stateJson?: JsonValue | null;
   continuation?: ProductionContinuationState;
@@ -909,6 +919,23 @@ export function getTaskFlowProductionContinuation(
   return normalizeProductionContinuationState(managedState.productionContinuation);
 }
 
+export function isTaskFlowProductionParentScopeClosed(
+  flow: TaskFlowRecord,
+  openWorkCount: number,
+): boolean {
+  const continuation = getTaskFlowProductionContinuation(flow);
+  return Boolean(
+    continuation?.activeProductionRun &&
+    openWorkCount === 0 &&
+    !continuation.blockerPresent &&
+    !continuation.ownerDecisionRequired &&
+    !continuation.restartOrReloadRequired &&
+    !continuation.hardStopPresent &&
+    !continuation.safetyStopPresent &&
+    !continuation.continuationViolation,
+  );
+}
+
 export function getTaskFlowActiveProductionContinuation(
   flow: TaskFlowRecord,
 ): ActiveProductionContinuationState | null {
@@ -945,7 +972,35 @@ function getBlockingTaskFlowMissionSettlement(
   return decision;
 }
 
-function assertFlowOwnerKey(ownerKey: string): string {
+function buildGovernedMissionCloseBlockedSummary(
+  flow: TaskFlowRecord,
+  requiredState: "terminal_pending_watchdog" | "released",
+): string | null {
+  const mission = readGovernedMissionStateFromTaskFlow(flow);
+  if (!mission && hasGovernedMissionClaimForFlow(flow)) {
+    return "Governed mission state is present but invalid; repair or migrate the governed state before closing this TaskFlow.";
+  }
+  if (
+    !mission ||
+    (mission.currentGovernedState === requiredState &&
+      !(
+        requiredState === "released" &&
+        (mission.proofs.delivery === "pending" || mission.proofs.delivery === "failed")
+      )) ||
+    (requiredState === "terminal_pending_watchdog" && mission.currentGovernedState === "released")
+  ) {
+    return null;
+  }
+  const nextAction =
+    mission.currentGovernedState === "released"
+      ? "record required visible delivery proof"
+      : requiredState === "released"
+        ? "complete the named governed proof operation, post-terminal watchdog check, and release operation"
+        : "complete the named governed proof operation and admit terminal pending through the governed owner";
+  return `Governed mission ${mission.missionId} remains ${mission.currentGovernedState} at revision ${mission.revision}; next action is to ${nextAction}.`;
+}
+
+export function requireTaskFlowOwnerKey(ownerKey: string): string {
   const normalized = normalizeOptionalString(ownerKey);
   if (!normalized) {
     throw new Error("Flow ownerKey is required.");
@@ -953,7 +1008,7 @@ function assertFlowOwnerKey(ownerKey: string): string {
   return normalized;
 }
 
-function assertControllerId(controllerId?: string | null): string {
+export function requireManagedTaskFlowControllerId(controllerId?: string | null): string {
   const normalized = normalizeOptionalString(controllerId);
   if (!normalized) {
     throw new Error("Managed flow controllerId is required.");
@@ -1120,11 +1175,12 @@ function tryPersistFlowDelete(flowId: string): boolean {
 function buildFlowRecord(params: CreateFlowRecordParams): TaskFlowRecord {
   const now = params.createdAt ?? Date.now();
   const syncMode = params.syncMode ?? "managed";
-  const controllerId = syncMode === "managed" ? assertControllerId(params.controllerId) : undefined;
+  const controllerId =
+    syncMode === "managed" ? requireManagedTaskFlowControllerId(params.controllerId) : undefined;
   return {
     flowId: crypto.randomUUID(),
     syncMode,
-    ownerKey: assertFlowOwnerKey(params.ownerKey),
+    ownerKey: requireTaskFlowOwnerKey(params.ownerKey),
     ...(params.requesterOrigin
       ? { requesterOrigin: cloneStructuredValue(params.requesterOrigin)! }
       : {}),
@@ -1155,7 +1211,7 @@ function applyFlowPatch(current: TaskFlowRecord, patch: FlowRecordPatch): TaskFl
       ? current.controllerId
       : normalizeOptionalString(patch.controllerId);
   if (current.syncMode === "managed") {
-    assertControllerId(controllerId);
+    requireManagedTaskFlowControllerId(controllerId);
   }
   return {
     ...current,
@@ -1202,7 +1258,44 @@ function writeFlowRecord(next: TaskFlowRecord, previous?: TaskFlowRecord): TaskF
   return cloneFlowRecord(next);
 }
 
+export function commitGovernedMissionLedger(
+  commit: GovernedMissionLedgerCommit,
+): GovernedMissionLedgerCommitResult {
+  ensureFlowRegistryReady();
+  const store = getTaskFlowRegistryStore();
+  if (!store.commitGovernance) {
+    throw new Error("configured TaskFlow store does not support governed mission transactions");
+  }
+  const previous = commit.nextFlow ? flows.get(commit.nextFlow.flowId) : undefined;
+  const result = store.commitGovernance({
+    ...commit,
+    ...(commit.nextFlow ? { nextFlow: cloneFlowRecord(commit.nextFlow) } : {}),
+  });
+  if (result.status !== "inserted" || !commit.nextFlow) {
+    return result;
+  }
+  restoreFailureMessage = null;
+  flows.set(commit.nextFlow.flowId, cloneFlowRecord(commit.nextFlow));
+  emitFlowRegistryObserverEvent(() => ({
+    kind: "upserted",
+    flow: cloneFlowRecord(commit.nextFlow!),
+    ...(previous ? { previous: cloneFlowRecord(previous) } : {}),
+  }));
+  return result;
+}
+
 export function createFlowRecord(params: CreateFlowRecordParams): TaskFlowRecord | null {
+  if (
+    hasGovernedMissionStateValue({
+      flowId: "generic-task-flow-create",
+      revision: 0,
+      stateJson: params.stateJson,
+    })
+  ) {
+    throw new Error(
+      "Governed mission state can only be created by the governed mission admission runtime.",
+    );
+  }
   ensureFlowRegistryReady();
   const record = buildFlowRecord(params);
   return writeFlowRecord(record);
@@ -1230,7 +1323,7 @@ export function createManagedTaskFlow(
   return createFlowRecord({
     ...params,
     syncMode: "managed",
-    controllerId: assertControllerId(params.controllerId),
+    controllerId: requireManagedTaskFlowControllerId(params.controllerId),
     stateJson: attachProductionContinuationToStateJson({
       flow: flowPreview,
       stateJson: params.stateJson,
@@ -1443,6 +1536,22 @@ function updateFlowRecordByIdUnchecked(
   return writeFlowRecord(applyFlowPatch(current, patch), current);
 }
 
+function patchMutatesGovernedMissionLifecycle(patch: FlowRecordPatch): boolean {
+  return (
+    patch.status !== undefined ||
+    patch.notifyPolicy !== undefined ||
+    patch.goal !== undefined ||
+    patch.currentStep !== undefined ||
+    patch.blockedTaskId !== undefined ||
+    patch.blockedSummary !== undefined ||
+    patch.controllerId !== undefined ||
+    patch.stateJson !== undefined ||
+    patch.waitJson !== undefined ||
+    patch.cancelRequestedAt !== undefined ||
+    patch.endedAt !== undefined
+  );
+}
+
 export function updateFlowRecordByIdExpectedRevision(params: {
   flowId: string;
   expectedRevision: number;
@@ -1462,6 +1571,44 @@ export function updateFlowRecordByIdExpectedRevision(params: {
       reason: "revision_conflict",
       current: cloneFlowRecord(current),
     };
+  }
+  if (
+    params.patch.stateJson !== undefined &&
+    hasGovernedMissionStateValue({
+      flowId: current.flowId,
+      revision: current.revision,
+      stateJson: params.patch.stateJson,
+    }) &&
+    !hasGovernedMissionStateValue(current)
+  ) {
+    return buildGuardBlockedResult(
+      current,
+      "Governed mission state can only be created by the governed mission admission runtime.",
+    );
+  }
+  if (hasGovernedMissionClaimForFlow(current) && params.patch.cancelRequestedAt !== undefined) {
+    const mission = readGovernedMissionStateFromTaskFlow(current);
+    if (!mission) {
+      return buildGuardBlockedResult(
+        current,
+        "Governed mission cancellation requires a valid canonical mission state.",
+      );
+    }
+    if (mission.currentGovernedState === "released") {
+      return buildGuardBlockedResult(
+        current,
+        "A released governed mission awaiting delivery cannot be cancelled; record the delivery result instead.",
+      );
+    }
+  }
+  if (
+    hasGovernedMissionClaimForFlow(current) &&
+    patchMutatesGovernedMissionLifecycle(params.patch)
+  ) {
+    return buildGuardBlockedResult(
+      current,
+      "Governed mission lifecycle fields can only be mutated by the governed mission runtime.",
+    );
   }
   const flow = writeFlowRecord(applyFlowPatch(current, params.patch), current);
   if (!flow) {
@@ -1762,6 +1909,10 @@ export function finishFlow(params: {
       reason: "not_found",
     };
   }
+  const governedCloseBlocked = buildGovernedMissionCloseBlockedSummary(current, "released");
+  if (governedCloseBlocked) {
+    return buildGuardBlockedResult(current, governedCloseBlocked);
+  }
   const missionSettlement = getBlockingTaskFlowMissionSettlement(current);
   if (missionSettlement) {
     const detail = buildMissionSettlementCloseBlockedSummary(missionSettlement);
@@ -1895,7 +2046,7 @@ export function finishFlow(params: {
   });
 }
 
-function updateContinuationForLawfulStop(params: {
+export function buildProductionContinuationForLawfulStop(params: {
   state: ProductionContinuationState | undefined;
   reason: ProductionContinuationStopReason;
   at: number;
@@ -1939,6 +2090,33 @@ export function recordFlowNextExecutableLaunch(params: {
   currentStep?: string | null;
   updatedAt?: number;
 }): TaskFlowUpdateResult {
+  const prepared = prepareFlowNextExecutableLaunch(params);
+  if (!prepared.applied) {
+    return prepared;
+  }
+  const current = flows.get(params.flowId);
+  if (!current) {
+    return { applied: false, reason: "not_found" };
+  }
+  if (hasGovernedMissionClaimForFlow(current)) {
+    return buildGuardBlockedResult(
+      current,
+      "Governed mission continuation launches require the governed mission runtime.",
+    );
+  }
+  const flow = writeFlowRecord(prepared.flow, current);
+  return flow
+    ? { applied: true, flow }
+    : { applied: false, reason: "persist_failed", current: cloneFlowRecord(current) };
+}
+
+export function prepareFlowNextExecutableLaunch(params: {
+  flowId: string;
+  expectedRevision: number;
+  detail: string;
+  currentStep?: string | null;
+  updatedAt?: number;
+}): TaskFlowUpdateResult {
   const current = getTaskFlowById(params.flowId);
   if (!current) {
     return {
@@ -1953,6 +2131,13 @@ export function recordFlowNextExecutableLaunch(params: {
       "Flow is not currently bound to an active production continuation contract.",
     );
   }
+  if (current.revision !== params.expectedRevision) {
+    return {
+      applied: false,
+      reason: "revision_conflict",
+      current,
+    };
+  }
   const launchedAt = params.updatedAt ?? Date.now();
   const passedContinuation =
     continuation.currentUnitStatus === "passed" || continuation.currentUnitStatus === "completed"
@@ -1963,10 +2148,9 @@ export function recordFlowNextExecutableLaunch(params: {
     launchedAt,
     params.detail,
   );
-  return updateFlowRecordByIdExpectedRevision({
-    flowId: current.flowId,
-    expectedRevision: params.expectedRevision,
-    patch: {
+  return {
+    applied: true,
+    flow: applyFlowPatch(current, {
       status: "running",
       currentStep: params.currentStep,
       stateJson: attachProductionContinuationToStateJson({
@@ -1976,8 +2160,8 @@ export function recordFlowNextExecutableLaunch(params: {
       blockedSummary: null,
       endedAt: null,
       updatedAt: launchedAt,
-    },
-  });
+    }),
+  };
 }
 
 export function recordFlowLawfulStop(params: {
@@ -2004,6 +2188,13 @@ export function recordFlowLawfulStop(params: {
     );
   }
   if (params.reason === "whole_run_complete") {
+    const governedCloseBlocked = buildGovernedMissionCloseBlockedSummary(
+      current,
+      "terminal_pending_watchdog",
+    );
+    if (governedCloseBlocked) {
+      return buildGuardBlockedResult(current, governedCloseBlocked);
+    }
     const missionSettlement = getBlockingTaskFlowMissionSettlement(current);
     if (missionSettlement) {
       const detail = buildMissionSettlementCloseBlockedSummary(missionSettlement);
@@ -2028,7 +2219,7 @@ export function recordFlowLawfulStop(params: {
     }
   }
   const updatedAt = params.updatedAt ?? Date.now();
-  const nextContinuation = updateContinuationForLawfulStop({
+  const nextContinuation = buildProductionContinuationForLawfulStop({
     state: continuation,
     reason: params.reason,
     at: updatedAt,
@@ -2090,6 +2281,75 @@ export function requestFlowCancel(params: {
   cancelRequestedAt?: number;
   updatedAt?: number;
 }): TaskFlowUpdateResult {
+  ensureFlowRegistryReady();
+  const current = flows.get(params.flowId);
+  if (!current) {
+    return { applied: false, reason: "not_found" };
+  }
+  if (current.revision !== params.expectedRevision) {
+    return { applied: false, reason: "revision_conflict", current: cloneFlowRecord(current) };
+  }
+  if (hasGovernedMissionClaimForFlow(current)) {
+    const mission = readGovernedMissionStateFromTaskFlow(current);
+    if (!mission) {
+      return buildGuardBlockedResult(
+        current,
+        "Governed mission cancellation requires a valid canonical mission state.",
+      );
+    }
+    if (mission.currentGovernedState === "released") {
+      return buildGuardBlockedResult(
+        current,
+        "A released governed mission awaiting delivery cannot be cancelled; record the delivery result instead.",
+      );
+    }
+    const cancelRequestedAt = params.cancelRequestedAt ?? params.updatedAt ?? Date.now();
+    const updatedAt = params.updatedAt ?? cancelRequestedAt;
+    const nextFlow = applyFlowPatch(current, { cancelRequestedAt, updatedAt });
+    const details = { cancelRequestedAt, updatedAt };
+    const payloadSha256 = crypto.createHash("sha256").update(JSON.stringify(details)).digest("hex");
+    const committed = commitGovernedMissionLedger({
+      nextFlow,
+      receipt: {
+        receiptId: `governed-cancel-request:${current.flowId}:${current.revision}`,
+        missionId: mission.missionId,
+        flowId: current.flowId,
+        runId: mission.ownerCorrelation.runId,
+        operation: "requestCancellation",
+        receiptKind: "transition",
+        fromState: mission.currentGovernedState,
+        toState: mission.currentGovernedState,
+        decision: "applied",
+        reasonCode: "CANCELLATION_REQUESTED",
+        expectedRevision: mission.revision,
+        resultingRevision: mission.revision,
+        contractId: mission.contractId,
+        contractHash: mission.contractHash,
+        authorityHash: mission.authorityHash,
+        planRevisionId: mission.planRevisionId,
+        sourceRevision: mission.sourceRevision,
+        runtimeBuildSha256: mission.runtimeBuildSha256,
+        policyVersion: mission.policyVersion,
+        skillSha256: mission.skillSha256,
+        payloadSha256,
+        producer: GOVERNED_MISSION_RUNTIME_PRODUCER,
+        idempotencyKey: `cancel-request:${current.flowId}:${current.revision}`,
+        details,
+        createdAt: updatedAt,
+      },
+    });
+    if (committed.status === "inserted") {
+      return { applied: true, flow: cloneFlowRecord(nextFlow) };
+    }
+    return {
+      applied: false,
+      reason: committed.status === "revision_conflict" ? "revision_conflict" : "guard_blocked",
+      current: cloneFlowRecord(flows.get(current.flowId) ?? current),
+      ...(committed.status === "revision_conflict"
+        ? {}
+        : { blockedSummary: `Governed mission cancellation receipt failed: ${committed.status}.` }),
+    };
+  }
   return updateFlowRecordByIdExpectedRevision({
     flowId: params.flowId,
     expectedRevision: params.expectedRevision,
@@ -2211,6 +2471,11 @@ export function deleteTaskFlowRecordById(flowId: string): boolean {
   ensureFlowRegistryReady();
   const current = flows.get(flowId);
   if (!current) {
+    return false;
+  }
+  // Governed rows retain the durable owner claim after terminalization. All
+  // removal must preserve that tombstone rather than reopening the session.
+  if (hasGovernedMissionClaimForFlow(current)) {
     return false;
   }
   if (!tryPersistFlowDelete(flowId)) {

@@ -272,6 +272,91 @@ describe("buildExportSessionReply", () => {
     expect(html).toContain('const base64 = document.getElementById("session-data").textContent;');
   });
 
+  it("omits display-hidden content from HTML data and keeps the visible branch connected", async () => {
+    hoisted.sessionTranscriptContent = [
+      { type: "session", version: 3, id: "session-1" },
+      {
+        type: "message",
+        id: "user-1",
+        parentId: null,
+        message: { role: "user", content: "visible start" },
+      },
+      {
+        type: "message",
+        id: "hidden-assistant",
+        parentId: "user-1",
+        message: { role: "assistant", content: "withheld model output", display: false },
+      },
+      {
+        type: "message",
+        id: "hidden-tool",
+        parentId: "hidden-assistant",
+        message: { role: "toolResult", content: "withheld tool result", display: false },
+      },
+      {
+        type: "compaction",
+        id: "hidden-compaction",
+        parentId: "hidden-tool",
+        summary: "withheld compacted result",
+        firstKeptEntryId: "hidden-assistant",
+        tokensBefore: 100,
+      },
+      {
+        type: "branch_summary",
+        id: "hidden-branch-summary",
+        parentId: "hidden-compaction",
+        fromId: "hidden-assistant",
+        summary: "withheld branch result",
+      },
+      {
+        type: "label",
+        id: "hidden-label",
+        parentId: "hidden-branch-summary",
+        targetId: "hidden-assistant",
+        label: "withheld label",
+      },
+      {
+        type: "message",
+        id: "user-2",
+        parentId: "hidden-label",
+        message: { role: "user", content: "visible continuation" },
+      },
+      {
+        type: "message",
+        id: "assistant-2",
+        parentId: "user-2",
+        message: { role: "assistant", content: "visible response" },
+      },
+      {
+        type: "custom_message",
+        id: "hidden-context",
+        parentId: "assistant-2",
+        customType: "openclaw.runtime-context",
+        content: "withheld runtime context",
+        display: false,
+      },
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n");
+
+    const reply = await buildExportSessionReply(makeParams());
+
+    const encoded = writtenHtml().match(/id="session-data"[\s\S]*?>([^<]*)<\/script>/u)?.[1];
+    expect(encoded).toBeDefined();
+    const data = JSON.parse(Buffer.from(encoded ?? "", "base64").toString("utf8")) as {
+      entries: Array<{ id: string; parentId: string | null }>;
+      leafId: string;
+    };
+    expect(data.entries.map(({ id, parentId }) => ({ id, parentId }))).toEqual([
+      { id: "user-1", parentId: null },
+      { id: "user-2", parentId: "user-1" },
+      { id: "assistant-2", parentId: "user-2" },
+    ]);
+    expect(data.leafId).toBe("assistant-2");
+    expect(JSON.stringify(data)).not.toContain("withheld");
+    expect(reply.text).toContain("📊 Entries: 3");
+  });
+
   it("suffixes colliding default export filenames instead of overwriting", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-05-05T10:11:12.345Z"));

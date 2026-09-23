@@ -84,6 +84,12 @@ export const mockedContextEngineCompact = mockedContextEngine.compact;
 export const mockedCompactDirect = mockedContextEngine.compact;
 export const mockedResolveContextEngine = vi.fn(async () => mockedContextEngine);
 export const mockedResolveContextEngineOwnerPluginId = vi.fn(() => undefined);
+export const mockedHasActiveGovernedMissionForOwnerKey = vi.fn(() => false);
+export const mockedCloseGovernedMissionExecutionLease = vi.fn();
+export const mockedRecordGovernedMissionWithheldPayload = vi.fn(() => ({
+  applied: false as const,
+  reason: "not_found" as const,
+}));
 export const mockedBuildAgentRuntimePlan = vi.fn(() => ({}));
 export const mockedRunPostCompactionSideEffects = vi.fn(async () => {});
 export const mockedEnsureRuntimePluginsLoaded = vi.fn<(params?: unknown) => void>();
@@ -278,6 +284,8 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
   mockedContextEngine.info.ownsCompaction = false;
   mockedResolveContextEngine.mockReset();
   mockedResolveContextEngine.mockResolvedValue(mockedContextEngine);
+  mockedHasActiveGovernedMissionForOwnerKey.mockReset();
+  mockedHasActiveGovernedMissionForOwnerKey.mockReturnValue(false);
   mockedBuildAgentRuntimePlan.mockReset();
   mockedBuildAgentRuntimePlan.mockReturnValue({});
   mockedContextEngineCompact.mockReset();
@@ -429,6 +437,11 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
   mockedShouldPreferExplicitConfigApiKeyAuth.mockReturnValue(false);
   mockedRunPostCompactionSideEffects.mockReset();
   mockedRunPostCompactionSideEffects.mockResolvedValue(undefined);
+  mockedRecordGovernedMissionWithheldPayload.mockReset().mockReturnValue({
+    applied: false,
+    reason: "not_found",
+  });
+  mockedCloseGovernedMissionExecutionLease.mockReset();
 }
 
 export async function loadRunOverflowCompactionHarness(): Promise<{
@@ -449,6 +462,21 @@ export async function loadRunOverflowCompactionHarness(): Promise<{
     resolveContextEngine: mockedResolveContextEngine,
     resolveContextEngineOwnerPluginId: mockedResolveContextEngineOwnerPluginId,
   }));
+
+  vi.doMock("../../governance/governed-mission-agent-runtime.js", () => ({
+    hasGovernedMissionClaimForOwnerKey: mockedHasActiveGovernedMissionForOwnerKey,
+    closeGovernedMissionExecutionLease: mockedCloseGovernedMissionExecutionLease,
+  }));
+
+  vi.doMock("../../governance/governed-mission-runtime.js", async () => {
+    const actual = await vi.importActual<
+      typeof import("../../governance/governed-mission-runtime.js")
+    >("../../governance/governed-mission-runtime.js");
+    return {
+      ...actual,
+      recordGovernedMissionWithheldPayload: mockedRecordGovernedMissionWithheldPayload,
+    };
+  });
 
   vi.doMock("../runtime-plugins.js", () => ({
     ensureRuntimePluginsLoaded: mockedEnsureRuntimePluginsLoaded,

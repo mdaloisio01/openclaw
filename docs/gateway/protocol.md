@@ -419,7 +419,7 @@ enumeration of `src/gateway/server-methods/*.ts`.
     - `agents.list` returns configured agent entries, including effective model and runtime metadata.
     - `agents.create`, `agents.update`, and `agents.delete` manage agent records and workspace wiring.
     - `agents.files.list`, `agents.files.get`, and `agents.files.set` manage the bootstrap workspace files exposed for an agent.
-    - `tasks.list`, `tasks.get`, and `tasks.cancel` expose the Gateway task ledger to SDK and operator clients.
+    - `tasks.list`, `tasks.get`, and `tasks.cancel` expose the Gateway task ledger to SDK and operator clients. `tasks.startProductionFlow` creates an owner-lane-authorized production flow and can admit a pinned governed mission package.
     - `artifacts.list`, `artifacts.get`, and `artifacts.download` expose transcript-derived artifact summaries and downloads for an explicit `sessionKey`, `runId`, or `taskId` scope. Run and task queries resolve the owning session server-side and only return transcript media with matching provenance; unsafe or local URL sources return unsupported downloads instead of fetching server-side.
     - `environments.list` and `environments.status` expose read-only Gateway-local and node environment discovery for SDK clients.
     - `agent.identity.get` returns the effective assistant identity for an agent or session.
@@ -536,6 +536,73 @@ runtime state.
     `{ "found": boolean, "cancelled": boolean, "reason"?: string, "task"?: TaskSummary }`.
   - `found` reports whether the ledger had a matching task. `cancelled`
     reports whether the runtime accepted or recorded cancellation.
+- `tasks.startProductionFlow` requires `operator.write`. Its ordinary production
+  flow fields retain their existing behavior. An optional `governedMission`
+  object requests governed admission and contains an idempotency key, pinned
+  authority reference ID and contract, manifest, requirements, gate kinds,
+  artifact declarations, and optional visible-delivery requirement. The object
+  and its contract, manifest, and requirement records use closed shapes. A governed
+  production contract also pins paired-device producers for implementation,
+  validation, review, and delivery proof.
+  - The referenced local authority file is a JSON record with schema
+    `openclaw.governed_authority_plan.v1`, `planRevisionId`, `planSha256`,
+    `scopeHash`, `authorizedScopeHash`, and `planRevisionAuthorized: true`.
+    `planSha256` is the SHA-256 digest of the recursively key-sorted compiled
+    plan JSON, omitting only the manifest's `planSha256` field. The server hashes
+    the file, matches its authorization fields to the compiled plan, measures the
+    adjacent build metadata plus the complete built JavaScript artifact set, and
+    derives enforcement and host facts at the trusted
+    operator-write/owner-lane boundary. Dirty builds and source-loader execution
+    without a host-measured runtime identity fail closed. Those facts are not accepted
+    from the client.
+  - Every artifact declaration pathname must be under
+    `<agent-workspace>/.openclaw/governed-artifacts/<mission-id>/`. The server
+    derives and pins that directory as `allowedRoot`; paths outside it and common
+    credential or private-key filenames are rejected.
+  - Success returns the admitted Task Flow and admission receipt. Invalid shape,
+    stale authority, identity mismatch, plan/declaration failure, and conflicting
+    idempotency return an invalid-request error. A canonical retry returns the
+    original flow and receipt even if host identity changed after the first response.
+- Governance `lookup` accepts an exact flow ID or owner session key. An owner
+  key selects its governed mission even when a newer ordinary flow exists.
+- `tasks.governance.status` and `tasks.governance.preview` require
+  `operator.read`. They return bounded, redacted governed Task Flow state or a
+  zero-write preview of one named operation. Preview derives the pinned
+  controller identity from the resolved canonical flow and remeasures the live
+  authority and runtime identity; clients do not need and cannot assert those
+  internal facts. Cancel/stop previews also check current queued and running
+  child work. Proof-producing previews are always
+  conservative: callers cannot assert passing proof, watchdog bindings, parent
+  closure, or zero active work through this read-only surface. These methods do
+  not mutate governed state.
+- `tasks.governance.apply` requires `operator.write`. It accepts a resolved flow,
+  expected mission revision, idempotency key, and one closed named action. The
+  server derives mission owner, controller, pinned identity, and time from
+  canonical state. It derives artifact results from bounded disk verification,
+  terminal-pending facts from Task Flow children and continuation state, and the
+  post-terminal result from a current Task Flow audit. It does not accept a
+  target state, raw receipt, caller-authored artifact result, watchdog result,
+  parent-closure flag, or active-work count. Named implementation, validation,
+  and review actions accept only a proof task ID. The server derives the result
+  from that task and requires its persisted executor assignment, role, capability,
+  run identity, and paired-device producer to match the admitted contract. Final
+  payload bytes remain withheld from transcript/history surfaces; a successful
+  `releaseFinalResult` returns them only after the canonical release gate passes.
+  `recordDeliveryResult` is a later acknowledgment from the pinned delivery
+  device and must bind to that release receipt ID and payload hash.
+  `requestReadmission` accepts a complete replacement governed package, including
+  its visible-delivery requirement, and remeasures its authority/runtime identity
+  before applying it. Direct `cancelMission` and `stopMission` actions require zero
+  queued or running children under an atomic child-creation fence; callers use
+  `tasks.cancel` when children must be cancelled first. Transition order,
+  execution-lease quiescence, required receipt kinds, release authorization, and
+  revision checks remain server-owned.
+- All three governance methods have closed parameter and result schemas in
+  `@openclaw/gateway-protocol`; unknown fields and unsupported operation names
+  are rejected.
+
+See [Task Flow governed missions](/automation/taskflow#governed-mission-lifecycle)
+for lifecycle, proof, receipt, and delivery semantics.
 
 `TaskSummary` includes `id`, `status`, and optional metadata such as `kind`,
 `runtime`, `title`, `agentId`, `sessionKey`, `childSessionKey`, `ownerKey`,

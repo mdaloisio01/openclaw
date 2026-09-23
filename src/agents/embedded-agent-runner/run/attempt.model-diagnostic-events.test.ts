@@ -524,6 +524,54 @@ describe("wrapStreamFnWithDiagnosticModelCallEvents", () => {
     expect(events[1]?.privateData.modelContent?.outputMessages).toEqual([assistant]);
   });
 
+  it("dynamically disables content capture at a governed provider boundary", async () => {
+    async function* stream() {
+      yield {
+        type: "done",
+        message: { role: "assistant", content: "private governed output" },
+      };
+    }
+    const wrapped = wrapStreamFnWithDiagnosticModelCallEvents(
+      (() => stream()) as unknown as StreamFn,
+      {
+        runId: "run-governed",
+        provider: "openai",
+        model: "gpt-5.4",
+        trace: createDiagnosticTraceContext(),
+        contentCapture: {
+          inputMessages: true,
+          outputMessages: true,
+          toolInputs: true,
+          toolOutputs: true,
+          systemPrompt: true,
+          toolDefinitions: true,
+          anyModelContent: true,
+        },
+        shouldCaptureContent: () => false,
+        nextCallId: () => "call-governed-content",
+      },
+    );
+
+    const events = await collectTrustedModelCallEvents(async () => {
+      await drain(
+        wrapped(
+          {} as never,
+          {
+            systemPrompt: "private governed system",
+            messages: [{ role: "user", content: "private governed input" }],
+            tools: [{ name: "private_tool" }],
+          } as never,
+          {},
+        ) as unknown as AsyncIterable<unknown>,
+      );
+    });
+
+    expect(events).toHaveLength(2);
+    for (const event of events) {
+      expect(event.privateData.modelContent).toBeUndefined();
+    }
+  });
+
   it("propagates the trusted model-call traceparent without mutating caller headers", async () => {
     async function* stream() {
       yield { type: "text", text: "ok" };

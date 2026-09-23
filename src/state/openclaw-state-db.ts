@@ -257,6 +257,11 @@ function ensureAdditiveStateColumns(db: DatabaseSync): void {
   ensureColumn(db, "task_runs", "mission_summary TEXT");
   ensureColumn(db, "task_runs", "mission_state TEXT");
   ensureColumn(db, "task_runs", "mission_updated_at INTEGER");
+  ensureColumn(db, "governed_mission_receipts", "contract_receipt_kinds_json TEXT");
+  ensureColumn(db, "governed_mission_receipts", "ledger_sequence INTEGER");
+  ensureColumn(db, "governed_mission_receipts", "previous_receipt_sha256 TEXT");
+  ensureColumn(db, "governed_mission_receipts", "governed_package_sha256 TEXT");
+  ensureColumn(db, "governed_mission_receipts", "receipt_sha256 TEXT");
 }
 
 function ensureSchema(db: DatabaseSync, pathname: string): void {

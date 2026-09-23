@@ -60,7 +60,8 @@ export type TrajectoryBundleWarning = {
     | "incomplete-session-branch"
     | "cyclic-session-branch"
     | "invalid-runtime-json"
-    | "invalid-runtime-event";
+    | "invalid-runtime-event"
+    | "runtime-omitted-hidden-session-content";
   count: number;
   rows: number[];
   message: string;

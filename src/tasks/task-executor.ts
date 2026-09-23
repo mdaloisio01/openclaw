@@ -1,4 +1,10 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  cancelGovernedMissionTaskFlow,
+  isGovernedMissionFlowClaimed,
+  isGovernedMissionCancellationComplete,
+} from "../governance/governed-mission-runtime.js";
+import { readGovernedMissionStateFromTaskFlow } from "../governance/governed-mission-state.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import type {
   DetachedRunningTaskCreateParams,
@@ -16,9 +22,12 @@ import {
   listTasksForFlowId,
   markTaskLostById,
   markTaskRunningByRunId,
+  finalizeTaskRunById as finalizeTaskRunByIdInRegistry,
   finalizeTaskRunByRunId as finalizeTaskRunByRunIdInRegistry,
   recordTaskProgressByRunId,
+  setTaskProgressById,
   setTaskRunDeliveryStatusByRunId,
+  type TaskRecordCreateOptions,
 } from "./runtime-internal.js";
 import { getTaskFlowByIdForOwner } from "./task-flow-owner-access.js";
 import type { TaskFlowRecord } from "./task-flow-registry.types.js";
@@ -143,6 +152,7 @@ type RunTaskInFlowParams = {
   startedAt?: number;
   lastEventAt?: number;
   progressSummary?: string | null;
+  persistTask?: TaskRecordCreateOptions["persist"];
 };
 
 export function startTaskRunByRunId(params: {
@@ -168,24 +178,69 @@ export function recordTaskRunProgressByRunId(params: {
   return recordTaskProgressByRunId(params);
 }
 
-export function completeTaskRunByRunId(params: {
-  runId: string;
-  runtime?: TaskRuntime;
-  sessionKey?: string;
-  endedAt: number;
+export function recordTaskRunProgressById(params: {
+  taskId: string;
   lastEventAt?: number;
   progressSummary?: string | null;
-  terminalSummary?: string | null;
-  terminalOutcome?: TaskTerminalOutcome | null;
+  eventSummary?: string | null;
 }) {
-  return finalizeTaskRunByRunId({
-    ...params,
-    status: "succeeded",
-  });
+  return setTaskProgressById(params);
 }
 
-export function finalizeTaskRunByRunId(params: DetachedTaskFinalizeParams) {
-  return finalizeTaskRunByRunIdInRegistry(params);
+export function completeTaskRunByRunId(
+  params: {
+    runId: string;
+    runtime?: TaskRuntime;
+    sessionKey?: string;
+    endedAt: number;
+    lastEventAt?: number;
+    progressSummary?: string | null;
+    terminalSummary?: string | null;
+    terminalOutcome?: TaskTerminalOutcome | null;
+  },
+  options: {
+    persist?: (task: TaskRecord) => boolean;
+    syncParentFlow?: boolean;
+  } = {},
+) {
+  return finalizeTaskRunByRunId(
+    {
+      ...params,
+      status: "succeeded",
+    },
+    options,
+  );
+}
+
+export function finalizeTaskRunByRunId(
+  params: DetachedTaskFinalizeParams,
+  options: {
+    persist?: (task: TaskRecord) => boolean;
+    syncParentFlow?: boolean;
+  } = {},
+) {
+  return finalizeTaskRunByRunIdInRegistry(params, options);
+}
+
+export function finalizeTaskRunById(
+  params: {
+    taskId: string;
+    status: Extract<TaskStatus, "succeeded" | "failed" | "timed_out" | "cancelled">;
+    deliveryStatus?: Extract<TaskDeliveryStatus, "delivered">;
+    startedAt?: number;
+    endedAt: number;
+    lastEventAt?: number;
+    error?: string;
+    progressSummary?: string | null;
+    terminalSummary?: string | null;
+    terminalOutcome?: TaskTerminalOutcome | null;
+  },
+  options: {
+    persist?: (task: TaskRecord) => boolean;
+    syncParentFlow?: boolean;
+  } = {},
+) {
+  return finalizeTaskRunByIdInRegistry(params, options);
 }
 
 export function failTaskRunByRunId(params: {
@@ -407,7 +462,7 @@ function markFlowCancelRequested(flow: TaskFlowRecord): TaskFlowRecord | FlowUpd
     return result.flow;
   }
   return {
-    reason: describeFlowUpdateFailure(result.reason),
+    reason: result.blockedSummary ?? describeFlowUpdateFailure(result.reason),
     flow: result.current ?? getTaskFlowById(flow.flowId),
   };
 }
@@ -436,6 +491,30 @@ function cancelManagedFlowAfterChildrenSettle(
   flow: TaskFlowRecord,
   endedAt: number,
 ): TaskFlowRecord | FlowUpdateFailure {
+  const mission = readGovernedMissionStateFromTaskFlow(flow);
+  if (isGovernedMissionFlowClaimed(flow)) {
+    if (!mission) {
+      return {
+        reason: "Governed mission state is missing or malformed; repair it before cancellation.",
+        flow,
+      };
+    }
+    const result = cancelGovernedMissionTaskFlow({ flowId: flow.flowId, occurredAt: endedAt });
+    if (isGovernedMissionCancellationComplete(result)) {
+      const completedFlow = "flow" in result ? result.flow : undefined;
+      return getTaskFlowById(flow.flowId) ?? completedFlow ?? flow;
+    }
+    const reasonCode =
+      "reasonCode" in result
+        ? result.reasonCode
+        : "decision" in result && result.decision
+          ? result.decision.reasonCode
+          : result.status;
+    return {
+      reason: `Governed mission cancellation was rejected: ${reasonCode}.`,
+      flow: "flow" in result ? (result.flow ?? flow) : flow,
+    };
+  }
   const result = updateFlowRecordByIdExpectedRevision({
     flowId: flow.flowId,
     expectedRevision: flow.revision,
@@ -477,6 +556,14 @@ function mapRunTaskInFlowCreateError(params: {
         found: true,
         created: false,
         reason: `Flow is already ${terminalStatus}.`,
+        ...(flow ? { flow } : {}),
+      };
+    }
+    if (params.error.code === "child_creation_closed") {
+      return {
+        found: true,
+        created: false,
+        reason: "Governed mission child creation is closed for closeout.",
         ...(flow ? { flow } : {}),
       };
     }
@@ -544,15 +631,18 @@ export function runTaskInFlow(params: RunTaskInFlowParams): RunTaskInFlowResult 
   };
   let task: TaskRecord | null;
   try {
-    task =
+    task = createTaskRecord(
       params.status === "running"
-        ? createRunningTaskRun({
+        ? {
             ...common,
+            status: "running",
             startedAt: params.startedAt,
             lastEventAt: params.lastEventAt,
             progressSummary: params.progressSummary,
-          })
-        : createQueuedTaskRun(common);
+          }
+        : { ...common, status: "queued" },
+      params.persistTask ? { persist: params.persistTask, syncParentFlow: false } : undefined,
+    );
   } catch (error) {
     return mapRunTaskInFlowCreateError({
       error,
@@ -616,6 +706,7 @@ export function runTaskInFlowForOwner(
     startedAt: params.startedAt,
     lastEventAt: params.lastEventAt,
     progressSummary: params.progressSummary,
+    persistTask: params.persistTask,
   });
 }
 

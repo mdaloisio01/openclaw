@@ -39,6 +39,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -329,6 +330,31 @@ describe("mission-specific tool enforcement", () => {
     });
   });
 
+  it("blocks messaging final output until governed closeout and release are complete", () => {
+    expect(
+      evaluateMissionSpecificToolEnforcement({
+        ...baseInput,
+        toolName: "message",
+        target: "tool:message",
+        signals: {
+          toolName: "message",
+          externalSideEffect: true,
+          finalOutput: true,
+        },
+        authority,
+      }),
+    ).toMatchObject({
+      protected: true,
+      decision: "BLOCKED",
+      reasonCode: "POLICY_BLOCKED",
+      obligations: ["require_closeout_and_release"],
+      policyDecision: {
+        decision: "BLOCKED",
+        reasonCode: "FINAL_OUTPUT_RELEASE_NOT_READY",
+      },
+    });
+  });
+
   it("blocks protected exec when supervisor wrapper is explicitly required but absent", () => {
     expect(
       evaluateMissionSpecificToolEnforcement({
@@ -540,4 +566,32 @@ describe("mission-specific tool enforcement", () => {
       }),
     });
   });
+
+  it.each([
+    "pending_override",
+    "closeout_ready",
+    "artifact_verified",
+    "terminal_pending_watchdog",
+    "released",
+  ] as const)(
+    "blocks protected tools while the mission is locked in %s",
+    (currentGovernedState) => {
+      expect(
+        evaluateMissionSpecificToolEnforcement({
+          ...baseInput,
+          authority: {
+            ...authority,
+            missionState: { ...missionState, currentGovernedState },
+          },
+        }),
+      ).toMatchObject({
+        decision: "BLOCKED",
+        reasonCode: "POLICY_BLOCKED",
+        policyDecision: {
+          decision: "BLOCKED",
+          reasonCode: "GOVERNED_MISSION_LOCKED",
+        },
+      });
+    },
+  );
 });

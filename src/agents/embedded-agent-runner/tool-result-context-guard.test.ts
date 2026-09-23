@@ -574,6 +574,29 @@ describe("installContextEngineLoopHook", () => {
     expect(engine.assemble).not.toHaveBeenCalled();
   });
 
+  it("bypasses context-engine processing when the owning runtime fences the turn", async () => {
+    const agent = makeGuardableAgent();
+    const engine = makeMockEngine();
+    installContextEngineLoopHook({
+      agent,
+      contextEngine: engine,
+      sessionId,
+      sessionKey,
+      sessionFile,
+      tokenBudget,
+      modelId,
+      getPrePromptMessageCount: () => 1,
+      shouldProcessTurn: () => false,
+    });
+
+    const messages = [makeUser("first"), makeToolResult("call_1", "governed result")];
+    const transformed = await callTransform(agent, messages);
+
+    expect(transformed).toBe(messages);
+    expect(engine.afterTurn).not.toHaveBeenCalled();
+    expect(engine.assemble).not.toHaveBeenCalled();
+  });
+
   it("keeps the pressure guard active around ownsCompaction loop assembly", async () => {
     const agent = makeGuardableAgent();
     const engine = makeMockEngine();

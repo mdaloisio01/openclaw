@@ -1,5 +1,7 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE } from "../../governance/governed-final-release-decision.js";
+import { onAgentEvent } from "../../infra/agent-events.js";
 import {
   hasCommittedMessagingToolDeliveryEvidence,
   hasOutboundDeliveryEvidence,
@@ -10,6 +12,7 @@ import {
   mockedClassifyFailoverReason,
   mockedGlobalHookRunner,
   mockedLog,
+  mockedRecordGovernedMissionWithheldPayload,
   mockedRunEmbeddedAttempt,
   mockedResolveModelAsync,
   overflowBaseRunParams,
@@ -397,6 +400,126 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
       result: "success",
       stage: "assistant",
     });
+  });
+
+  it("does not recover governed final text when a prompt timeout races completion", async () => {
+    mockedClassifyFailoverReason.mockReturnValue(null);
+    const finalText = "private governed final";
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+      makeAttemptResult({
+        assistantTexts: [],
+        timedOut: true,
+        governedMissionFlowId: "governed-flow-1",
+        governedMissionAttemptReceiptId: "governed-attempt-1",
+        finalPromptText: "private governed prompt",
+        systemPromptReport: { systemPrompt: "private governed system prompt" } as never,
+        lastAssistant: {
+          role: "assistant",
+          stopReason: "stop",
+          provider: "openai",
+          model: "gpt-5.5",
+          content: [{ type: "text", text: finalText }],
+        } as unknown as EmbeddedRunAttemptResult["lastAssistant"],
+      }),
+    );
+
+    const result = await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      provider: "openai",
+      model: "gpt-5.5",
+      runId: "run-governed-prompt-timeout-final-withheld",
+    });
+
+    expect(result.payloads?.[0]).toEqual({
+      text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE,
+      isStatusNotice: true,
+    });
+    expect(result.payloads?.some((payload) => payload.text?.includes(finalText))).toBe(false);
+    expect(result.meta.finalPromptText).toBeUndefined();
+    expect(result.meta.systemPromptReport).toBeUndefined();
+    expect(result.meta.finalAssistantVisibleText).toBeUndefined();
+    expect(result.meta.finalAssistantRawText).toBeUndefined();
+    expect(mockedRecordGovernedMissionWithheldPayload).not.toHaveBeenCalled();
+  });
+
+  it("does not publish governed planning-only text through plan events", async () => {
+    mockedClassifyFailoverReason.mockReturnValue(null);
+    const onAttemptEvent = vi.fn();
+    const observedGlobalEvents: Array<{ runId: string; stream: string; data: unknown }> = [];
+    const stopObserving = onAgentEvent((event) => {
+      if (event.runId === "run-governed-planning-only") {
+        observedGlobalEvents.push(event);
+      }
+    });
+    mockedRunEmbeddedAttempt.mockResolvedValue(
+      makeAttemptResult({
+        governedMissionFlowId: "governed-flow-1",
+        governedMissionAttemptReceiptId: "governed-attempt-1",
+        assistantTexts: ["I'll inspect the code, make the change, and run the checks."],
+      }),
+    );
+
+    try {
+      await runEmbeddedAgent({
+        ...overflowBaseRunParams,
+        prompt: "Please inspect the code, make the change, and run the checks.",
+        provider: "openai",
+        model: "gpt-5.4",
+        runId: "run-governed-planning-only",
+        onAgentEvent: onAttemptEvent,
+        config: {
+          agents: {
+            list: [{ id: "main" }],
+          },
+        } as OpenClawConfig,
+      });
+    } finally {
+      stopObserving();
+    }
+
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(3);
+    expect(mockedRecordGovernedMissionWithheldPayload).not.toHaveBeenCalled();
+    expect(onAttemptEvent.mock.calls.some(([event]) => event.stream === "plan")).toBe(false);
+    expect(observedGlobalEvents.some((event) => event.stream === "plan")).toBe(false);
+  });
+
+  it("withholds a governed result when the outer retry limit is exhausted", async () => {
+    mockedClassifyFailoverReason.mockReturnValue(null);
+    mockedRunEmbeddedAttempt.mockResolvedValue(
+      makeAttemptResult({
+        governedMissionFlowId: "governed-retry-limit-flow",
+        governedMissionAttemptReceiptId: "governed-retry-limit-attempt",
+        assistantTexts: ["I'll inspect the code, make the change, and run the checks."],
+      }),
+    );
+
+    const result = await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      prompt: "Please inspect the code, make the change, and run the checks.",
+      provider: "openai",
+      model: "gpt-5.4",
+      runId: "run-governed-retry-limit",
+      config: {
+        agents: {
+          defaults: {
+            runRetries: { base: 1, perProfile: 0, min: 1, max: 1 },
+          },
+          list: [{ id: "main" }],
+        },
+      } as OpenClawConfig,
+    });
+
+    expect(mockedRunEmbeddedAttempt).toHaveBeenCalledTimes(1);
+    expect(result.payloads).toEqual([
+      { text: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE, isStatusNotice: true },
+    ]);
+    expect(result.meta.error).toMatchObject({
+      kind: "retry_limit",
+      message: GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE,
+    });
+    expect(result.meta.finalAssistantVisibleText).toBeUndefined();
+    expect(result.meta.finalAssistantRawText).toBeUndefined();
+    expect(mockedRecordGovernedMissionWithheldPayload).not.toHaveBeenCalled();
   });
 
   it("auto-activates strict-agentic for unconfigured GPT-5 openai runs and surfaces the blocked state", async () => {
@@ -2593,6 +2716,39 @@ describe("runEmbeddedAgent incomplete-turn safety", () => {
     expect(result.payloads).toEqual([{ text: "NO_REPLY" }]);
     expect(result.meta.terminalReplyKind).toBe("silent-empty");
     expect(result.meta.livenessState).toBe("working");
+  });
+
+  it("captures NO_REPLY as the governed payload for a clean silent turn", async () => {
+    mockedClassifyFailoverReason.mockReturnValue(null);
+    mockedRecordGovernedMissionWithheldPayload.mockReturnValueOnce({ applied: true } as never);
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(
+      makeAttemptResult({
+        assistantTexts: [],
+        governedMissionFlowId: "governed-silent-flow",
+        governedMissionAttemptReceiptId: "governed-silent-attempt",
+        lastAssistant: {
+          role: "assistant",
+          stopReason: "stop",
+          provider: "openai",
+          model: "gpt-5.5",
+          content: [{ type: "text", text: "" }],
+        } as unknown as EmbeddedRunAttemptResult["lastAssistant"],
+      }),
+    );
+
+    await runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      allowEmptyAssistantReplyAsSilent: true,
+      provider: "openai",
+      model: "gpt-5.5",
+      runId: "run-governed-empty-assistant-silent",
+    });
+
+    expect(mockedRecordGovernedMissionWithheldPayload).toHaveBeenCalledWith({
+      flowId: "governed-silent-flow",
+      attemptReceiptId: "governed-silent-attempt",
+      payload: [{ text: "NO_REPLY" }],
+    });
   });
 
   it("keeps retrying and surfacing clean empty assistant turns without the silence flag", async () => {

@@ -234,6 +234,7 @@ type ToolHandlerParams = Pick<
   | "onExecutionPhase"
   | "onHeartbeatToolResponse"
   | "onToolResult"
+  | "shouldSuppressAssistantOutput"
   | "sessionKey"
   | "sessionId"
   | "agentId"

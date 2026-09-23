@@ -2,6 +2,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { filterVisibleSessionEntries } from "../../agents/sessions/session-export-visibility.js";
 import {
   migrateSessionEntries,
   type FileEntry as SessionFileEntry,
@@ -246,9 +247,11 @@ async function readSessionDataFromTranscript(sessionFile: string): Promise<{
   migrateSessionEntries(fileEntries);
   const header =
     fileEntries.find((entry): entry is SessionHeader => entry.type === "session") ?? null;
-  const entries = fileEntries.filter(
+  const transcriptEntries = fileEntries.filter(
     (entry): entry is AgentSessionEntry => entry.type !== "session",
   );
+  // HTML embeds the entire entry array as raw base64 JSON.
+  const entries = filterVisibleSessionEntries(transcriptEntries);
   const lastEntry = entries.at(-1);
   const leafId = typeof lastEntry?.id === "string" ? lastEntry.id : null;
   return { header, entries, leafId, warnings: summarizeSessionExportWarnings(warnings) };

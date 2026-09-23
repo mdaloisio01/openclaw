@@ -429,11 +429,11 @@ describe("subscribeEmbeddedAgentSession", () => {
         content: [{ type: "text", text: "Here is the image." }],
       },
     });
-    await flushBlockReplyCallbacks();
-
-    expectBlockReplyPayload(onBlockReply, {
-      text: "Here is the image.",
-      mediaUrls: ["/tmp/generated.png"],
+    await vi.waitFor(() => {
+      expectBlockReplyPayload(onBlockReply, {
+        text: "Here is the image.",
+        mediaUrls: ["/tmp/generated.png"],
+      });
     });
   });
 
@@ -482,11 +482,11 @@ describe("subscribeEmbeddedAgentSession", () => {
         content: [{ type: "text", text: "Here is the selected image.\nMEDIA:./selected.png" }],
       },
     });
-    await flushBlockReplyCallbacks();
-
-    expectBlockReplyPayload(onBlockReply, {
-      text: "Here is the selected image.",
-      mediaUrls: ["./selected.png"],
+    await vi.waitFor(() => {
+      expectBlockReplyPayload(onBlockReply, {
+        text: "Here is the selected image.",
+        mediaUrls: ["./selected.png"],
+      });
     });
   });
 
@@ -530,8 +530,10 @@ describe("subscribeEmbeddedAgentSession", () => {
     emit({ type: "message_start", message: { role: "assistant" } });
     emitAssistantTextDelta(emit, "Generated 1 image.\n");
 
-    expectBlockReplyPayload(onBlockReply, {
-      text: "Generated 1 image.",
+    await vi.waitFor(() => {
+      expectBlockReplyPayload(onBlockReply, {
+        text: "Generated 1 image.",
+      });
     });
     const earlyMediaPayloads = onBlockReply.mock.calls
       .map(([payload]) => payload)
@@ -761,11 +763,11 @@ describe("subscribeEmbeddedAgentSession", () => {
       },
     });
     emit({ type: "agent_end" });
-    await flushBlockReplyCallbacks();
-
-    expect(onBlockReply).toHaveBeenCalledWith({
-      mediaUrls: ["/tmp/reply.opus"],
-      audioAsVoice: true,
+    await vi.waitFor(() => {
+      expect(onBlockReply).toHaveBeenCalledWith({
+        mediaUrls: ["/tmp/reply.opus"],
+        audioAsVoice: true,
+      });
     });
     expect(subscription.getPendingToolMediaReply()).toBeNull();
     expect(subscription.getVisibleBlockReplyCount()).toBe(1);
@@ -850,6 +852,90 @@ describe("subscribeEmbeddedAgentSession", () => {
       .filter((value): value is string => typeof value === "string");
     expect(streamTexts.at(-1)).toBe("Checking files done");
     expect(onReasoningEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("suppresses every outward assistant stream when governance claims the run", async () => {
+    const emitAgentEventSpy = vi.spyOn(agentEvents, "emitAgentEvent").mockImplementation(() => {});
+    const onAgentEvent = vi.fn();
+    const onPartialReply = vi.fn();
+    const onAssistantMessageStart = vi.fn();
+    const onReasoningStream = vi.fn();
+    const onReasoningEnd = vi.fn();
+    const onToolResult = vi.fn();
+    const onBlockReply = vi.fn();
+    const onBlockReplyFlush = vi.fn();
+
+    const { emit } = createSubscribedHarness({
+      runId: "governed-run",
+      shouldSuppressAssistantOutput: () => true,
+      reasoningMode: "stream",
+      onAgentEvent,
+      onPartialReply,
+      onAssistantMessageStart,
+      onReasoningStream,
+      onReasoningEnd,
+      onToolResult,
+      onBlockReply,
+      onBlockReplyFlush,
+      blockReplyBreak: "message_end",
+    });
+
+    emit({ type: "agent_start" });
+    emit({ type: "message_start", message: { role: "assistant" } });
+    emit({
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "private reasoning" }],
+      },
+      assistantMessageEvent: { type: "thinking_delta", delta: "private reasoning" },
+    });
+    emit({
+      type: "message_update",
+      message: {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "private reasoning" }],
+      },
+      assistantMessageEvent: { type: "thinking_end" },
+    });
+    emitAssistantTextDelta(emit, "private final");
+    emitAssistantTextEnd(emit, "private final");
+    emitToolRun({
+      emit,
+      toolName: "exec",
+      toolCallId: "governed-tool-1",
+      args: { command: "printf private-tool-output" },
+      isError: false,
+      result: { content: [{ type: "text", text: "private-tool-output" }] },
+    });
+    emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "private final" }],
+      },
+    });
+    emit({ type: "agent_end" });
+    await flushBlockReplyCallbacks();
+
+    expect(onAgentEvent).not.toHaveBeenCalled();
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(onAssistantMessageStart).not.toHaveBeenCalled();
+    expect(onReasoningStream).not.toHaveBeenCalled();
+    expect(onReasoningEnd).not.toHaveBeenCalled();
+    expect(onToolResult).not.toHaveBeenCalled();
+    expect(onBlockReply).not.toHaveBeenCalled();
+    expect(
+      emitAgentEventSpy.mock.calls.some(
+        ([event]) =>
+          event.stream === "assistant" ||
+          event.stream === "thinking" ||
+          event.stream === "tool" ||
+          event.stream === "item" ||
+          event.stream === "command_output",
+      ),
+    ).toBe(false);
+    emitAgentEventSpy.mockRestore();
   });
 
   it("extracts correct reasoning delta for incremental stream updates", () => {
@@ -1188,7 +1274,7 @@ describe("subscribeEmbeddedAgentSession", () => {
     expect(subscription.getLastToolError()?.toolName).toBe("write");
   });
 
-  it("clears unresolved mutating failure when the same action succeeds", () => {
+  it("clears unresolved mutating failure when the same action succeeds", async () => {
     const { emit, subscription } = createWriteFailureHarness({
       runId: "run-tools-2",
       path: "/tmp/demo.txt",
@@ -1204,7 +1290,7 @@ describe("subscribeEmbeddedAgentSession", () => {
       result: { ok: true },
     });
 
-    expect(subscription.getLastToolError()).toBeUndefined();
+    await vi.waitFor(() => expect(subscription.getLastToolError()).toBeUndefined());
   });
 
   it("keeps unresolved mutating failure when same tool succeeds on a different target", () => {
@@ -1277,7 +1363,7 @@ describe("subscribeEmbeddedAgentSession", () => {
     expect(error).toContain("API rate limit reached");
   });
 
-  it("preserves replay-invalid lifecycle truth across compaction retries after mutating tools", () => {
+  it("preserves replay-invalid lifecycle truth across compaction retries after mutating tools", async () => {
     const { session, emit } = createStubSessionHarness();
     const onAgentEvent = vi.fn();
 
@@ -1307,15 +1393,16 @@ describe("subscribeEmbeddedAgentSession", () => {
       replayInvalid: true,
       hadPotentialSideEffects: true,
     });
-    const payloads = extractAgentEventPayloads(onAgentEvent.mock.calls);
-    expectLifecyclePayload(payloads, {
-      phase: "end",
-      livenessState: "abandoned",
-      replayInvalid: true,
+    await vi.waitFor(() => {
+      expectLifecyclePayload(extractAgentEventPayloads(onAgentEvent.mock.calls), {
+        phase: "end",
+        livenessState: "abandoned",
+        replayInvalid: true,
+      });
     });
   });
 
-  it("preserves deterministic side-effect liveness across compaction retries", () => {
+  it("preserves deterministic side-effect liveness across compaction retries", async () => {
     const { session, emit } = createStubSessionHarness();
     const onAgentEvent = vi.fn();
 
@@ -1337,15 +1424,16 @@ describe("subscribeEmbeddedAgentSession", () => {
     emit({ type: "compaction_end", willRetry: true, result: { summary: "compacted" } });
     emit({ type: "agent_end" });
 
-    const payloads = extractAgentEventPayloads(onAgentEvent.mock.calls);
-    expectLifecyclePayload(payloads, {
-      phase: "end",
-      livenessState: "working",
-      replayInvalid: true,
+    await vi.waitFor(() => {
+      expectLifecyclePayload(extractAgentEventPayloads(onAgentEvent.mock.calls), {
+        phase: "end",
+        livenessState: "working",
+        replayInvalid: true,
+      });
     });
   });
 
-  it("preserves accepted session spawn terminal evidence across compaction retries", () => {
+  it("preserves accepted session spawn terminal evidence across compaction retries", async () => {
     const { session, emit } = createStubSessionHarness();
     const onAgentEvent = vi.fn();
     const subscription = subscribeEmbeddedAgentSession({
@@ -1380,11 +1468,12 @@ describe("subscribeEmbeddedAgentSession", () => {
 
     emit({ type: "agent_end" });
 
-    const payloads = extractAgentEventPayloads(onAgentEvent.mock.calls);
-    expectLifecyclePayload(payloads, {
-      phase: "end",
-      livenessState: "working",
-      replayInvalid: true,
+    await vi.waitFor(() => {
+      expectLifecyclePayload(extractAgentEventPayloads(onAgentEvent.mock.calls), {
+        phase: "end",
+        livenessState: "working",
+        replayInvalid: true,
+      });
     });
   });
 

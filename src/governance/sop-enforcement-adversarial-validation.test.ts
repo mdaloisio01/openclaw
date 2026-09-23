@@ -64,6 +64,7 @@ const contract: GovernedMissionContract = {
   sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
   runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
   policyVersion: "sop-enforcement-v1",
+  skillSha256: "skill-sha",
   mode: "shadow",
   authoritativeCompletionOwner: "governed_mission_state",
   requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -505,6 +506,7 @@ function admission(
       sourceRevision: contract.sourceRevision,
       runtimeBuildSha256: contract.runtimeBuildSha256,
       policyVersion: contract.policyVersion,
+      skillSha256: contract.skillSha256,
     },
     ownerCorrelation: { owner: "Cleanup Crew", taskFlowId: "flow-sop-enf-20" },
     enforcementCapabilities: healthyCapabilities,
@@ -633,11 +635,12 @@ function override(
     hostAuthority?: { openclawAllows: boolean; osAllows: boolean; hostAllows: boolean };
   } = {},
 ): ReturnType<typeof decideGovernedOperatorOverrideWorkflow> {
-  return decideGovernedOperatorOverrideWorkflow({
+  const overrideContract = overrides.staleContract
+    ? { ...contract, authorityHash: "other-authority" }
+    : contract;
+  const input = {
     record: taskFlowRecord(missionState),
-    contract: overrides.staleContract
-      ? { ...contract, authorityHash: "other-authority" }
-      : contract,
+    contract: overrideContract,
     overrideId: "override-1",
     operatorAuthority: {
       refId: "mark-approval",
@@ -658,6 +661,33 @@ function override(
     },
     now,
     producer: "sop-enf-20-test",
+  } as const;
+  if (overrides.staleContract) {
+    return decideGovernedOperatorOverrideWorkflow(input);
+  }
+  const eligibleState = updateGovernedMissionState(missionState, {
+    expectedRevision: missionState.revision,
+    currentGovernedState: "executing",
+    currentStep: "adversarial_validation",
+    now,
+  });
+  const eligibleRecord = taskFlowRecord(eligibleState);
+  const pending = decideGovernedOperatorOverrideWorkflow({
+    ...input,
+    record: eligibleRecord,
+    decisionStatus: "pending",
+    approverRef: undefined,
+  });
+  if (pending.decision !== "pending") {
+    throw new Error(`expected pending override, got ${pending.decision}`);
+  }
+  return decideGovernedOperatorOverrideWorkflow({
+    ...input,
+    record: {
+      flowId: eligibleRecord.flowId,
+      revision: eligibleRecord.revision + 1,
+      stateJson: pending.patch.stateJson,
+    },
   });
 }
 
@@ -729,7 +759,7 @@ function watchdog(overrides: {
       executorLeaseCurrent: executorCount === 1,
     },
     governedMissionState: overrides.staleProof
-      ? { state: "GOVERNED_MISSION_PENDING_OVERRIDE", proofCurrent: false }
+      ? { state: "pending_override", proofCurrent: false }
       : undefined,
     findings:
       overrides.runtimeHealth === false
@@ -819,7 +849,7 @@ async function webChatWithheld(
 function terminalFailedMissionState(): GovernedMissionState {
   return updateGovernedMissionState(missionState, {
     expectedRevision: missionState.revision,
-    currentGovernedState: "GOVERNED_MISSION_TERMINAL",
+    currentGovernedState: "failed",
     terminalStatus: "failed",
     currentStep: "failed_contract",
     now,

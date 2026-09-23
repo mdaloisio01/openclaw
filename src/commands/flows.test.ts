@@ -1,11 +1,29 @@
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ENFORCEMENT_HEALTH_CAPABILITIES } from "../governance/enforcement-health.js";
+import {
+  GOVERNED_REQUIRED_RECEIPT_KINDS,
+  type GovernedMissionContract,
+} from "../governance/governed-mission-contract.js";
+import { readGovernedWorkspaceSkillSha256 } from "../governance/governed-mission-identity.js";
+import {
+  admitGovernedMissionToTaskFlow,
+  applyGovernedMissionOperation,
+  listGovernedMissionReceipts,
+} from "../governance/governed-mission-runtime.js";
+import { readGovernedMissionStateFromTaskFlow } from "../governance/governed-mission-state.js";
+import { compileMissionPlan } from "../governance/mission-plan-compiler.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { createRunningTaskRun as createRunningTaskRunOrNull } from "../tasks/task-executor.js";
 import {
   createManagedTaskFlow as createManagedTaskFlowOrNull,
+  getTaskFlowById,
   getTaskFlowProductionContinuation,
   resetTaskFlowRegistryForTests,
 } from "../tasks/task-flow-registry.js";
+import { configureTaskFlowRegistryRuntime } from "../tasks/task-flow-registry.store.js";
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
 import {
   createTaskRecord,
@@ -19,6 +37,9 @@ import {
   flowsCancelCommand,
   flowsLawfulStopCommand,
   flowsListCommand,
+  flowsGovernancePreviewCommand,
+  flowsGovernanceReceiptsCommand,
+  flowsGovernanceShowCommand,
   flowsResumeProductionCommand,
   flowsShowCommand,
   flowsStartProductionCommand,
@@ -38,7 +59,9 @@ const runRuntimeAssetGuardPreflight = vi.hoisted(() =>
 );
 
 vi.mock("../config/config.js", () => ({
-  getRuntimeConfig: vi.fn(() => ({})),
+  getRuntimeConfig: vi.fn(() => ({
+    agents: { defaults: { workspace: process.env.OPENCLAW_STATE_DIR } },
+  })),
   loadConfig: vi.fn(() => ({})),
 }));
 
@@ -193,6 +216,290 @@ describe("flows commands", () => {
           },
         ],
       });
+    });
+  });
+
+  it("shows and previews governed state without writing SQLite or config health", async () => {
+    await withTaskFlowCommandStateDir(async (stateDir) => {
+      const now = "2026-09-17T00:00:00.000Z";
+      const authorityPath = path.join(stateDir, "work-order.json");
+      const authorityBody = Buffer.from('{"workOrder":"cli-preview"}\n');
+      fs.writeFileSync(authorityPath, authorityBody);
+      const authorityHash = createHash("sha256").update(authorityBody).digest("hex");
+      const trustedRuntimeIdentity = {
+        sourceRevision: "source-1",
+        runtimeBuildSha256: "build-1",
+      };
+      const skillSha256 = readGovernedWorkspaceSkillSha256({
+        workspaceDir: stateDir,
+        config: { agents: { defaults: { workspace: stateDir } } },
+        agentId: "main",
+      });
+      if (!skillSha256) {
+        throw new Error("expected governed workspace skill identity");
+      }
+      const authorityRef = {
+        refId: "work-order-1",
+        kind: "work_order" as const,
+        uri: authorityPath,
+        sha256: authorityHash,
+      };
+      const contract: GovernedMissionContract = {
+        schema: "openclaw.governed_mission_contract.v1",
+        missionId: "mission-cli-read-only",
+        contractId: "contract-cli-read-only",
+        contractVersion: "1",
+        contractHash: "contract-hash",
+        authorityHash,
+        authorityRefs: [authorityRef],
+        admissionReceiptRef: "admission-cli-read-only",
+        planRevisionId: "plan-1",
+        sourceRevision: "source-1",
+        runtimeBuildSha256: "build-1",
+        policyVersion: "policy-1",
+        skillSha256,
+        mode: "enforce",
+        authoritativeCompletionOwner: "governed_mission_state",
+        requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
+        createdAt: now,
+      };
+      const admitted = admitGovernedMissionToTaskFlow({
+        admission: {
+          hookName: "before_agent_run",
+          classification: "governed_required",
+          actor: { actorId: "controller-1" },
+          contract,
+          observedAuthority: {
+            contractHash: contract.contractHash,
+            authorityHash: contract.authorityHash,
+            authorityRef,
+            planRevisionId: contract.planRevisionId,
+            sourceRevision: contract.sourceRevision,
+            runtimeBuildSha256: contract.runtimeBuildSha256,
+            policyVersion: contract.policyVersion,
+            skillSha256: contract.skillSha256,
+          },
+          enforcementCapabilities: ENFORCEMENT_HEALTH_CAPABILITIES.map((capability) => ({
+            capability,
+            state: "known_healthy" as const,
+            observedAt: now,
+          })),
+          hostAuthority: { openclawAllows: true, osAllows: true, hostAllows: true },
+          now,
+        },
+        idempotencyKey: "admit-cli-read-only",
+        ownerKey: "Will",
+        controllerId: "controller-1",
+        goal: "Prove read-only governance CLI",
+        compiledPlan: compileMissionPlan({
+          manifest: {
+            schema: "openclaw.mission_manifest.v1",
+            missionId: contract.missionId,
+            planRevisionId: contract.planRevisionId,
+            planSha256: "plan-sha",
+            sourceRevision: contract.sourceRevision,
+            runtimeBuildSha256: contract.runtimeBuildSha256,
+            policyVersion: contract.policyVersion,
+            skillSha256: contract.skillSha256,
+            mode: contract.mode,
+            scopeHash: "scope",
+            authorizedScopeHash: "scope",
+            planRevisionAuthorized: true,
+            createdAt: now,
+          },
+          requirements: [{ id: "REQ-1", text: "Prove read-only CLI", required: true }],
+          gateKinds: ["test"],
+        }),
+        artifactDeclarations: [
+          {
+            artifactId: "proof-1",
+            artifactKind: "validation",
+            missionId: contract.missionId,
+            workOrderId: "work-1",
+            gateId: "REQ-1:test",
+            allowedRoot: stateDir,
+            pathname: path.join(stateDir, "proof.json"),
+            required: true,
+            identityBindings: {
+              missionId: contract.missionId,
+              contractHash: contract.contractHash,
+              authorityHash: contract.authorityHash,
+              planRevisionId: contract.planRevisionId,
+              sourceRevision: contract.sourceRevision,
+              runtimeBuildSha256: contract.runtimeBuildSha256,
+              policyVersion: contract.policyVersion,
+              skillSha256: contract.skillSha256,
+            },
+          },
+        ],
+      });
+      if (admitted.status !== "admitted") {
+        throw new Error(`expected governed admission, got ${admitted.status}`);
+      }
+      const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
+      const configHealthPath = path.join(stateDir, "config-health.json");
+      const beforeStat = fs.statSync(databasePath);
+      const beforeReceiptCount = listGovernedMissionReceipts({
+        flowId: admitted.flow.flowId,
+      }).length;
+      const runtime = createRuntime();
+      const newerOrdinary = createManagedTaskFlowOrNull({
+        ownerKey: "Will",
+        controllerId: "ordinary-after-governance-cli",
+        goal: "Ordinary work for the same owner",
+        createdAt: admitted.flow.createdAt + 1,
+      });
+      expect(newerOrdinary).toBeDefined();
+
+      await flowsGovernanceShowCommand({ lookup: "Will", json: true }, runtime);
+      await flowsGovernancePreviewCommand(
+        { lookup: "Will", operation: "startWorkOrder", json: true },
+        runtime,
+        trustedRuntimeIdentity,
+      );
+      await flowsGovernanceReceiptsCommand({ lookup: "Will", json: true }, runtime);
+      await flowsGovernancePreviewCommand(
+        { lookup: admitted.flow.flowId, operation: "openExecutionLease", json: true },
+        runtime,
+      );
+
+      const afterStat = fs.statSync(databasePath);
+      expect(afterStat.size).toBe(beforeStat.size);
+      expect(afterStat.mtimeMs).toBe(beforeStat.mtimeMs);
+      expect(listGovernedMissionReceipts({ flowId: admitted.flow.flowId })).toHaveLength(
+        beforeReceiptCount,
+      );
+      expect(fs.existsSync(configHealthPath)).toBe(false);
+      expect(runtime.writeJson).toHaveBeenCalledTimes(3);
+      expect(runtime.writeJson.mock.calls.map(([value]) => value.flowId)).toEqual([
+        admitted.flow.flowId,
+        admitted.flow.flowId,
+        admitted.flow.flowId,
+      ]);
+      const receiptsOutput = runtime.writeJson.mock.calls[2]?.[0] as {
+        receipts?: Array<Record<string, unknown>>;
+      };
+      expect(receiptsOutput.receipts?.length).toBeGreaterThan(0);
+      expect(receiptsOutput.receipts?.every((receipt) => !("details" in receipt))).toBe(true);
+      expect(runtime.error).toHaveBeenCalledWith(
+        "Unknown governed mission operation: openExecutionLease",
+      );
+
+      createTaskRecord({
+        runtime: "acp",
+        ownerKey: "Will",
+        requesterSessionKey: "Will",
+        scopeKind: "session",
+        parentFlowId: admitted.flow.flowId,
+        childSessionKey: "agent:main:acp:cli-preview-child",
+        runId: "cli-preview-child-run",
+        task: "Remain active during the preview",
+        status: "running",
+      });
+      runtime.writeJson.mockClear();
+      await flowsGovernancePreviewCommand(
+        { lookup: admitted.flow.flowId, operation: "cancelMission", json: true },
+        runtime,
+        trustedRuntimeIdentity,
+      );
+      expect(runtime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          decision: expect.objectContaining({
+            status: "conflict",
+            reasonCode: "ACTIVE_WORK_CONFLICT",
+          }),
+        }),
+        2,
+      );
+
+      fs.writeFileSync(authorityPath, '{"workOrder":"drifted"}\n');
+      runtime.writeJson.mockClear();
+      await flowsGovernancePreviewCommand(
+        { lookup: admitted.flow.flowId, operation: "startWorkOrder", json: true },
+        runtime,
+        trustedRuntimeIdentity,
+      );
+      expect(runtime.writeJson).toHaveBeenCalledWith(
+        expect.objectContaining({
+          decision: expect.objectContaining({
+            status: "denied",
+            reasonCode: "AUTHORITY_HASH_MISMATCH",
+          }),
+        }),
+        2,
+      );
+
+      const currentFlow = getTaskFlowById(admitted.flow.flowId)!;
+      const currentMission = readGovernedMissionStateFromTaskFlow(currentFlow)!;
+      const hostileReason = "REPAIR_REQUIRED\u001B[31mred\u0007";
+      expect(
+        applyGovernedMissionOperation({
+          flowId: currentFlow.flowId,
+          request: {
+            operation: "blockForRepair",
+            expectedRevision: currentMission.revision,
+            idempotencyKey: "hostile-receipt-terminal-render",
+            owner: currentMission.ownerCorrelation.owner,
+            controllerId: currentFlow.controllerId,
+            bindings: {
+              contractHash: currentMission.contractHash,
+              authorityHash: currentMission.authorityHash,
+              planRevisionId: currentMission.planRevisionId,
+              sourceRevision: currentMission.sourceRevision,
+              runtimeBuildSha256: currentMission.runtimeBuildSha256,
+              policyVersion: currentMission.policyVersion,
+              skillSha256: currentMission.skillSha256,
+            },
+            occurredAt: now,
+            reasonCode: hostileReason,
+            nextAction: "Repair the governed mission.",
+          },
+        }),
+      ).toMatchObject({ receipt: { reasonCode: hostileReason } });
+      vi.mocked(runtime.log).mockClear();
+      await flowsGovernanceReceiptsCommand({ lookup: currentFlow.flowId, json: false }, runtime);
+      const humanReceiptOutput = vi.mocked(runtime.log).mock.calls.flat().join("\n");
+      expect(humanReceiptOutput).not.toContain(String.fromCharCode(0x1b));
+      expect(humanReceiptOutput).not.toContain(String.fromCharCode(0x07));
+
+      const mission = readGovernedMissionStateFromTaskFlow(admitted.flow);
+      if (!mission) {
+        throw new Error("expected governed mission state");
+      }
+      const tamperedFlow: TaskFlowRecord = {
+        ...admitted.flow,
+        stateJson: {
+          ...(admitted.flow.stateJson as Record<string, never>),
+          governedMissionState: {
+            ...mission,
+            revision: mission.revision + 1,
+            stateVersion: `${mission.missionId}:${mission.revision + 1}`,
+          },
+        },
+      };
+      resetTaskFlowRegistryForTests({ persist: false });
+      configureTaskFlowRegistryRuntime({
+        store: {
+          loadSnapshot: () => ({ flows: new Map([[tamperedFlow.flowId, tamperedFlow]]) }),
+          saveSnapshot: () => {},
+        },
+      });
+      const rejectedRuntime = createRuntime();
+
+      await flowsGovernanceShowCommand(
+        { lookup: tamperedFlow.flowId, json: true },
+        rejectedRuntime,
+      );
+      await flowsGovernanceReceiptsCommand(
+        { lookup: tamperedFlow.flowId, json: true },
+        rejectedRuntime,
+      );
+
+      expect(rejectedRuntime.error).toHaveBeenCalledTimes(2);
+      expect(rejectedRuntime.error).toHaveBeenCalledWith(
+        `TaskFlow has untrusted governed state: ${tamperedFlow.flowId}`,
+      );
+      expect(rejectedRuntime.writeJson).not.toHaveBeenCalled();
     });
   });
 

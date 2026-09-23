@@ -2,6 +2,7 @@ import {
   assertContextEngineHostSupport,
   type ContextEngineHostSupport,
 } from "../../context-engine/host-compat.js";
+import { hasGovernedMissionClaimForOwnerKey } from "../../governance/governed-mission-agent-runtime.js";
 import { diagnosticErrorCategory } from "../../infra/diagnostic-error-metadata.js";
 import {
   emitTrustedDiagnosticEvent,
@@ -104,6 +105,19 @@ export function adaptAgentHarnessToV2(harness: AgentHarness): AgentHarnessV2 {
           operation: "agent-run",
           host: session.contextEngineHost ?? buildAgentHarnessContextEngineHostSupport(harness),
         });
+      }
+      const governedOwnerKey =
+        session.params.sandboxSessionKey?.trim() ||
+        session.params.sessionKey?.trim() ||
+        session.params.sessionId;
+      if (
+        harness.id !== "openclaw" &&
+        (session.params.governedMissionContentHooksSuppressed === true ||
+          hasGovernedMissionClaimForOwnerKey(governedOwnerKey))
+      ) {
+        throw new Error(
+          `Governed mission execution requires the OpenClaw harness; selected harness ${harness.id} cannot enforce the durable release boundary.`,
+        );
       }
       return harness.runAttempt(session.params);
     },

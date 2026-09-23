@@ -554,6 +554,7 @@ export function installSessionToolResultGuard(
     beforeMessageWriteHook?: (
       event: PluginHookBeforeMessageWriteEvent,
     ) => PluginHookBeforeMessageWriteResult | undefined;
+    shouldBlockMessagePersistence?: (message: AgentMessage) => boolean;
     redactLoggingConfig?: ToolResultDetailRedactionConfig;
     maxToolResultChars?: number;
     suppressNextUserMessagePersistence?: boolean;
@@ -626,6 +627,9 @@ export function installSessionToolResultGuard(
    * or null if the message should be blocked.
    */
   const applyBeforeWriteHook = (msg: AgentMessage): AgentMessage | null => {
+    if (opts?.shouldBlockMessagePersistence?.(msg)) {
+      return null;
+    }
     if (!beforeWrite) {
       return msg;
     }
@@ -634,7 +638,7 @@ export function installSessionToolResultGuard(
       return null;
     }
     if (result?.message) {
-      return result.message;
+      return opts?.shouldBlockMessagePersistence?.(result.message) ? null : result.message;
     }
     return msg;
   };

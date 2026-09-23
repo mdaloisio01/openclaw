@@ -44,6 +44,7 @@ type ModelCallDiagnosticContext = {
   contextWindowReferenceTokens?: number;
   trace: DiagnosticTraceContext;
   contentCapture?: DiagnosticModelContentCapturePolicy;
+  shouldCaptureContent?: () => boolean;
   nextCallId: () => string;
   onStarted?: () => void;
 };
@@ -619,14 +620,15 @@ export function wrapStreamFnWithDiagnosticModelCallEvents(
     const callId = ctx.nextCallId();
     const trace = freezeDiagnosticTraceContext(createChildDiagnosticTraceContext(ctx.trace));
     const eventBase = baseModelCallEvent(ctx, callId, trace);
-    const modelContent = streamContextModelContentFields(ctx.contentCapture, streamContext);
+    const contentCapture = ctx.shouldCaptureContent?.() === false ? undefined : ctx.contentCapture;
+    const modelContent = streamContextModelContentFields(contentCapture, streamContext);
     emitModelCallStarted(eventBase, modelContent);
     ctx.onStarted?.();
     const startedAt = Date.now();
     const state: ModelCallObservationState = {
       responseStreamBytes: 0,
       modelContent,
-      contentCapture: ctx.contentCapture,
+      contentCapture,
     };
     const propagatedOptions = withDiagnosticTraceparentHeader(options, trace, state);
 

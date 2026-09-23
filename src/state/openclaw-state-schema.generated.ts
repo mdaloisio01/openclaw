@@ -1171,6 +1171,85 @@ CREATE INDEX IF NOT EXISTS idx_flow_runs_status ON flow_runs(status);
 CREATE INDEX IF NOT EXISTS idx_flow_runs_owner_key ON flow_runs(owner_key);
 CREATE INDEX IF NOT EXISTS idx_flow_runs_updated_at ON flow_runs(updated_at);
 
+-- Governed mission mutable state remains embedded in flow_runs.state_json.
+-- These tables are the append-only decision/artifact ledger for that state.
+CREATE TABLE IF NOT EXISTS governed_mission_receipts (
+  receipt_id TEXT NOT NULL PRIMARY KEY,
+  mission_id TEXT NOT NULL,
+  flow_id TEXT,
+  run_id TEXT,
+  work_order_id TEXT,
+  gate_id TEXT,
+  attempt_id TEXT,
+  operation TEXT NOT NULL,
+  receipt_kind TEXT NOT NULL,
+  from_state TEXT,
+  to_state TEXT,
+  decision TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  expected_revision INTEGER,
+  resulting_revision INTEGER,
+  contract_id TEXT,
+  contract_hash TEXT,
+  authority_hash TEXT,
+  plan_revision_id TEXT,
+  source_revision TEXT,
+  runtime_build_sha256 TEXT,
+  policy_version TEXT,
+  skill_sha256 TEXT,
+  payload_sha256 TEXT NOT NULL,
+  contract_receipt_kinds_json TEXT,
+  ledger_sequence INTEGER,
+  previous_receipt_sha256 TEXT,
+  governed_package_sha256 TEXT,
+  receipt_sha256 TEXT,
+  producer TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  details_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (mission_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_governed_mission_receipts_flow_created
+  ON governed_mission_receipts(flow_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_governed_mission_receipts_mission_created
+  ON governed_mission_receipts(mission_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_governed_mission_receipts_decision
+  ON governed_mission_receipts(decision, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_governed_mission_single_admission
+  ON governed_mission_receipts(mission_id)
+  WHERE operation = 'admitMission' AND decision = 'applied';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_governed_mission_runtime_ledger_sequence
+  ON governed_mission_receipts(flow_id, ledger_sequence)
+  WHERE ledger_sequence IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS governed_mission_artifacts (
+  verification_id TEXT NOT NULL PRIMARY KEY,
+  receipt_id TEXT NOT NULL REFERENCES governed_mission_receipts(receipt_id) ON DELETE CASCADE,
+  mission_id TEXT NOT NULL,
+  flow_id TEXT,
+  work_order_id TEXT,
+  gate_id TEXT,
+  logical_artifact_id TEXT NOT NULL,
+  artifact_kind TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  status TEXT NOT NULL,
+  failure_code TEXT,
+  size_bytes INTEGER,
+  computed_sha256 TEXT,
+  expected_sha256 TEXT,
+  expected_labels_json TEXT NOT NULL,
+  identity_bindings_json TEXT NOT NULL,
+  verifier_version TEXT NOT NULL,
+  verified_at INTEGER NOT NULL,
+  UNIQUE (receipt_id, logical_artifact_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_governed_mission_artifacts_mission_gate
+  ON governed_mission_artifacts(mission_id, gate_id, verified_at DESC);
+CREATE INDEX IF NOT EXISTS idx_governed_mission_artifacts_status
+  ON governed_mission_artifacts(status, verified_at DESC);
+
 CREATE TABLE IF NOT EXISTS migration_runs (
   id TEXT NOT NULL PRIMARY KEY,
   started_at INTEGER NOT NULL,

@@ -6,6 +6,7 @@ import type {
 } from "@openclaw/acp-core/runtime/types";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
+import { parseAgentSessionKey } from "../../routing/session-key.js";
 import { isAcpSessionKey } from "../../sessions/session-key-utils.js";
 import { AcpRuntimeError } from "../runtime/errors.js";
 import { runManagerCancelSession } from "./manager.cancel-session.js";
@@ -96,7 +97,9 @@ export class AcpSessionManager {
         meta: acp,
       };
     }
-    if (isAcpSessionKey(sessionKey)) {
+    // Unscoped acp:<uuid> keys belong to the public ACP bridge. Managed ACP
+    // runtimes are agent-scoped, so only those keys can be stale here.
+    if (parseAgentSessionKey(sessionKey) && isAcpSessionKey(sessionKey)) {
       return {
         kind: "stale",
         sessionKey,

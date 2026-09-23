@@ -183,7 +183,7 @@ describe("subagent registry persistence", () => {
 
   const restartRegistry = () => {
     resetSubagentRegistryForTests({ persist: false });
-    initSubagentRegistry();
+    void initSubagentRegistry();
   };
 
   const fastPersistSubagentRunsToDisk = (runs: Map<string, SubagentRunRecord>) => {

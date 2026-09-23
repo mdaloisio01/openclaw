@@ -308,7 +308,7 @@ describe("gateway server agent", () => {
     expect(call.sessionId).toBe("sess-ops");
   });
 
-  test("agent preserves ACP session key owner when agentId is omitted", async () => {
+  test("agent preserves ACP session key without a native agent override", async () => {
     const sessionKey = "agent:openclaw:acp:phase5";
     await setTestSessionStore({
       agentId: "openclaw",
@@ -334,10 +334,10 @@ describe("gateway server agent", () => {
     const call = await waitForAgentCommandCall("idem-openclaw-acp-owner");
     expect(call.sessionKey).toBe(sessionKey);
     expect(call.sessionId).toBe("sess-openclaw-acp");
-    expect(call.agentId).toBe("openclaw");
+    expect(call.agentId).toBeUndefined();
   });
 
-  test("agent accepts ACP harness owner even when it is not a configured chat agent", async () => {
+  test("agent accepts an unconfigured ACP harness without a native agent override", async () => {
     const sessionKey = "agent:openclaw:acp:phase5";
     await setTestSessionStore({
       agentId: "openclaw",
@@ -363,7 +363,7 @@ describe("gateway server agent", () => {
     const call = await waitForAgentCommandCall("idem-openclaw-acp-harness-owner");
     expect(call.sessionKey).toBe(sessionKey);
     expect(call.sessionId).toBe("sess-openclaw-acp");
-    expect(call.agentId).toBe("openclaw");
+    expect(call.agentId).toBeUndefined();
   });
 
   test("agent rejects unknown reply channel", async () => {

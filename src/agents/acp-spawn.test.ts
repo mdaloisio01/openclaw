@@ -948,7 +948,7 @@ describe("spawnAcpDirect", () => {
       status: "error",
       errorCode: "spawn_failed",
     });
-    expect(String("error" in result ? result.error : "")).toContain("ACP metadata is not readable");
+    expect("error" in result ? result.error : "").toContain("ACP metadata is not readable");
     expect(hoisted.initializeSessionMock).toHaveBeenCalledOnce();
     expect(hoisted.cleanupFailedAcpSpawnMock).toHaveBeenCalledOnce();
     expectGatewayMethodNotCalled("agent");
@@ -981,9 +981,7 @@ describe("spawnAcpDirect", () => {
       status: "error",
       errorCode: "spawn_failed",
     });
-    expect(String("error" in result ? result.error : "")).toContain(
-      "ACP metadata readback mismatch",
-    );
+    expect("error" in result ? result.error : "").toContain("ACP metadata readback mismatch");
     expect(hoisted.initializeSessionMock).toHaveBeenCalledOnce();
     expect(hoisted.cleanupFailedAcpSpawnMock).toHaveBeenCalledOnce();
     expectGatewayMethodNotCalled("agent");

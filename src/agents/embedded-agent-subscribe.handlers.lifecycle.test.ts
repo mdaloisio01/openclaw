@@ -18,6 +18,7 @@ function createContext(
     onBeforeLifecycleTerminal?: () => void | Promise<void>;
     onBlockReply?: ((payload: unknown) => void) | undefined;
     onBlockReplyFlush?: () => void | Promise<void>;
+    shouldSuppressAssistantOutput?: () => boolean;
   },
 ): EmbeddedAgentSubscribeContext {
   const hasOnBlockReplyOverride = Boolean(overrides && "onBlockReply" in overrides);
@@ -32,6 +33,7 @@ function createContext(
       onBeforeLifecycleTerminal: overrides?.onBeforeLifecycleTerminal,
       ...(onBlockReply ? { onBlockReply } : {}),
       onBlockReplyFlush: overrides?.onBlockReplyFlush,
+      shouldSuppressAssistantOutput: overrides?.shouldSuppressAssistantOutput,
     },
     state: {
       lastAssistant: lastAssistant as EmbeddedAgentSubscribeContext["state"]["lastAssistant"],
@@ -86,6 +88,42 @@ function firstWarnMeta(ctx: EmbeddedAgentSubscribeContext): Record<string, unkno
 }
 
 describe("handleAgentEnd", () => {
+  it("suppresses global and per-run terminal lifecycle output", async () => {
+    emitAgentEventMock.mockClear();
+    const onAgentEvent = vi.fn();
+    const ctx = createContext(undefined, {
+      onAgentEvent,
+      shouldSuppressAssistantOutput: () => true,
+    });
+
+    await handleAgentEnd(ctx);
+
+    expect(emitAgentEventMock).not.toHaveBeenCalled();
+    expect(onAgentEvent).not.toHaveBeenCalled();
+  });
+
+  it("suppresses global and per-run error lifecycle output", async () => {
+    emitAgentEventMock.mockClear();
+    const onAgentEvent = vi.fn();
+    const ctx = createContext(
+      {
+        role: "assistant",
+        stopReason: "error",
+        errorMessage: "SECRET_CANARY_69737",
+        content: [],
+      },
+      {
+        onAgentEvent,
+        shouldSuppressAssistantOutput: () => true,
+      },
+    );
+
+    await handleAgentEnd(ctx);
+
+    expect(emitAgentEventMock).not.toHaveBeenCalled();
+    expect(onAgentEvent).not.toHaveBeenCalled();
+  });
+
   it("suppresses raw assistant error messages in user-facing lifecycle events", async () => {
     const onAgentEvent = vi.fn();
     const ctx = createContext(

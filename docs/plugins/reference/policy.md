@@ -18,7 +18,7 @@ Adds policy-backed doctor checks for workspace conformance.
 
 plugin
 
-<!-- openclaw-plugin-reference:manual-start -->
+<span data-openclaw-plugin-reference="manual-start" />
 
 ## Behavior
 
@@ -65,7 +65,7 @@ for its selector. Overlay rules are additional claims, so they do not weaken
 top-level policy and can produce their own findings when the same observed
 config violates both scopes.
 
-<!-- openclaw-plugin-reference:manual-end -->
+<span data-openclaw-plugin-reference="manual-end" />
 
 ## Related docs
 

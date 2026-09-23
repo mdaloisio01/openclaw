@@ -2652,6 +2652,170 @@ public struct TasksGetResult: Codable, Sendable {
     }
 }
 
+public struct TasksGovernanceApplyParams: Codable, Sendable {
+    public let lookup: String
+    public let expectedrevision: Int
+    public let idempotencykey: String
+    public let action: AnyCodable
+
+    public init(
+        lookup: String,
+        expectedrevision: Int,
+        idempotencykey: String,
+        action: AnyCodable)
+    {
+        self.lookup = lookup
+        self.expectedrevision = expectedrevision
+        self.idempotencykey = idempotencykey
+        self.action = action
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case lookup
+        case expectedrevision = "expectedRevision"
+        case idempotencykey = "idempotencyKey"
+        case action
+    }
+}
+
+public struct TasksGovernanceApplyResult: Codable, Sendable {
+    public let status: AnyCodable
+    public let flowid: String?
+    public let flowrevision: Int?
+    public let reasoncode: String?
+    public let receipt: [String: AnyCodable]?
+    public let decision: [String: AnyCodable]?
+    public let releasedpayload: AnyCodable?
+
+    public init(
+        status: AnyCodable,
+        flowid: String?,
+        flowrevision: Int?,
+        reasoncode: String?,
+        receipt: [String: AnyCodable]?,
+        decision: [String: AnyCodable]?,
+        releasedpayload: AnyCodable?)
+    {
+        self.status = status
+        self.flowid = flowid
+        self.flowrevision = flowrevision
+        self.reasoncode = reasoncode
+        self.receipt = receipt
+        self.decision = decision
+        self.releasedpayload = releasedpayload
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case flowid = "flowId"
+        case flowrevision = "flowRevision"
+        case reasoncode = "reasonCode"
+        case receipt
+        case decision
+        case releasedpayload = "releasedPayload"
+    }
+}
+
+public struct TasksGovernanceStatusParams: Codable, Sendable {
+    public let lookup: String
+    public let receiptlimit: Int?
+
+    public init(
+        lookup: String,
+        receiptlimit: Int?)
+    {
+        self.lookup = lookup
+        self.receiptlimit = receiptlimit
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case lookup
+        case receiptlimit = "receiptLimit"
+    }
+}
+
+public struct TasksGovernanceStatusResult: Codable, Sendable {
+    public let flowid: String
+    public let flowrevision: Int
+    public let governed: Bool
+    public let malformed: Bool
+    public let canonical: Bool
+    public let mission: AnyCodable
+    public let receipts: [[String: AnyCodable]]
+
+    public init(
+        flowid: String,
+        flowrevision: Int,
+        governed: Bool,
+        malformed: Bool,
+        canonical: Bool,
+        mission: AnyCodable,
+        receipts: [[String: AnyCodable]])
+    {
+        self.flowid = flowid
+        self.flowrevision = flowrevision
+        self.governed = governed
+        self.malformed = malformed
+        self.canonical = canonical
+        self.mission = mission
+        self.receipts = receipts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case flowid = "flowId"
+        case flowrevision = "flowRevision"
+        case governed
+        case malformed
+        case canonical
+        case mission
+        case receipts
+    }
+}
+
+public struct TasksGovernancePreviewParams: Codable, Sendable {
+    public let lookup: String
+    public let operation: AnyCodable
+    public let payloadhash: String?
+    public let reasoncode: String?
+    public let nextaction: String?
+
+    public init(
+        lookup: String,
+        operation: AnyCodable,
+        payloadhash: String?,
+        reasoncode: String?,
+        nextaction: String?)
+    {
+        self.lookup = lookup
+        self.operation = operation
+        self.payloadhash = payloadhash
+        self.reasoncode = reasoncode
+        self.nextaction = nextaction
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case lookup
+        case operation
+        case payloadhash = "payloadHash"
+        case reasoncode = "reasonCode"
+        case nextaction = "nextAction"
+    }
+}
+
+public struct TasksGovernancePreviewResult: Codable, Sendable {
+    public let preview: AnyCodable
+
+    public init(
+        preview: AnyCodable)
+    {
+        self.preview = preview
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case preview
+    }
+}
+
 public struct TasksCancelParams: Codable, Sendable {
     public let taskid: String
     public let reason: String?
@@ -2701,18 +2865,26 @@ public struct ConfigGetParams: Codable, Sendable {}
 public struct ConfigSetParams: Codable, Sendable {
     public let raw: String
     public let basehash: String?
+    public let controlplanemanifest: AnyCodable?
+    public let controlplaneapproval: AnyCodable?
 
     public init(
         raw: String,
-        basehash: String?)
+        basehash: String?,
+        controlplanemanifest: AnyCodable? = nil,
+        controlplaneapproval: AnyCodable? = nil)
     {
         self.raw = raw
         self.basehash = basehash
+        self.controlplanemanifest = controlplanemanifest
+        self.controlplaneapproval = controlplaneapproval
     }
 
     private enum CodingKeys: String, CodingKey {
         case raw
         case basehash = "baseHash"
+        case controlplanemanifest = "controlPlaneManifest"
+        case controlplaneapproval = "controlPlaneApproval"
     }
 }
 
@@ -2723,6 +2895,8 @@ public struct ConfigApplyParams: Codable, Sendable {
     public let deliverycontext: [String: AnyCodable]?
     public let note: String?
     public let restartdelayms: Int?
+    public let controlplanemanifest: AnyCodable?
+    public let controlplaneapproval: AnyCodable?
 
     public init(
         raw: String,
@@ -2730,7 +2904,9 @@ public struct ConfigApplyParams: Codable, Sendable {
         sessionkey: String?,
         deliverycontext: [String: AnyCodable]?,
         note: String?,
-        restartdelayms: Int?)
+        restartdelayms: Int?,
+        controlplanemanifest: AnyCodable? = nil,
+        controlplaneapproval: AnyCodable? = nil)
     {
         self.raw = raw
         self.basehash = basehash
@@ -2738,6 +2914,8 @@ public struct ConfigApplyParams: Codable, Sendable {
         self.deliverycontext = deliverycontext
         self.note = note
         self.restartdelayms = restartdelayms
+        self.controlplanemanifest = controlplanemanifest
+        self.controlplaneapproval = controlplaneapproval
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -2747,6 +2925,8 @@ public struct ConfigApplyParams: Codable, Sendable {
         case deliverycontext = "deliveryContext"
         case note
         case restartdelayms = "restartDelayMs"
+        case controlplanemanifest = "controlPlaneManifest"
+        case controlplaneapproval = "controlPlaneApproval"
     }
 }
 
@@ -2757,6 +2937,8 @@ public struct ConfigPatchParams: Codable, Sendable {
     public let deliverycontext: [String: AnyCodable]?
     public let note: String?
     public let restartdelayms: Int?
+    public let controlplanemanifest: AnyCodable?
+    public let controlplaneapproval: AnyCodable?
 
     public init(
         raw: String,
@@ -2764,7 +2946,9 @@ public struct ConfigPatchParams: Codable, Sendable {
         sessionkey: String?,
         deliverycontext: [String: AnyCodable]?,
         note: String?,
-        restartdelayms: Int?)
+        restartdelayms: Int?,
+        controlplanemanifest: AnyCodable? = nil,
+        controlplaneapproval: AnyCodable? = nil)
     {
         self.raw = raw
         self.basehash = basehash
@@ -2772,6 +2956,8 @@ public struct ConfigPatchParams: Codable, Sendable {
         self.deliverycontext = deliverycontext
         self.note = note
         self.restartdelayms = restartdelayms
+        self.controlplanemanifest = controlplanemanifest
+        self.controlplaneapproval = controlplaneapproval
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -2781,6 +2967,8 @@ public struct ConfigPatchParams: Codable, Sendable {
         case deliverycontext = "deliveryContext"
         case note
         case restartdelayms = "restartDelayMs"
+        case controlplanemanifest = "controlPlaneManifest"
+        case controlplaneapproval = "controlPlaneApproval"
     }
 }
 
@@ -6960,6 +7148,9 @@ public struct ChatSendParams: Codable, Sendable {
     public let timeoutms: Int?
     public let systeminputprovenance: [String: AnyCodable]?
     public let systemprovenancereceipt: String?
+    public let clientsendattemptid: String?
+    public let clientsendattemptatms: Int?
+    public let clientpendingsendattempts: [[String: AnyCodable]]?
     public let idempotencykey: String
 
     public init(
@@ -6978,6 +7169,9 @@ public struct ChatSendParams: Codable, Sendable {
         timeoutms: Int?,
         systeminputprovenance: [String: AnyCodable]?,
         systemprovenancereceipt: String?,
+        clientsendattemptid: String? = nil,
+        clientsendattemptatms: Int? = nil,
+        clientpendingsendattempts: [[String: AnyCodable]]? = nil,
         idempotencykey: String)
     {
         self.sessionkey = sessionkey
@@ -6995,6 +7189,9 @@ public struct ChatSendParams: Codable, Sendable {
         self.timeoutms = timeoutms
         self.systeminputprovenance = systeminputprovenance
         self.systemprovenancereceipt = systemprovenancereceipt
+        self.clientsendattemptid = clientsendattemptid
+        self.clientsendattemptatms = clientsendattemptatms
+        self.clientpendingsendattempts = clientpendingsendattempts
         self.idempotencykey = idempotencykey
     }
 
@@ -7014,6 +7211,9 @@ public struct ChatSendParams: Codable, Sendable {
         case timeoutms = "timeoutMs"
         case systeminputprovenance = "systemInputProvenance"
         case systemprovenancereceipt = "systemProvenanceReceipt"
+        case clientsendattemptid = "clientSendAttemptId"
+        case clientsendattemptatms = "clientSendAttemptAtMs"
+        case clientpendingsendattempts = "clientPendingSendAttempts"
         case idempotencykey = "idempotencyKey"
     }
 }

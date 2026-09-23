@@ -1,4 +1,5 @@
 import type { EvidenceReceipt, MissionMode } from "./mission-manifest.types.js";
+import type { CompiledMissionPlan } from "./mission-plan-compiler.js";
 
 export const GOVERNED_RECEIPT_KINDS = [
   "admission",
@@ -16,7 +17,19 @@ export const GOVERNED_RECEIPT_KINDS = [
 
 export type GovernedReceiptKind = (typeof GOVERNED_RECEIPT_KINDS)[number];
 
-export const GOVERNED_REQUIRED_RECEIPT_KINDS = GOVERNED_RECEIPT_KINDS;
+export const GOVERNED_REQUIRED_RECEIPT_KINDS = [
+  "admission",
+  "policy_decision",
+  "evidence",
+  "supervisor",
+  "closeout",
+  "release",
+] as const satisfies readonly GovernedReceiptKind[];
+
+export const GOVERNED_RUNTIME_RECEIPT_KINDS = [
+  ...GOVERNED_REQUIRED_RECEIPT_KINDS,
+  "rollback",
+] as const satisfies readonly GovernedReceiptKind[];
 
 export const GOVERNED_MISSION_FAILURE_STATES = [
   "DENIED_POLICY",
@@ -36,8 +49,11 @@ export const GOVERNED_MISSION_FAILURE_STATES = [
 export type GovernedMissionFailureState = (typeof GOVERNED_MISSION_FAILURE_STATES)[number];
 
 export const GOVERNED_MISSION_LOCK_STATES = [
-  "GOVERNED_MISSION_PENDING_OVERRIDE",
-  "AWAITING_CLOSEOUT",
+  "pending_override",
+  "closeout_ready",
+  "artifact_verified",
+  "terminal_pending_watchdog",
+  "released",
 ] as const;
 
 export type GovernedMissionLockState = (typeof GOVERNED_MISSION_LOCK_STATES)[number];
@@ -56,11 +72,47 @@ export type GovernedAuthorityRef = {
   sha256?: string;
 };
 
-export type GovernedCompletionOwner =
-  | "task_flow"
-  | "task_registry"
-  | "governed_mission_state"
-  | "release_gate";
+const GOVERNED_AUTHORITY_REF_KINDS = new Set<GovernedAuthorityRef["kind"]>([
+  "sop",
+  "build_plan",
+  "work_order",
+  "operator_approval",
+  "policy",
+  "source_lock",
+  "runtime_lock",
+]);
+
+const GOVERNED_MISSION_MODES = new Set<MissionMode>(["shadow", "enforce", "off"]);
+
+export function isGovernedAuthorityRefPinnedToContract(
+  contract: Pick<GovernedMissionContract, "authorityHash" | "authorityRefs">,
+  authorityRef: GovernedAuthorityRef,
+): boolean {
+  if (
+    !isGovernedAuthorityRef(authorityRef) ||
+    !Array.isArray(contract.authorityRefs) ||
+    typeof contract.authorityHash !== "string"
+  ) {
+    return false;
+  }
+  return (
+    authorityRef.sha256 === contract.authorityHash &&
+    contract.authorityRefs.some(
+      (candidate) =>
+        isGovernedAuthorityRef(candidate) &&
+        candidate.refId === authorityRef.refId &&
+        candidate.kind === authorityRef.kind &&
+        candidate.uri === authorityRef.uri &&
+        candidate.sha256 === authorityRef.sha256,
+    )
+  );
+}
+
+export type GovernedCompletionOwner = "governed_mission_state";
+
+export type GovernedProofProducerKind = "implementation" | "validation" | "review" | "delivery";
+
+export type GovernedProofProducers = Record<GovernedProofProducerKind, { deviceId: string }>;
 
 export type GovernedMissionContract = {
   schema: "openclaw.governed_mission_contract.v1";
@@ -75,9 +127,11 @@ export type GovernedMissionContract = {
   sourceRevision: string;
   runtimeBuildSha256: string;
   policyVersion: string;
+  skillSha256: string;
   mode: MissionMode;
   authoritativeCompletionOwner: GovernedCompletionOwner;
   requiredReceiptKinds: GovernedReceiptKind[];
+  proofProducers?: GovernedProofProducers;
   createdAt: string;
 };
 
@@ -207,6 +261,9 @@ export function missingGovernedContractFoundationFields(
   contract: Partial<GovernedMissionContract>,
 ): string[] {
   const missing: string[] = [];
+  if (contract.schema !== "openclaw.governed_mission_contract.v1") {
+    missing.push("schema.unsupported");
+  }
   const requiredStringFields: Array<keyof GovernedMissionContract> = [
     "missionId",
     "contractId",
@@ -218,6 +275,7 @@ export function missingGovernedContractFoundationFields(
     "sourceRevision",
     "runtimeBuildSha256",
     "policyVersion",
+    "skillSha256",
     "createdAt",
   ];
   for (const field of requiredStringFields) {
@@ -226,17 +284,97 @@ export function missingGovernedContractFoundationFields(
       missing.push(field);
     }
   }
-  if (!contract.authoritativeCompletionOwner) {
-    missing.push("authoritativeCompletionOwner");
+  if (contract.authoritativeCompletionOwner !== "governed_mission_state") {
+    missing.push("authoritativeCompletionOwner.unsupported");
   }
-  if (!Array.isArray(contract.authorityRefs) || contract.authorityRefs.length === 0) {
+  if (!GOVERNED_MISSION_MODES.has(contract.mode as MissionMode)) {
+    missing.push("mode.unsupported");
+  }
+  const authorityRefs = contract.authorityRefs;
+  if (!Array.isArray(authorityRefs) || authorityRefs.length === 0) {
     missing.push("authorityRefs");
+  } else {
+    for (const [index, authorityRef] of authorityRefs.entries()) {
+      if (!isGovernedAuthorityRef(authorityRef)) {
+        missing.push(`authorityRefs.${index}.invalid`);
+      }
+    }
   }
-  const receiptKinds = new Set(contract.requiredReceiptKinds ?? []);
+  if (!Array.isArray(contract.requiredReceiptKinds)) {
+    missing.push("requiredReceiptKinds");
+  }
+  if (contract.proofProducers !== undefined && !isGovernedProofProducers(contract.proofProducers)) {
+    missing.push("proofProducers.invalid");
+  }
+  const receiptKinds = new Set(
+    Array.isArray(contract.requiredReceiptKinds) ? contract.requiredReceiptKinds : [],
+  );
   for (const kind of GOVERNED_REQUIRED_RECEIPT_KINDS) {
     if (!receiptKinds.has(kind)) {
       missing.push(`requiredReceiptKinds.${kind}`);
     }
   }
+  const supportedReceiptKinds = new Set<string>(GOVERNED_RUNTIME_RECEIPT_KINDS);
+  for (const kind of receiptKinds) {
+    if (typeof kind !== "string" || !supportedReceiptKinds.has(kind)) {
+      missing.push(`requiredReceiptKinds.unsupported.${kind}`);
+    }
+  }
   return missing;
+}
+
+export function isGovernedProofProducers(value: unknown): value is GovernedProofProducers {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const kinds: GovernedProofProducerKind[] = ["implementation", "validation", "review", "delivery"];
+  if (Object.keys(record).length !== kinds.length) {
+    return false;
+  }
+  return kinds.every((kind) => {
+    const producer = record[kind];
+    const deviceId = (producer as { deviceId?: unknown } | undefined)?.deviceId;
+    return (
+      producer !== null &&
+      typeof producer === "object" &&
+      !Array.isArray(producer) &&
+      Object.keys(producer).length === 1 &&
+      typeof deviceId === "string" &&
+      deviceId.length > 0 &&
+      deviceId === deviceId.trim()
+    );
+  });
+}
+
+export function governedMissionPlanCanSatisfyContract(
+  contract: GovernedMissionContract,
+  plan: CompiledMissionPlan,
+): boolean {
+  if (
+    !Array.isArray(contract.requiredReceiptKinds) ||
+    !contract.requiredReceiptKinds.includes("rollback")
+  ) {
+    return true;
+  }
+  return (
+    Array.isArray(plan.gates) &&
+    plan.gates.some((gate) => gate?.required && gate.kind === "rollback")
+  );
+}
+
+function isGovernedAuthorityRef(value: unknown): value is GovernedAuthorityRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Partial<GovernedAuthorityRef>;
+  return (
+    typeof candidate.refId === "string" &&
+    candidate.refId.trim().length > 0 &&
+    GOVERNED_AUTHORITY_REF_KINDS.has(candidate.kind as GovernedAuthorityRef["kind"]) &&
+    typeof candidate.uri === "string" &&
+    candidate.uri.trim().length > 0 &&
+    (candidate.sha256 === undefined ||
+      (typeof candidate.sha256 === "string" && candidate.sha256.trim().length > 0))
+  );
 }

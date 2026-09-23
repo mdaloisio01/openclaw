@@ -530,6 +530,20 @@ async function invokeAgentIdentityGet(
   return respond;
 }
 
+async function invokeFalseCloseoutAdmissionProbe(params: AgentHandlerArgs["params"]) {
+  const respond = vi.fn();
+  const method = "agent.falseCloseoutAdmission.probe";
+  await agentHandlers[method]({
+    params,
+    respond,
+    context: makeContext(),
+    req: { type: "req", id: "false-closeout-probe", method },
+    client: null,
+    isWebchatConnect: () => false,
+  });
+  return respond;
+}
+
 describe("gateway agent handler", () => {
   afterEach(() => {
     if (ORIGINAL_STATE_DIR === undefined) {
@@ -628,19 +642,13 @@ describe("gateway agent handler", () => {
 
   it("exposes an operator probe for live false-closeout admission proof", async () => {
     process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
-    const respond = vi.fn();
-
-    await agentHandlers["agent.falseCloseoutAdmission.probe"]({
-      params: {
-        message:
-          "Cleanup Crew live enforcement probe. Try to end this active Cleanup Crew mission now.",
-        responseText: "Final closeout report: complete.",
-        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
-        evidenceManifestSha256: "evidence-manifest-sha",
-      },
-      respond,
-      context: makeContext(),
-    } as Parameters<(typeof agentHandlers)["agent.falseCloseoutAdmission.probe"]>[0]);
+    const respond = await invokeFalseCloseoutAdmissionProbe({
+      message:
+        "Cleanup Crew live enforcement probe. Try to end this active Cleanup Crew mission now.",
+      responseText: "Final closeout report: complete.",
+      identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+      evidenceManifestSha256: "evidence-manifest-sha",
+    });
 
     expect(respond).toHaveBeenCalledWith(
       true,
@@ -660,20 +668,14 @@ describe("gateway agent handler", () => {
 
   it("exposes an operator probe for controlled complete admission proof", async () => {
     process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
-    const respond = vi.fn();
-
-    await agentHandlers["agent.falseCloseoutAdmission.probe"]({
-      params: {
-        fixture: "complete",
-        message:
-          "Cleanup Crew live enforcement probe. Try to close a controlled complete mission now.",
-        responseText: "Final closeout report: complete.",
-        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
-        evidenceManifestSha256: "evidence-manifest-sha",
-      },
-      respond,
-      context: makeContext(),
-    } as Parameters<(typeof agentHandlers)["agent.falseCloseoutAdmission.probe"]>[0]);
+    const respond = await invokeFalseCloseoutAdmissionProbe({
+      fixture: "complete",
+      message:
+        "Cleanup Crew live enforcement probe. Try to close a controlled complete mission now.",
+      responseText: "Final closeout report: complete.",
+      identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+      evidenceManifestSha256: "evidence-manifest-sha",
+    });
 
     expect(respond).toHaveBeenCalledWith(
       true,
@@ -694,21 +696,15 @@ describe("gateway agent handler", () => {
 
   it("exposes an operator probe for controlled final COMPLETE admission proof", async () => {
     process.env.OPENCLAW_FALSE_CLOSEOUT_ADMISSION = "enforce";
-    const respond = vi.fn();
-
-    await agentHandlers["agent.falseCloseoutAdmission.probe"]({
-      params: {
-        fixture: "complete",
-        requestedTransition: "terminal_pending_watchdog -> COMPLETE",
-        message:
-          "Cleanup Crew live enforcement probe. Try to finalize a terminal-pending mission now.",
-        responseText: "Final closeout report: complete.",
-        identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
-        evidenceManifestSha256: "evidence-manifest-sha",
-      },
-      respond,
-      context: makeContext(),
-    } as Parameters<(typeof agentHandlers)["agent.falseCloseoutAdmission.probe"]>[0]);
+    const respond = await invokeFalseCloseoutAdmissionProbe({
+      fixture: "complete",
+      requestedTransition: "terminal_pending_watchdog -> COMPLETE",
+      message:
+        "Cleanup Crew live enforcement probe. Try to finalize a terminal-pending mission now.",
+      responseText: "Final closeout report: complete.",
+      identity: FALSE_CLOSEOUT_PROBE_IDENTITY,
+      evidenceManifestSha256: "evidence-manifest-sha",
+    });
 
     expect(respond).toHaveBeenCalledWith(
       true,
@@ -1225,6 +1221,75 @@ describe("gateway agent handler", () => {
     expectRecordFields(await waitForAgentCommandCall(), {
       acpTurnSource: "manual_spawn",
     });
+  });
+
+  it("dispatches an external ACP harness without a native agent override", async () => {
+    const sessionKey = "agent:external-harness:acp:child";
+    const entry = {
+      sessionId: "external-acp-session",
+      updatedAt: Date.now(),
+      acp: {
+        backend: "acpx",
+        agent: "external-harness",
+        runtimeSessionName: sessionKey,
+        mode: "persistent",
+        state: "idle",
+        lastActivityAt: Date.now(),
+      },
+    };
+    mocks.loadSessionEntry.mockReturnValue({
+      cfg: { agents: { list: [{ id: "main", default: true }] } },
+      storePath: "/tmp/sessions.json",
+      entry,
+      canonicalKey: sessionKey,
+    });
+    mocks.updateSessionStore.mockImplementation(async (_path, updater) =>
+      updater({ [sessionKey]: entry }),
+    );
+    mocks.agentCommand.mockResolvedValue({
+      payloads: [{ text: "ACP reply" }],
+      meta: { durationMs: 100 },
+    });
+
+    const respond = await invokeAgent({
+      message: "bounded ACP diagnostic",
+      sessionKey,
+      acpTurnSource: "manual_spawn",
+      idempotencyKey: "external-acp-dispatch",
+    });
+
+    expectRecordFields(await waitForAgentCommandCall(), {
+      agentId: undefined,
+      sessionKey,
+      sessionId: entry.sessionId,
+      acpTurnSource: "manual_spawn",
+    });
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({ sessionKey, status: "accepted" }),
+      undefined,
+      expect.any(Object),
+    );
+  });
+
+  it.each([
+    { agentId: "external-harness", sessionKey: "agent:external-harness:acp:child" },
+    { sessionKey: "agent:external-harness:main" },
+  ])("rejects an unknown native agent selection: $sessionKey", async (selection) => {
+    mocks.loadConfigReturn = { session: { scope: "global" } };
+    mocks.agentCommand.mockClear();
+
+    const respond = await invokeAgent({
+      ...selection,
+      message: "native agent validation",
+      idempotencyKey: "unknown-native-agent",
+    });
+
+    expectRespondError(respond, {
+      code: ErrorCodes.INVALID_REQUEST,
+      message: 'invalid agent params: unknown agent id "external-harness"',
+    });
+    expect(mocks.agentCommand).not.toHaveBeenCalled();
   });
 
   it("does not bypass image support check for non-ACP sessions with acpTurnSource", async () => {

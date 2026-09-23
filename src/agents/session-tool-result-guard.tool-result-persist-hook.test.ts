@@ -5,6 +5,7 @@ import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import { SessionManager } from "openclaw/plugin-sdk/agent-sessions";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import {
+  getGlobalHookRunner,
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
 } from "../plugins/hook-runner-global.js";
@@ -685,6 +686,86 @@ describe("tool_result_persist hook", () => {
     expect(Array.isArray(toolResult.content)).toBe(true);
   });
 
+  it("does not expose blocked governed tool results to persistence hooks", () => {
+    initializeTempPlugin({
+      tmpPrefix: "openclaw-toolpersist-governed-",
+      id: "persist-governed",
+      body: `export default { id: "persist-governed", register(api) {
+  api.on("tool_result_persist", (event) => ({ message: event.message }));
+} };`,
+    });
+    const hookRunner = getGlobalHookRunner();
+    if (!hookRunner) {
+      throw new Error("expected global hook runner");
+    }
+    const runToolResultPersist = vi.spyOn(hookRunner, "runToolResultPersist");
+    const sm = guardSessionManager(SessionManager.inMemory(), {
+      agentId: "main",
+      sessionKey: "main",
+      shouldBlockMessagePersistence: (message) => message.role !== "user",
+    });
+
+    appendToolCallAndResult(sm);
+
+    expect(runToolResultPersist).not.toHaveBeenCalled();
+    expect(getPersistedToolResult(sm)).toBeUndefined();
+  });
+
+  it("keeps governed tool context model-visible but display-hidden", () => {
+    initializeTempPlugin({
+      tmpPrefix: "openclaw-toolpersist-governed-hidden-",
+      id: "persist-governed-hidden",
+      body: `export default { id: "persist-governed-hidden", register(api) {
+  api.on("tool_result_persist", (event) => ({ message: event.message }));
+  api.on("before_message_write", (event) => ({ message: event.message }));
+} };`,
+    });
+    const hookRunner = getGlobalHookRunner();
+    if (!hookRunner) {
+      throw new Error("expected global hook runner");
+    }
+    const runToolResultPersist = vi.spyOn(hookRunner, "runToolResultPersist");
+    const runBeforeMessageWrite = vi.spyOn(hookRunner, "runBeforeMessageWrite");
+    const sm = guardSessionManager(SessionManager.inMemory(), {
+      agentId: "main",
+      sessionKey: "agent:main:governed",
+      shouldHideMessageFromDisplay: (message) => message.role !== "user",
+    });
+
+    const secret = "sk-abcdef1234567890xyz";
+    const appendMessage = sm.appendMessage.bind(sm) as unknown as (message: AgentMessage) => void;
+    appendMessage({
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "call_1",
+          name: "read",
+          arguments: { apiKey: secret },
+        },
+      ],
+    } as unknown as AgentMessage);
+    appendMessage({
+      role: "toolResult",
+      toolCallId: "call_1",
+      toolName: "read",
+      isError: false,
+      content: [{ type: "text", text: `private result ${secret}` }],
+      details: { apiKey: secret },
+    } as AgentMessage);
+
+    const persisted = sm
+      .getEntries()
+      .filter((entry) => entry.type === "message")
+      .map((entry) => (entry as { message: AgentMessage & { display?: boolean } }).message);
+    expect(persisted).toHaveLength(2);
+    expect(persisted.every((message) => message.display === false)).toBe(true);
+    expect(JSON.stringify(persisted)).not.toContain(secret);
+    expect(sm.buildSessionContext().messages).toHaveLength(2);
+    expect(runToolResultPersist).not.toHaveBeenCalled();
+    expect(runBeforeMessageWrite).not.toHaveBeenCalled();
+  });
+
   it("reapplies the cap after tool_result_persist expands a tool result", () => {
     initializeTempPlugin({
       tmpPrefix: "openclaw-toolpersist-expand-",
@@ -764,6 +845,31 @@ describe("tool_result_persist hook", () => {
 });
 
 describe("before_message_write hook", () => {
+  it("does not expose messages blocked by the governed persistence predicate", () => {
+    initializeTempPlugin({
+      tmpPrefix: "openclaw-beforewrite-governed-",
+      id: "beforewrite-governed",
+      body: `export default { id: "beforewrite-governed", register(api) {
+  api.on("before_message_write", (event) => ({ message: event.message }));
+} };`,
+    });
+    const hookRunner = getGlobalHookRunner();
+    if (!hookRunner) {
+      throw new Error("expected global hook runner");
+    }
+    const runBeforeMessageWrite = vi.spyOn(hookRunner, "runBeforeMessageWrite");
+    const sm = guardSessionManager(SessionManager.inMemory(), {
+      agentId: "main",
+      sessionKey: "agent:main:governed",
+      shouldBlockMessagePersistence: () => true,
+    });
+
+    sm.appendMessage({ role: "user", content: "private governed prompt", timestamp: 1 });
+
+    expect(runBeforeMessageWrite).not.toHaveBeenCalled();
+    expect(sm.getEntries().filter((entry) => entry.type === "message")).toEqual([]);
+  });
+
   it("continues persistence when a before_message_write hook throws", () => {
     initializeTempPlugin({
       tmpPrefix: "openclaw-before-write-",

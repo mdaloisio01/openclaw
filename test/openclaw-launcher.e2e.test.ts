@@ -455,7 +455,7 @@ describe("openclaw launcher", () => {
       },
     );
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr || result.stdout).toBe(0);
     expect(result.stderr).toBe("");
 
     const requestsDir = path.join(workspaceDir, "var", "grant", "retirement_requests");

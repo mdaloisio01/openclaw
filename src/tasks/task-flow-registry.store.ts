@@ -1,5 +1,10 @@
+import type {
+  GovernedMissionLedgerCommit,
+  GovernedMissionLedgerCommitResult,
+} from "../governance/governed-mission-ledger.types.js";
 import {
   closeTaskFlowRegistryDatabase,
+  commitGovernedMissionLedgerToSqlite,
   deleteTaskFlowRegistryRecordFromSqlite,
   loadTaskFlowRegistryStateFromSqlite,
   saveTaskFlowRegistryStateToSqlite,
@@ -15,6 +20,7 @@ export type TaskFlowRegistryStore = {
   saveSnapshot: (snapshot: TaskFlowRegistryStoreSnapshot) => void;
   upsertFlow?: (flow: TaskFlowRecord) => void;
   deleteFlow?: (flowId: string) => void;
+  commitGovernance?: (commit: GovernedMissionLedgerCommit) => GovernedMissionLedgerCommitResult;
   close?: () => void;
 };
 
@@ -44,6 +50,7 @@ const defaultFlowRegistryStore: TaskFlowRegistryStore = {
   saveSnapshot: saveTaskFlowRegistryStateToSqlite,
   upsertFlow: upsertTaskFlowRegistryRecordToSqlite,
   deleteFlow: deleteTaskFlowRegistryRecordFromSqlite,
+  commitGovernance: commitGovernedMissionLedgerToSqlite,
   close: closeTaskFlowRegistryDatabase,
 };
 

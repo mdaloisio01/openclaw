@@ -1,6 +1,6 @@
 import type { AgentTool } from "openclaw/plugin-sdk/agent-core";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   CLIENT_TOOL_NAME_CONFLICT_PREFIX,
   createClientToolNameConflictError,
@@ -9,10 +9,19 @@ import {
   toClientToolDefinitions,
   toToolDefinitions,
 } from "./agent-tool-definition-adapter.js";
+import { setDirtyTreeHygieneStatusReaderForTest } from "./agent-tools.before-tool-call.js";
 import type { ClientToolDefinition } from "./embedded-agent-runner/run/params.js";
 
 type ToolExecute = ReturnType<typeof toToolDefinitions>[number]["execute"];
 const extensionContext = {} as Parameters<ToolExecute>[4];
+
+beforeEach(() => {
+  setDirtyTreeHygieneStatusReaderForTest(async () => "");
+});
+
+afterEach(() => {
+  setDirtyTreeHygieneStatusReaderForTest();
+});
 
 async function executeThrowingTool(name: string, callId: string) {
   const tool = {

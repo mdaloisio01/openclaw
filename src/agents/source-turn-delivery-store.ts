@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { withFileLock } from "@openclaw/fs-safe/file-lock";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
@@ -23,6 +23,7 @@ import { shouldRemoveDeadOwnerOrExpiredLock } from "../infra/stale-lock-file.js"
 import type { ParentYieldWaitRef } from "../infra/system-events.js";
 import { hasOutboundReplyContent } from "../plugin-sdk/reply-payload.js";
 import { getProcessStartTime } from "../shared/pid-alive.js";
+import { runQueuedStoreWrite, type StoreWriterQueues } from "../shared/store-writer-queue.js";
 import {
   resolveSourceTurnDeliveryState,
   type SourceTurnDeliveryDecision,
@@ -34,6 +35,7 @@ export const SOURCE_TURN_DELIVERY_ROW_KIND = "openclaw.source-delivery-obligatio
 export const SOURCE_TURN_DELIVERY_QUEUE_OWNER_KIND = "source_turn_delivery";
 const SOURCE_TURN_DELIVERY_LOCK_STALE_MS = 30_000;
 const LOCK_OWNER_STARTTIME = getProcessStartTime(process.pid) ?? undefined;
+const sourceTurnDeliveryWriterQueues: StoreWriterQueues = new Map();
 
 export function resolveSourceTurnDeliveryRegistryPath(): string {
   const override = normalizeOptionalString(process.env.OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH);
@@ -307,33 +309,43 @@ async function writeRegistry(path: string, registry: SourceTurnDeliveryRegistry)
 
 async function withSourceTurnDeliveryRegistryLock<T>(
   registryPath: string,
-  run: () => Promise<T>,
+  run: (canonicalRegistryPath: string) => Promise<T>,
 ): Promise<T> {
-  await mkdir(dirname(registryPath), { recursive: true, mode: 0o700 });
-  return await withFileLock(
-    registryPath,
-    {
-      managerKey: "openclaw.source-turn-delivery",
-      allowReentrant: false,
-      staleMs: SOURCE_TURN_DELIVERY_LOCK_STALE_MS,
-      timeoutMs: 30_000,
-      retry: { minTimeout: 10, maxTimeout: 100, factor: 1.2 },
-      staleRecovery: "remove-if-unchanged",
-      shouldReclaim: isAbandonedDeliveryLock,
-      shouldRemoveStaleLock: ({ lockPath, payload }) =>
-        isAbandonedDeliveryLock({
-          lockPath,
-          payload,
+  const registryDir = dirname(registryPath);
+  await mkdir(registryDir, { recursive: true, mode: 0o700 });
+  const canonicalRegistryPath = join(await realpath(registryDir), basename(registryPath));
+  return await runQueuedStoreWrite({
+    queues: sourceTurnDeliveryWriterQueues,
+    storePath: canonicalRegistryPath,
+    label: "source turn delivery registry",
+    // Only one local contender may recover an abandoned sidecar. Otherwise,
+    // concurrent stale removers can unlink the first contender's fresh lock.
+    fn: async () =>
+      await withFileLock(
+        canonicalRegistryPath,
+        {
+          managerKey: "openclaw.source-turn-delivery",
+          allowReentrant: false,
           staleMs: SOURCE_TURN_DELIVERY_LOCK_STALE_MS,
-        }),
-      payload: () => ({
-        pid: process.pid,
-        createdAt: new Date().toISOString(),
-        starttime: LOCK_OWNER_STARTTIME,
-      }),
-    },
-    run,
-  );
+          timeoutMs: 30_000,
+          retry: { minTimeout: 10, maxTimeout: 100, factor: 1.2 },
+          staleRecovery: "remove-if-unchanged",
+          shouldReclaim: isAbandonedDeliveryLock,
+          shouldRemoveStaleLock: ({ lockPath, payload }) =>
+            isAbandonedDeliveryLock({
+              lockPath,
+              payload,
+              staleMs: SOURCE_TURN_DELIVERY_LOCK_STALE_MS,
+            }),
+          payload: () => ({
+            pid: process.pid,
+            createdAt: new Date().toISOString(),
+            starttime: LOCK_OWNER_STARTTIME,
+          }),
+        },
+        () => run(canonicalRegistryPath),
+      ),
+  });
 }
 
 function statusForDecision(decision: SourceTurnDeliveryDecision): string {
@@ -799,8 +811,8 @@ export async function transitionExternalSourceDelivery(params: {
   if (params.owner.kind !== SOURCE_TURN_DELIVERY_QUEUE_OWNER_KIND) {
     throw new Error("External delivery transition requires a source delivery owner");
   }
-  return await withSourceTurnDeliveryRegistryLock(registryPath, async () => {
-    const registry = await readRegistry(registryPath);
+  return await withSourceTurnDeliveryRegistryLock(registryPath, async (lockedRegistryPath) => {
+    const registry = await readRegistry(lockedRegistryPath);
     const owners = registry.rows.filter((row) => row.idempotencyKey === params.owner.key);
     if (owners.length !== 1) {
       throw new Error(
@@ -847,7 +859,7 @@ export async function transitionExternalSourceDelivery(params: {
         outboundDelivery: params.delivery,
       },
     };
-    await writeRegistry(registryPath, {
+    await writeRegistry(lockedRegistryPath, {
       rows: registry.rows.map((row) => (row === owner ? next : row)),
     });
     return next;
@@ -862,8 +874,8 @@ export async function settleSourceTurnDeliveryFinal(params: {
   if (params.owner.kind !== SOURCE_TURN_DELIVERY_QUEUE_OWNER_KIND) {
     throw new Error("Source final settlement requires a source delivery owner");
   }
-  return await withSourceTurnDeliveryRegistryLock(registryPath, async () => {
-    const registry = await readRegistry(registryPath);
+  return await withSourceTurnDeliveryRegistryLock(registryPath, async (lockedRegistryPath) => {
+    const registry = await readRegistry(lockedRegistryPath);
     const owners = registry.rows.filter((row) => row.idempotencyKey === params.owner.key);
     if (owners.length !== 1) {
       throw new Error(
@@ -907,7 +919,7 @@ export async function settleSourceTurnDeliveryFinal(params: {
       durabilityDecision,
     };
     delete next.failureReason;
-    await writeRegistry(registryPath, {
+    await writeRegistry(lockedRegistryPath, {
       rows: registry.rows.map((row) => (row === owner ? next : row)),
     });
     return next;
@@ -1004,129 +1016,133 @@ export async function persistSourceTurnDeliveryState(
 ): Promise<SourceTurnDeliveryRow> {
   // Serialize the entire update, including same-process callers. Reentrant locks
   // would permit overlapping reads; atomic replacement also protects live readers.
-  return await withSourceTurnDeliveryRegistryLock(params.registryPath, async () => {
-    const registry = await readRegistry(params.registryPath);
-    const legacyExisting = registry.rows.find((row) => row.id === params.id);
-    const decision = resolveSourceTurnDeliveryState(params.facts);
-    const now = params.now ?? new Date().toISOString();
-    const sourceTurnId = params.sourceTurnId ?? legacyExisting?.sourceTurnId ?? params.id;
-    const obligationIdentity = normalizeObligationIdentity(params, legacyExisting);
-    const idempotencyKey = buildSourceTurnDeliveryObligationKey({
-      sourceTurnId,
-      ...obligationIdentity,
-    });
-    const existing =
-      registry.rows.find((row) => row.idempotencyKey === idempotencyKey) ??
-      (hasExplicitObligationIdentity(params) ? undefined : legacyExisting);
-    const obligationStage = deriveObligationStage({
-      decision,
-      facts: params.facts,
-      reportArtifactPaths: params.reportArtifactPaths,
-      reportPrepared: params.reportPrepared,
-      deliveryAttempted: params.deliveryAttempted,
-      needsReview: params.needsReview,
-    });
-    const markFacingExport = normalizeMarkFacingExportDelivery(params.facts);
-    const trbRecovery = normalizeTrbRecoveryLinkage(params.facts);
-    const sourceSessionKey =
-      normalizeIdentityPart(params.sourceSessionKey) ??
-      normalizeIdentityPart(existing?.sourceSessionKey);
-    const sourceMessageId =
-      normalizeIdentityPart(params.sourceMessageId) ??
-      normalizeIdentityPart(existing?.sourceMessageId);
-    const sourceChannel =
-      normalizeIdentityPart(params.sourceChannel) ?? normalizeIdentityPart(existing?.sourceChannel);
-    const deliveryContext =
-      normalizeDeliveryContext(params.deliveryContext) ??
-      normalizeDeliveryContext(existing?.deliveryContext);
-    const retryOrRecoveryRecorded = hasRetryOrRecoveryCoverage(params.watchdogReconciliation);
-    const durabilityDecision = resolveGovernedRunDurability({
-      finalDeliveryRequired:
-        params.facts.finalDeliveryRequired === true || params.facts.reportRequired === true,
-      deliveryObligationStage: toGovernedRunDeliveryObligationStage(obligationStage),
-      deliveryRetryScheduled: retryOrRecoveryRecorded,
-      deliveryRecoveryHandoffRecorded: retryOrRecoveryRecorded,
-      deliveryExhaustedBlockerRecorded:
-        params.watchdogReconciliation?.status?.toLowerCase() === "closed_verified_blocked",
-      idempotencyKey,
-    });
-    const parentYieldWaits = params.parentYieldWaits ?? existing?.parentYieldWaits;
-    const preparedSourceFinal = resolvePreparedSourceFinal({
-      prepared: params.preparedSourceFinal,
-      existing,
-      sourceSessionKey,
-      sourceChannel,
-      deliveryContext,
-      parentYieldWaits,
-      runId: obligationIdentity.runId,
-      obligationKey: idempotencyKey,
-      externalDelivery: params.preparedExternalFinalDelivery,
-    });
-    if (
-      decision.finalDeliveryDelivered &&
-      preparedSourceFinal &&
-      (preparedSourceFinal.parts.length !== preparedSourceFinal.expectedPartCount ||
-        (preparedSourceFinal.kind === "external_channel" &&
-          preparedSourceFinal.outboundDelivery.status !== "delivered"))
-    ) {
-      throw new Error("Incomplete prepared source final cannot be delivered");
-    }
-    const row: SourceTurnDeliveryRow = {
-      id: params.id,
-      kind: SOURCE_TURN_DELIVERY_ROW_KIND,
-      sourceTurnId,
-      ...(sourceSessionKey ? { sourceSessionKey } : {}),
-      ...(sourceMessageId ? { sourceMessageId } : {}),
-      ...(sourceChannel ? { sourceChannel } : {}),
-      ...(deliveryContext ? { deliveryContext } : {}),
-      ...(parentYieldWaits?.length
-        ? { parentYieldWaits: parentYieldWaits.map((wait) => Object.assign({}, wait)) }
-        : {}),
-      ...(preparedSourceFinal ? { preparedSourceFinal } : {}),
-      acceptedAt: existing?.acceptedAt ?? now,
-      updatedAt: now,
-      deliveryStatus: statusForDecision(decision),
-      obligationStage,
-      obligationIdentity,
-      idempotencyKey,
-      sourceTurnState: decision.state,
-      finalDeliveryDelivered: decision.finalDeliveryDelivered,
-      visibleDeliveryCount: visibleDeliveryCountForDecision(decision),
-      ...(params.currentStage ? { currentStage: params.currentStage } : {}),
-      ...(decision.state === "final_delivery_failed" ||
-      decision.state === "final_delivery_unknown" ||
-      decision.state === "blocked_refused"
-        ? { failureReason: decision.reason }
-        : {}),
-      ...(params.reportArtifactPaths && params.reportArtifactPaths.length > 0
-        ? { reportArtifactPaths: [...params.reportArtifactPaths] }
-        : {}),
-      ...(markFacingExport ? { markFacingExport } : {}),
-      ...(trbRecovery ? { trbRecovery } : {}),
-      ...(params.watchdogReconciliation
-        ? { watchdogReconciliation: params.watchdogReconciliation }
-        : decision.state === "settled_resolved_later"
-          ? {
-              watchdogReconciliation: {
-                status: "settled_resolved_later",
-                action: "settle-source-resolved-later",
-                reason: decision.reason,
-                originalFinalDeliveryDelivered: false,
-                originalVisibleDeliveryCount: 0,
-              },
-            }
+  return await withSourceTurnDeliveryRegistryLock(
+    params.registryPath,
+    async (lockedRegistryPath) => {
+      const registry = await readRegistry(lockedRegistryPath);
+      const legacyExisting = registry.rows.find((row) => row.id === params.id);
+      const decision = resolveSourceTurnDeliveryState(params.facts);
+      const now = params.now ?? new Date().toISOString();
+      const sourceTurnId = params.sourceTurnId ?? legacyExisting?.sourceTurnId ?? params.id;
+      const obligationIdentity = normalizeObligationIdentity(params, legacyExisting);
+      const idempotencyKey = buildSourceTurnDeliveryObligationKey({
+        sourceTurnId,
+        ...obligationIdentity,
+      });
+      const existing =
+        registry.rows.find((row) => row.idempotencyKey === idempotencyKey) ??
+        (hasExplicitObligationIdentity(params) ? undefined : legacyExisting);
+      const obligationStage = deriveObligationStage({
+        decision,
+        facts: params.facts,
+        reportArtifactPaths: params.reportArtifactPaths,
+        reportPrepared: params.reportPrepared,
+        deliveryAttempted: params.deliveryAttempted,
+        needsReview: params.needsReview,
+      });
+      const markFacingExport = normalizeMarkFacingExportDelivery(params.facts);
+      const trbRecovery = normalizeTrbRecoveryLinkage(params.facts);
+      const sourceSessionKey =
+        normalizeIdentityPart(params.sourceSessionKey) ??
+        normalizeIdentityPart(existing?.sourceSessionKey);
+      const sourceMessageId =
+        normalizeIdentityPart(params.sourceMessageId) ??
+        normalizeIdentityPart(existing?.sourceMessageId);
+      const sourceChannel =
+        normalizeIdentityPart(params.sourceChannel) ??
+        normalizeIdentityPart(existing?.sourceChannel);
+      const deliveryContext =
+        normalizeDeliveryContext(params.deliveryContext) ??
+        normalizeDeliveryContext(existing?.deliveryContext);
+      const retryOrRecoveryRecorded = hasRetryOrRecoveryCoverage(params.watchdogReconciliation);
+      const durabilityDecision = resolveGovernedRunDurability({
+        finalDeliveryRequired:
+          params.facts.finalDeliveryRequired === true || params.facts.reportRequired === true,
+        deliveryObligationStage: toGovernedRunDeliveryObligationStage(obligationStage),
+        deliveryRetryScheduled: retryOrRecoveryRecorded,
+        deliveryRecoveryHandoffRecorded: retryOrRecoveryRecorded,
+        deliveryExhaustedBlockerRecorded:
+          params.watchdogReconciliation?.status?.toLowerCase() === "closed_verified_blocked",
+        idempotencyKey,
+      });
+      const parentYieldWaits = params.parentYieldWaits ?? existing?.parentYieldWaits;
+      const preparedSourceFinal = resolvePreparedSourceFinal({
+        prepared: params.preparedSourceFinal,
+        existing,
+        sourceSessionKey,
+        sourceChannel,
+        deliveryContext,
+        parentYieldWaits,
+        runId: obligationIdentity.runId,
+        obligationKey: idempotencyKey,
+        externalDelivery: params.preparedExternalFinalDelivery,
+      });
+      if (
+        decision.finalDeliveryDelivered &&
+        preparedSourceFinal &&
+        (preparedSourceFinal.parts.length !== preparedSourceFinal.expectedPartCount ||
+          (preparedSourceFinal.kind === "external_channel" &&
+            preparedSourceFinal.outboundDelivery.status !== "delivered"))
+      ) {
+        throw new Error("Incomplete prepared source final cannot be delivered");
+      }
+      const row: SourceTurnDeliveryRow = {
+        id: params.id,
+        kind: SOURCE_TURN_DELIVERY_ROW_KIND,
+        sourceTurnId,
+        ...(sourceSessionKey ? { sourceSessionKey } : {}),
+        ...(sourceMessageId ? { sourceMessageId } : {}),
+        ...(sourceChannel ? { sourceChannel } : {}),
+        ...(deliveryContext ? { deliveryContext } : {}),
+        ...(parentYieldWaits?.length
+          ? { parentYieldWaits: parentYieldWaits.map((wait) => Object.assign({}, wait)) }
           : {}),
-      deliveryDecision: decision,
-      durabilityDecision,
-    };
-    const nextRows = existing
-      ? registry.rows.map((candidate) => (candidate === existing ? row : candidate))
-      : [...registry.rows, row];
-    // Readers do not acquire the writer lock, so a failed replacement must
-    // leave the previous registry intact.
-    await writeRegistry(params.registryPath, { rows: nextRows });
-    return row;
-  });
+        ...(preparedSourceFinal ? { preparedSourceFinal } : {}),
+        acceptedAt: existing?.acceptedAt ?? now,
+        updatedAt: now,
+        deliveryStatus: statusForDecision(decision),
+        obligationStage,
+        obligationIdentity,
+        idempotencyKey,
+        sourceTurnState: decision.state,
+        finalDeliveryDelivered: decision.finalDeliveryDelivered,
+        visibleDeliveryCount: visibleDeliveryCountForDecision(decision),
+        ...(params.currentStage ? { currentStage: params.currentStage } : {}),
+        ...(decision.state === "final_delivery_failed" ||
+        decision.state === "final_delivery_unknown" ||
+        decision.state === "blocked_refused"
+          ? { failureReason: decision.reason }
+          : {}),
+        ...(params.reportArtifactPaths && params.reportArtifactPaths.length > 0
+          ? { reportArtifactPaths: [...params.reportArtifactPaths] }
+          : {}),
+        ...(markFacingExport ? { markFacingExport } : {}),
+        ...(trbRecovery ? { trbRecovery } : {}),
+        ...(params.watchdogReconciliation
+          ? { watchdogReconciliation: params.watchdogReconciliation }
+          : decision.state === "settled_resolved_later"
+            ? {
+                watchdogReconciliation: {
+                  status: "settled_resolved_later",
+                  action: "settle-source-resolved-later",
+                  reason: decision.reason,
+                  originalFinalDeliveryDelivered: false,
+                  originalVisibleDeliveryCount: 0,
+                },
+              }
+            : {}),
+        deliveryDecision: decision,
+        durabilityDecision,
+      };
+      const nextRows = existing
+        ? registry.rows.map((candidate) => (candidate === existing ? row : candidate))
+        : [...registry.rows, row];
+      // Readers do not acquire the writer lock, so a failed replacement must
+      // leave the previous registry intact.
+      await writeRegistry(lockedRegistryPath, { rows: nextRows });
+      return row;
+    },
+  );
 }
 
 export function classifySourceTurnDeliveryWatchdogStatus(

@@ -202,7 +202,7 @@ describe("announce loop guard (#18264)", () => {
 
     // Initialization attempts resume once, then gives up for exhausted entries.
     const beforeInit = Date.now();
-    registry.initSubagentRegistry();
+    void registry.initSubagentRegistry();
     await flushAsync();
 
     expect(mocks.runSubagentAnnounceFlow).not.toHaveBeenCalled();
@@ -237,7 +237,7 @@ describe("announce loop guard (#18264)", () => {
       ]),
     );
 
-    registry.initSubagentRegistry();
+    void registry.initSubagentRegistry();
     await flushAsync();
 
     expect(mocks.runSubagentAnnounceFlow).toHaveBeenCalledTimes(1);
@@ -270,7 +270,7 @@ describe("announce loop guard (#18264)", () => {
       ]),
     );
 
-    registry.initSubagentRegistry();
+    void registry.initSubagentRegistry();
     await flushAsync();
 
     const stored = await waitForRun(

@@ -75,6 +75,8 @@ If `pnpm test` flakes on a loaded host, rerun once before treating it as a regre
 - `OPENCLAW_VITEST_MAX_WORKERS=1 pnpm test`
 - `OPENCLAW_VITEST_FS_MODULE_CACHE_PATH=/tmp/openclaw-vitest-cache pnpm test:changed`
 
+For a full release build with limited RAM, use `OPENCLAW_TSDOWN_SERIAL_BUILD=1 NODE_OPTIONS=--max-old-space-size=5120 pnpm build`. This runs each tsdown configuration in a separate process, including declaration generation, and takes longer than the default build.
+
 ## Model latency bench (local keys)
 
 Script: [`scripts/bench-model.ts`](https://github.com/openclaw/openclaw/blob/main/scripts/bench-model.ts)

@@ -29,8 +29,8 @@ const PLUGIN_DOC_ALIASES = new Map([
   ["tavily", "/tools/tavily"],
   ["tokenjuice", "/tools/tokenjuice"],
 ]);
-const MANUAL_SECTION_START = "<!-- openclaw-plugin-reference:manual-start -->";
-const MANUAL_SECTION_END = "<!-- openclaw-plugin-reference:manual-end -->";
+const MANUAL_SECTION_START = '<span data-openclaw-plugin-reference="manual-start" />';
+const MANUAL_SECTION_END = '<span data-openclaw-plugin-reference="manual-end" />';
 
 function readJson(relativePath) {
   return JSON.parse(fs.readFileSync(path.join(ROOT, relativePath), "utf8"));

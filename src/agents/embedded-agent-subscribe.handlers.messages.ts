@@ -42,6 +42,11 @@ function shouldSuppressAssistantVisibleOutput(message: AgentMessage | undefined)
   return resolveAssistantMessagePhase(message) === "commentary";
 }
 
+function shouldSuppressAssistantOutput(ctx: EmbeddedAgentSubscribeContext): boolean {
+  const predicate = ctx.params.shouldSuppressAssistantOutput;
+  return typeof predicate === "function" && predicate();
+}
+
 function isTranscriptOnlyOpenClawAssistantMessage(message: AgentMessage | undefined): boolean {
   if (!message || message.role !== "assistant") {
     return false;
@@ -137,7 +142,9 @@ function emitReasoningEnd(ctx: EmbeddedAgentSubscribeContext) {
     return;
   }
   ctx.state.reasoningStreamOpen = false;
-  void ctx.params.onReasoningEnd?.();
+  if (!shouldSuppressAssistantOutput(ctx)) {
+    void ctx.params.onReasoningEnd?.();
+  }
 }
 
 function openReasoningStream(ctx: EmbeddedAgentSubscribeContext) {
@@ -532,7 +539,9 @@ export function handleMessageStart(
   // re-trigger block replies.
   ctx.resetAssistantMessageState(ctx.state.assistantTexts.length);
   // Use assistant message_start as the earliest "writing" signal for typing.
-  void ctx.params.onAssistantMessageStart?.();
+  if (!shouldSuppressAssistantOutput(ctx)) {
+    void ctx.params.onAssistantMessageStart?.();
+  }
 }
 
 export function handleMessageUpdate(
@@ -573,15 +582,17 @@ export function handleMessageUpdate(
     const thinkingDelta = typeof assistantRecord?.delta === "string" ? assistantRecord.delta : "";
     const thinkingContent =
       typeof assistantRecord?.content === "string" ? assistantRecord.content : "";
-    appendRawStream({
-      ts: Date.now(),
-      event: "assistant_thinking_stream",
-      runId: ctx.params.runId,
-      sessionId: (ctx.params.session as { id?: string }).id,
-      evtType,
-      delta: thinkingDelta,
-      content: thinkingContent,
-    });
+    if (!shouldSuppressAssistantOutput(ctx)) {
+      appendRawStream({
+        ts: Date.now(),
+        event: "assistant_thinking_stream",
+        runId: ctx.params.runId,
+        sessionId: (ctx.params.session as { id?: string }).id,
+        evtType,
+        delta: thinkingDelta,
+        content: thinkingContent,
+      });
+    }
     if (ctx.state.streamReasoning) {
       // Prefer full partial-message thinking when available; fall back to event payloads.
       const partialThinking = extractAssistantThinking(msg);
@@ -603,15 +614,17 @@ export function handleMessageUpdate(
   const delta = typeof assistantRecord?.delta === "string" ? assistantRecord.delta : "";
   const content = typeof assistantRecord?.content === "string" ? assistantRecord.content : "";
 
-  appendRawStream({
-    ts: Date.now(),
-    event: "assistant_text_stream",
-    runId: ctx.params.runId,
-    sessionId: (ctx.params.session as { id?: string }).id,
-    evtType,
-    delta,
-    content,
-  });
+  if (!shouldSuppressAssistantOutput(ctx)) {
+    appendRawStream({
+      ts: Date.now(),
+      event: "assistant_text_stream",
+      runId: ctx.params.runId,
+      sessionId: (ctx.params.session as { id?: string }).id,
+      evtType,
+      delta,
+      content,
+    });
+  }
 
   const chunk = resolveAssistantTextChunk({
     evtType,
@@ -639,7 +652,9 @@ export function handleMessageUpdate(
     if (previousStreamItemId && previousStreamItemId !== streamItemId) {
       void ctx.flushBlockReplyBuffer({ assistantMessageIndex: ctx.state.assistantMessageIndex });
       ctx.resetAssistantMessageState(ctx.state.assistantTexts.length);
-      void ctx.params.onAssistantMessageStart?.();
+      if (!shouldSuppressAssistantOutput(ctx)) {
+        void ctx.params.onAssistantMessageStart?.();
+      }
     }
     ctx.state.lastAssistantStreamItemId = streamItemId;
   }
@@ -784,17 +799,23 @@ export function handleMessageUpdate(
         mediaUrls,
         phase: deliveryPhase ?? assistantPhase,
       });
-      emitAgentEvent({
-        runId: ctx.params.runId,
-        stream: "assistant",
-        data,
-      });
-      void ctx.params.onAgentEvent?.({
-        stream: "assistant",
-        data,
-      });
+      if (!shouldSuppressAssistantOutput(ctx)) {
+        emitAgentEvent({
+          runId: ctx.params.runId,
+          stream: "assistant",
+          data,
+        });
+        void ctx.params.onAgentEvent?.({
+          stream: "assistant",
+          data,
+        });
+      }
       ctx.state.emittedAssistantUpdate = true;
-      if (ctx.params.onPartialReply && ctx.state.shouldEmitPartialReplies) {
+      if (
+        !shouldSuppressAssistantOutput(ctx) &&
+        ctx.params.onPartialReply &&
+        ctx.state.shouldEmitPartialReplies
+      ) {
         void ctx.params.onPartialReply(data);
       }
     }
@@ -848,15 +869,19 @@ export function handleMessageEnd(
 
   const rawText = coerceChatContentText(extractAssistantText(assistantMessage));
   const rawVisibleText = coerceChatContentText(extractAssistantVisibleText(assistantMessage));
-  appendRawStream({
-    ts: Date.now(),
-    event: "assistant_message_end",
-    runId: ctx.params.runId,
-    sessionId: (ctx.params.session as { id?: string }).id,
-    rawText,
-    rawThinking: extractAssistantThinking(assistantMessage),
-  });
-  warnIfAssistantEmittedToolText(ctx, assistantMessage);
+  if (!shouldSuppressAssistantOutput(ctx)) {
+    appendRawStream({
+      ts: Date.now(),
+      event: "assistant_message_end",
+      runId: ctx.params.runId,
+      sessionId: (ctx.params.session as { id?: string }).id,
+      rawText,
+      rawThinking: extractAssistantThinking(assistantMessage),
+    });
+  }
+  if (!shouldSuppressAssistantOutput(ctx)) {
+    warnIfAssistantEmittedToolText(ctx, assistantMessage);
+  }
   const visibleText =
     extractStandaloneMessageToolText(rawVisibleText, {
       allowRoutedReply: isOpenAiCompletionsAssistantMessage(assistantMessage),
@@ -936,15 +961,17 @@ export function handleMessageEnd(
       mediaUrls,
       phase: assistantPhase,
     });
-    emitAgentEvent({
-      runId: ctx.params.runId,
-      stream: "assistant",
-      data,
-    });
-    void ctx.params.onAgentEvent?.({
-      stream: "assistant",
-      data,
-    });
+    if (!shouldSuppressAssistantOutput(ctx)) {
+      emitAgentEvent({
+        runId: ctx.params.runId,
+        stream: "assistant",
+        data,
+      });
+      void ctx.params.onAgentEvent?.({
+        stream: "assistant",
+        data,
+      });
+    }
     ctx.state.emittedAssistantUpdate = true;
     ctx.state.lastStreamedAssistantCleaned = cleanedText;
   }
@@ -1108,6 +1135,7 @@ export function handleMessageEnd(
 
   if (
     !ctx.params.silentExpected &&
+    !shouldSuppressAssistantOutput(ctx) &&
     ctx.state.blockReplyBreak === "message_end" &&
     ctx.params.onBlockReplyFlush
   ) {

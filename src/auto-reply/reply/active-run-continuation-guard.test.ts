@@ -1,7 +1,11 @@
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  closeTaskFlowRegistryDatabase,
+  findGovernedMissionReceiptByIdempotencyFromSqlite,
+} from "../../tasks/task-flow-registry.store.sqlite.js";
 import type { ReplyPayload } from "../types.js";
 import {
   allowTerminalCloseout,
@@ -23,9 +27,11 @@ let tempDir: string;
 beforeEach(async () => {
   tempDir = await mkdtemp(path.join(tmpdir(), "openclaw-active-run-guard-"));
   vi.stubEnv("OPENCLAW_WORKSPACE_DIR", tempDir);
+  vi.stubEnv("OPENCLAW_STATE_DIR", path.join(tempDir, "state"));
 });
 
 afterEach(async () => {
+  closeTaskFlowRegistryDatabase();
   vi.unstubAllEnvs();
   await rm(tempDir, { recursive: true, force: true });
 });
@@ -51,22 +57,6 @@ function createDispatcher() {
     markComplete: () => undefined,
   };
   return { dispatcher, finalPayloads, toolPayloads };
-}
-
-async function readDurabilityObligations(): Promise<Array<Record<string, unknown>>> {
-  const obligationDir = path.join(
-    tempDir,
-    "var",
-    "continuity_gate_v2",
-    "active_run_guard",
-    "durability_obligations",
-  );
-  const entries = await readdir(obligationDir);
-  return Promise.all(
-    entries.map(async (entry) =>
-      JSON.parse(await readFile(path.join(obligationDir, entry), "utf8")),
-    ),
-  );
 }
 
 describe("active run continuation guard durability obligations", () => {
@@ -259,26 +249,23 @@ describe("active run continuation guard durability obligations", () => {
     await testing.flushPersistence(dispatcher);
 
     expect(finalPayloads.at(-1)?.text).toContain("BLOCKED_CLOSEOUT");
-    const obligations = await readDurabilityObligations();
-    expect(obligations).toHaveLength(1);
-    expect(obligations[0]).toMatchObject({
-      kind: "openclaw.governed-run-durability-obligation",
-      status: "open",
-      sourceSurface: "active-run-continuation-guard:test",
-      activeMission: "system-wide governed run durability test",
-      obligatedOwner: "active_run_controller",
-      watchdogVisible: true,
-      requiredActions: [
-        "record_durable_next_executable_step",
-        "record_owner_boundary_handoff",
-        "record_lawful_blocker",
-        "record_terminal_completion_proof",
-      ],
-      lastNonTerminalDetail: "milestone_report_delivered",
-      proofRefs: ["proof:test"],
-      durabilityDecision: {
-        state: "needs_durable_continuation",
-        allowedToSettle: false,
+    const receiptId = testing
+      .getEvents(dispatcher)
+      .find((event) => event.type === "GOVERNED_RUN_DURABILITY_OBLIGATION_WRITTEN")?.detail;
+    expect(receiptId).toMatch(/^durability:/u);
+    const receipt = findGovernedMissionReceiptByIdempotencyFromSqlite({
+      missionId: "system-wide governed run durability test",
+      idempotencyKey: receiptId!.slice("durability:".length),
+    });
+    expect(receipt).toMatchObject({
+      receiptId,
+      receiptKind: "durability_obligation",
+      decision: "repair_required",
+      reasonCode: "needs_durable_continuation",
+      details: {
+        eventKind: "blocked_closeout",
+        watchdogVisible: true,
+        sourceSurface: "active-run-continuation-guard:test",
       },
     });
   });

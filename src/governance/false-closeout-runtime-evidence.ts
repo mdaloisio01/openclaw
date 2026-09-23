@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { commitGovernedMissionLedgerToSqlite } from "../tasks/task-flow-registry.store.sqlite.js";
+import type { JsonValue } from "../tasks/task-flow-registry.types.js";
 import { resolveFalseCloseoutAdmissionMode } from "./false-closeout-admission-controller.js";
 import type {
   AcceptanceGate,
@@ -63,6 +64,8 @@ export type FalseCloseoutDecisionReceipt = {
   writtenAt: string;
 };
 
+const FALSE_CLOSEOUT_LEDGER_DETAILS_MAX_BYTES = 1024 * 1024;
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -84,39 +87,76 @@ export function resolveFalseCloseoutAdmissionDecisionReceiptDir(
   return path.join(workspaceDir, "var", "false_closeout_admission", "decisions");
 }
 
-function safeReceiptName(value: string): string {
-  return (
-    value
-      .trim()
-      .replace(/[^a-zA-Z0-9._:-]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 160) || `decision-${Date.now()}`
-  );
-}
-
-function writeJsonDurable(filePath: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  fs.renameSync(tmpPath, filePath);
-}
-
 export function writeFalseCloseoutAdmissionDecisionReceipt(params: {
   input: CloseoutAdmissionInput;
   decision: CompletionDecision;
-  workspaceDir?: string;
-}): { path: string; sha256: string } {
-  const directory = resolveFalseCloseoutAdmissionDecisionReceiptDir(params.workspaceDir);
+}): { receiptId: string; sha256: string } {
   const receipt: FalseCloseoutDecisionReceipt = {
     schema: "openclaw.false_closeout_admission_decision_receipt.v1",
     input: params.input,
     decision: params.decision,
-    writtenAt: new Date().toISOString(),
+    writtenAt: params.decision.evaluatedAt,
   };
   const body = `${JSON.stringify(receipt, null, 2)}\n`;
-  const filePath = path.join(directory, `${safeReceiptName(params.decision.decisionId)}.json`);
-  writeJsonDurable(filePath, receipt);
-  return { path: filePath, sha256: sha256(body) };
+  const payloadSha256 = sha256(body);
+  const receiptId = `false-closeout:${sha256(params.decision.decisionId).slice(0, 40)}`;
+  const committed = commitGovernedMissionLedgerToSqlite({
+    receipt: {
+      receiptId,
+      missionId: params.decision.missionId,
+      operation: "falseCloseoutAdmission",
+      receiptKind: "false_closeout",
+      decision: params.decision.allowed ? "allowed" : "denied",
+      reasonCode: params.decision.rejectionCodes[0] ?? params.decision.state,
+      planRevisionId: params.decision.planRevisionId,
+      payloadSha256,
+      producer: "openclaw.false_closeout_admission",
+      idempotencyKey: params.decision.decisionId,
+      details: buildFalseCloseoutLedgerDetails(receipt),
+      createdAt: Date.parse(params.decision.evaluatedAt),
+    },
+  });
+  if (committed.status === "idempotency_conflict") {
+    throw new Error("false-closeout receipt idempotency key was reused with changed input");
+  }
+  if (committed.status === "revision_conflict") {
+    throw new Error("false-closeout receipt unexpectedly encountered a flow revision conflict");
+  }
+  return { receiptId: committed.receipt.receiptId, sha256: payloadSha256 };
+}
+
+export function buildFalseCloseoutLedgerDetails(receipt: {
+  schema: string;
+  decision: unknown;
+  input?: CloseoutAdmissionInput;
+  writtenAt?: string;
+}): JsonValue {
+  const input = receipt.input;
+  const auditReceipt = {
+    schema: receipt.schema,
+    ...(input
+      ? {
+          input: {
+            ...input,
+            completionRequest: {
+              ...input.completionRequest,
+              closeoutText: {
+                redacted: true,
+                sha256: input.completionRequest.closeoutSha256,
+                byteLength: Buffer.byteLength(input.completionRequest.closeoutText, "utf8"),
+              },
+            },
+          },
+        }
+      : {}),
+    decision: receipt.decision,
+    ...(receipt.writtenAt ? { writtenAt: receipt.writtenAt } : {}),
+  };
+  const serialized = JSON.stringify({ auditReceipt });
+  if (Buffer.byteLength(serialized, "utf8") > FALSE_CLOSEOUT_LEDGER_DETAILS_MAX_BYTES) {
+    throw new Error("false-closeout audit receipt exceeds the bounded SQLite payload limit");
+  }
+  return JSON.parse(serialized) as JsonValue;
 }
 
 function resolveRuntimeAdmissionMode(explicitMode?: MissionMode): MissionMode {

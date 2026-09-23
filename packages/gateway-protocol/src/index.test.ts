@@ -14,6 +14,12 @@ import {
   validateNodePairRequestParams,
   validateNodePresenceAlivePayload,
   validateTasksCancelParams,
+  validateTasksGovernanceApplyParams,
+  validateTasksGovernanceApplyResult,
+  validateTasksGovernancePreviewParams,
+  validateTasksGovernancePreviewResult,
+  validateTasksGovernanceStatusParams,
+  validateTasksGovernanceStatusResult,
   validateTasksListParams,
   validateTalkConfigResult,
   validateTalkEvent,
@@ -670,6 +676,114 @@ describe("validateTasksListParams", () => {
   it("rejects internal task statuses and unknown fields", () => {
     expect(validateTasksListParams({ status: "succeeded" })).toBe(false);
     expect(validateTasksCancelParams({ taskId: "task-1", force: true })).toBe(false);
+  });
+});
+
+describe("governed task protocol validators", () => {
+  it("accepts closed status and preview parameter contracts", () => {
+    expect(validateTasksGovernanceStatusParams({ lookup: "flow-1", receiptLimit: 20 })).toBe(true);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "requestCloseout",
+      }),
+    ).toBe(true);
+    expect(
+      validateTasksGovernanceStatusResult({
+        flowId: "flow-1",
+        flowRevision: 0,
+        governed: false,
+        malformed: false,
+        canonical: false,
+        mission: null,
+        receipts: [],
+      }),
+    ).toBe(true);
+    expect(validateTasksGovernancePreviewResult({ preview: { status: "not_found" } })).toBe(true);
+    expect(
+      validateTasksGovernanceApplyParams({
+        lookup: "flow-1",
+        expectedRevision: 0,
+        idempotencyKey: "start-1",
+        action: { operation: "startWorkOrder" },
+      }),
+    ).toBe(true);
+    expect(
+      validateTasksGovernanceApplyParams({
+        lookup: "flow-1",
+        expectedRevision: 3,
+        idempotencyKey: "validation-1",
+        action: {
+          operation: "recordValidationResult",
+          proofTaskId: "validation-task-1",
+        },
+      }),
+    ).toBe(true);
+    expect(validateTasksGovernanceApplyResult({ status: "not_found" })).toBe(true);
+  });
+
+  it("rejects unknown fields and invalid governed operation parameters", () => {
+    expect(validateTasksGovernanceStatusParams({ lookup: "flow-1", mutate: true })).toBe(false);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "recordValidationResult",
+        passed: true,
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "requestCloseout",
+        owner: "Will",
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "requestCloseout",
+        bindings: { contractHash: "contract-hash" },
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "openExecutionLease",
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "closeExecutionLease",
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernancePreviewParams({
+        lookup: "flow-1",
+        operation: "bypassRelease",
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernancePreviewResult({
+        preview: { status: "not_found", releaseAllowed: true },
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernanceApplyParams({
+        lookup: "flow-1",
+        expectedRevision: 3,
+        idempotencyKey: "artifact-1",
+        action: { operation: "verifyRequiredArtifacts", passed: true },
+      }),
+    ).toBe(false);
+    expect(
+      validateTasksGovernanceApplyParams({
+        lookup: "flow-1",
+        expectedRevision: 3,
+        idempotencyKey: "watchdog-1",
+        action: { operation: "recordPostTerminalWatchdog", passed: true },
+      }),
+    ).toBe(false);
   });
 });
 

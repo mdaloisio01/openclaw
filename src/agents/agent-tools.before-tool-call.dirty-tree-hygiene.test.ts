@@ -14,6 +14,8 @@ import {
 } from "../governance/governed-supervisor-receipt.js";
 import type { MissionSpecificToolEnforcementAuthority } from "../governance/mission-specific-tool-enforcement.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { createEmptyPluginRegistry } from "../plugins/registry.js";
+import { setActivePluginRegistry } from "../plugins/runtime.js";
 import type { RunRecord } from "../process/supervisor/types.js";
 import {
   runBeforeToolCallHook,
@@ -50,6 +52,7 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
 
   afterEach(() => {
     setDirtyTreeHygieneStatusReaderForTest();
+    setActivePluginRegistry(createEmptyPluginRegistry());
     delete process.env.OPENCLAW_GOVERNED_BUILD_WORKSPACE_METADATA;
   });
 
@@ -151,6 +154,7 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
       sourceRevision: "31d50dc436ddada2c38cb02e33a9e68a20216959",
       runtimeBuildSha256: "openclaw-2026.6.2-a87590b",
       policyVersion: "sop-enforcement-v1",
+      skillSha256: "skill-sha",
       mode: "shadow",
       authoritativeCompletionOwner: "governed_mission_state",
       requiredReceiptKinds: [...GOVERNED_REQUIRED_RECEIPT_KINDS],
@@ -790,7 +794,7 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
     expect(result.blocked ? result.reason : "").toContain("MISSING_SUPERVISOR_WRAPPER");
   });
 
-  it("allows governed exec when the required supervisor wrapper is active", async () => {
+  it("withholds arbitrary governed exec even when the required supervisor wrapper is active", async () => {
     const params = {
       cmd: "bash scripts/repair-governance.sh",
       sandbox_permissions: "require_escalated",
@@ -821,7 +825,444 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
       },
     });
 
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    expect(result.blocked ? result.reason : "").toContain("POLICY_BLOCKED");
+    expect(result.blocked ? result.reason : "").toContain("require_closeout_and_release");
+  });
+
+  it.each([
+    ["nodes", { action: "notify", node: "device-1", body: "private result" }],
+    ["process", { action: "write", sessionId: "pty-1", data: "private result" }],
+    ["process", { action: "send_keys", sessionId: "pty-1", keys: ["ENTER"] }],
+  ])("withholds governed %s runtime mutations", async (toolName, params) => {
+    const result = await runBeforeToolCallHook({
+      toolName,
+      params,
+      ctx: {
+        agentId: "main",
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    expect(result.blocked ? result.reason : "").toContain("POLICY_BLOCKED");
+    expect(result.blocked ? result.reason : "").toContain("require_closeout_and_release");
+  });
+
+  it.each([
+    ["nodes", { action: "status" }],
+    ["process", { action: "poll", sessionId: "pty-1" }],
+  ])("allows governed read-only %s inspection", async (toolName, params) => {
+    const result = await runBeforeToolCallHook({
+      toolName,
+      params,
+      ctx: {
+        agentId: "main",
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
     expect(result).toEqual({ blocked: false, params });
+  });
+
+  it("authorizes trusted-policy rewrites using the final tool parameters", async () => {
+    const registry = createEmptyPluginRegistry();
+    registry.trustedToolPolicies = [
+      {
+        pluginId: "trusted-rewrite",
+        pluginName: "Trusted Rewrite",
+        source: "test",
+        policy: {
+          id: "rewrite-node-status",
+          description: "Rewrite the node action for the regression fixture",
+          evaluate: () => ({
+            params: { action: "notify", node: "device-1", body: "private result" },
+          }),
+        },
+      },
+    ];
+    setActivePluginRegistry(registry);
+    const observedInvocations: unknown[] = [];
+    try {
+      const result = await runBeforeToolCallHook({
+        toolName: "nodes",
+        params: { action: "status" },
+        ctx: {
+          agentId: "main",
+          cwd: "/home/will/openclaw-source",
+          workspaceDir: "/home/will/openclaw-source",
+          governedMissionToolEnforcement: {
+            active: true,
+            conversationClassification: "governed",
+            expectedCurrentStep: "SOP-ENF-10",
+            trustedHostPolicy: {
+              trustedHost: true,
+              openclawAllows: true,
+              osAllows: true,
+              hostAllows: true,
+            },
+            authority: governedToolAuthority(),
+            onDecision: (_decision, invocation) => observedInvocations.push(invocation),
+          },
+        },
+      });
+
+      expect(result).toMatchObject({
+        blocked: true,
+        deniedReason: "governed-mission-tool-enforcement",
+      });
+      expect(observedInvocations).toEqual([
+        expect.objectContaining({
+          params: { action: "notify", node: "device-1", body: "private result" },
+        }),
+      ]);
+    } finally {
+      setActivePluginRegistry(createEmptyPluginRegistry());
+    }
+  });
+
+  it("withholds shell diagnostics during governed execution", async () => {
+    const params = { cmd: "git status --short" };
+
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.exec_command",
+      params,
+      ctx: {
+        agentId: "main",
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+  });
+
+  it("withholds governed shell file reads even for workspace targets", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-governed-read-"));
+    await fs.writeFile(path.join(workspaceDir, "status.txt"), "ready\n", "utf8");
+    const params = { cmd: "cat status.txt" };
+
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.exec_command",
+      params,
+      ctx: {
+        agentId: "main",
+        cwd: workspaceDir,
+        workspaceDir,
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["an absolute target outside the workspace", "cat /proc/self/environ"],
+    ["a backslash-escaped absolute target", "cat \\/proc/self/environ"],
+    ["a quote-spliced absolute target", 'cat /pro"c/self/environ"'],
+    ["a traversing target outside the workspace", "cat ../credentials/token"],
+    ["a secret-bearing workspace target", "cat credentials/provider.json"],
+    ["an expanding workspace target", "cat *"],
+  ])("withholds governed file diagnostics containing %s", async (_label, command) => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-governed-read-"));
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.exec_command",
+      params: { cmd: command },
+      ctx: {
+        agentId: "main",
+        cwd: workspaceDir,
+        workspaceDir,
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  });
+
+  it("withholds governed file diagnostics when an in-workspace symlink escapes", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-governed-read-"));
+    await fs.symlink("/proc/self/environ", path.join(workspaceDir, "environment"));
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.exec_command",
+      params: { cmd: "cat environment" },
+      ctx: {
+        agentId: "main",
+        cwd: workspaceDir,
+        workspaceDir,
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  });
+
+  it.each(["start", "stop", "import", "summarize"])(
+    "withholds governed transcript %s mutations",
+    async (action) => {
+      const params = { action };
+      const result = await runBeforeToolCallHook({
+        toolName: "transcripts",
+        params,
+        ctx: {
+          agentId: "main",
+          cwd: "/home/will/openclaw-source",
+          workspaceDir: "/home/will/openclaw-source",
+          governedMissionToolEnforcement: {
+            active: true,
+            conversationClassification: "governed",
+            expectedCurrentStep: "SOP-ENF-10",
+            trustedHostPolicy: {
+              trustedHost: true,
+              openclawAllows: true,
+              osAllows: true,
+              hostAllows: true,
+            },
+            authority: governedToolAuthority(),
+          },
+        },
+      });
+
+      expect(result).toMatchObject({
+        blocked: true,
+        kind: "veto",
+        deniedReason: "governed-mission-tool-enforcement",
+      });
+    },
+  );
+
+  it("allows governed transcript status inspection", async () => {
+    const params = { action: "status" };
+    const result = await runBeforeToolCallHook({
+      toolName: "transcripts",
+      params,
+      ctx: {
+        agentId: "main",
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toEqual({ blocked: false, params });
+  });
+
+  it("withholds a governed core read even for a non-secret workspace file", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-governed-read-"));
+    const pathname = path.join(workspaceDir, "status.txt");
+    await fs.writeFile(pathname, "ready\n", "utf8");
+    const params = { path: pathname };
+    const result = await runBeforeToolCallHook({
+      toolName: "read",
+      params,
+      ctx: {
+        agentId: "main",
+        cwd: workspaceDir,
+        workspaceDir,
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["an arbitrary host path", "/proc/self/environ"],
+    ["a workspace secret path", "credentials/provider.json"],
+  ])("withholds a governed core read of %s", async (_label, pathname) => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-governed-read-"));
+    const result = await runBeforeToolCallHook({
+      toolName: "read",
+      params: { path: pathname },
+      ctx: {
+        agentId: "main",
+        cwd: workspaceDir,
+        workspaceDir,
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    await fs.rm(workspaceDir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ["a second shell command", 'git status\npython -c "print(1)"'],
+    ["an in-place editor", "sed -i s/old/new/ file.txt"],
+    ["a deleting file search", "find . -delete"],
+    ["a mutating git subcommand", "git branch -D release"],
+    ["a jq environment read", "jq -n env"],
+    ["a recursive grep", "grep -R . ."],
+    ["an unsupported git status option", "git status --short --bogus"],
+  ])("withholds governed diagnostics containing %s", async (_label, command) => {
+    const result = await runBeforeToolCallHook({
+      toolName: "functions.exec_command",
+      params: { cmd: command },
+      ctx: {
+        agentId: "main",
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+        governedMissionToolEnforcement: {
+          active: true,
+          conversationClassification: "governed",
+          expectedCurrentStep: "SOP-ENF-10",
+          trustedHostPolicy: {
+            trustedHost: true,
+            openclawAllows: true,
+            osAllows: true,
+            hostAllows: true,
+          },
+          authority: governedToolAuthority(),
+        },
+      },
+    });
+
+    expect(result).toMatchObject({
+      blocked: true,
+      kind: "veto",
+      deniedReason: "governed-mission-tool-enforcement",
+    });
+    expect(result.blocked ? result.reason : "").toContain("POLICY_BLOCKED");
+    expect(result.blocked ? result.reason : "").toContain("require_closeout_and_release");
   });
 
   it("blocks governed exec when the supervisor wrapper is active but receipt proof is missing", async () => {
@@ -961,6 +1402,73 @@ describe("before_tool_call dirty-tree hygiene gate", () => {
     });
     expect(result.blocked ? result.reason : "").toContain("Use isolated worktree");
     expect(statusCalls).toEqual([]);
+  });
+
+  it("applies workspace vetoes before approval side effects", async () => {
+    const onResolution = vi.fn();
+    const registry = createEmptyPluginRegistry();
+    registry.trustedToolPolicies = [
+      {
+        pluginId: "trusted-policy",
+        pluginName: "Trusted Policy",
+        source: "test",
+        policy: {
+          id: "workspace-approval-policy",
+          description: "Require approval for source mutation",
+          evaluate: () => ({
+            requireApproval: {
+              pluginId: "trusted-policy",
+              title: "Source mutation approval",
+              description: "Approve the source mutation",
+              onResolution,
+            },
+          }),
+        },
+      },
+    ];
+    setActivePluginRegistry(registry);
+    const statusCalls: string[] = [];
+    setStatus(broadMixedStatus(), statusCalls);
+
+    const rootBlocked = await runBeforeToolCallHook({
+      toolName: "write",
+      params: { path: "src/infra/governed-build-workspace.ts", content: "mutation" },
+      approvalMode: "report",
+      ctx: {
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+        governedBuildWorkspace: {
+          active: true,
+          buildId: "clean-tree",
+          sourceRoot: "/home/will/openclaw-source",
+          worktreePath:
+            "/home/will/.openclaw/workspace-orchestrator/var/governed_build_workspaces/clean-tree/source",
+          allowedWriteScopes: ["src/infra"],
+          markFacingExportRoots: [],
+        },
+      },
+    });
+    expect(rootBlocked).toMatchObject({
+      blocked: true,
+      deniedReason: "governed-build-root-mutation-guard",
+    });
+
+    const dirtyTreeBlocked = await runBeforeToolCallHook({
+      toolName: "write",
+      params: { path: "src/infra/governed-build-workspace.ts", content: "mutation" },
+      approvalMode: "report",
+      ctx: {
+        cwd: "/home/will/openclaw-source",
+        workspaceDir: "/home/will/openclaw-source",
+      },
+    });
+    expect(dirtyTreeBlocked).toMatchObject({
+      blocked: true,
+      deniedReason: "dirty-tree-hygiene",
+    });
+    expect(onResolution).not.toHaveBeenCalled();
+    expect(hookRunner.runBeforeToolCall).not.toHaveBeenCalled();
+    expect(statusCalls).toEqual(["git -C /home/will/openclaw-source status --short"]);
   });
 
   it("allows governed build mutation inside the active isolated worktree", async () => {

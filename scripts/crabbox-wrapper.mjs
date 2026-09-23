@@ -1653,7 +1653,7 @@ function remoteAwsMacosJsBootstrap({ packageManager = false } = {}) {
     'mkdir -p "$tool_root" || { status=$?; return "$status"; };',
     'install_lock="$tool_root/.node-${node_version}-${node_arch}.lock";',
     "lock_acquired=0;",
-    'lock_deadline=$((SECONDS + 300));',
+    "lock_deadline=$((SECONDS + 300));",
     "while true; do",
     'if mkdir "$install_lock" 2>/dev/null; then lock_acquired=1; printf "%s\\n" "$$" >"$install_lock/pid" || { status=$?; rm -rf "$install_lock"; return "$status"; }; break; fi;',
     'if [ -x "$node_dir/bin/node" ] && [ -f "$ready_marker" ]; then break; fi;',
@@ -1662,11 +1662,11 @@ function remoteAwsMacosJsBootstrap({ packageManager = false } = {}) {
     'if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then echo "timed out waiting for active macOS Node toolchain install lock: $install_lock pid=$lock_pid" >&2; return 1; fi;',
     'echo "reclaiming stale macOS Node toolchain install lock: $install_lock" >&2;',
     'rm -rf "$install_lock" || return 1;',
-    'lock_deadline=$((SECONDS + 300));',
+    "lock_deadline=$((SECONDS + 300));",
     "fi;",
     "sleep 1;",
     "done;",
-    "release_install_lock() { if [ \"$lock_acquired\" = \"1\" ]; then rm -rf \"$install_lock\" 2>/dev/null || true; fi; };",
+    'release_install_lock() { if [ "$lock_acquired" = "1" ]; then rm -rf "$install_lock" 2>/dev/null || true; fi; };',
     'if [ ! -x "$node_dir/bin/node" ] || [ ! -f "$ready_marker" ]; then',
     'tmp_dir="$(mktemp -d)" || { release_install_lock; return 1; };',
     'pkg="node-v${node_version}-darwin-${node_arch}.tar.gz";',
@@ -2006,7 +2006,7 @@ const providerHelpOmissions = new Set(["tensorlake"]);
 
 function addProviderNames(names, text) {
   for (const name of text
-    .replace(/\s+\(default\b.*$/u, "")
+    .replace(/\s+\(defaults?\b.*$/u, "")
     .split(/\s*(?:,|\||\bor\b)\s*/u)
     .map((s) => s.trim())
     .filter(Boolean)) {
@@ -2018,12 +2018,12 @@ function addProviderNames(names, text) {
 
 function providerListContinuation(line, previousText) {
   const match = line.match(
-    /^\s*((?:or\s+)?[a-z0-9][a-z0-9-]*(?:\s*(?:,|\||\bor\b)\s*(?:or\s+)?[a-z0-9][a-z0-9-]*)*\s*(?:,|\|)?)(?:\s+\(default\b.*)?\s*$/u,
+    /^\s*((?:or\s+)?[a-z0-9][a-z0-9-]*(?:\s*(?:,|\||\bor\b)\s*(?:or\s+)?[a-z0-9][a-z0-9-]*)*\s*(?:,|\|)?)(?:\s+\(defaults?\b.*)?\s*$/u,
   );
   if (!match) {
     return "";
   }
-  if (/[,|]\s*$/u.test(previousText) || /[,|]|\bor\b|\(default\b/u.test(line)) {
+  if (/[,|]\s*$/u.test(previousText) || /[,|]|\bor\b|\(defaults?\b/u.test(line)) {
     return match[1];
   }
   return "";
@@ -2034,10 +2034,10 @@ function parseProvidersFromHelp(text) {
   const lines = text.split(/\r?\n/u);
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
-    const providerMatch = line.match(/provider:\s*([a-z0-9][a-z0-9, -]*)(?:\s*\(default\b|$)/u);
+    const providerMatch = line.match(/provider:\s*([a-z0-9][a-z0-9, -]*)(?:\s*\(defaults?\b|$)/u);
     if (providerMatch) {
       let providerText = providerMatch[1];
-      while (!/\(default\b/u.test(lines[index]) && index + 1 < lines.length) {
+      while (!/\(defaults?\b/u.test(lines[index]) && index + 1 < lines.length) {
         const continuation = providerListContinuation(lines[index + 1], providerText);
         if (!continuation) {
           break;

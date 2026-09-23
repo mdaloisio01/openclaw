@@ -16,6 +16,7 @@ import {
   pruneUntrackedGeneratedSourceDeclarations,
   resolveTsdownDtsMode,
   resolveTsdownBuildInvocation,
+  resolveTsdownBuildInvocations,
   runTsdownBuildInvocation,
 } from "../../scripts/tsdown-build.mjs";
 import { createScriptTestHarness } from "./test-helpers.js";
@@ -105,6 +106,27 @@ describe("resolveTsdownBuildInvocation", () => {
     expect(result.args).toContain("tsdown");
     expect(result.args).toEqual(expect.arrayContaining(["--config-loader", "unrun", "--no-clean"]));
     expect(result.args.slice(-2)).toEqual(["--format", "esm"]);
+  });
+
+  it("runs configured builds in separate processes when serial mode is requested", () => {
+    const params = {
+      args: ["--format", "esm"],
+      env: {
+        OPENCLAW_BUILD_ALL_NO_PNPM: "1",
+        OPENCLAW_TSDOWN_SERIAL_BUILD: "1",
+        NODE_OPTIONS: "--max-old-space-size=5120",
+      },
+      ...NO_MEMORY_LIMIT,
+    };
+    const invocations = resolveTsdownBuildInvocations(params);
+
+    expect(invocations).toHaveLength(countTsdownConfigBlocks());
+    expect(invocations[0]?.args).toEqual(
+      expect.arrayContaining(["--format", "esm", "--filter", "openclaw-build-0"]),
+    );
+    expect(invocations.at(-1)?.args.at(-1)).toBe(`openclaw-build-${invocations.length - 1}`);
+    expect(invocations[0]?.options.env.NODE_OPTIONS).toBe("--max-old-space-size=5120");
+    expect(resolveTsdownBuildInvocations({ ...params, env: {} })).toHaveLength(1);
   });
 
   it("routes Windows tsdown builds through the pnpm runner instead of shell=true", () => {
@@ -537,6 +559,11 @@ describe("resolveTsdownBuildInvocation", () => {
     );
 
     expect(countTsdownConfigBlocks({ cwd: rootDir })).toBe(3);
+  });
+
+  it("keeps the serial build count aligned with the actual config array", async () => {
+    const { default: configs } = await import("../../tsdown.config.ts");
+    expect(configs).toHaveLength(countTsdownConfigBlocks());
   });
 
   it("formats heartbeats with pid, elapsed time, rss, and DTS state", () => {

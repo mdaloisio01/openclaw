@@ -376,6 +376,15 @@ describe("artifacts RPC handlers", () => {
     expect(artifacts[0]).not.toHaveProperty("data");
   });
 
+  it("does not project artifacts from display-hidden transcript messages", () => {
+    const artifacts = collectArtifactsFromMessages({
+      sessionKey: "agent:main:governed",
+      messages: [{ ...resultImageMessage(), display: false }],
+    });
+
+    expect(artifacts).toEqual([]);
+  });
+
   it("hydrates inline data only for the requested download artifact", () => {
     const messages = [
       {

@@ -10,6 +10,8 @@ import {
 } from "./run.overflow-compaction.harness.js";
 
 let runEmbeddedAgent: typeof import("./run.js").runEmbeddedAgent;
+let hasOwnerRunForGovernedMissionAdmission: typeof import("../../governance/governed-mission-owner-run-fence.js").hasOwnerRunForGovernedMissionAdmission;
+let beginActiveToolExecution: typeof import("../active-tool-execution-tracker.js").beginActiveToolExecution;
 
 function firstBeforeAgentReplyCall() {
   const call = mockedGlobalHookRunner.runBeforeAgentReply.mock.calls[0];
@@ -36,6 +38,9 @@ function firstAttemptParams(): {
 describe("runEmbeddedAgent cron before_agent_reply seam", () => {
   beforeAll(async () => {
     ({ runEmbeddedAgent } = await loadRunOverflowCompactionHarness());
+    ({ hasOwnerRunForGovernedMissionAdmission } =
+      await import("../../governance/governed-mission-owner-run-fence.js"));
+    ({ beginActiveToolExecution } = await import("../active-tool-execution-tracker.js"));
   });
 
   beforeEach(() => {
@@ -157,5 +162,69 @@ describe("runEmbeddedAgent cron before_agent_reply seam", () => {
     });
 
     expect(firstAttemptParams().promptCacheKey).toBe("cron-cache-key");
+  });
+
+  it("fences governed admission from call entry through queued run completion", async () => {
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+    let releaseQueue!: () => void;
+    const queueGate = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+    let firstEnqueue = true;
+
+    const run = runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      enqueue: async (task) => {
+        if (firstEnqueue) {
+          firstEnqueue = false;
+          await queueGate;
+        }
+        return await task();
+      },
+    });
+
+    expect(hasOwnerRunForGovernedMissionAdmission("test-key")).toBe(true);
+    releaseQueue();
+    await run;
+    expect(hasOwnerRunForGovernedMissionAdmission("test-key")).toBe(false);
+  });
+
+  it("fences governed admission by canonical session owner instead of sandbox policy key", async () => {
+    mockedRunEmbeddedAttempt.mockResolvedValueOnce(makeAttemptResult({ promptError: null }));
+    let releaseQueue!: () => void;
+    const queueGate = new Promise<void>((resolve) => {
+      releaseQueue = resolve;
+    });
+
+    const run = runEmbeddedAgent({
+      ...overflowBaseRunParams,
+      sandboxSessionKey: "agent:main:peer-policy-key",
+      enqueue: async (task) => {
+        await queueGate;
+        return await task();
+      },
+    });
+
+    expect(hasOwnerRunForGovernedMissionAdmission("test-key")).toBe(true);
+    expect(hasOwnerRunForGovernedMissionAdmission("agent:main:peer-policy-key")).toBe(false);
+    releaseQueue();
+    await run;
+    expect(hasOwnerRunForGovernedMissionAdmission("test-key")).toBe(false);
+  });
+
+  it("keeps governed admission fenced until timed-out tool execution drains", async () => {
+    let finishToolExecution: (() => void) | undefined;
+    mockedRunEmbeddedAttempt.mockImplementationOnce(async () => {
+      finishToolExecution = beginActiveToolExecution(overflowBaseRunParams.runId, "late-tool");
+      return makeAttemptResult({ promptError: null });
+    });
+
+    await runEmbeddedAgent(overflowBaseRunParams);
+
+    expect(hasOwnerRunForGovernedMissionAdmission("test-key")).toBe(true);
+    finishToolExecution?.();
+    await vi.waitFor(() => {
+      expect(hasOwnerRunForGovernedMissionAdmission("test-key")).toBe(false);
+    });
   });
 });

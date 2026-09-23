@@ -365,6 +365,41 @@ describe("task-flow-registry", () => {
     expect(getTaskFlowById(created.flowId)?.flowId).toBe(created.flowId);
   });
 
+  it("refuses generic deletion of restored governed tombstones", () => {
+    const deleteFlow = vi.fn();
+    const governed: TaskFlowRecord = {
+      flowId: "governed-tombstone",
+      syncMode: "managed",
+      ownerKey: "agent:main:governed-tombstone",
+      controllerId: "tests/governed-tombstone",
+      revision: 4,
+      status: "succeeded",
+      notifyPolicy: "done_only",
+      goal: "Retain the governed owner claim",
+      stateJson: {
+        governedMissionState: {
+          schema: "openclaw.governed_mission_state.v2",
+          missionId: "governed-tombstone-mission",
+        },
+      },
+      createdAt: 1,
+      updatedAt: 2,
+      endedAt: 2,
+    };
+    configureTaskFlowRegistryRuntime({
+      store: {
+        loadSnapshot: () => ({ flows: new Map([[governed.flowId, governed]]) }),
+        saveSnapshot: () => {},
+        deleteFlow,
+      },
+    });
+
+    expect(getTaskFlowById(governed.flowId)).toEqual(governed);
+    expect(deleteTaskFlowRecordById(governed.flowId)).toBe(false);
+    expect(deleteFlow).not.toHaveBeenCalled();
+    expect(getTaskFlowById(governed.flowId)).toEqual(governed);
+  });
+
   it("normalizes restored managed flows without a controller id", () => {
     configureTaskFlowRegistryRuntime({
       store: {
@@ -1030,6 +1065,79 @@ describe("task-flow-registry", () => {
         throw new Error("Expected close after lawful whole-run completion");
       }
       expect(closed.flow.status).toBe("succeeded");
+    });
+  });
+
+  it("fails closed when a governed mission state value is present but invalid", async () => {
+    await withFlowRegistryTempDir(async (root) => {
+      process.env.OPENCLAW_STATE_DIR = root;
+      resetTaskFlowRegistryForTests();
+      const malformed: TaskFlowRecord = {
+        flowId: "malformed-governed-flow",
+        syncMode: "managed",
+        ownerKey: "agent:main:main",
+        controllerId: "tests/governed-invalid-state",
+        revision: 0,
+        status: "running",
+        notifyPolicy: "done_only",
+        goal: "Do not close malformed governed state",
+        stateJson: {
+          governedMissionState: {
+            schema: "openclaw.governed_mission_state.v2",
+            missionId: "mission-with-incomplete-state",
+          },
+        },
+        createdAt: 1,
+        updatedAt: 1,
+      };
+      configureTaskFlowRegistryRuntime({
+        store: {
+          loadSnapshot: () => ({ flows: new Map([[malformed.flowId, malformed]]) }),
+          saveSnapshot: () => {},
+        },
+      });
+
+      const result = finishFlow({
+        flowId: malformed.flowId,
+        expectedRevision: malformed.revision,
+      });
+      expect(result).toMatchObject({
+        applied: false,
+        reason: "guard_blocked",
+        blockedSummary: expect.stringContaining("state is present but invalid"),
+      });
+      expect(getTaskFlowById(malformed.flowId)).toMatchObject({ status: "running" });
+    });
+  });
+
+  it("reserves governed mission state creation for the admission runtime", async () => {
+    await withFlowRegistryTempDir(async () => {
+      expect(() =>
+        createManagedTaskFlow({
+          ownerKey: "agent:main:main",
+          controllerId: "tests/governed-state-injection",
+          goal: "Inject governed state",
+          stateJson: { governedMissionState: {} },
+        }),
+      ).toThrow("can only be created by the governed mission admission runtime");
+      expect(listTaskFlowRecords()).toEqual([]);
+
+      const ordinary = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/ordinary-flow",
+        goal: "Ordinary flow",
+      });
+      expect(
+        updateFlowRecordByIdExpectedRevision({
+          flowId: ordinary.flowId,
+          expectedRevision: ordinary.revision,
+          patch: { stateJson: { governedMissionState: {} } },
+        }),
+      ).toMatchObject({
+        applied: false,
+        reason: "guard_blocked",
+        blockedSummary: expect.stringContaining("admission runtime"),
+      });
     });
   });
 

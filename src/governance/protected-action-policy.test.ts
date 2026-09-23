@@ -90,6 +90,7 @@ describe("protected action and trusted host policy foundation", () => {
       "plugin_mutation",
     );
     expect(classifyProtectedAction({ externalSideEffect: true })).toBe("external_side_effect");
+    expect(classifyProtectedAction({ finalOutput: true })).toBe("external_side_effect");
     expect(classifyProtectedAction({ projectDefinedHighAuthority: true })).toBe(
       "project_defined_high_authority",
     );

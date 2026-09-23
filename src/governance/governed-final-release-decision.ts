@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   recomputePinnedReleaseStateHash,
   type GovernedPinnedReleaseState,
@@ -7,6 +8,26 @@ export const GOVERNED_FINAL_RELEASE_DECISION_VERSION =
   "governed-final-release-decision-v1" as const;
 export const GOVERNED_FINAL_RELEASE_WITHHELD_NOTICE =
   "Governed result withheld because compliance state could not be verified.";
+
+export function computeGovernedFinalPayloadHash(payload: unknown): string {
+  return createHash("sha256")
+    .update(JSON.stringify(sortJson(payload)))
+    .digest("hex");
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortJson);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value)
+        .toSorted(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, sortJson(entry)]),
+    );
+  }
+  return value;
+}
 
 export type GovernedFinalReleaseCheck = {
   missionId: string;

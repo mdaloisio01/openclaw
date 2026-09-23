@@ -10,6 +10,7 @@ import {
   clearMemoryPluginState,
   registerMemoryPromptSection,
 } from "../../../plugins/memory-state.js";
+import { beginActiveToolExecution } from "../../active-tool-execution-tracker.js";
 import {
   type AttemptContextEngine,
   buildLoopPromptCacheInfo,
@@ -1645,6 +1646,290 @@ describe("runEmbeddedAttempt context engine sessionKey forwarding", () => {
     expect(result.finalPromptText).toBeUndefined();
     expect(result.promptErrorSource).toBe("hook:before_agent_run");
     expectInitialLockReleasedBeforePostTurnWrite(lockEvents);
+  });
+
+  it("binds governed mission tool enforcement before provider submission", async () => {
+    const onPartialReply = vi.fn();
+    const onAssistantMessageStart = vi.fn();
+    const onBlockReply = vi.fn();
+    const onBlockReplyFlush = vi.fn();
+    const toolEnforcement = {
+      active: true,
+      conversationClassification: "governed",
+      expectedCurrentStep: "execute_required_work",
+      trustedHostPolicy: {
+        trustedHost: true,
+        openclawAllows: true,
+        osAllows: true,
+        hostAllows: true,
+      },
+      authority: {},
+      onDecision: vi.fn(),
+    };
+    const runAgentEnd = vi.fn(async () => {});
+    const runLlmOutput = vi.fn(async () => {});
+    const runLlmInput = vi.fn(async () => {});
+    const runBeforeAgentRun = vi.fn(async () => ({ decision: { outcome: "allow" } }));
+    const runBeforePromptBuild = vi.fn(async () => ({ prependContext: "secret hook context" }));
+    const runBeforeAgentStart = vi.fn(async () => ({ prependContext: "secret legacy context" }));
+    hoisted.getGlobalHookRunnerMock.mockReturnValue({
+      hasHooks: vi.fn(
+        (name: string) =>
+          name === "agent_end" ||
+          name === "llm_input" ||
+          name === "llm_output" ||
+          name === "before_agent_run" ||
+          name === "before_prompt_build" ||
+          name === "before_agent_start",
+      ),
+      runAgentEnd,
+      runLlmOutput,
+      runLlmInput,
+      runBeforeAgentRun,
+      runBeforePromptBuild,
+      runBeforeAgentStart,
+    });
+    const afterTurn = vi.fn(async () => {});
+    const governedContextEngine = createContextEngineBootstrapAndAssemble();
+    hoisted.prepareGovernedMissionAgentRunMock.mockReturnValue({
+      status: "bound",
+      flowId: "governed-flow-1",
+      attemptReceiptId: "governed-attempt-1",
+      toolEnforcement,
+    });
+    const sessionPrompt = vi.fn(async (session) => {
+      const subscription = hoisted.subscribeEmbeddedAgentSessionMock.mock.calls[0]?.[0];
+      await subscription?.onPartialReply?.({ text: "secret partial" });
+      await subscription?.onAssistantMessageStart?.();
+      await subscription?.onBlockReply?.({ text: "secret block" });
+      await subscription?.onBlockReplyFlush?.();
+      session.messages = [
+        ...session.messages,
+        {
+          api: "responses",
+          provider: "openai",
+          model: "gpt-5.5",
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          role: "assistant",
+          content: "secret governed final",
+          timestamp: 2,
+          stopReason: "stop",
+        },
+      ];
+    });
+
+    const result = await createContextEngineAttemptRunner({
+      contextEngine: {
+        ...governedContextEngine,
+        afterTurn,
+      },
+      sessionKey,
+      tempPaths,
+      trajectory: true,
+      sessionPrompt,
+      attemptOverrides: {
+        config: {
+          tools: {
+            web: {
+              search: {
+                enabled: true,
+                openaiCodex: { enabled: true, mode: "live" },
+              },
+            },
+          },
+        },
+        disableTools: false,
+        governedMissionContentHooksSuppressed: true,
+        deferGovernedMissionLeaseClose: true,
+        sandboxSessionKey: "agent:main:peer-policy-key",
+        onPartialReply,
+        onAssistantMessageStart,
+        onBlockReply,
+        onBlockReplyFlush,
+      },
+    });
+
+    expect(
+      mockParams(hoisted.prepareGovernedMissionAgentRunMock, 0, "governed preparation"),
+    ).toMatchObject({
+      ownerKey: sessionKey,
+      runId: expect.stringMatching(/^run-context-engine-forwarding:attempt:/u),
+      readObservedSkillSha256: expect.any(Function),
+    });
+    const toolOptions = mockParams(hoisted.splitSdkToolsMock, 0, "splitSdkTools governed options");
+    const creationOptions = mockParams(
+      hoisted.createOpenClawCodingToolsMock,
+      0,
+      "createOpenClawCodingTools governed options",
+    );
+    expect(creationOptions).toMatchObject({
+      suppressManagedWebSearch: false,
+      config: { tools: { web: { search: { enabled: true } } } },
+    });
+    const providerRegistration = mockParams(
+      hoisted.registerProviderStreamForModelMock,
+      0,
+      "governed provider registration",
+    );
+    expect(providerRegistration).toMatchObject({
+      cfg: {
+        tools: {
+          web: {
+            search: {
+              enabled: false,
+              openaiCodex: { enabled: true, mode: "live" },
+            },
+          },
+        },
+      },
+    });
+    expect(mockArg(hoisted.applyExtraParamsToAgentMock, 0, 1, "governed provider config")).toEqual(
+      providerRegistration.cfg,
+    );
+    expect(creationOptions.beforeToolCallHookContext).toBe(toolOptions.toolHookContext);
+    expect(requireRecord(toolOptions.toolHookContext, "governed tool hook context")).toHaveProperty(
+      "governedMissionToolEnforcement",
+      toolEnforcement,
+    );
+    expect(sessionPrompt).toHaveBeenCalledTimes(1);
+    expect(result.governedMissionFlowId).toBe("governed-flow-1");
+    expect(result.governedMissionAttemptReceiptId).toBe("governed-attempt-1");
+    expect(result.governedMissionExecutionRunId).toMatch(
+      /^run-context-engine-forwarding:attempt:/u,
+    );
+    expect(hoisted.closeGovernedMissionExecutionLeaseMock).not.toHaveBeenCalled();
+    const guardOptions = requireRecord(
+      mockArg(hoisted.guardSessionManagerMock, 0, 1, "governed session guard options"),
+      "governed session guard options",
+    );
+    const shouldHideMessageFromDisplay = guardOptions.shouldHideMessageFromDisplay as
+      | ((message: AgentMessage) => boolean)
+      | undefined;
+    expect(shouldHideMessageFromDisplay?.(seedMessage)).toBe(false);
+    expect(shouldHideMessageFromDisplay?.(doneMessage)).toBe(true);
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(onAssistantMessageStart).not.toHaveBeenCalled();
+    expect(onBlockReply).not.toHaveBeenCalled();
+    expect(onBlockReplyFlush).not.toHaveBeenCalled();
+    expect(afterTurn).not.toHaveBeenCalled();
+    expect(governedContextEngine.bootstrap).not.toHaveBeenCalled();
+    expect(governedContextEngine.assemble).not.toHaveBeenCalled();
+    expect(hoisted.createCacheTraceMock).not.toHaveBeenCalled();
+    expect(hoisted.updateActiveEmbeddedRunSnapshotMock).toHaveBeenCalledWith(
+      "embedded-session",
+      expect.objectContaining({ messages: [] }),
+    );
+    expect(hoisted.updateActiveEmbeddedRunSnapshotMock.mock.calls.at(-1)?.[1]).not.toHaveProperty(
+      "inFlightPrompt",
+    );
+    expect(runBeforeAgentRun).not.toHaveBeenCalled();
+    expect(runBeforePromptBuild).not.toHaveBeenCalled();
+    expect(runBeforeAgentStart).not.toHaveBeenCalled();
+    expect(runAgentEnd).not.toHaveBeenCalled();
+    expect(runLlmOutput).not.toHaveBeenCalled();
+    expect(runLlmInput).not.toHaveBeenCalled();
+    await expect(
+      fs.readFile(path.join(tempPaths[0] ?? "", "session.trajectory.jsonl"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("retries a deferred governed lease close after active tool execution drains", async () => {
+    const toolEnforcement = {
+      active: true,
+      conversationClassification: "governed",
+      expectedCurrentStep: "execute_required_work",
+      trustedHostPolicy: {
+        trustedHost: true,
+        openclawAllows: true,
+        osAllows: true,
+        hostAllows: true,
+      },
+      authority: {},
+      onDecision: vi.fn(),
+    };
+    hoisted.prepareGovernedMissionAgentRunMock.mockReturnValue({
+      status: "bound",
+      flowId: "governed-flow-deferred-retry",
+      attemptReceiptId: "governed-attempt-deferred-retry",
+      toolEnforcement,
+    });
+    hoisted.closeGovernedMissionExecutionLeaseMock
+      .mockImplementationOnce(() => {
+        throw new Error("transient deferred lease persistence failure");
+      })
+      .mockImplementationOnce(() => undefined);
+    const finishToolExecution = beginActiveToolExecution(
+      "run-context-engine-forwarding",
+      "late-governed-tool",
+    );
+
+    try {
+      await expect(
+        createContextEngineAttemptRunner({
+          contextEngine: createContextEngineBootstrapAndAssemble(),
+          sessionKey,
+          tempPaths,
+          attemptOverrides: {
+            governedMissionContentHooksSuppressed: true,
+            deferGovernedMissionLeaseClose: true,
+          },
+        }),
+      ).rejects.toThrow("governed execution lease remains open while tool executions are active");
+      expect(hoisted.closeGovernedMissionExecutionLeaseMock).not.toHaveBeenCalled();
+
+      const executionAttemptId = String(
+        mockParams(hoisted.prepareGovernedMissionAgentRunMock, 0, "governed preparation").runId,
+      );
+      finishToolExecution();
+      await vi.waitFor(() => {
+        expect(hoisted.closeGovernedMissionExecutionLeaseMock).toHaveBeenCalledTimes(2);
+      });
+      expect(hoisted.closeGovernedMissionExecutionLeaseMock.mock.calls).toEqual([
+        [
+          expect.objectContaining({
+            flowId: "governed-flow-deferred-retry",
+            runId: executionAttemptId,
+          }),
+        ],
+        [
+          expect.objectContaining({
+            flowId: "governed-flow-deferred-retry",
+            runId: executionAttemptId,
+          }),
+        ],
+      ]);
+    } finally {
+      finishToolExecution();
+    }
+  });
+
+  it("fails closed before provider submission when governed mission binding is invalid", async () => {
+    const sessionPrompt = vi.fn(async () => {
+      throw new Error("blocked governed prompt should not be submitted");
+    });
+    hoisted.prepareGovernedMissionAgentRunMock.mockReturnValue({
+      status: "blocked",
+      reasonCode: "GOVERNED_MISSION_PROVENANCE_INVALID",
+      message: "Governed mission state is not backed by canonical receipts.",
+    });
+
+    const result = await createContextEngineAttemptRunner({
+      contextEngine: createContextEngineBootstrapAndAssemble(),
+      sessionKey,
+      tempPaths,
+      sessionPrompt,
+    });
+
+    expect(sessionPrompt).not.toHaveBeenCalled();
+    expect(result.promptErrorSource).toBe("hook:before_agent_run");
+    expect(String(result.promptError)).toContain("GOVERNED_MISSION_PROVENANCE_INVALID");
   });
 
   it("preserves provider prompt errors when cleanup reacquire detects session takeover", async () => {

@@ -18,7 +18,7 @@ Adds syntax highlighting for languages outside the default diffs viewer set.
 
 plugin
 
-<!-- openclaw-plugin-reference:manual-start -->
+<span data-openclaw-plugin-reference="manual-start" />
 
 ## Added languages
 
@@ -28,4 +28,4 @@ Examples include Astro, Vue, Svelte, MDX, GraphQL, Terraform/HCL, Nix, Clojure, 
 
 See [Shiki languages](https://shiki.style/languages) for Shiki's upstream language and alias catalog.
 
-<!-- openclaw-plugin-reference:manual-end -->
+<span data-openclaw-plugin-reference="manual-end" />

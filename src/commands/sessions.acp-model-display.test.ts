@@ -32,7 +32,7 @@ import {
  *
  * Decided fix shape (catalog #20, mirrors #18): SENTINEL OVERLAY at the call
  * site, gated on BOTH key shape AND persisted SQLite ACP metadata. Key shape
- * alone is not sufficient because ACP bridge sessions (translator.ts) also use
+ * alone is not sufficient because legacy/explicit ACP bridge sessions can use
  * ACP-shaped keys without ever writing `SessionAcpMeta` — those sessions run
  * the normal configured model and must not receive the sentinel.
  *
@@ -116,8 +116,8 @@ function mockAgentConfigWithCopilotModel(): void {
 }
 
 /**
- * ACP bridge session entry: ACP-shaped key but no ACP metadata. The ACP bridge
- * (translator.ts) uses an in-memory-only session store and never writes
+ * Legacy/explicit ACP bridge session entry: ACP-shaped key but no ACP metadata. The
+ * ACP bridge uses an in-memory-only session store and never writes
  * `SessionAcpMeta` to disk. If a bridge client passes an explicit ACP-shaped
  * key (e.g. `agent:copilot:acp:session-1`) and the Gateway persists the
  * session, it will have an ACP key without ACP metadata. The overlay must NOT
@@ -275,8 +275,8 @@ describe("sessionsCommand model/modelProvider display for ACP sessions (catalog 
     expect(row?.modelProvider).toBe("acpx");
   });
 
-  it("GREEN control: ACP bridge session (ACP key, no ACP metadata) reports the configured model", async () => {
-    // ACP bridge sessions (translator.ts) use ACP-shaped keys but never
+  it("GREEN control: legacy ACP-shaped bridge session without ACP metadata reports the configured model", async () => {
+    // Legacy/explicit ACP bridge sessions can use ACP-shaped keys but never
     // persist SessionAcpMeta. They run the normal configured model
     // and must NOT receive the acpx sentinel. This guards against a regression
     // where key-shape-only detection would misreport bridge sessions.

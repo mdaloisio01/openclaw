@@ -51,6 +51,16 @@ describe("AcpSessionManager", () => {
     });
   });
 
+  it("does not claim unscoped ACP bridge sessions", () => {
+    hoisted.readAcpSessionEntryMock.mockReturnValue(null);
+    const manager = new AcpSessionManager();
+
+    expect(manager.resolveSession({ cfg: baseCfg, sessionKey: "acp:bridge-session" })).toEqual({
+      kind: "none",
+      sessionKey: "acp:bridge-session",
+    });
+  });
+
   it("canonicalizes the main alias before ACP rehydrate after restart", async () => {
     const runtimeState = createRuntime();
     hoisted.requireAcpRuntimeBackendMock.mockReturnValue({

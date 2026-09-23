@@ -8,6 +8,15 @@ import {
 } from "../agents/agent-run-terminal-outcome.js";
 import { shouldRouteCompletionThroughRequesterSession } from "../auto-reply/reply/completion-delivery-policy.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import {
+  cancelGovernedMissionTaskFlow,
+  isGovernedMissionFlowClaimed,
+  isGovernedMissionCancellationComplete,
+} from "../governance/governed-mission-runtime.js";
+import {
+  governedMissionStateBlocksChildCreation,
+  readGovernedMissionStateFromTaskFlow,
+} from "../governance/governed-mission-state.js";
 import { onAgentEvent } from "../infra/agent-events.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { requestHeartbeat } from "../infra/heartbeat-wake.js";
@@ -36,6 +45,7 @@ import {
   updateFlowRecordByIdExpectedRevision,
   type TaskFlowUpdateResult,
 } from "./task-flow-runtime-internal.js";
+import { isParentFlowLinkError, ParentFlowLinkError } from "./task-parent-flow-link-error.js";
 import type { TaskRegistryControlRuntime } from "./task-registry-control.types.js";
 import { getTaskRegistryProcessState } from "./task-registry.process-state.js";
 import {
@@ -107,30 +117,11 @@ type TaskDeliveryOwner = {
   flowId?: string;
 };
 
-export type ParentFlowLinkErrorCode =
-  | "scope_kind_not_session"
-  | "parent_flow_not_found"
-  | "owner_key_mismatch"
-  | "cancel_requested"
-  | "terminal";
-
-export class ParentFlowLinkError extends Error {
-  constructor(
-    public readonly code: ParentFlowLinkErrorCode,
-    message: string,
-    public readonly details?: {
-      flowId?: string;
-      status?: TaskFlowRecord["status"];
-    },
-  ) {
-    super(message);
-    this.name = "ParentFlowLinkError";
-  }
-}
-
-export function isParentFlowLinkError(error: unknown): error is ParentFlowLinkError {
-  return error instanceof ParentFlowLinkError;
-}
+export {
+  isParentFlowLinkError,
+  ParentFlowLinkError,
+  type ParentFlowLinkErrorCode,
+} from "./task-parent-flow-link-error.js";
 
 function isActiveTaskStatus(status: TaskStatus): boolean {
   return status === "queued" || status === "running";
@@ -182,6 +173,13 @@ function assertParentFlowLinkAllowed(params: {
     throw new ParentFlowLinkError(
       "cancel_requested",
       "Parent flow cancellation has already been requested.",
+      { flowId, status: flow.status },
+    );
+  }
+  if (governedMissionStateBlocksChildCreation(flow.stateJson)) {
+    throw new ParentFlowLinkError(
+      "child_creation_closed",
+      "Parent governed mission has closed child creation for closeout.",
       { flowId, status: flow.status },
     );
   }
@@ -316,6 +314,9 @@ function tryPersistTaskUpsert(
     persistTaskUpsert(task, pendingDeliveryState);
     return true;
   } catch (error) {
+    if (isParentFlowLinkError(error)) {
+      throw error;
+    }
     log.warn("Failed to persist task registry upsert", {
       operation,
       taskId: task.taskId,
@@ -883,6 +884,7 @@ function compareTasksNewestFirst(
 
 function findExistingTaskForCreate(params: {
   runtime: TaskRuntime;
+  atomicPersist: boolean;
   ownerKey: string;
   scopeKind: TaskScopeKind;
   childSessionKey?: string;
@@ -917,7 +919,7 @@ function findExistingTaskForCreate(params: {
   if (exact) {
     return exact;
   }
-  if (!runId || params.runtime !== "acp") {
+  if (!runId || (params.runtime !== "acp" && !params.atomicPersist)) {
     return undefined;
   }
   if (runScopeMatches.length === 0) {
@@ -1119,6 +1121,21 @@ function syncManagedFlowCancellationFromTask(task: TaskRecord): void {
   }
   const endedAt = task.endedAt ?? task.lastEventAt ?? Date.now();
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const governedMission = readGovernedMissionStateFromTaskFlow(flow);
+    if (isGovernedMissionFlowClaimed(flow)) {
+      if (!governedMission) {
+        return;
+      }
+      const result = cancelGovernedMissionTaskFlow({ flowId, occurredAt: endedAt });
+      if (isGovernedMissionCancellationComplete(result)) {
+        return;
+      }
+      flow = getTaskFlowById(flowId);
+      if (!flow || isTerminalFlowStatus(flow.status)) {
+        return;
+      }
+      continue;
+    }
     const result: TaskFlowUpdateResult =
       getTaskFlowProductionContinuation(flow)?.activeProductionRun === true
         ? recordFlowLawfulStop({
@@ -1260,9 +1277,22 @@ export function reloadTaskRegistryFromStore(): void {
   restoreTaskRegistryOnce();
 }
 
-function updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | null {
+type TaskUpdateOptions = {
+  persist?: (task: TaskRecord) => boolean;
+  syncParentFlow?: boolean;
+  expectedStatuses?: readonly TaskStatus[];
+};
+
+function updateTask(
+  taskId: string,
+  patch: Partial<TaskRecord>,
+  options: TaskUpdateOptions = {},
+): TaskRecord | null {
   const current = tasks.get(taskId);
   if (!current) {
+    return null;
+  }
+  if (options.expectedStatuses && !options.expectedStatuses.includes(current.status)) {
     return null;
   }
   const next = normalizeTaskTimestamps({ ...current, ...patch });
@@ -1281,7 +1311,7 @@ function updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | nu
   const parentFlowIndexChanged = current.parentFlowId?.trim() !== next.parentFlowId?.trim();
   // Persist before mutating memory. If the store rejects the write, keep the
   // in-memory mirror at the durable value and report that no mutation applied.
-  if (!tryPersistTaskUpsert(next, "update")) {
+  if (!(options.persist ? options.persist(next) : tryPersistTaskUpsert(next, "update"))) {
     return null;
   }
   tasks.set(taskId, next);
@@ -1302,7 +1332,9 @@ function updateTask(taskId: string, patch: Partial<TaskRecord>): TaskRecord | nu
     deleteParentFlowIdIndex(taskId, current);
     addParentFlowIdIndex(taskId, next);
   }
-  syncFlowFromTaskAfterTaskMutation(next, "update");
+  if (options.syncParentFlow !== false) {
+    syncFlowFromTaskAfterTaskMutation(next, "update");
+  }
   try {
     syncManagedFlowCancellationFromTask(next);
   } catch (error) {
@@ -1605,6 +1637,7 @@ export function setTaskProgressById(params: {
   taskId: string;
   progressSummary?: string | null;
   lastEventAt?: number;
+  eventSummary?: string | null;
 }): TaskRecord | null {
   ensureTaskRegistryReady();
   const current = tasks.get(params.taskId);
@@ -1634,7 +1667,18 @@ export function setTaskProgressById(params: {
   if (params.lastEventAt != null) {
     patch.lastEventAt = params.lastEventAt;
   }
-  return updateTask(params.taskId, patch);
+  const task = updateTask(params.taskId, patch);
+  if (task && params.eventSummary !== undefined) {
+    void maybeDeliverTaskStateChangeUpdate(
+      task.taskId,
+      appendTaskEvent({
+        at: eventAt,
+        kind: "progress",
+        summary: normalizeTaskSummary(params.eventSummary),
+      }),
+    );
+  }
+  return task;
 }
 
 export function setTaskMissionById(params: {
@@ -2151,38 +2195,46 @@ function ensureListener() {
   });
 }
 
-export function createTaskRecord(params: {
-  runtime: TaskRuntime;
-  taskKind?: string;
-  sourceId?: string;
-  requesterSessionKey?: string;
-  ownerKey?: string;
-  scopeKind?: TaskScopeKind;
-  requesterOrigin?: TaskDeliveryState["requesterOrigin"];
-  childSessionKey?: string;
-  parentFlowId?: string;
-  parentTaskId?: string;
-  agentId?: string;
-  runId?: string;
-  label?: string;
-  task: string;
-  missionId?: string;
-  missionSummary?: string | null;
-  missionState?: TaskMissionState | null;
-  missionUpdatedAt?: number;
-  preferMetadata?: boolean;
-  status?: TaskStatus;
-  deliveryStatus?: TaskDeliveryStatus;
-  notifyPolicy?: TaskNotifyPolicy;
-  startedAt?: number;
-  endedAt?: number;
-  lastEventAt?: number;
-  cleanupAfter?: number;
-  error?: string | null;
-  progressSummary?: string | null;
-  terminalSummary?: string | null;
-  terminalOutcome?: TaskTerminalOutcome | null;
-}): TaskRecord | null {
+export type TaskRecordCreateOptions = {
+  persist?: (task: TaskRecord, deliveryState?: TaskDeliveryState) => boolean;
+  syncParentFlow?: boolean;
+};
+
+export function createTaskRecord(
+  params: {
+    runtime: TaskRuntime;
+    taskKind?: string;
+    sourceId?: string;
+    requesterSessionKey?: string;
+    ownerKey?: string;
+    scopeKind?: TaskScopeKind;
+    requesterOrigin?: TaskDeliveryState["requesterOrigin"];
+    childSessionKey?: string;
+    parentFlowId?: string;
+    parentTaskId?: string;
+    agentId?: string;
+    runId?: string;
+    label?: string;
+    task: string;
+    missionId?: string;
+    missionSummary?: string | null;
+    missionState?: TaskMissionState | null;
+    missionUpdatedAt?: number;
+    preferMetadata?: boolean;
+    status?: TaskStatus;
+    deliveryStatus?: TaskDeliveryStatus;
+    notifyPolicy?: TaskNotifyPolicy;
+    startedAt?: number;
+    endedAt?: number;
+    lastEventAt?: number;
+    cleanupAfter?: number;
+    error?: string | null;
+    progressSummary?: string | null;
+    terminalSummary?: string | null;
+    terminalOutcome?: TaskTerminalOutcome | null;
+  },
+  options: TaskRecordCreateOptions = {},
+): TaskRecord | null {
   ensureTaskRegistryReady();
   const requesterSessionKey = resolveTaskRequesterSessionKey(params);
   const scopeKind = resolveTaskScopeKind({
@@ -2209,6 +2261,7 @@ export function createTaskRecord(params: {
   });
   const existing = findExistingTaskForCreate({
     runtime: params.runtime,
+    atomicPersist: Boolean(options.persist),
     ownerKey,
     scopeKind,
     childSessionKey: params.childSessionKey,
@@ -2218,6 +2271,11 @@ export function createTaskRecord(params: {
     task: params.task,
   });
   if (existing) {
+    // Atomic callers persist the task with its authority record. A retry must
+    // leave both untouched so the caller can validate the original receipt.
+    if (options.persist) {
+      return cloneTaskRecord(existing);
+    }
     return mergeExistingTaskForCreate(existing, { ...params, agentId });
   }
   const now = Date.now();
@@ -2285,7 +2343,11 @@ export function createTaskRecord(params: {
         requesterOrigin,
       }
     : undefined;
-  if (!tryPersistTaskUpsert(record, "create", deliveryState)) {
+  if (
+    !(options.persist
+      ? options.persist(record, deliveryState)
+      : tryPersistTaskUpsert(record, "create", deliveryState))
+  ) {
     return null;
   }
   tasks.set(taskId, record);
@@ -2297,7 +2359,9 @@ export function createTaskRecord(params: {
   addMissionIdIndex(taskId, record);
   addParentFlowIdIndex(taskId, record);
   addRelatedSessionKeyIndex(taskId, record);
-  syncFlowFromTaskAfterTaskMutation(record, "create");
+  if (options.syncParentFlow !== false) {
+    syncFlowFromTaskAfterTaskMutation(record, "create");
+  }
   emitTaskRegistryObserverEvent(() => ({
     kind: "upserted",
     task: cloneTaskRecord(record),
@@ -2308,11 +2372,9 @@ export function createTaskRecord(params: {
   return cloneTaskRecord(record);
 }
 
-function updateTaskStateByRunId(params: {
-  runId: string;
-  runtime?: TaskRuntime;
-  sessionKey?: string;
+type TaskStateUpdateParams = {
   status?: TaskStatus;
+  deliveryStatus?: TaskDeliveryStatus;
   startedAt?: number;
   endedAt?: number;
   lastEventAt?: number;
@@ -2321,97 +2383,108 @@ function updateTaskStateByRunId(params: {
   terminalSummary?: string | null;
   terminalOutcome?: TaskTerminalOutcome | null;
   eventSummary?: string | null;
-}) {
-  ensureTaskRegistryReady();
-  const matches = getTasksByRunScope(params);
-  if (matches.length === 0) {
-    return [];
-  }
-  const updated: TaskRecord[] = [];
-  for (const current of matches) {
-    const patch: Partial<TaskRecord> = {};
-    const eventAt = params.lastEventAt ?? params.endedAt ?? Date.now();
-    const nextStatus = params.status ? normalizeTaskStatus(params.status) : current.status;
-    const abandonedMissionBlockedPatch = buildAbandonedMissionBlockedPatch({
-      current,
-      eventAt,
-      progressSummary: params.progressSummary,
-    });
-    if (abandonedMissionBlockedPatch) {
-      const task = updateTask(current.taskId, abandonedMissionBlockedPatch);
-      if (task) {
-        updated.push(task);
-        void maybeDeliverTaskTerminalUpdate(task.taskId);
-      }
-      continue;
-    }
-    if (blocksForwardProgressForAbandonedMission({ current, nextStatus: params.status })) {
-      continue;
-    }
-    if (
-      params.status &&
-      !shouldApplyRunScopedStatusUpdate({
-        currentStatus: current.status,
-        nextStatus,
-      })
-    ) {
-      continue;
-    }
-    if (params.status) {
-      patch.status = normalizeTaskStatus(params.status);
-    }
-    if (params.startedAt != null) {
-      patch.startedAt = params.startedAt;
-    }
-    if (params.endedAt != null) {
-      patch.endedAt = params.endedAt;
-    }
-    if (params.lastEventAt != null) {
-      patch.lastEventAt = params.lastEventAt;
-    }
-    if (params.error !== undefined) {
-      patch.error = params.error;
-    }
-    if (params.progressSummary !== undefined) {
-      patch.progressSummary = normalizeTaskSummary(params.progressSummary);
-    }
-    if (params.terminalSummary !== undefined) {
-      patch.terminalSummary = normalizeTaskSummary(params.terminalSummary);
-    }
-    if (params.terminalOutcome !== undefined) {
-      patch.terminalOutcome = resolveTaskTerminalOutcome({
-        status: nextStatus,
-        terminalOutcome: params.terminalOutcome,
-      });
-    }
-    const eventSummary =
-      normalizeTaskSummary(params.eventSummary) ??
-      (nextStatus === "failed"
-        ? normalizeTaskSummary(params.error ?? current.error)
-        : nextStatus === "succeeded"
-          ? normalizeTaskSummary(params.terminalSummary ?? current.terminalSummary)
-          : undefined);
-    const shouldAppendEvent =
-      (params.status && params.status !== current.status) ||
-      Boolean(normalizeTaskSummary(params.eventSummary));
-    const nextEvent = shouldAppendEvent
-      ? appendTaskEvent({
-          at: eventAt,
-          kind:
-            params.status && normalizeTaskStatus(params.status) !== current.status
-              ? normalizeTaskStatus(params.status)
-              : "progress",
-          summary: eventSummary,
-        })
-      : undefined;
-    const task = updateTask(current.taskId, patch);
+};
+
+function updateTaskStateById(
+  current: TaskRecord,
+  params: TaskStateUpdateParams,
+  options: TaskUpdateOptions,
+): TaskRecord | null {
+  const patch: Partial<TaskRecord> = {};
+  const eventAt = params.lastEventAt ?? params.endedAt ?? Date.now();
+  const nextStatus = params.status ? normalizeTaskStatus(params.status) : current.status;
+  const abandonedMissionBlockedPatch = buildAbandonedMissionBlockedPatch({
+    current,
+    eventAt,
+    progressSummary: params.progressSummary,
+  });
+  if (abandonedMissionBlockedPatch) {
+    const task = updateTask(current.taskId, abandonedMissionBlockedPatch, options);
     if (task) {
-      updated.push(task);
-      void maybeDeliverTaskStateChangeUpdate(task.taskId, nextEvent);
       void maybeDeliverTaskTerminalUpdate(task.taskId);
     }
+    return task;
   }
-  return updated;
+  if (blocksForwardProgressForAbandonedMission({ current, nextStatus: params.status })) {
+    return null;
+  }
+  if (
+    params.status &&
+    !shouldApplyRunScopedStatusUpdate({
+      currentStatus: current.status,
+      nextStatus,
+    })
+  ) {
+    return null;
+  }
+  if (params.status) {
+    patch.status = nextStatus;
+  }
+  if (params.deliveryStatus) {
+    patch.deliveryStatus = params.deliveryStatus;
+  }
+  if (params.startedAt != null) {
+    patch.startedAt = params.startedAt;
+  }
+  if (params.endedAt != null) {
+    patch.endedAt = params.endedAt;
+  }
+  if (params.lastEventAt != null) {
+    patch.lastEventAt = params.lastEventAt;
+  }
+  if (params.error !== undefined) {
+    patch.error = params.error;
+  }
+  if (params.progressSummary !== undefined) {
+    patch.progressSummary = normalizeTaskSummary(params.progressSummary);
+  }
+  if (params.terminalSummary !== undefined) {
+    patch.terminalSummary = normalizeTaskSummary(params.terminalSummary);
+  }
+  if (params.terminalOutcome !== undefined) {
+    patch.terminalOutcome = resolveTaskTerminalOutcome({
+      status: nextStatus,
+      terminalOutcome: params.terminalOutcome,
+    });
+  }
+  const eventSummary =
+    normalizeTaskSummary(params.eventSummary) ??
+    (nextStatus === "failed"
+      ? normalizeTaskSummary(params.error ?? current.error)
+      : nextStatus === "succeeded"
+        ? normalizeTaskSummary(params.terminalSummary ?? current.terminalSummary)
+        : undefined);
+  const shouldAppendEvent =
+    (params.status && params.status !== current.status) ||
+    Boolean(normalizeTaskSummary(params.eventSummary));
+  const nextEvent = shouldAppendEvent
+    ? appendTaskEvent({
+        at: eventAt,
+        kind: params.status && nextStatus !== current.status ? nextStatus : "progress",
+        summary: eventSummary,
+      })
+    : undefined;
+  const task = updateTask(current.taskId, patch, options);
+  if (task) {
+    void maybeDeliverTaskStateChangeUpdate(task.taskId, nextEvent);
+    void maybeDeliverTaskTerminalUpdate(task.taskId);
+  }
+  return task;
+}
+
+function updateTaskStateByRunId(
+  params: {
+    runId: string;
+    runtime?: TaskRuntime;
+    sessionKey?: string;
+  } & TaskStateUpdateParams,
+  options: TaskUpdateOptions = {},
+) {
+  ensureTaskRegistryReady();
+  return getTasksByRunScope(params).flatMap((current) => {
+    const task = updateTaskStateById(current, params, options);
+    return task ? [task] : [];
+  });
 }
 
 function updateTaskDeliveryByRunId(params: {
@@ -2491,32 +2564,58 @@ export function markTaskTerminalByRunId(params: {
   return finalizeTaskRunByRunId(params);
 }
 
-export function finalizeTaskRunByRunId(params: {
-  runId: string;
-  runtime?: TaskRuntime;
-  sessionKey?: string;
-  status: Extract<TaskStatus, "succeeded" | "failed" | "timed_out" | "cancelled">;
-  startedAt?: number;
-  endedAt: number;
-  lastEventAt?: number;
-  error?: string;
-  progressSummary?: string | null;
-  terminalSummary?: string | null;
-  terminalOutcome?: TaskTerminalOutcome | null;
-}) {
-  return updateTaskStateByRunId({
-    runId: params.runId,
-    runtime: params.runtime,
-    sessionKey: params.sessionKey,
-    status: params.status,
-    startedAt: params.startedAt,
-    endedAt: params.endedAt,
-    lastEventAt: params.lastEventAt,
-    error: params.error,
-    progressSummary: params.progressSummary,
-    terminalSummary: params.terminalSummary,
-    terminalOutcome: params.terminalOutcome,
-  });
+export function finalizeTaskRunById(
+  params: {
+    taskId: string;
+    status: Extract<TaskStatus, "succeeded" | "failed" | "timed_out" | "cancelled">;
+    deliveryStatus?: Extract<TaskDeliveryStatus, "delivered">;
+    startedAt?: number;
+    endedAt: number;
+    lastEventAt?: number;
+    error?: string;
+    progressSummary?: string | null;
+    terminalSummary?: string | null;
+    terminalOutcome?: TaskTerminalOutcome | null;
+  },
+  options: TaskUpdateOptions = {},
+): TaskRecord | null {
+  ensureTaskRegistryReady();
+  const current = tasks.get(params.taskId);
+  return current ? updateTaskStateById(current, params, options) : null;
+}
+
+export function finalizeTaskRunByRunId(
+  params: {
+    runId: string;
+    runtime?: TaskRuntime;
+    sessionKey?: string;
+    status: Extract<TaskStatus, "succeeded" | "failed" | "timed_out" | "cancelled">;
+    startedAt?: number;
+    endedAt: number;
+    lastEventAt?: number;
+    error?: string;
+    progressSummary?: string | null;
+    terminalSummary?: string | null;
+    terminalOutcome?: TaskTerminalOutcome | null;
+  },
+  options: TaskUpdateOptions = {},
+) {
+  return updateTaskStateByRunId(
+    {
+      runId: params.runId,
+      runtime: params.runtime,
+      sessionKey: params.sessionKey,
+      status: params.status,
+      startedAt: params.startedAt,
+      endedAt: params.endedAt,
+      lastEventAt: params.lastEventAt,
+      error: params.error,
+      progressSummary: params.progressSummary,
+      terminalSummary: params.terminalSummary,
+      terminalOutcome: params.terminalOutcome,
+    },
+    options,
+  );
 }
 
 export function setTaskRunDeliveryStatusByRunId(params: {
@@ -2647,13 +2746,7 @@ export async function cancelTaskById(params: {
   if (!task) {
     return { found: false, cancelled: false, reason: "Task not found." };
   }
-  if (
-    task.status === "succeeded" ||
-    task.status === "failed" ||
-    task.status === "timed_out" ||
-    task.status === "lost" ||
-    task.status === "cancelled"
-  ) {
+  if (isTerminalTaskStatus(task.status)) {
     return {
       found: true,
       cancelled: false,
@@ -2708,18 +2801,34 @@ export async function cancelTaskById(params: {
         };
       }
     }
-    const updated = updateTask(task.taskId, {
-      status: "cancelled",
-      endedAt: Date.now(),
-      lastEventAt: Date.now(),
-      error: params.reason?.trim() || "Cancelled by operator.",
-    });
+    const cancelledAt = Date.now();
+    // External teardown can yield while task completion atomically records a
+    // terminal result. Only an active task may still become cancelled.
+    const updated = updateTask(
+      task.taskId,
+      {
+        status: "cancelled",
+        endedAt: cancelledAt,
+        lastEventAt: cancelledAt,
+        error: params.reason?.trim() || "Cancelled by operator.",
+      },
+      { expectedStatuses: ["queued", "running"] },
+    );
     if (!updated) {
+      const current = tasks.get(task.taskId);
+      if (current && isTerminalTaskStatus(current.status)) {
+        return {
+          found: true,
+          cancelled: false,
+          reason: "Task became terminal while cancellation was in progress.",
+          task: cloneTaskRecord(current),
+        };
+      }
       return {
         found: true,
         cancelled: false,
         reason: "Task persistence failed.",
-        task: cloneTaskRecord(task),
+        task: cloneTaskRecord(current ?? task),
       };
     }
     if (updated) {

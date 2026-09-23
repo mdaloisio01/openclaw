@@ -27,8 +27,16 @@ export {
   handleCompactionStart,
 } from "./embedded-agent-subscribe.handlers.compaction.js";
 
+function shouldSuppressAssistantOutput(ctx: EmbeddedAgentSubscribeContext): boolean {
+  const predicate = ctx.params.shouldSuppressAssistantOutput;
+  return typeof predicate === "function" && predicate();
+}
+
 export function handleAgentStart(ctx: EmbeddedAgentSubscribeContext) {
   ctx.log.debug(`embedded run agent start: runId=${ctx.params.runId}`);
+  if (shouldSuppressAssistantOutput(ctx)) {
+    return;
+  }
   emitAgentEvent({
     runId: ctx.params.runId,
     stream: "lifecycle",
@@ -120,6 +128,10 @@ export function handleAgentEnd(ctx: EmbeddedAgentSubscribeContext): void | Promi
   }
 
   const emitLifecycleTerminal = () => {
+    const suppressAssistantOutput = shouldSuppressAssistantOutput(ctx);
+    if (suppressAssistantOutput) {
+      return;
+    }
     const terminalMeta = {
       ...(ctx.state.terminalStopReason ? { stopReason: ctx.state.terminalStopReason } : {}),
       ...(ctx.state.yielded === true ? { yielded: true } : {}),
@@ -192,8 +204,12 @@ export function handleAgentEnd(ctx: EmbeddedAgentSubscribeContext): void | Promi
   };
 
   const flushPendingMediaAndChannel = () => {
-    if (ctx.params.onBlockReply) {
-      const pendingToolMediaReply = consumePendingToolMediaReply(ctx.state);
+    const suppressAssistantOutput = shouldSuppressAssistantOutput(ctx);
+    const pendingToolMediaReply =
+      suppressAssistantOutput || ctx.params.onBlockReply
+        ? consumePendingToolMediaReply(ctx.state)
+        : null;
+    if (!suppressAssistantOutput && ctx.params.onBlockReply) {
       if (pendingToolMediaReply && hasAssistantVisibleReply(pendingToolMediaReply)) {
         ctx.emitBlockReply(pendingToolMediaReply);
       }
@@ -202,6 +218,9 @@ export function handleAgentEnd(ctx: EmbeddedAgentSubscribeContext): void | Promi
     const postMediaFlushResult = ctx.flushBlockReplyBuffer();
     if (isPromiseLike<void>(postMediaFlushResult)) {
       return postMediaFlushResult.then(() => {
+        if (shouldSuppressAssistantOutput(ctx)) {
+          return undefined;
+        }
         const onBlockReplyFlushResult = ctx.params.onBlockReplyFlush?.();
         if (isPromiseLike<void>(onBlockReplyFlushResult)) {
           return onBlockReplyFlushResult;
@@ -210,7 +229,9 @@ export function handleAgentEnd(ctx: EmbeddedAgentSubscribeContext): void | Promi
       });
     }
 
-    const onBlockReplyFlushResult = ctx.params.onBlockReplyFlush?.();
+    const onBlockReplyFlushResult = shouldSuppressAssistantOutput(ctx)
+      ? undefined
+      : ctx.params.onBlockReplyFlush?.();
     if (isPromiseLike<void>(onBlockReplyFlushResult)) {
       return onBlockReplyFlushResult;
     }
