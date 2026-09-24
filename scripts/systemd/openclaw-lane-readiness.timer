@@ -1,0 +1,10 @@
+[Unit]
+Description=Run OpenClaw lane readiness every Monday
+
+[Timer]
+OnCalendar=Mon *-*-* 14:15:00 UTC
+Persistent=true
+Unit=openclaw-lane-readiness.service
+
+[Install]
+WantedBy=timers.target

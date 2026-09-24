@@ -1,0 +1,9 @@
+[Unit]
+Description=OpenClaw lane readiness report
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/openclaw-source
+Environment=OPENCLAW_CONFIG_PATH=%h/.openclaw/control-plane/live/openclaw.json
+ExecStart=/usr/bin/env node %h/openclaw-source/scripts/lane-readiness-scheduled.mjs %h/.openclaw/workspace-orchestrator/file_hub/exports
+TimeoutStartSec=220
