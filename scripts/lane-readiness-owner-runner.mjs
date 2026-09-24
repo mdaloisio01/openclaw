@@ -80,12 +80,16 @@ if (key === "engineering_delivery.focused_test") {
   }
   // The regular test wrapper detaches Vitest. Keep this CLI in the owner's
   // process group so the harness deadline stops the full test tree.
+  const vitestReportPath = path.resolve("proof/engineering_delivery/focused_test-vitest.json");
+  fs.mkdirSync(path.dirname(vitestReportPath), { recursive: true });
   const command = [
     ...resolveVitestNodeArgs(),
     resolveVitestCliEntry(),
     "run",
     "--config",
     "test/vitest/vitest.unit.config.ts",
+    "--reporter=json",
+    `--outputFile=${vitestReportPath}`,
     "src/governance/lane-readiness-harness.test.ts",
   ];
   const run = spawnSync(process.execPath, command, {
@@ -94,14 +98,31 @@ if (key === "engineering_delivery.focused_test") {
     encoding: "utf8",
     maxBuffer: 16 * 1024 * 1024,
   });
-  const result = /Tests\s+(\d+) passed \((\d+)\)/.exec(run.stdout ?? "");
-  const passed = Number(result?.[1]);
-  const total = Number(result?.[2]);
+  let result;
+  try {
+    result = JSON.parse(fs.readFileSync(vitestReportPath, "utf8"));
+  } catch {
+    // Missing or malformed structured test output cannot certify PASS.
+  }
+  const passed = result?.numPassedTests;
+  const total = result?.numTotalTests;
+  const onlyTargetFile =
+    result?.testResults?.length === 1 && result.testResults[0].name === testFile;
   const after = sourceSnapshot();
-  const evidence = { command, before, after, passed, total, exitCode: run.status };
+  const evidence = {
+    command,
+    before,
+    after,
+    passed,
+    total,
+    exitCode: run.status,
+    vitestReportPath,
+  };
   if (
     run.status !== 0 ||
     run.error ||
+    result?.success !== true ||
+    !onlyTargetFile ||
     total <= 0 ||
     passed !== total ||
     after.revision !== before.revision ||
