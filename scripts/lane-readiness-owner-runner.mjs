@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -42,6 +43,42 @@ const commands = {
   "gateway_runtime.health": ["health", "--json", "--verbose", "--timeout", "10000"],
   "gateway_runtime.method_smoke": ["cron", "list", "--json", "--timeout", "10000"],
 };
+if (key === "watchdog.fixture_matrix") {
+  const ownerTest =
+    "/home/will/.openclaw/workspace-orchestrator/scripts/test_system_wide_active_work_watchdog.py";
+  const run = spawnSync("python3", [ownerTest], {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 64_000,
+  });
+  const testCount = Number(/Ran (\d+) tests? in/.exec(run.stderr ?? "")?.[1]);
+  let ownerTestSha256;
+  try {
+    ownerTestSha256 = createHash("sha256").update(fs.readFileSync(ownerTest)).digest("hex");
+  } catch {
+    // A missing owner test remains a FAIL with its process error recorded.
+  }
+  const evidence = {
+    ownerTest,
+    ownerTestSha256,
+    testCount,
+    exitCode: run.status,
+  };
+  if (
+    run.status !== 0 ||
+    !Number.isSafeInteger(testCount) ||
+    testCount <= 0 ||
+    !ownerTestSha256 ||
+    !(run.stderr ?? "").includes("\nOK\n")
+  ) {
+    respond(
+      "FAIL",
+      `Owner watchdog fixture matrix failed: exit=${run.status ?? "none"}, error=${run.error?.code ?? "none"}, tests=${testCount}`,
+      evidence,
+    );
+  }
+  respond("PASS", undefined, evidence);
+}
 if (
   key === "cleanup_crew.clean_watchdog" ||
   key === "watchdog.cron_freshness" ||
