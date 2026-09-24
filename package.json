@@ -133,6 +133,7 @@
     "!docs/**/*.png",
     "src/agents/templates/",
     "scripts/crabbox-wrapper.mjs",
+    "scripts/lane-readiness-harness.mjs",
     "patches/",
     "skills/",
     "scripts/npm-runner.mjs",
@@ -149,6 +150,10 @@
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
+    "./lane-readiness": {
+      "types": "./dist/lane-readiness.d.ts",
+      "default": "./dist/lane-readiness.js"
+    },
     "./plugin-sdk": {
       "types": "./dist/plugin-sdk/index.d.ts",
       "default": "./dist/plugin-sdk/index.js"
