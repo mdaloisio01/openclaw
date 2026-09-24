@@ -2,6 +2,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  importLegacyOwnerRequestIntakeLedger,
+  listOwnerRequestIntakeRecords,
+} from "../agents/owner-request-intake-ledger.js";
+import {
+  importLegacySourceTurnDeliveryRegistry,
+  loadSourceTurnDeliveryRegistry,
+} from "../agents/source-turn-delivery-store.js";
 import type { OpenClawConfig } from "../config/config.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
@@ -539,6 +547,227 @@ function ensureCredentialsDir(root: string) {
 }
 
 describe("doctor legacy state migrations", () => {
+  it("keeps a newer canonical intake row when an older snapshot is retried", async () => {
+    const root = await makeTempRoot();
+    const databasePath = path.join(root, "state", "openclaw.sqlite");
+    const legacy = {
+      kind: "openclaw.owner-request-intake",
+      schemaVersion: 1,
+      requestId: "intake:advanced",
+      status: "prompt_persisted",
+      governed: true,
+      classification: "governed_mission",
+      expectedDurability: "taskflow_or_exemption",
+      messageFingerprintSha256: "a".repeat(64),
+      createdAtMs: 1_000,
+      updatedAtMs: 2_000,
+    };
+    const advanced = { ...legacy, status: "mission_registered", updatedAtMs: 3_000 };
+    expect(
+      importLegacyOwnerRequestIntakeLedger({ databasePath, ledger: { records: [advanced] } }),
+    ).toEqual({ imported: 1, verified: 0, rejected: 0 });
+    expect(
+      importLegacyOwnerRequestIntakeLedger({ databasePath, ledger: { records: [legacy] } }),
+    ).toEqual({ imported: 0, verified: 1, rejected: 0 });
+    expect(listOwnerRequestIntakeRecords({ stateDir: root })[0]).toMatchObject(advanced);
+  });
+
+  it("reports an unreadable source registry without aborting doctor detection", async () => {
+    const home = await makeTempRoot();
+    const sourcePath = path.join(home, "unreadable-source.json");
+    fs.writeFileSync(sourcePath, JSON.stringify({ rows: [] }));
+    const openSync = fs.openSync.bind(fs);
+    const readSpy = vi.spyOn(fs, "openSync").mockImplementation(((file, ...args) => {
+      if (String(file) === sourcePath) {
+        throw new Error("read denied");
+      }
+      return openSync(file, ...args);
+    }) as typeof fs.openSync);
+    try {
+      const detected = await detectLegacyStateMigrations({
+        cfg: {},
+        env: {
+          OPENCLAW_STATE_DIR: path.join(home, "state"),
+          OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH: sourcePath,
+        } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        includeLegacyGovernanceState: true,
+      });
+      expect(detected.preview).toContain(
+        "- Source delivery obligations: unreadable legacy source requires repair",
+      );
+      const result = await runLegacyStateMigrations({ detected });
+      expect(result.warnings.some((warning) => warning.includes("read denied"))).toBe(true);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("uses the legacy source store's HOME when the state directory is elsewhere", async () => {
+    const home = await makeTempRoot();
+    const sourcePath = path.join(
+      home,
+      ".openclaw",
+      "workspace-orchestrator",
+      "var",
+      "source_delivery_obligations",
+      "source_delivery_obligations.json",
+    );
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    fs.writeFileSync(sourcePath, JSON.stringify({ rows: [] }));
+    const detected = await detectLegacyStateMigrations({
+      cfg: {},
+      env: { HOME: home, OPENCLAW_STATE_DIR: path.join(home, "other-state") } as NodeJS.ProcessEnv,
+      homedir: () => path.join(home, "host-home"),
+      includeLegacyGovernanceState: true,
+    });
+    expect(detected.legacyGovernanceState?.sourceDeliveryPath).toBe(sourcePath);
+    expect(detected.preview).toContain(
+      "- Source delivery obligations: legacy JSON → shared SQLite state",
+    );
+  });
+
+  it("finds the legacy source registry at its configured path outside a custom state directory", async () => {
+    const home = await makeTempRoot();
+    const sourcePath = path.join(home, "custom-source-delivery.json");
+    fs.writeFileSync(
+      sourcePath,
+      JSON.stringify([
+        {
+          kind: "openclaw.source-delivery-obligation",
+          id: "source:custom-path",
+          acceptedAt: "2026-09-15T12:00:00.000Z",
+          updatedAt: "2026-09-15T12:01:00.000Z",
+          deliveryStatus: "failure_delivered",
+          sourceTurnState: "failure_delivered",
+          finalDeliveryDelivered: false,
+          visibleDeliveryCount: 1,
+        },
+      ]),
+    );
+    const env = {
+      OPENCLAW_STATE_DIR: path.join(home, "custom-state"),
+      OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH: sourcePath,
+    } as NodeJS.ProcessEnv;
+    const detected = await detectLegacyStateMigrations({
+      cfg: {},
+      env,
+      homedir: () => home,
+      includeLegacyGovernanceState: true,
+    });
+    expect(detected.legacyGovernanceState?.sourceDeliveryPath).toBe(sourcePath);
+    expect(detected.preview).toContain(
+      "- Source delivery obligations: legacy JSON → shared SQLite state",
+    );
+    const result = await runLegacyStateMigrations({ detected });
+    expect(result.warnings).toEqual([]);
+    expect(fs.existsSync(`${sourcePath}.migrated`)).toBe(true);
+    const registry = await loadSourceTurnDeliveryRegistry(sourcePath);
+    expect(registry.rows[0]?.id).toBe("source:custom-path");
+    const after = await detectLegacyStateMigrations({
+      cfg: {},
+      env,
+      homedir: () => home,
+      includeLegacyGovernanceState: true,
+    });
+    expect(after.preview).not.toContain(
+      "- Source delivery obligations: legacy JSON → shared SQLite state",
+    );
+  });
+
+  it("moves legacy intake and source delivery records into shared SQLite before activation", async () => {
+    const home = await makeTempRoot();
+    const root = path.join(home, ".openclaw");
+    const intakePath = path.join(root, "owner-request-intake-ledger", "records.json");
+    const sourcePath = path.join(
+      root,
+      "workspace-orchestrator",
+      "var",
+      "source_delivery_obligations",
+      "source_delivery_obligations.json",
+    );
+    fs.mkdirSync(path.dirname(intakePath), { recursive: true });
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    fs.writeFileSync(
+      intakePath,
+      JSON.stringify({
+        records: [
+          {
+            kind: "openclaw.owner-request-intake",
+            schemaVersion: 1,
+            requestId: "legacy-request",
+            status: "prompt_persisted",
+            governed: true,
+            classification: "governed_mission",
+            expectedDurability: "taskflow_or_exemption",
+            messageFingerprintSha256: "a".repeat(64),
+            createdAtMs: 1_000,
+            updatedAtMs: 2_000,
+          },
+          { kind: "invalid.owner-intake", requestId: "discarded-intake" },
+        ],
+      }),
+    );
+    fs.writeFileSync(
+      sourcePath,
+      JSON.stringify({
+        rows: [
+          {
+            kind: "openclaw.source-delivery-obligation",
+            id: "source:legacy-turn",
+            acceptedAt: "2026-09-15T12:00:00.000Z",
+            updatedAt: "2026-09-15T12:01:00.000Z",
+            deliveryStatus: "failure_delivered",
+            sourceTurnState: "failure_delivered",
+            finalDeliveryDelivered: false,
+            visibleDeliveryCount: 1,
+          },
+          { kind: "invalid.source-delivery", id: "discarded-source" },
+        ],
+      }),
+    );
+
+    const sourceSnapshot = JSON.parse(fs.readFileSync(sourcePath, "utf8")) as {
+      rows: unknown[];
+    };
+    importLegacySourceTurnDeliveryRegistry({
+      databasePath: path.join(root, "state", "openclaw.sqlite"),
+      registry: sourceSnapshot,
+    });
+    fs.writeFileSync(`${sourcePath}.migrated`, "previous archive");
+
+    const detected = await detectLegacyStateMigrations({
+      cfg: {},
+      env: { OPENCLAW_STATE_DIR: root } as NodeJS.ProcessEnv,
+      homedir: () => home,
+      includeLegacyGovernanceState: true,
+    });
+    const result = await runLegacyStateMigrations({ detected });
+
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Rejected 1 invalid owner request intake rows"),
+        expect.stringContaining("Rejected 1 invalid source delivery rows"),
+      ]),
+    );
+    expect(result.changes).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("Migrated 1 and verified 0 owner request intake rows"),
+        expect.stringContaining("Migrated 0 and verified 1 source delivery rows"),
+      ]),
+    );
+    expect(fs.existsSync(intakePath)).toBe(false);
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(fs.existsSync(`${intakePath}.migrated`)).toBe(true);
+    expect(fs.existsSync(`${sourcePath}.migrated.1`)).toBe(true);
+    expect(listOwnerRequestIntakeRecords({ stateDir: root })[0]?.requestId).toBe("legacy-request");
+    const rows = await loadSourceTurnDeliveryRegistry(path.join(root, "state", "openclaw.sqlite"));
+    expect(rows.rows[0]).toMatchObject({
+      id: "source:legacy-turn",
+      deliveryStatus: "failure_delivered",
+      finalDeliveryDelivered: false,
+    });
+  });
   let migratedLegacySessionsCase: {
     result: Awaited<ReturnType<typeof runLegacyStateMigrations>>;
     targetDir: string;

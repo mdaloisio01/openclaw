@@ -91,14 +91,27 @@ describe("source turn delivery storage adapter", () => {
         databasePath: registryPath,
         registry: legacySnapshot,
       }),
-    ).toBe(1);
+    ).toEqual({ imported: 1, verified: 0, rejected: 0 });
     expect(
       importLegacySourceTurnDeliveryRegistry({
         databasePath: registryPath,
         registry: legacySnapshot,
       }),
-    ).toBe(0);
+    ).toEqual({ imported: 0, verified: 1, rejected: 0 });
     expect(await loadSourceTurnDeliveryRegistry(registryPath)).toEqual({ rows: [row] });
+    const advanced = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: row.id,
+      facts: { finalDeliveryRequired: true },
+      now: "2026-09-15T12:02:00.000Z",
+    });
+    expect(
+      importLegacySourceTurnDeliveryRegistry({
+        databasePath: registryPath,
+        registry: legacySnapshot,
+      }),
+    ).toEqual({ imported: 0, verified: 1, rejected: 0 });
+    expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows[0]).toEqual(advanced);
   });
 
   it("normalizes pre-key legacy rows at the one-time import boundary", async () => {
@@ -117,7 +130,7 @@ describe("source turn delivery storage adapter", () => {
         databasePath: registryPath,
         registry: { rows: [legacyRow] },
       }),
-    ).toBe(1);
+    ).toEqual({ imported: 1, verified: 0, rejected: 0 });
     expect((await loadSourceTurnDeliveryRegistry(registryPath)).rows[0]).toMatchObject({
       id: legacyRow.id,
       sourceTurnId: legacyRow.id,
@@ -153,7 +166,7 @@ describe("source turn delivery storage adapter", () => {
           databasePath: registryPath,
           registry: { rows: [legacyRow] },
         }),
-      ).toBe(1);
+      ).toEqual({ imported: 1, verified: 0, rejected: 0 });
       const row = (await loadSourceTurnDeliveryRegistry(registryPath)).rows[0];
       expect(row).toMatchObject({
         obligationStage: "settled_by_verified_later_delivery",

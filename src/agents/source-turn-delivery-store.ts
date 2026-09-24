@@ -456,19 +456,40 @@ function withSourceTurnDeliveryRegistryTransaction<T>(
 export function importLegacySourceTurnDeliveryRegistry(params: {
   databasePath?: string;
   registry: { rows: unknown[] };
-}): number {
-  const rows = params.registry.rows.map((row) => {
+}): { imported: number; verified: number; rejected: number } {
+  const rows = params.registry.rows.flatMap((row) => {
     const normalized = normalizeLegacySourceTurnDeliveryRow(row);
-    if (!normalized) {
-      throw new Error("Legacy source delivery snapshot contains an invalid row");
-    }
-    return normalized;
+    return normalized ? [normalized] : [];
   });
   let imported = 0;
+  let verified = 0;
   withSourceTurnDeliveryRegistryTransaction(
     params.databasePath ?? resolveSourceTurnDeliveryRegistryPath(),
     ({ db, stateDb }) => {
       for (const row of rows) {
+        const existing = executeSqliteQuerySync(
+          db,
+          stateDb
+            .selectFrom("source_turn_delivery_obligations")
+            .select("row_json")
+            .where("idempotency_key", "=", row.idempotencyKey),
+        ).rows[0];
+        if (existing) {
+          const canonical: unknown = JSON.parse(existing.row_json);
+          const advanced =
+            canonical !== null &&
+            typeof canonical === "object" &&
+            (canonical as SourceTurnDeliveryRow).idempotencyKey === row.idempotencyKey &&
+            (canonical as SourceTurnDeliveryRow).id === row.id &&
+            Date.parse((canonical as SourceTurnDeliveryRow).updatedAt) > Date.parse(row.updatedAt);
+          if (!isDeepStrictEqual(canonical, row) && !advanced) {
+            throw new Error(
+              `Legacy source delivery row conflicts with shared state: ${row.idempotencyKey}`,
+            );
+          }
+          verified++;
+          continue;
+        }
         const result = executeSqliteQuerySync(
           db,
           stateDb
@@ -480,7 +501,7 @@ export function importLegacySourceTurnDeliveryRegistry(params: {
       }
     },
   );
-  return imported;
+  return { imported, verified, rejected: params.registry.rows.length - rows.length };
 }
 
 function statusForDecision(decision: SourceTurnDeliveryDecision): string {

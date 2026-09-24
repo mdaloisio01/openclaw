@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import type { Kysely } from "kysely";
 import { classifyCurrentInboundInstruction } from "../governance/current-inbound-instruction.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
@@ -150,6 +151,61 @@ function isOwnerRequestIntakeRecord(record: unknown): record is OwnerRequestInta
     (record as { schemaVersion?: unknown }).schemaVersion === OWNER_REQUEST_INTAKE_SCHEMA_VERSION &&
     typeof (record as { requestId?: unknown }).requestId === "string",
   );
+}
+
+/** One-time doctor import; runtime reads the canonical SQLite ledger only. */
+export function importLegacyOwnerRequestIntakeLedger(params: {
+  databasePath: string;
+  ledger: { records: unknown[] };
+}): { imported: number; verified: number; rejected: number } {
+  const records = params.ledger.records.filter(isOwnerRequestIntakeRecord);
+  let imported = 0;
+  let verified = 0;
+  runOpenClawStateWriteTransaction(
+    ({ db }) => {
+      const stateDb = getNodeSqliteKysely<OwnerRequestIntakeDatabase>(db);
+      for (const record of records) {
+        const existing = executeSqliteQuerySync(
+          db,
+          stateDb
+            .selectFrom("owner_request_intake_records")
+            .select("record_json")
+            .where("request_id", "=", record.requestId),
+        ).rows[0];
+        if (existing) {
+          const canonical: unknown = JSON.parse(existing.record_json);
+          const advanced =
+            isOwnerRequestIntakeRecord(canonical) &&
+            canonical.requestId === record.requestId &&
+            canonical.updatedAtMs > record.updatedAtMs;
+          if (!isDeepStrictEqual(canonical, record) && !advanced) {
+            throw new Error(
+              `Legacy owner request intake row conflicts with shared state: ${record.requestId}`,
+            );
+          }
+          verified++;
+          continue;
+        }
+        const result = executeSqliteQuerySync(
+          db,
+          stateDb
+            .insertInto("owner_request_intake_records")
+            .values({
+              request_id: record.requestId,
+              status: record.status,
+              governed: record.governed ? 1 : 0,
+              created_at: record.createdAtMs,
+              updated_at: record.updatedAtMs,
+              record_json: JSON.stringify(record),
+            })
+            .onConflict((conflict) => conflict.column("request_id").doNothing()),
+        );
+        imported += Number(result.numAffectedRows ?? 0);
+      }
+    },
+    { path: params.databasePath },
+  );
+  return { imported, verified, rejected: params.ledger.records.length - records.length };
 }
 
 function persistRecord(

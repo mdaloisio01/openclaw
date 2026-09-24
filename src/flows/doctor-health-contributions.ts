@@ -357,7 +357,10 @@ async function runLegacyStateHealth(ctx: DoctorHealthFlowContext): Promise<void>
   const { detectLegacyStateMigrations, runLegacyStateMigrations } =
     await import("../commands/doctor-state-migrations.js");
   const { note } = await loadNoteModule();
-  const legacyState = await detectLegacyStateMigrations({ cfg: ctx.cfg });
+  const legacyState = await detectLegacyStateMigrations({
+    cfg: ctx.cfg,
+    includeLegacyGovernanceState: true,
+  });
   if (legacyState.preview.length === 0) {
     return;
   }

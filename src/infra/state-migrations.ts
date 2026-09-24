@@ -5,6 +5,8 @@ import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { writeAcpSessionMetaForMigration } from "../acp/runtime/session-meta.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { importLegacyOwnerRequestIntakeLedger } from "../agents/owner-request-intake-ledger.js";
+import { importLegacySourceTurnDeliveryRegistry } from "../agents/source-turn-delivery-store.js";
 import {
   listBundledChannelLegacySessionSurfaces,
   listBundledChannelLegacyStateMigrationDetectors,
@@ -60,8 +62,10 @@ import {
 } from "../routing/session-key.js";
 import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
+import { closeOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
+import { resolveRequiredOsHomeDir } from "./home-dir.js";
 import { expandHomePrefix } from "./home-dir.js";
 import {
   executeSqliteQuerySync,
@@ -129,6 +133,11 @@ export type LegacyStateDetection = {
     outboundPath: string;
     sessionPath: string;
     hasLegacy: boolean;
+  };
+  legacyGovernanceState?: {
+    ownerRequestIntakePath: string;
+    sourceDeliveryPath: string;
+    sourceDeliveryTargetPath: string;
   };
   preview: string[];
 };
@@ -2529,6 +2538,7 @@ export async function detectLegacyStateMigrations(params: {
   cfg: OpenClawConfig;
   env?: NodeJS.ProcessEnv;
   homedir?: () => string;
+  includeLegacyGovernanceState?: boolean;
 }): Promise<LegacyStateDetection> {
   const env = params.env ?? process.env;
   const homedir = params.homedir ?? os.homedir;
@@ -2605,6 +2615,29 @@ export async function detectLegacyStateMigrations(params: {
     listLegacyDeliveryQueueDeliveredMarkers(deliveryQueuePaths.outboundPath).length > 0 ||
     listLegacyDeliveryQueueFiles(deliveryQueuePaths.sessionPath).length > 0 ||
     listLegacyDeliveryQueueDeliveredMarkers(deliveryQueuePaths.sessionPath).length > 0;
+  const legacyGovernanceState = params.includeLegacyGovernanceState
+    ? {
+        ownerRequestIntakePath:
+          env.OPENCLAW_OWNER_REQUEST_INTAKE_LEDGER_PATH?.trim() ||
+          path.join(stateDir, "owner-request-intake-ledger", "records.json"),
+        sourceDeliveryPath:
+          env.OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH?.trim() ||
+          path.join(
+            env.OPENCLAW_WORKSPACE_ORCHESTRATOR_DIR?.trim() ||
+              path.join(
+                resolveRequiredOsHomeDir(env, homedir),
+                ".openclaw",
+                "workspace-orchestrator",
+              ),
+            "var",
+            "source_delivery_obligations",
+            "source_delivery_obligations.json",
+          ),
+        sourceDeliveryTargetPath:
+          env.OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH?.trim() ||
+          resolveOpenClawStateSqlitePath({ ...env, OPENCLAW_STATE_DIR: stateDir }),
+      }
+    : undefined;
   const channelPlans = await collectChannelLegacyStateMigrationPlans({
     cfg: params.cfg,
     env,
@@ -2642,6 +2675,20 @@ export async function detectLegacyStateMigrations(params: {
   }
   if (hasDeliveryQueues) {
     preview.push("- Delivery queues: legacy JSON queue files → shared SQLite state");
+  }
+  if (legacyGovernanceState && fileExists(legacyGovernanceState.ownerRequestIntakePath)) {
+    preview.push("- Owner request intake ledger: legacy JSON → shared SQLite state");
+  }
+  if (legacyGovernanceState && fileExists(legacyGovernanceState.sourceDeliveryPath)) {
+    try {
+      if (!isSqliteFile(legacyGovernanceState.sourceDeliveryPath)) {
+        preview.push("- Source delivery obligations: legacy JSON → shared SQLite state");
+      }
+    } catch {
+      // The migration reports the concrete read failure as a warning; doctor
+      // can still run its other checks when this evidence file is unreadable.
+      preview.push("- Source delivery obligations: unreadable legacy source requires repair");
+    }
   }
   if (governedReceiptFiles.present) {
     preview.push(
@@ -2704,8 +2751,97 @@ export async function detectLegacyStateMigrations(params: {
       ...deliveryQueuePaths,
       hasLegacy: hasDeliveryQueues,
     },
+    legacyGovernanceState,
     preview,
   };
+}
+
+function isSqliteFile(filePath: string): boolean {
+  const handle = fs.openSync(filePath, "r");
+  try {
+    const header = Buffer.alloc(16);
+    fs.readSync(handle, header, 0, header.length, 0);
+    return header.equals(Buffer.from("SQLite format 3\0"));
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function migrateLegacyGovernanceState(detected: LegacyStateDetection): {
+  changes: string[];
+  warnings: string[];
+} {
+  const changes: string[] = [];
+  const warnings: string[] = [];
+  const sources = detected.legacyGovernanceState;
+  if (!sources) {
+    return { changes, warnings };
+  }
+  const databasePath = resolveOpenClawStateSqlitePath({
+    ...process.env,
+    OPENCLAW_STATE_DIR: detected.stateDir,
+  });
+  for (const [label, sourcePath, member] of [
+    ["owner request intake", sources.ownerRequestIntakePath, "records"],
+    ["source delivery", sources.sourceDeliveryPath, "rows"],
+  ] as const) {
+    if (!fileExists(sourcePath)) {
+      continue;
+    }
+    try {
+      if (member === "rows" && isSqliteFile(sourcePath)) {
+        continue;
+      }
+      const payload: unknown = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+      const rows =
+        member === "rows" && Array.isArray(payload)
+          ? payload
+          : payload && typeof payload === "object"
+            ? (payload as Record<string, unknown>)[member]
+            : undefined;
+      if (!Array.isArray(rows)) {
+        throw new Error(`Legacy ${label} snapshot lacks ${member}`);
+      }
+      const customSourceTarget =
+        member === "rows" && sources.sourceDeliveryTargetPath === sourcePath;
+      const importPath = customSourceTarget ? `${sourcePath}.migrating.sqlite` : databasePath;
+      const result =
+        member === "records"
+          ? importLegacyOwnerRequestIntakeLedger({ databasePath, ledger: { records: rows } })
+          : importLegacySourceTurnDeliveryRegistry({
+              databasePath: importPath,
+              registry: { rows },
+            });
+      // The importer verifies every existing row against the snapshot, so an
+      // interrupted post-commit archive can complete on the next doctor run.
+      let archive = `${sourcePath}.migrated`;
+      for (let suffix = 1; fileExists(archive); suffix++) {
+        archive = `${sourcePath}.migrated.${suffix}`;
+      }
+      if (customSourceTarget) {
+        closeOpenClawStateDatabase();
+      }
+      if (customSourceTarget) {
+        // The legacy path stays readable until the completed SQLite database
+        // replaces it atomically; a crash before this rename can be retried.
+        fs.copyFileSync(sourcePath, archive, fs.constants.COPYFILE_EXCL);
+        fs.renameSync(importPath, sourcePath);
+      } else {
+        fs.renameSync(sourcePath, archive);
+      }
+      changes.push(
+        `Migrated ${result.imported} and verified ${result.verified} ${label} rows → SQLite state; archived ${sourcePath}`,
+      );
+      if (result.rejected > 0) {
+        warnings.push(
+          `Rejected ${result.rejected} invalid ${label} rows from ${sourcePath}; original snapshot preserved at ${archive}`,
+        );
+      }
+    } catch (error) {
+      warnings.push(`Failed migrating ${label} ${sourcePath}: ${String(error)}`);
+    }
+  }
+  return { changes, warnings };
 }
 
 async function migrateLegacySessions(
@@ -2976,6 +3112,7 @@ export async function runLegacyStateMigrations(params: {
   const deliveryQueues = await migrateLegacyDeliveryQueues({
     stateDir: detected.stateDir,
   });
+  const legacyGovernanceState = migrateLegacyGovernanceState(detected);
   const preSessionChannelPlans = await runLegacyMigrationPlans(
     detected.channelPlans.plans.filter((plan) => plan.kind === "plugin-state-import"),
   );
@@ -3002,6 +3139,7 @@ export async function runLegacyStateMigrations(params: {
       ...taskStateSidecars.changes,
       ...governedReceiptFiles.changes,
       ...deliveryQueues.changes,
+      ...legacyGovernanceState.changes,
       ...preSessionChannelPlans.changes,
       ...pluginPlans.changes,
       ...sessions.changes,
@@ -3015,6 +3153,7 @@ export async function runLegacyStateMigrations(params: {
       ...taskStateSidecars.warnings,
       ...governedReceiptFiles.warnings,
       ...deliveryQueues.warnings,
+      ...legacyGovernanceState.warnings,
       ...preSessionChannelPlans.warnings,
       ...pluginPlans.warnings,
       ...sessions.warnings,

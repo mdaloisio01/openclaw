@@ -350,7 +350,10 @@ const legacyStateCheck: HealthCheck = {
   source: "doctor",
   async detect(ctx) {
     const { detectLegacyStateMigrations } = await import("../commands/doctor-state-migrations.js");
-    const detected = await detectLegacyStateMigrations({ cfg: ctx.cfg });
+    const detected = await detectLegacyStateMigrations({
+      cfg: ctx.cfg,
+      includeLegacyGovernanceState: true,
+    });
     return detected.preview.map(
       (line): HealthFinding => ({
         checkId: "core/doctor/legacy-state",
