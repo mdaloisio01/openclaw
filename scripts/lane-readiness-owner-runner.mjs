@@ -332,15 +332,19 @@ if (
   }
 }
 const args = commands[key];
-if (!args) {
+if (!args && key !== "gateway_runtime.build_info") {
   respond("FAIL", `No production owner command is registered for ${key}`);
 }
 
 // The CLI can probe a healthy older Gateway. Bind PASS to the built source and
 // the selected Gateway process, or the report would misattribute it.
-const buildInfo = JSON.parse(
-  fs.readFileSync(path.resolve(import.meta.dirname, "../dist/build-info.json"), "utf8"),
-);
+const buildInfoPath = path.resolve(import.meta.dirname, "../dist/build-info.json");
+let buildInfo;
+try {
+  buildInfo = JSON.parse(fs.readFileSync(buildInfoPath, "utf8"));
+} catch {
+  respond("FAIL", `${key} build-info.json is missing or unreadable`);
+}
 const builtAtMs = Date.parse(buildInfo.builtAt);
 if (
   buildInfo.commit !== request.sourceRevision ||
@@ -353,7 +357,6 @@ if (
     { buildCommit: buildInfo.commit, buildDirty: buildInfo.dirty },
   );
 }
-
 const entry = path.resolve(import.meta.dirname, "../dist/entry.js");
 const probeEnv = { ...process.env };
 delete probeEnv.OPENCLAW_GATEWAY_URL;
@@ -450,6 +453,19 @@ for (const scope of ["user", "system"]) {
 const startedAtMs = Date.parse(unitFacts.ExecMainStartTimestamp ?? "");
 if (!unitScope || !Number.isFinite(startedAtMs) || startedAtMs < builtAtMs) {
   respond("FAIL", `${key} selected Gateway process is not bound to the current build`);
+}
+if (key === "gateway_runtime.build_info") {
+  const buildInfoSha256 = createHash("sha256").update(fs.readFileSync(buildInfoPath)).digest("hex");
+  respond("PASS", undefined, {
+    buildInfoPath,
+    buildInfoSha256,
+    buildCommit: buildInfo.commit,
+    builtAt: buildInfo.builtAt,
+    gatewayStartedAt: new Date(startedAtMs).toISOString(),
+    gatewayPid: runtimePid,
+    gatewayUnit: unitName,
+    gatewayUnitScope: unitScope,
+  });
 }
 
 const result = spawnSync(process.execPath, [entry, ...args], {
