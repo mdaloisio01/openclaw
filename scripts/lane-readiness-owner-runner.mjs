@@ -80,7 +80,14 @@ if (key === "engineering_delivery.focused_test") {
   }
   // The regular test wrapper detaches Vitest. Keep this CLI in the owner's
   // process group so the harness deadline stops the full test tree.
-  const command = [...resolveVitestNodeArgs(), resolveVitestCliEntry(), "run", testFile];
+  const command = [
+    ...resolveVitestNodeArgs(),
+    resolveVitestCliEntry(),
+    "run",
+    "--config",
+    "test/vitest/vitest.unit.config.ts",
+    "src/governance/lane-readiness-harness.test.ts",
+  ];
   const run = spawnSync(process.execPath, command, {
     cwd: repoRoot,
     env: resolveVitestSpawnEnv(),
