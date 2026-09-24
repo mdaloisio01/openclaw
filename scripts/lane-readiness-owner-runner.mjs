@@ -341,7 +341,9 @@ if (
   }
 }
 const args = commands[key];
-if (!args && key !== "gateway_runtime.build_info") {
+const runtimeIdentityCheck =
+  key === "gateway_runtime.build_info" || key === "engineering_delivery.runtime_identity";
+if (!args && !runtimeIdentityCheck) {
   respond("FAIL", `No production owner command is registered for ${key}`);
 }
 
@@ -463,7 +465,7 @@ const startedAtMs = Date.parse(unitFacts.ExecMainStartTimestamp ?? "");
 if (!unitScope || !Number.isFinite(startedAtMs) || startedAtMs < builtAtMs) {
   respond("FAIL", `${key} selected Gateway process is not bound to the current build`);
 }
-if (key === "gateway_runtime.build_info") {
+if (runtimeIdentityCheck) {
   const buildInfoSha256 = createHash("sha256").update(fs.readFileSync(buildInfoPath)).digest("hex");
   respond("PASS", undefined, {
     buildInfoPath,
@@ -472,6 +474,7 @@ if (key === "gateway_runtime.build_info") {
     builtAt: buildInfo.builtAt,
     gatewayStartedAt: new Date(startedAtMs).toISOString(),
     gatewayPid: runtimePid,
+    gatewayUrl: gatewayStatus.rpc.url,
     gatewayUnit: unitName,
     gatewayUnitScope: unitScope,
   });
