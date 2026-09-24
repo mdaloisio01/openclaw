@@ -1099,7 +1099,7 @@ it("runs owner checks before accepting current proof and reports runner failure"
         runLabel: "phase8-owner-runner",
         sourceRevision,
         checkedAt: new Date().toISOString(),
-        recurrenceMs: 500,
+        recurrenceMs: 2_000,
         checkTimeoutMs: 1_000,
         runTimeoutMs: 5_000,
       }),

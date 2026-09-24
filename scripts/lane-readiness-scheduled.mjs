@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 const exportDir = process.argv[2];
 if (!exportDir) {
@@ -70,33 +71,94 @@ if (
 ) {
   throw new Error("lane readiness harness returned an inconsistent report");
 }
+const operatingModule = await import(
+  pathToFileURL(path.resolve(import.meta.dirname, "../dist/lane-readiness.js")).href
+);
+const operatingRegistry = operatingModule.SOP_OPERATING_REGISTRY;
+const operatingState = operatingModule.resolveSopOperatingLaneState(
+  operatingRegistry,
+  report,
+  new Date().toISOString(),
+);
+const operatingLanes = (states) =>
+  operatingRegistry.lanes.map((lane, index) =>
+    Object.assign({}, lane, {
+      observedReadiness: {
+        result: states[index].status === "ready" ? "PASS" : "FAIL",
+        observedAt: report.checkedAt,
+        expiresAt: report.nextRunDueAt,
+        proofPaths: states[index].proofPaths,
+        blockers: states[index].blockers,
+      },
+    }),
+  );
+const operatingReport = {
+  schema: operatingModule.SOP_OPERATING_REGISTRY_SCHEMA,
+  runLabel,
+  sourceRevision,
+  checkedAt: report.checkedAt,
+  nextRunDueAt: report.nextRunDueAt,
+  observedResult: operatingState.every((lane) => lane.status === "ready") ? "PASS" : "FAIL",
+  observationExpiresAt: report.nextRunDueAt,
+  lanes: operatingLanes(operatingState),
+};
+const operatingPath = path.join(root, `operating_registry_${stamp}-report.json`);
+const operatingBody = `${JSON.stringify(operatingReport, null, 2)}\n`;
 const temporaryReportPath = `${reportPath}.${process.pid}.tmp`;
-fs.writeFileSync(temporaryReportPath, harness.stdout);
+const operatingTemporary = `${operatingPath}.${process.pid}.tmp`;
 const dashboardExportDir = path.join(os.homedir(), ".openclaw", "workspace", "file_hub", "exports");
 const dashboardReportPath = path.join(dashboardExportDir, path.basename(reportPath));
+const operatingDashboardPath = path.join(dashboardExportDir, path.basename(operatingPath));
 const temporaryDashboardPath = `${dashboardReportPath}.${process.pid}.tmp`;
+const operatingDashboardTemporary = `${operatingDashboardPath}.${process.pid}.tmp`;
+fs.writeFileSync(temporaryReportPath, harness.stdout);
+fs.writeFileSync(operatingTemporary, operatingBody);
 try {
-  fs.copyFileSync(temporaryReportPath, temporaryDashboardPath);
-  fs.renameSync(temporaryDashboardPath, dashboardReportPath);
   const token = fs
     .readFileSync(path.join(os.homedir(), ".openclaw", "workspace", ".dashboard_api_token"), "utf8")
     .trim();
-  const url = `http://127.0.0.1:18888/api/file-hub/download?path=${encodeURIComponent(`exports/${path.basename(reportPath)}`)}`;
-  const downloaded = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (
-    !downloaded.ok ||
-    !Buffer.from(await downloaded.arrayBuffer()).equals(Buffer.from(harness.stdout))
-  ) {
-    throw new Error(`dashboard File Hub report readback failed: HTTP ${downloaded.status}`);
+  const headers = { Authorization: `Bearer ${token}` };
+  for (const item of [
+    {
+      source: operatingTemporary,
+      destination: operatingDashboardPath,
+      temporary: operatingDashboardTemporary,
+      body: operatingBody,
+    },
+    {
+      source: temporaryReportPath,
+      destination: dashboardReportPath,
+      temporary: temporaryDashboardPath,
+      body: harness.stdout,
+    },
+  ]) {
+    fs.copyFileSync(item.source, item.temporary);
+    fs.renameSync(item.temporary, item.destination);
+    const url = `http://127.0.0.1:18888/api/file-hub/download?path=${encodeURIComponent(`exports/${path.basename(item.destination)}`)}`;
+    const downloaded = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+    if (
+      !downloaded.ok ||
+      !Buffer.from(await downloaded.arrayBuffer()).equals(Buffer.from(item.body))
+    ) {
+      throw new Error(
+        `dashboard File Hub readback failed for ${path.basename(item.destination)}: HTTP ${downloaded.status}`,
+      );
+    }
   }
-  // Publish the source report only after the dashboard serves the same bytes.
+  // Publish source artifacts only after both dashboard downloads match.
+  fs.renameSync(operatingTemporary, operatingPath);
   fs.renameSync(temporaryReportPath, reportPath);
 } catch (error) {
-  fs.rmSync(temporaryDashboardPath, { force: true });
-  fs.rmSync(dashboardReportPath, { force: true });
+  for (const file of [
+    temporaryDashboardPath,
+    dashboardReportPath,
+    operatingDashboardTemporary,
+    operatingDashboardPath,
+    operatingTemporary,
+    operatingPath,
+  ]) {
+    fs.rmSync(file, { force: true });
+  }
   const detail = `Dashboard File Hub report publication failed: ${error?.message ?? "unknown"}`;
   const lane = report.lanes.find((item) => item.laneId === "file_hub_export");
   const check = lane?.checks.find((item) => item.checkId === "write_export");
@@ -123,8 +185,18 @@ try {
   );
   fs.writeFileSync(temporaryReportPath, JSON.stringify(report) + "\n");
   fs.renameSync(temporaryReportPath, reportPath);
+  const failedOperatingState = operatingModule.resolveSopOperatingLaneState(
+    operatingRegistry,
+    report,
+    new Date().toISOString(),
+  );
+  operatingReport.observedResult = "FAIL";
+  operatingReport.lanes = operatingLanes(failedOperatingState);
+  fs.writeFileSync(operatingTemporary, JSON.stringify(operatingReport, null, 2) + "\n");
+  fs.renameSync(operatingTemporary, operatingPath);
 }
 process.stdout.write(
-  JSON.stringify({ status: report.status, reportPath, summary: report.summary }) + "\n",
+  JSON.stringify({ status: report.status, reportPath, operatingPath, summary: report.summary }) +
+    "\n",
 );
 process.exitCode = report.status === "PASS" ? 0 : 1;

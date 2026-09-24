@@ -1,5 +1,6 @@
 import { redactToolPayloadText } from "../logging/redact.js";
 import { MAX_TIMER_TIMEOUT_MS } from "../shared/number-coercion.js";
+import { buildSopOperatingRegistry } from "./sop-operating-registry.js";
 
 export const LANE_READINESS_REPORT_SCHEMA = "openclaw.lane_readiness_report.v1" as const;
 
@@ -182,6 +183,7 @@ for (const lane of laneReadinessLanes) {
 }
 
 export const LANE_READINESS_LANES: readonly LaneReadinessLane[] = Object.freeze(laneReadinessLanes);
+export const SOP_OPERATING_REGISTRY = buildSopOperatingRegistry(LANE_READINESS_LANES);
 
 export type LaneReadinessCheckExecution = {
   runLabel: string;
