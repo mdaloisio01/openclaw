@@ -42,6 +42,70 @@ const commands = {
   "gateway_runtime.health": ["health", "--json", "--verbose", "--timeout", "10000"],
   "gateway_runtime.method_smoke": ["cron", "list", "--json", "--timeout", "10000"],
 };
+if (
+  key === "cleanup_crew.clean_watchdog" ||
+  key === "watchdog.cron_freshness" ||
+  key === "watchdog.seven_dimensions"
+) {
+  // This owner command reads the live SQLite store in report-only mode.
+  // A fresh scan is evidence; its metadata alone cannot certify a clean lane.
+  const ownerScript =
+    "/home/will/.openclaw/workspace-orchestrator/scripts/system_wide_active_work_watchdog.py";
+  const command = [
+    ownerScript,
+    "--mode",
+    "report-only",
+    "--reason",
+    "lane-readiness",
+    "--chat-delivery",
+    "off",
+    "--stdout-json",
+  ];
+  const run = spawnSync("python3", command, {
+    encoding: "utf8",
+    timeout: 10_000,
+    maxBuffer: 1024 * 1024,
+  });
+  let receipt;
+  try {
+    const jsonStart = run.stdout.indexOf("{");
+    receipt = JSON.parse(run.stdout.slice(jsonStart)).receipt;
+  } catch {
+    // A missing or malformed owner receipt cannot certify the lane.
+  }
+  const validReceipt =
+    receipt?.watchdog === "system_wide_active_work_watchdog" &&
+    typeof receipt.checked_at === "string" &&
+    Number.isSafeInteger(receipt.summary?.items_suspicious) &&
+    Array.isArray(receipt.clean_dimensions_required);
+  if (run.status !== 0 || !validReceipt) {
+    respond(
+      "FAIL",
+      `${key} owner watchdog scan failed: exit=${run.status ?? "none"}, error=${run.error?.code ?? "none"}, validReceipt=${validReceipt}`,
+      { ownerCommand: command },
+    );
+  }
+  const suspicious = receipt.summary?.items_suspicious;
+  const cron = receipt.watchdog_cron;
+  const detail =
+    key === "cleanup_crew.clean_watchdog"
+      ? `Owner watchdog scan found ${suspicious} suspicious items; clean watchdog proof unavailable`
+      : key === "watchdog.cron_freshness"
+        ? `Owner watchdog cron has enabled=${cron?.enabled}, lastRunStatus=${cron?.last_run_status}, lastRunAt=${cron?.last_run_at}; fresh scheduled proof unavailable`
+        : `Owner scan declares ${receipt.clean_dimensions_required?.length ?? 0} clean dimensions and found ${suspicious} suspicious items; seven-dimension clean proof unavailable`;
+  respond("FAIL", detail, {
+    ownerCommand: command,
+    ownerCheckedAt: receipt.checked_at,
+    suspiciousItems: suspicious,
+    cleanDimensionsRequired: receipt.clean_dimensions_required,
+    cron: {
+      enabled: cron?.enabled,
+      lastRunStatus: cron?.last_run_status,
+      lastRunAt: cron?.last_run_at,
+      nextRunAt: cron?.next_run_at,
+    },
+  });
+}
 const args = commands[key];
 if (!args) {
   respond("FAIL", `No production owner command is registered for ${key}`);
