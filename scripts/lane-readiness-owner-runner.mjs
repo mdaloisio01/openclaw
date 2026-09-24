@@ -82,6 +82,8 @@ if (key === "watchdog.fixture_matrix") {
   respond("PASS", undefined, evidence);
 }
 if (
+  key === "will_controller.active_worker_proof" ||
+  key === "will_controller.final_source_delivery" ||
   key === "cleanup_crew.clean_watchdog" ||
   key === "cleanup_crew.stale_worker" ||
   key === "cleanup_crew.repair_routing" ||
@@ -89,7 +91,8 @@ if (
   key === "watchdog.seven_dimensions" ||
   key === "watchdog.repair_closure" ||
   key === "source_report_delivery.failure_notice" ||
-  key === "source_report_delivery.final_delivered"
+  key === "source_report_delivery.final_delivered" ||
+  key === "source_report_delivery.obligation_round_trip"
 ) {
   // This owner command reads the live SQLite store in report-only mode.
   // A fresh scan is evidence; its metadata alone cannot certify a clean lane.
@@ -162,7 +165,11 @@ if (
     });
   }
   let detail;
-  if (key === "cleanup_crew.clean_watchdog") {
+  if (key === "will_controller.active_worker_proof") {
+    detail = `Owner watchdog scan found ${completeItemList ? "" : "at least "}${workerFindings} suspicious worker records; active ownership proof unavailable`;
+  } else if (key === "will_controller.final_source_delivery") {
+    detail = `Owner watchdog found ${sourceFailed} failed and ${sourceStale} stale source-delivery obligations; final source delivery proof unavailable`;
+  } else if (key === "cleanup_crew.clean_watchdog") {
     detail = `Owner watchdog scan found ${suspicious} suspicious items; clean watchdog proof unavailable`;
   } else if (key === "cleanup_crew.stale_worker") {
     detail = `Owner watchdog scan found ${completeItemList ? "" : "at least "}${workerFindings} suspicious worker records; clean worker proof unavailable`;
@@ -176,6 +183,8 @@ if (
     detail = `Owner watchdog scan found ${suspicious} suspicious items; routed repair closure proof unavailable`;
   } else if (key === "source_report_delivery.failure_notice") {
     detail = `Owner watchdog found ${sourceFailed} failed source-delivery obligations; visible failure notice proof unavailable`;
+  } else if (key === "source_report_delivery.obligation_round_trip") {
+    detail = `Owner watchdog found ${sourceFailed} failed and ${sourceStale} stale delivery obligations; live obligation round-trip proof unavailable`;
   } else {
     detail = `Owner watchdog found ${sourceFailed} failed and ${sourceStale} stale source-delivery obligations; final delivery proof unavailable`;
   }
