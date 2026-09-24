@@ -14,20 +14,37 @@ const response = {
   sourceRevision: request.sourceRevision,
   executedAt,
 };
+if (
+  !/^[a-z][a-z0-9_]{0,63}$/.test(request.laneId) ||
+  !/^[a-z][a-z0-9_]{0,63}$/.test(request.checkId)
+) {
+  throw new Error("invalid lane readiness check identity");
+}
+function respond(status, detail, evidence = {}) {
+  const proofPath = path.join("proof", request.laneId, `${request.checkId}.json`);
+  const absolute = path.resolve(process.cwd(), proofPath);
+  fs.mkdirSync(path.dirname(absolute), { recursive: true });
+  fs.writeFileSync(
+    absolute,
+    JSON.stringify({ check: key, executedAt, status, ...(detail ? { detail } : {}), ...evidence }),
+  );
+  process.stdout.write(
+    JSON.stringify({
+      ...response,
+      status,
+      proofPaths: [proofPath],
+      ...(detail ? { detail } : {}),
+    }),
+  );
+  process.exit(0);
+}
 const commands = {
   "gateway_runtime.health": ["health", "--json", "--verbose", "--timeout", "10000"],
   "gateway_runtime.method_smoke": ["cron", "list", "--json", "--timeout", "10000"],
 };
 const args = commands[key];
 if (!args) {
-  process.stdout.write(
-    JSON.stringify({
-      ...response,
-      status: "FAIL",
-      detail: `No production owner command is registered for ${key}`,
-    }),
-  );
-  process.exit(0);
+  respond("FAIL", `No production owner command is registered for ${key}`);
 }
 
 // The CLI can probe a healthy older Gateway. Bind PASS to the built source and
@@ -41,14 +58,11 @@ if (
   buildInfo.dirty !== false ||
   !Number.isFinite(builtAtMs)
 ) {
-  process.stdout.write(
-    JSON.stringify({
-      ...response,
-      status: "FAIL",
-      detail: `${key} build identity mismatch: source=${request.sourceRevision}, build=${buildInfo.commit}, buildDirty=${buildInfo.dirty}`,
-    }),
+  respond(
+    "FAIL",
+    `${key} build identity mismatch: source=${request.sourceRevision}, build=${buildInfo.commit}, buildDirty=${buildInfo.dirty}`,
+    { buildCommit: buildInfo.commit, buildDirty: buildInfo.dirty },
   );
-  process.exit(0);
 }
 
 const entry = path.resolve(import.meta.dirname, "../dist/entry.js");
@@ -106,14 +120,7 @@ const localGateway =
 const unitPath = gatewayStatus?.service?.command?.sourcePath;
 const unitName = typeof unitPath === "string" ? path.basename(unitPath) : "";
 if (!localGateway || !/^openclaw-[A-Za-z0-9_.@-]+\.service$/.test(unitName)) {
-  process.stdout.write(
-    JSON.stringify({
-      ...response,
-      status: "FAIL",
-      detail: `${key} could not bind the probed Gateway to the running local service`,
-    }),
-  );
-  process.exit(0);
+  respond("FAIL", `${key} could not bind the probed Gateway to the running local service`);
 }
 probeEnv.OPENCLAW_GATEWAY_PORT = String(gatewayStatus.gateway.port);
 
@@ -153,14 +160,7 @@ for (const scope of ["user", "system"]) {
 }
 const startedAtMs = Date.parse(unitFacts.ExecMainStartTimestamp ?? "");
 if (!unitScope || !Number.isFinite(startedAtMs) || startedAtMs < builtAtMs) {
-  process.stdout.write(
-    JSON.stringify({
-      ...response,
-      status: "FAIL",
-      detail: `${key} selected Gateway process is not bound to the current build`,
-    }),
-  );
-  process.exit(0);
+  respond("FAIL", `${key} selected Gateway process is not bound to the current build`);
 }
 
 const result = spawnSync(process.execPath, [entry, ...args], {
@@ -183,44 +183,32 @@ const healthy =
         (Array.isArray(payload.plugins.errors) && payload.plugins.errors.length === 0))
     : Array.isArray(payload?.jobs);
 if (result.status !== 0 || !payload || !healthy) {
-  process.stdout.write(
-    JSON.stringify({
-      ...response,
-      status: "FAIL",
-      detail: `${key} CLI probe failed: exit=${result.status ?? "none"}, error=${result.error?.code ?? "none"}, validJson=${Boolean(payload)}, healthy=${healthy}`,
-    }),
+  respond(
+    "FAIL",
+    `${key} CLI probe failed: exit=${result.status ?? "none"}, error=${result.error?.code ?? "none"}, validJson=${Boolean(payload)}, healthy=${healthy}`,
+    { command: args, exitCode: result.status, errorCode: result.error?.code },
   );
-  process.exit(0);
 }
 
-const proofPath = path.join("proof", request.laneId, `${request.checkId}.json`);
-const absolute = path.resolve(process.cwd(), proofPath);
-fs.mkdirSync(path.dirname(absolute), { recursive: true });
-fs.writeFileSync(
-  absolute,
-  JSON.stringify({
-    check: key,
-    executedAt,
-    command: args,
-    exitCode: result.status,
-    sourceRevision: request.sourceRevision,
-    buildCommit: buildInfo.commit,
-    buildAt: buildInfo.builtAt,
-    gatewayStartedAt: new Date(startedAtMs).toISOString(),
-    gatewayPid: runtimePid,
-    gatewayUrl: gatewayStatus.rpc.url,
-    gatewayUnit: unitName,
-    gatewayUnitScope: unitScope,
-    result:
-      key === "gateway_runtime.health"
-        ? {
-            ok: payload.ok,
-            observedAt: payload.ts,
-            durationMs: payload.durationMs,
-            eventLoopDegraded: payload.eventLoop?.degraded,
-            pluginErrorCount: payload.plugins?.errors?.length,
-          }
-        : { jobCount: payload.jobs.length, total: payload.total },
-  }),
-);
-process.stdout.write(JSON.stringify({ ...response, status: "PASS", proofPaths: [proofPath] }));
+respond("PASS", undefined, {
+  command: args,
+  exitCode: result.status,
+  sourceRevision: request.sourceRevision,
+  buildCommit: buildInfo.commit,
+  buildAt: buildInfo.builtAt,
+  gatewayStartedAt: new Date(startedAtMs).toISOString(),
+  gatewayPid: runtimePid,
+  gatewayUrl: gatewayStatus.rpc.url,
+  gatewayUnit: unitName,
+  gatewayUnitScope: unitScope,
+  result:
+    key === "gateway_runtime.health"
+      ? {
+          ok: payload.ok,
+          observedAt: payload.ts,
+          durationMs: payload.durationMs,
+          eventLoopDegraded: payload.eventLoop?.degraded,
+          pluginErrorCount: payload.plugins?.errors?.length,
+        }
+      : { jobCount: payload.jobs.length, total: payload.total },
+});
