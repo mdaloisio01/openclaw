@@ -22,3 +22,13 @@ export {
   type SopOperatingLaneState,
   type SopOperatingRegistry,
 } from "./governance/sop-operating-registry.js";
+export {
+  requireCurrentSopArtifact,
+  resolveSopCurrentTruth,
+  SOP_ARTIFACT_ROLES,
+  type SopArtifact,
+  type SopArtifactClass,
+  type SopArtifactClassification,
+  type SopArtifactRole,
+  type SopCurrentTruthContext,
+} from "./governance/sop-current-truth.js";

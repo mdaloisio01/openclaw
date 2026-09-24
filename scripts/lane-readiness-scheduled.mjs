@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -74,11 +75,44 @@ if (
 const operatingModule = await import(
   pathToFileURL(path.resolve(import.meta.dirname, "../dist/lane-readiness.js")).href
 );
+const temporaryReportPath = `${reportPath}.${process.pid}.tmp`;
+fs.writeFileSync(temporaryReportPath, harness.stdout);
+const observedAt = new Date().toISOString();
+try {
+  const currentReadiness = operatingModule.resolveSopCurrentTruth(
+    [
+      {
+        id: runLabel,
+        role: "readiness_report",
+        scope: runLabel,
+        issuedAt: report.checkedAt,
+        expiresAt: report.nextRunDueAt,
+        sourceRevision,
+        proofPaths: [temporaryReportPath],
+        proofBindings: [
+          {
+            path: temporaryReportPath,
+            sha256: createHash("sha256").update(harness.stdout).digest("hex"),
+            artifactId: runLabel,
+            role: "readiness_report",
+            scope: runLabel,
+            sourceRevision,
+          },
+        ],
+      },
+    ],
+    { activeScope: runLabel, activeRevision: sourceRevision, now: observedAt },
+  );
+  operatingModule.requireCurrentSopArtifact(currentReadiness, "readiness_report");
+} catch (error) {
+  fs.rmSync(temporaryReportPath, { force: true });
+  throw error;
+}
 const operatingRegistry = operatingModule.SOP_OPERATING_REGISTRY;
 const operatingState = operatingModule.resolveSopOperatingLaneState(
   operatingRegistry,
   report,
-  new Date().toISOString(),
+  observedAt,
 );
 const operatingLanes = (states) =>
   operatingRegistry.lanes.map((lane, index) =>
@@ -104,14 +138,12 @@ const operatingReport = {
 };
 const operatingPath = path.join(root, `operating_registry_${stamp}-report.json`);
 const operatingBody = `${JSON.stringify(operatingReport, null, 2)}\n`;
-const temporaryReportPath = `${reportPath}.${process.pid}.tmp`;
 const operatingTemporary = `${operatingPath}.${process.pid}.tmp`;
 const dashboardExportDir = path.join(os.homedir(), ".openclaw", "workspace", "file_hub", "exports");
 const dashboardReportPath = path.join(dashboardExportDir, path.basename(reportPath));
 const operatingDashboardPath = path.join(dashboardExportDir, path.basename(operatingPath));
 const temporaryDashboardPath = `${dashboardReportPath}.${process.pid}.tmp`;
 const operatingDashboardTemporary = `${operatingDashboardPath}.${process.pid}.tmp`;
-fs.writeFileSync(temporaryReportPath, harness.stdout);
 fs.writeFileSync(operatingTemporary, operatingBody);
 try {
   const token = fs
