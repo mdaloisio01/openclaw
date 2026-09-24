@@ -216,6 +216,7 @@ describe("write-cli-startup-metadata", () => {
 
     writeStartupMetadataSourceSignatureFixture(tempRoot);
     writeFixtureFile(distDir, "root-help-fixture.js", "export function outputRootHelp() {}\n");
+    writeFixtureFile(distDir, "build-info.json", JSON.stringify({ commit: "commit-one" }));
 
     const writeMetadata = async (): Promise<void> => {
       await writeCliStartupMetadata({
@@ -243,6 +244,10 @@ describe("write-cli-startup-metadata", () => {
     await writeMetadata();
     expect(nodesRenderCount).toBe(1);
 
+    writeFixtureFile(distDir, "build-info.json", JSON.stringify({ commit: "commit-two" }));
+    await writeMetadata();
+    expect(nodesRenderCount).toBe(2);
+
     const staleGeneratorMetadata = JSON.parse(readFileSync(outputPath, "utf8")) as Record<
       string,
       unknown
@@ -251,7 +256,7 @@ describe("write-cli-startup-metadata", () => {
     writeFileSync(outputPath, `${JSON.stringify(staleGeneratorMetadata, null, 2)}\n`, "utf8");
 
     await writeMetadata();
-    expect(nodesRenderCount).toBe(2);
+    expect(nodesRenderCount).toBe(3);
 
     writeFixtureFile(
       tempRoot,
@@ -264,7 +269,7 @@ describe("write-cli-startup-metadata", () => {
     const written = JSON.parse(readFileSync(outputPath, "utf8")) as {
       nodesHelpText: string;
     };
-    expect(nodesRenderCount).toBe(3);
-    expect(written.nodesHelpText).toContain("openclaw nodes 3");
+    expect(nodesRenderCount).toBe(4);
+    expect(written.nodesHelpText).toContain("openclaw nodes 4");
   });
 });

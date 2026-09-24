@@ -44,6 +44,17 @@ const CORE_CHANNEL_ORDER = [
 ] as const;
 const generatorSignature = createHash("sha1").update(readFileSync(scriptPath)).digest("hex");
 
+function readBuildCommit(directory: string): string | null {
+  try {
+    const buildInfo = JSON.parse(readFileSync(path.join(directory, "build-info.json"), "utf8")) as {
+      commit?: unknown;
+    };
+    return typeof buildInfo.commit === "string" ? buildInfo.commit : null;
+  } catch {
+    return null;
+  }
+}
+
 type ExtensionChannelEntry = {
   id: string;
   order: number;
@@ -668,6 +679,7 @@ export async function writeCliStartupMetadata(options?: {
   const resolvedOutputPath = options?.outputPath ?? outputPath;
   const resolvedExtensionsDir = options?.extensionsDir ?? extensionsDir;
   const resolvedSourceRootDir = options?.sourceRootDir ?? rootDir;
+  const buildCommit = readBuildCommit(resolvedDistDir);
   const channelCatalog = readBundledChannelCatalog(resolvedExtensionsDir);
   const bundleIdentity = resolveRootHelpBundleIdentity(resolvedDistDir);
   const browserHelpSourceSignature = resolveBrowserHelpSourceSignature(resolvedSourceRootDir);
@@ -684,6 +696,7 @@ export async function writeCliStartupMetadata(options?: {
     const existing = JSON.parse(readFileSync(resolvedOutputPath, "utf8")) as {
       rootHelpBundleSignature?: unknown;
       generatorSignature?: unknown;
+      buildCommit?: unknown;
       browserHelpSourceSignature?: unknown;
       secretsHelpSourceSignature?: unknown;
       nodesHelpSourceSignature?: unknown;
@@ -698,6 +711,7 @@ export async function writeCliStartupMetadata(options?: {
       bundleIdentity &&
       existing.rootHelpBundleSignature === bundleIdentity.signature &&
       existing.generatorSignature === generatorSignature &&
+      existing.buildCommit === buildCommit &&
       existing.browserHelpSourceSignature === browserHelpSourceSignature &&
       existing.secretsHelpSourceSignature === secretsHelpSourceSignature &&
       existing.nodesHelpSourceSignature === nodesHelpSourceSignature &&
@@ -762,6 +776,7 @@ export async function writeCliStartupMetadata(options?: {
       {
         generatedBy: "scripts/write-cli-startup-metadata.ts",
         generatorSignature,
+        buildCommit,
         channelOptions,
         channelCatalogSignature: channelCatalog.signature,
         rootHelpBundleSignature: bundleIdentity?.signature ?? null,
