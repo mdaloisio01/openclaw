@@ -7,7 +7,7 @@ import {
   createRunningTaskRun,
   failTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
-import { clearCronJobActive, markCronJobActive } from "../active-jobs.js";
+import { clearCronJobActive, isCronJobActive, markCronJobActive } from "../active-jobs.js";
 import { resolveCronDeliveryPlan, resolveFailureDestination } from "../delivery-plan.js";
 import { createCronRunDiagnosticsFromError } from "../run-diagnostics.js";
 import { createCronExecutionId } from "../run-id.js";
@@ -714,7 +714,7 @@ async function inspectManualRunPreflight(
       await skipInvalidPersistedManualRun({ state, job, mode, error });
       return { ok: true, ran: false, reason: "invalid-spec" as const };
     }
-    if (typeof job.state.runningAtMs === "number") {
+    if (typeof job.state.runningAtMs === "number" || isCronJobActive(job.id)) {
       return { ok: true, ran: false, reason: "already-running" as const };
     }
     const now = state.deps.nowMs();
@@ -764,7 +764,7 @@ async function prepareManualRun(
     // Reserve this run under lock, then execute outside lock so read ops
     // (`list`, `status`) stay responsive while the run is in progress.
     const job = findJobOrThrow(state, id);
-    if (typeof job.state.runningAtMs === "number") {
+    if (typeof job.state.runningAtMs === "number" || isCronJobActive(job.id)) {
       return { ok: true, ran: false, reason: "already-running" as const };
     }
     job.state.runningAtMs = preflight.now;

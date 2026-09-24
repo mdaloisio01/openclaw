@@ -457,20 +457,16 @@ async function readActiveWorkWatchdogJob(
   context: GatewayRequestContext,
   stage: WatchdogProbeDiagnosticError["diagnostic"]["stage"] = "poll-read",
 ) {
-  const byId = await withWatchdogProbeCronTimeout(
-    "cron.readJob",
-    stage,
-    context.cron.readJob(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID),
-  );
-  if (byId) {
-    return byId;
-  }
   const jobs = await withWatchdogProbeCronTimeout(
     "cron.list",
     stage,
     context.cron.list({ includeDisabled: true }),
   );
-  return jobs.find((job) => job.name === ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME);
+  return jobs
+    .filter((job) => job.name === ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME)
+    .toSorted(
+      (left, right) => right.createdAtMs - left.createdAtMs || right.updatedAtMs - left.updatedAtMs,
+    )[0];
 }
 
 async function waitForActiveWorkWatchdogEnabledState(params: {

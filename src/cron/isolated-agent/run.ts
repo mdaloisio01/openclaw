@@ -47,6 +47,7 @@ import type {
   CronJob,
   CronRunTelemetry,
 } from "../types.js";
+import { isWatchdogReceiptProofJob } from "../watchdog-proof-job.js";
 import { resolveCronChannelOutputPolicy } from "./channel-output-policy.js";
 import {
   isHeartbeatOnlyResponse,
@@ -295,6 +296,7 @@ function buildCronDeliveryTrace(params: {
 }
 
 function resolveCronSourceDeliveryPlan(params: {
+  job: CronJob;
   deliveryPlan: CronDeliveryPlan;
   resolvedDelivery: ResolvedCronDeliveryTarget;
 }): SourceDeliveryPlan {
@@ -317,7 +319,8 @@ function resolveCronSourceDeliveryPlan(params: {
       owner: "none",
       reason: "cron_none",
       target,
-      messageToolEnabled: true,
+      // The managed watchdog must finish same-run proof before any visible delivery.
+      messageToolEnabled: !isWatchdogReceiptProofJob(params.job),
       messageToolForced: false,
       directFallback: false,
     });
@@ -370,7 +373,11 @@ async function resolveCronDeliveryContext(params: {
       deliveryPlan,
       deliveryRequested: deliveryPlan.requested,
       resolvedDelivery,
-      sourceDelivery: resolveCronSourceDeliveryPlan({ deliveryPlan, resolvedDelivery }),
+      sourceDelivery: resolveCronSourceDeliveryPlan({
+        job: params.job,
+        deliveryPlan,
+        resolvedDelivery,
+      }),
     };
   }
   if (deliveryPlan.mode === "none" && !hasExplicitCronDeliveryTarget(deliveryPlan)) {
@@ -387,7 +394,11 @@ async function resolveCronDeliveryContext(params: {
       deliveryPlan,
       deliveryRequested: false,
       resolvedDelivery,
-      sourceDelivery: resolveCronSourceDeliveryPlan({ deliveryPlan, resolvedDelivery }),
+      sourceDelivery: resolveCronSourceDeliveryPlan({
+        job: params.job,
+        deliveryPlan,
+        resolvedDelivery,
+      }),
     };
   }
   const { resolveDeliveryTarget } = await loadCronDeliveryRuntime();
@@ -402,7 +413,11 @@ async function resolveCronDeliveryContext(params: {
     deliveryPlan,
     deliveryRequested: deliveryPlan.requested,
     resolvedDelivery,
-    sourceDelivery: resolveCronSourceDeliveryPlan({ deliveryPlan, resolvedDelivery }),
+    sourceDelivery: resolveCronSourceDeliveryPlan({
+      job: params.job,
+      deliveryPlan,
+      resolvedDelivery,
+    }),
   };
 }
 
@@ -1196,7 +1211,9 @@ async function disposeCronRunContext(params: {
       sessionId: params.sessionId,
       reason: "isolated-cron-dispose",
       onError: (error, sid) => {
-        logWarn(`[cron] Failed to retire MCP runtime during isolated cron dispose ${sid}: ${String(error)}`);
+        logWarn(
+          `[cron] Failed to retire MCP runtime during isolated cron dispose ${sid}: ${String(error)}`,
+        );
       },
     }).catch(() => {});
   }

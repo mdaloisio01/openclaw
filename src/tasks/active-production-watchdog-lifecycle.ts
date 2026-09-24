@@ -2,8 +2,11 @@ import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { persistCleanupCrewContinuityGateDecision } from "../commands/cleanup-plan.js";
 import type { AuthoritySource } from "../continuity/continuity-gate-v2.js";
+import { isCronJobActive } from "../cron/active-jobs.js";
 import type { CronServiceContract } from "../cron/service-contract.js";
 import type { Logger } from "../cron/service/state.js";
+import type { CronJob } from "../cron/types.js";
+import { isWatchdogReceiptProofJob } from "../cron/watchdog-proof-job.js";
 import { getTaskFlowProductionContinuation, listTaskFlowRecords } from "./task-flow-registry.js";
 import {
   configureTaskFlowRegistryRuntime,
@@ -46,6 +49,13 @@ export type ProductionWatchdogLifecycleResult =
       decision: ProductionWatchdogLifecycleDecision;
       jobId: string;
       error: string;
+    }
+  | {
+      ok: false;
+      action: "older-run-active";
+      decision: ProductionWatchdogLifecycleDecision;
+      jobId: string;
+      activeOlderIds: string[];
     };
 
 export type ProductionWatchdogContinuityGatePersistenceOptions = {
@@ -63,6 +73,7 @@ type GateLogger = Pick<Logger, "info" | "warn">;
 let installed = false;
 let pendingReconcile: Promise<ProductionWatchdogLifecycleResult> | null = null;
 let reconcileAgain = false;
+let olderRunRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 function isOpenTaskStatus(status: string): boolean {
   return (
@@ -160,14 +171,52 @@ export function resolveProductionWatchdogLifecycleDecision(): ProductionWatchdog
 
 async function resolveWatchdogCronJob(
   cron: CronServiceContract,
-): Promise<{ id: string; enabled: boolean } | null> {
-  const byId = await cron.readJob(ACTIVE_WORK_WATCHDOG_CRON_JOB_ID);
-  if (byId) {
-    return { id: byId.id, enabled: byId.enabled };
-  }
+): Promise<{ current: CronJob; olderIds: string[]; olderEnabledIds: string[] } | null> {
   const jobs = await cron.list({ includeDisabled: true });
-  const byName = jobs.find((job) => job.name === ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME);
-  return byName ? { id: byName.id, enabled: byName.enabled } : null;
+  const named = jobs
+    .filter((job) => job.name === ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME)
+    .toSorted(
+      (left, right) => right.createdAtMs - left.createdAtMs || right.updatedAtMs - left.updatedAtMs,
+    );
+  const current = named[0];
+  return current
+    ? {
+        current,
+        olderIds: named.slice(1).map((job) => job.id),
+        olderEnabledIds: named
+          .slice(1)
+          .filter((job) => job.enabled)
+          .map((job) => job.id),
+      }
+    : null;
+}
+
+function isValidManagedWatchdogJob(job: CronJob): boolean {
+  if (job.payload.kind !== "agentTurn") {
+    return false;
+  }
+  const command = job.payload.message;
+  return (
+    job.sessionTarget === "isolated" &&
+    isWatchdogReceiptProofJob(job) &&
+    hasOnlyFlagValue(command, "reason", "cron_tick") &&
+    hasOnlyFlagValue(command, "mode", "report-only") &&
+    hasOnlyFlagValue(command, "chat-delivery", "off") &&
+    job.delivery?.mode === "none" &&
+    job.schedule.kind === "cron" &&
+    job.schedule.expr === "*/5 * * * *" &&
+    job.schedule.tz === "UTC"
+  );
+}
+
+function hasOnlyFlagValue(command: string, flag: string, expected: string): boolean {
+  const mentions = [...command.matchAll(new RegExp(`--${flag}(?=\\s|=|$)`, "g"))];
+  const values = [...command.matchAll(new RegExp(`--${flag}(?:\\s+|=)([\\w-]+)`, "g"))];
+  return (
+    mentions.length > 0 &&
+    values.length === mentions.length &&
+    values.every(([, value]) => value === expected)
+  );
 }
 
 function resolveActiveWatchdogFlows(
@@ -322,8 +371,40 @@ export async function reconcileProductionWatchdogCron(params: {
     });
     return result;
   }
-  if (job.enabled === decision.shouldRun) {
-    const result = { ok: true, action: "already-correct", decision, jobId: job.id } as const;
+  const current = job.current;
+  if (decision.shouldRun && !isValidManagedWatchdogJob(current)) {
+    let error = "newest managed watchdog cron has an invalid owner, payload, delivery, or schedule";
+    if (current.enabled) {
+      try {
+        await withCronOperationTimeout(
+          "cron.update invalid active production watchdog",
+          params.cron.update(current.id, { enabled: false }),
+        );
+      } catch (cause) {
+        error += `; disabling invalid job failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+      }
+    }
+    const result = {
+      ok: false,
+      action: "update-failed",
+      decision,
+      jobId: current.id,
+      error,
+    } as const;
+    await persistProductionWatchdogContinuityGateDecision({
+      decision,
+      result,
+      continuityGate: params.continuityGate,
+      log: params.log,
+    });
+    return result;
+  }
+  if (
+    current.enabled === decision.shouldRun &&
+    job.olderEnabledIds.length === 0 &&
+    !job.olderIds.some(isCronJobActive)
+  ) {
+    const result = { ok: true, action: "already-correct", decision, jobId: current.id } as const;
     await persistProductionWatchdogContinuityGateDecision({
       decision,
       result,
@@ -333,13 +414,45 @@ export async function reconcileProductionWatchdogCron(params: {
     return result;
   }
   try {
-    await withCronOperationTimeout(
-      "cron.update active production watchdog lifecycle",
-      params.cron.update(job.id, { enabled: decision.shouldRun }),
-    );
+    // Retire older copies before enabling the replacement so two timers cannot race shared proof.
+    for (const olderId of job.olderEnabledIds) {
+      await withCronOperationTimeout(
+        "cron.update retired active production watchdog",
+        params.cron.update(olderId, { enabled: false }),
+      );
+    }
+    const activeOlderIds = job.olderIds.filter(isCronJobActive);
+    if (decision.shouldRun && activeOlderIds.length > 0) {
+      if (current.enabled) {
+        await withCronOperationTimeout(
+          "cron.update active production watchdog replacement hold",
+          params.cron.update(current.id, { enabled: false }),
+        );
+      }
+      const result = {
+        ok: false,
+        action: "older-run-active",
+        decision,
+        jobId: current.id,
+        activeOlderIds,
+      } as const;
+      await persistProductionWatchdogContinuityGateDecision({
+        decision,
+        result,
+        continuityGate: params.continuityGate,
+        log: params.log,
+      });
+      return result;
+    }
+    if (current.enabled !== decision.shouldRun) {
+      await withCronOperationTimeout(
+        "cron.update active production watchdog lifecycle",
+        params.cron.update(current.id, { enabled: decision.shouldRun }),
+      );
+    }
     params.log?.info(
       {
-        jobId: job.id,
+        jobId: current.id,
         enabled: decision.shouldRun,
         activeProductionFlowIds: decision.activeProductionFlowIds,
         openTaskCount: decision.openTaskCount,
@@ -350,7 +463,7 @@ export async function reconcileProductionWatchdogCron(params: {
       ok: true,
       action: decision.shouldRun ? "enabled" : "disabled",
       decision,
-      jobId: job.id,
+      jobId: current.id,
     } as const;
     await persistProductionWatchdogContinuityGateDecision({
       decision,
@@ -363,7 +476,7 @@ export async function reconcileProductionWatchdogCron(params: {
     const message = error instanceof Error ? error.message : String(error);
     params.log?.warn(
       {
-        jobId: job.id,
+        jobId: current.id,
         enabled: decision.shouldRun,
         error: message,
       },
@@ -373,7 +486,7 @@ export async function reconcileProductionWatchdogCron(params: {
       ok: false,
       action: "update-failed",
       decision,
-      jobId: job.id,
+      jobId: current.id,
       error: message,
     } as const;
     await persistProductionWatchdogContinuityGateDecision({
@@ -402,13 +515,24 @@ export function installProductionWatchdogLifecycleGate(params: {
       reconcileAgain = true;
       return;
     }
-    pendingReconcile = reconcileProductionWatchdogCron(params).finally(() => {
-      pendingReconcile = null;
-      if (reconcileAgain) {
-        reconcileAgain = false;
-        scheduleReconcile();
-      }
-    });
+    pendingReconcile = reconcileProductionWatchdogCron(params)
+      .then((result) => {
+        if (result.action === "older-run-active" && !olderRunRetryTimer) {
+          olderRunRetryTimer = setTimeout(() => {
+            olderRunRetryTimer = null;
+            scheduleReconcile();
+          }, 1_000);
+          olderRunRetryTimer.unref?.();
+        }
+        return result;
+      })
+      .finally(() => {
+        pendingReconcile = null;
+        if (reconcileAgain) {
+          reconcileAgain = false;
+          scheduleReconcile();
+        }
+      });
   };
   configureTaskRegistryRuntime({
     observers: {
@@ -433,4 +557,8 @@ export function resetProductionWatchdogLifecycleGateForTests(): void {
   installed = false;
   pendingReconcile = null;
   reconcileAgain = false;
+  if (olderRunRetryTimer) {
+    clearTimeout(olderRunRetryTimer);
+    olderRunRetryTimer = null;
+  }
 }

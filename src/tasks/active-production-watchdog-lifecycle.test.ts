@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { markCronJobActive, clearCronJobActive } from "../cron/active-jobs.js";
 import type { CronServiceContract } from "../cron/service-contract.js";
 import type { CronJob } from "../cron/types.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -30,10 +31,15 @@ function createWatchdogJob(enabled: boolean): CronJob {
     name: ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME,
     enabled,
     agentId: "orchestrator",
-    schedule: { kind: "cron", expr: "*/5 * * * *" },
-    payload: { kind: "systemEvent", text: "watch active production" },
-    sessionTarget: "main",
-    wakeMode: "next-heartbeat",
+    schedule: { kind: "cron", expr: "*/5 * * * *", tz: "UTC" },
+    payload: {
+      kind: "agentTurn",
+      message:
+        "Run scripts/system_wide_active_work_watchdog.py --mode report-only --reason cron_tick --write-receipt --chat-delivery off",
+    },
+    delivery: { mode: "none" },
+    sessionTarget: "isolated",
+    wakeMode: "now",
     deleteAfterRun: false,
     createdAtMs: 100,
     updatedAtMs: 100,
@@ -137,6 +143,252 @@ describe("active production watchdog lifecycle", () => {
       });
       expect(cron.job.enabled).toBe(true);
       expect(resolveProductionWatchdogLifecycleDecision().shouldRun).toBe(true);
+    });
+  });
+
+  it("uses the newest managed watchdog when an older fixed-ID job remains", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(false),
+        id: "replacement-watchdog-job",
+        createdAtMs: 200,
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+      createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog-replacement",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+
+      const result = await reconcileProductionWatchdogCron({ cron });
+
+      expect(result).toMatchObject({ ok: true, action: "enabled", jobId: replacement.id });
+      expect(cron.update).toHaveBeenNthCalledWith(1, cron.job.id, { enabled: false });
+      expect(cron.update).toHaveBeenNthCalledWith(2, replacement.id, { enabled: true });
+    });
+  });
+
+  it("preserves the working watchdog when a newer same-name job is invalid", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(false),
+        id: "invalid-replacement-watchdog",
+        createdAtMs: 200,
+        delivery: { mode: "announce" as const },
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+      createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog-invalid-replacement",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+      const result = await reconcileProductionWatchdogCron({ cron });
+      expect(result).toMatchObject({ ok: false, action: "update-failed", jobId: replacement.id });
+      expect(cron.update).not.toHaveBeenCalled();
+
+      cron.list = vi.fn(async () => [
+        cron.job,
+        {
+          ...replacement,
+          delivery: { mode: "none" as const },
+          payload: {
+            kind: "agentTurn" as const,
+            message: "Run scripts/system_wide_active_work_watchdog.py --write-receipt",
+          },
+        },
+      ]);
+      const missingReason = await reconcileProductionWatchdogCron({ cron });
+      expect(missingReason).toMatchObject({
+        ok: false,
+        action: "update-failed",
+        jobId: replacement.id,
+      });
+      expect(cron.update).not.toHaveBeenCalled();
+
+      cron.list = vi.fn(async () => [
+        cron.job,
+        {
+          ...replacement,
+          delivery: { mode: "none" as const },
+          payload: {
+            kind: "systemEvent" as const,
+            text: "Run scripts/system_wide_active_work_watchdog.py --write-receipt",
+          },
+        },
+      ]);
+      const invalidPayload = await reconcileProductionWatchdogCron({ cron });
+      expect(invalidPayload).toMatchObject({
+        ok: false,
+        action: "update-failed",
+        jobId: replacement.id,
+      });
+      expect(cron.update).not.toHaveBeenCalled();
+    });
+  });
+
+  it("disables older jobs even when the newest spec is invalid after production closes", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(false),
+        id: "closed-invalid-watchdog",
+        createdAtMs: 200,
+        delivery: { mode: "announce" as const },
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+
+      const result = await reconcileProductionWatchdogCron({ cron });
+
+      expect(result).toMatchObject({ ok: true, action: "disabled", jobId: replacement.id });
+      expect(cron.update).toHaveBeenCalledWith(cron.job.id, { enabled: false });
+      expect(cron.update).not.toHaveBeenCalledWith(replacement.id, { enabled: true });
+    });
+  });
+
+  it("disables an enabled invalid replacement while production is open", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(true),
+        id: "enabled-invalid-watchdog",
+        createdAtMs: 200,
+        delivery: { mode: "announce" as const },
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+      createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog-enabled-invalid",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+
+      const result = await reconcileProductionWatchdogCron({ cron });
+
+      expect(result).toMatchObject({ ok: false, action: "update-failed", jobId: replacement.id });
+      expect(cron.update).toHaveBeenCalledWith(replacement.id, { enabled: false });
+      expect(cron.update).not.toHaveBeenCalledWith(replacement.id, { enabled: true });
+    });
+  });
+
+  it("rejects managed commands with conflicting scanner flags", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(false);
+      const valid = createWatchdogJob(false);
+      if (valid.payload.kind !== "agentTurn") {
+        throw new Error("expected isolated watchdog fixture");
+      }
+      const commands = [
+        valid.payload.message.replace("--reason cron_tick", "--reason manual"),
+        valid.payload.message.replace("--mode report-only", "--mode write-action"),
+        valid.payload.message.replace("--chat-delivery off", "--chat-delivery auto"),
+        `${valid.payload.message} --chat-delivery auto`,
+      ];
+      createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog-conflicting-command",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+
+      for (const message of commands) {
+        cron.list = vi.fn(async () => [{ ...valid, payload: { kind: "agentTurn", message } }]);
+        const result = await reconcileProductionWatchdogCron({ cron });
+        expect(result).toMatchObject({ ok: false, action: "update-failed" });
+      }
+      expect(cron.update).not.toHaveBeenCalled();
+    });
+  });
+
+  it("disables the current job after production closes while an older run drains", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(true),
+        id: "closed-active-watchdog",
+        createdAtMs: 200,
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+      markCronJobActive(cron.job.id);
+      try {
+        const result = await reconcileProductionWatchdogCron({ cron });
+        expect(result).toMatchObject({ ok: true, action: "disabled", jobId: replacement.id });
+        expect(cron.update).toHaveBeenCalledWith(cron.job.id, { enabled: false });
+        expect(cron.update).toHaveBeenCalledWith(replacement.id, { enabled: false });
+      } finally {
+        clearCronJobActive(cron.job.id);
+      }
+    });
+  });
+
+  it("waits for an older active run before enabling the replacement", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(false),
+        id: "active-replacement-watchdog",
+        createdAtMs: 200,
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+      createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog-active-replacement",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+      markCronJobActive(cron.job.id);
+      try {
+        const result = await reconcileProductionWatchdogCron({ cron });
+        expect(result).toMatchObject({
+          ok: false,
+          action: "older-run-active",
+          activeOlderIds: [cron.job.id],
+        });
+        expect(cron.update).not.toHaveBeenCalledWith(replacement.id, { enabled: true });
+      } finally {
+        clearCronJobActive(cron.job.id);
+      }
+    });
+  });
+
+  it("holds an already enabled replacement while an older run drains", async () => {
+    await withTaskState(async () => {
+      const cron = createCronHarness(true);
+      const replacement = {
+        ...createWatchdogJob(true),
+        id: "enabled-active-replacement-watchdog",
+        createdAtMs: 200,
+      };
+      cron.list = vi.fn(async () => [cron.job, replacement]);
+      createManagedTaskFlow({
+        ownerKey: "agent:orchestrator:main",
+        controllerId: "tests/production-watchdog-enabled-active-replacement",
+        goal: "100% production run",
+        status: "running",
+        continuation: { activeProductionRun: true },
+      });
+      markCronJobActive(cron.job.id);
+      try {
+        const result = await reconcileProductionWatchdogCron({ cron });
+        expect(result).toMatchObject({
+          ok: false,
+          action: "older-run-active",
+          activeOlderIds: [cron.job.id],
+        });
+        expect(cron.update).toHaveBeenCalledWith(cron.job.id, { enabled: false });
+        expect(cron.update).toHaveBeenCalledWith(replacement.id, { enabled: false });
+        expect(cron.update).not.toHaveBeenCalledWith(replacement.id, { enabled: true });
+      } finally {
+        clearCronJobActive(cron.job.id);
+      }
     });
   });
 

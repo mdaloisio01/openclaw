@@ -191,10 +191,14 @@ function createWatchdogJob(enabled: boolean): CronJob {
     name: ACTIVE_WORK_WATCHDOG_CRON_JOB_NAME,
     enabled,
     agentId: "orchestrator",
-    schedule: { kind: "cron", expr: "*/5 * * * *" },
-    payload: { kind: "systemEvent", text: "watch active production" },
-    sessionTarget: "main",
-    wakeMode: "next-heartbeat",
+    schedule: { kind: "cron", expr: "*/5 * * * *", tz: "UTC" },
+    payload: {
+      kind: "agentTurn",
+      message: "Run scripts/system_wide_active_work_watchdog.py --write-receipt",
+    },
+    delivery: { mode: "none" },
+    sessionTarget: "isolated",
+    wakeMode: "now",
     deleteAfterRun: false,
     createdAtMs: 100,
     updatedAtMs: 100,
@@ -2613,9 +2617,27 @@ describe("tasks gateway handlers", () => {
     expect(flow?.status).toBe("succeeded");
   });
 
-  it("returns structured diagnostics when watchdog probe cron.readJob stalls", async () => {
+  it("probes the newest named watchdog when the historical row remains", async () => {
     const cron = createCronHarness(false);
-    cron.readJob = vi.fn(async () => await new Promise<never>(() => {}));
+    const replacement = {
+      ...createWatchdogJob(false),
+      id: "replacement-watchdog-probe",
+      createdAtMs: 200,
+    };
+    const jobs = [cron.job, replacement];
+    cron.list = vi.fn(async () => jobs);
+    cron.update = vi.fn(async (id: string, patch: Partial<CronJob>) => {
+      const job = jobs.find((entry) => entry.id === id);
+      if (!job) {
+        throw new Error(`missing cron job ${id}`);
+      }
+      if (typeof patch.enabled === "boolean") {
+        job.enabled = patch.enabled;
+      }
+      job.updatedAtMs += 1;
+      return job;
+    });
+    installProductionWatchdogLifecycleGate({ cron });
 
     const { calls, payload } = await runTaskHandler(
       "tasks.probeProductionWatchdogLifecycle",
@@ -2623,22 +2645,14 @@ describe("tasks gateway handlers", () => {
       { cron },
     );
 
-    expect(calls[0]?.[0]).toBe(false);
-    expect(payload?.diagnostic).toMatchObject({
-      kind: "watchdog_lifecycle_probe_timeout",
-      operation: "cron.readJob",
-      stage: "initial-read",
-      timeoutMs: 2000,
-    });
-    expect(calls[0]?.[2]).toMatchObject({
-      code: "UNAVAILABLE",
-      message: expect.stringContaining("cron.readJob timed out"),
-    });
+    expect(calls[0]?.[0]).toBe(true);
+    expect(payload).toMatchObject({ ok: true, afterOpenEnabled: true, afterCloseEnabled: false });
+    expect(cron.update).toHaveBeenCalledWith(replacement.id, { enabled: true });
+    expect(cron.update).toHaveBeenCalledWith(replacement.id, { enabled: false });
   });
 
   it("returns structured diagnostics when watchdog probe cron.list stalls", async () => {
     const cron = createCronHarness(false);
-    cron.readJob = vi.fn(async () => undefined);
     cron.list = vi.fn(async () => await new Promise<never>(() => {}));
 
     const { calls, payload } = await runTaskHandler(

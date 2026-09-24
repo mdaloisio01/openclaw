@@ -502,6 +502,91 @@ describe("CronService", () => {
     await stopCronAndCleanup(cron, store);
   });
 
+  it("binds an isolated owner watchdog run to its own receipt", async () => {
+    const runIsolatedAgentJob = vi.fn(async (_params: { message: string }) => ({
+      status: "ok" as const,
+      summary: "claimed complete",
+    }));
+    const { store, cron } = await createCronHarness({ runIsolatedAgentJob });
+    const job = await cron.add({
+      name: "system-wide-active-work-watchdog-report-only",
+      enabled: true,
+      agentId: "orchestrator",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      delivery: { mode: "none" },
+      payload: {
+        kind: "agentTurn",
+        message:
+          "Run scripts/system_wide_active_work_watchdog.py --reason cron_tick --write-receipt --chat-delivery off",
+      },
+    });
+
+    const runPromise = cron.run(job.id, "force");
+    await vi.advanceTimersByTimeAsync(5_250);
+    await runPromise;
+
+    expect(runIsolatedAgentJob).toHaveBeenCalledTimes(1);
+    expect(runIsolatedAgentJob.mock.calls[0]?.[0].message).toMatch(
+      new RegExp(`--cron-run-id cron:${job.id}:\\d+:proof:[0-9a-f-]+`),
+    );
+    expect(runIsolatedAgentJob.mock.calls[0]?.[0].message).toContain("--reason cron_tick");
+    expect(job.state.lastStatus).toBe("error");
+    expect(job.state.lastError).toContain("did not write fresh receipt/status/report/latest proof");
+    await stopCronAndCleanup(cron, store);
+  });
+
+  it("rejects isolated watchdog delivery before an unproved announcement", async () => {
+    const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const }));
+    const { store, cron } = await createCronHarness({ runIsolatedAgentJob });
+    const job = await cron.add({
+      name: "system-wide-active-work-watchdog-report-only",
+      enabled: true,
+      agentId: "orchestrator",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      delivery: { mode: "announce" },
+      payload: {
+        kind: "agentTurn",
+        message:
+          "Run scripts/system_wide_active_work_watchdog.py --reason cron_tick --write-receipt --chat-delivery off",
+      },
+    });
+
+    await cron.run(job.id, "force");
+
+    expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    expect(job.state.lastStatus).toBe("error");
+    expect(job.state.lastError).toContain("delivery mode none");
+    await stopCronAndCleanup(cron, store);
+  });
+
+  it("leaves other agents' isolated script jobs on the normal cron path", async () => {
+    const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const }));
+    const { store, cron } = await createCronHarness({ runIsolatedAgentJob });
+    const job = await cron.add({
+      name: "independent scanner",
+      enabled: true,
+      agentId: "other-agent",
+      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
+      sessionTarget: "isolated",
+      wakeMode: "now",
+      delivery: { mode: "none" },
+      payload: {
+        kind: "agentTurn",
+        message: "Run scripts/system_wide_active_work_watchdog.py --write-receipt",
+      },
+    });
+
+    await cron.run(job.id, "force");
+
+    expect(runIsolatedAgentJob).toHaveBeenCalledTimes(1);
+    expect(job.state.lastStatus).toBe("ok");
+    await stopCronAndCleanup(cron, store);
+  });
+
   it("runs an isolated job without posting a fallback summary to main", async () => {
     const runIsolatedAgentJob = vi.fn(async () => ({ status: "ok" as const, summary: "done" }));
     const { store, cron, enqueueSystemEvent, requestHeartbeat, events } =

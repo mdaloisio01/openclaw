@@ -21,7 +21,13 @@
 // production callers.
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { isCronJobActive, resetCronActiveJobsForTests } from "./active-jobs.js";
+import {
+  clearCronJobCorePending,
+  hasActiveCronJobs,
+  isCronJobActive,
+  markCronJobCorePending,
+  resetCronActiveJobsForTests,
+} from "./active-jobs.js";
 import { CronService } from "./service.js";
 import {
   createDeferred,
@@ -102,6 +108,23 @@ describe("cron activeJobIds — manual-run mark/clear", () => {
 
       expect(isCronJobActive("manual-isolated-ok")).toBe(false);
     } finally {
+      cron.stop();
+      await store.cleanup();
+    }
+  });
+
+  it("blocks a manual retry while a timed-out core remains pending", async () => {
+    const id = "manual-pending-core";
+    const { cron, store } = await createManualRunHarness(id);
+    try {
+      await cron.start();
+      markCronJobCorePending(id);
+      expect(isCronJobActive(id)).toBe(true);
+      expect(hasActiveCronJobs()).toBe(false);
+      const result = await cron.run(id, "force");
+      expect(result).toMatchObject({ ok: true, ran: false, reason: "already-running" });
+    } finally {
+      clearCronJobCorePending(id);
       cron.stop();
       await store.cleanup();
     }

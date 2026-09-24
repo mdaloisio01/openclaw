@@ -372,6 +372,26 @@ describe("runCronIsolatedAgentTurn message tool policy", () => {
     });
   });
 
+  it("disables the message tool for the managed isolated watchdog", async () => {
+    mockRunCronFallbackPassthrough();
+    resolveCronDeliveryPlanMock.mockReturnValue({ requested: false, mode: "none" });
+    const params = makeParams();
+    await runCronIsolatedAgentTurn({
+      ...params,
+      job: {
+        ...params.job,
+        name: "system-wide-active-work-watchdog-report-only",
+        agentId: "orchestrator",
+        payload: {
+          kind: "agentTurn",
+          message: "Run scripts/system_wide_active_work_watchdog.py --write-receipt",
+        },
+        delivery: { mode: "none" },
+      },
+    });
+    expectEmbeddedRunFields({ disableMessageTool: true, forceMessageTool: false });
+  });
+
   it('skips implicit target resolution for bare delivery.mode "none"', async () => {
     mockRunCronFallbackPassthrough();
     resolveCronDeliveryPlanMock.mockReturnValue({

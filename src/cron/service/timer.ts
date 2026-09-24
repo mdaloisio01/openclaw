@@ -18,7 +18,13 @@ import {
 } from "../../routing/session-key.js";
 import { deliveryContextFromSession } from "../../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../../utils/delivery-context.types.js";
-import { clearCronJobActive, markCronJobActive } from "../active-jobs.js";
+import {
+  clearCronJobActive,
+  clearCronJobCorePending,
+  isCronJobActive,
+  markCronJobActive,
+  markCronJobCorePending,
+} from "../active-jobs.js";
 import { resolveCronDeliveryPlan, resolveFailureDestination } from "../delivery-plan.js";
 import { resolveCronExecutionRetryHint } from "../retry-hint.js";
 import {
@@ -40,6 +46,7 @@ import type {
   CronRunStatus,
   CronRunTelemetry,
 } from "../types.js";
+import { isWatchdogReceiptProofJob } from "../watchdog-proof-job.js";
 import { cleanupTimedOutCronAgentRun, createCronAgentWatchdog } from "./agent-watchdog.js";
 import {
   abortErrorMessage,
@@ -180,16 +187,24 @@ type WatchdogReceiptRecord = {
     recommendation_code?: string;
   };
   watchdog_cron?: {
+    id?: string;
     run_id?: string;
   };
   chat_delivery?: WatchdogChatDeliveryRecord;
 };
 
 type WatchdogStatusRecord = {
+  timestamp?: string;
   status?: string;
   suspicious_count?: number;
   recommendation_code?: string;
   latest_receipt_path?: string;
+};
+
+type WatchdogReportRecord = {
+  timestamp?: string;
+  latest_receipt_path?: string;
+  suspicious_count?: number;
 };
 
 type WatchdogChatDeliveryStateRecord = {
@@ -244,10 +259,21 @@ export async function executeJobCoreWithTimeout(
     jobTimeoutMs,
     triggerTimeout,
   });
+  const holdCoreUntilSettled = isWatchdogReceiptProofJob(job);
+  if (holdCoreUntilSettled) {
+    markCronJobCorePending(job.id);
+  }
   const corePromise = executeJobCore(state, job, runAbortController.signal, {
     onExecutionStarted: deferTimeoutUntilExecutionStart ? watchdog.noteRunnerStarted : undefined,
     onExecutionPhase: deferTimeoutUntilExecutionStart ? watchdog.notePhase : undefined,
   });
+  if (holdCoreUntilSettled) {
+    // Timeout can return before the aborted core settles; keep the replacement gate closed.
+    void corePromise.then(
+      () => clearCronJobCorePending(job.id),
+      () => clearCronJobCorePending(job.id),
+    );
+  }
   watchdog.start();
   void corePromise.catch((err: unknown) => {
     if (runAbortController.signal.aborted) {
@@ -349,44 +375,42 @@ function fileMtimeMsOrUndefined(filePath: string): number | undefined {
   }
 }
 
-function resolveLatestWatchdogReceiptSnapshot(): Pick<
-  WatchdogProofSurfaceSnapshot,
-  "receiptPath" | "receiptMtimeMs"
-> {
+function resolveLatestWatchdogReceiptSnapshot(
+  expectedCronRunId?: string,
+  startedAtMs?: number,
+): Pick<WatchdogProofSurfaceSnapshot, "receiptPath" | "receiptMtimeMs"> {
   try {
-    const latest = readdirSync(WATCHDOG_RECEIPT_DIR)
+    const candidates = readdirSync(WATCHDOG_RECEIPT_DIR)
       .filter((entry) => entry.endsWith(".json"))
       .map((entry) => {
         const filePath = path.join(WATCHDOG_RECEIPT_DIR, entry);
         return { filePath, mtimeMs: statSync(filePath).mtimeMs };
       })
-      .toSorted((left, right) => right.mtimeMs - left.mtimeMs)[0];
+      .filter((entry) => startedAtMs === undefined || entry.mtimeMs >= startedAtMs)
+      .toSorted((left, right) => right.mtimeMs - left.mtimeMs);
+    const latest = expectedCronRunId
+      ? candidates.find((entry) => {
+          const receipt = loadJsonFile(entry.filePath) as WatchdogReceiptRecord | undefined;
+          return receipt?.watchdog_cron?.run_id === expectedCronRunId;
+        })
+      : candidates[0];
     return latest ? { receiptPath: latest.filePath, receiptMtimeMs: latest.mtimeMs } : {};
   } catch {
     return {};
   }
 }
 
-function captureWatchdogProofSurfaceSnapshot(): WatchdogProofSurfaceSnapshot {
-  const receipt = resolveLatestWatchdogReceiptSnapshot();
+function captureWatchdogProofSurfaceSnapshot(
+  expectedCronRunId?: string,
+  startedAtMs?: number,
+): WatchdogProofSurfaceSnapshot {
+  const receipt = resolveLatestWatchdogReceiptSnapshot(expectedCronRunId, startedAtMs);
   return {
     ...receipt,
     statusMtimeMs: fileMtimeMsOrUndefined(WATCHDOG_STATUS_JSON_PATH),
     reportMtimeMs: fileMtimeMsOrUndefined(WATCHDOG_REPORT_JSON_PATH),
     latestMtimeMs: fileMtimeMsOrUndefined(WATCHDOG_LATEST_JSON_PATH),
   };
-}
-
-function isWatchdogReceiptProofJob(job: CronJob): boolean {
-  if (job.sessionTarget !== "main" || job.payload.kind !== "systemEvent") {
-    return false;
-  }
-  const text = job.payload.text;
-  return (
-    typeof text === "string" &&
-    text.includes("scripts/system_wide_active_work_watchdog.py") &&
-    text.includes("--write-receipt")
-  );
 }
 
 function watchdogProofSurfacesAdvanced(params: {
@@ -415,22 +439,34 @@ function watchdogProofSurfacesAdvanced(params: {
 async function waitForWatchdogProofSurfaces(params: {
   startedAtMs: number;
   before: WatchdogProofSurfaceSnapshot;
+  expectedJobId?: string;
+  expectedCronRunId?: string;
   abortSignal?: AbortSignal;
   waitWithAbort: (ms: number) => Promise<void>;
 }): Promise<boolean> {
   const deadline = Date.now() + WATCHDOG_PROOF_WAIT_MS;
   for (;;) {
-    const after = captureWatchdogProofSurfaceSnapshot();
-    if (
-      watchdogProofSurfacesAdvanced({
-        before: params.before,
-        after,
-        startedAtMs: params.startedAtMs,
-      })
-    ) {
+    if (params.abortSignal?.aborted) {
+      return false;
+    }
+    const after = captureWatchdogProofSurfaceSnapshot(params.expectedCronRunId, params.startedAtMs);
+    const advanced = watchdogProofSurfacesAdvanced({
+      before: params.before,
+      after,
+      startedAtMs: params.startedAtMs,
+    });
+    const boundProofReady =
+      !params.expectedCronRunId ||
+      (params.expectedJobId !== undefined &&
+        resolveWatchdogCronProofSummary(
+          after.receiptPath,
+          params.expectedJobId,
+          params.expectedCronRunId,
+        ) !== undefined);
+    if (advanced && boundProofReady) {
       return true;
     }
-    if (params.abortSignal?.aborted || Date.now() >= deadline) {
+    if (Date.now() >= deadline) {
       return false;
     }
     await params.waitWithAbort(WATCHDOG_PROOF_POLL_MS);
@@ -439,6 +475,7 @@ async function waitForWatchdogProofSurfaces(params: {
 
 function resolveWatchdogCronProofSummary(
   receiptPath: string | undefined,
+  expectedJobId: string | undefined,
   expectedCronRunId: string,
 ): string | undefined {
   if (!receiptPath) {
@@ -446,10 +483,24 @@ function resolveWatchdogCronProofSummary(
   }
   const receipt = loadJsonFile(receiptPath) as WatchdogReceiptRecord | undefined;
   const status = loadJsonFile(WATCHDOG_STATUS_JSON_PATH) as WatchdogStatusRecord | undefined;
+  const report = loadJsonFile(WATCHDOG_REPORT_JSON_PATH) as WatchdogReportRecord | undefined;
+  const latest = loadJsonFile(WATCHDOG_LATEST_JSON_PATH) as WatchdogReceiptRecord | undefined;
   if (receipt?.watchdog !== "system_wide_active_work_watchdog") {
     return undefined;
   }
-  if (receipt.watchdog_cron?.run_id !== expectedCronRunId) {
+  if (
+    (expectedJobId !== undefined &&
+      (receipt.watchdog_cron?.id !== expectedJobId || receipt.reason !== "cron_tick")) ||
+    receipt.watchdog_cron?.run_id !== expectedCronRunId ||
+    latest?.watchdog_cron?.run_id !== expectedCronRunId ||
+    latest?.checked_at !== receipt.checked_at ||
+    status?.latest_receipt_path !== receiptPath ||
+    report?.latest_receipt_path !== receiptPath ||
+    status?.timestamp !== receipt.checked_at ||
+    report?.timestamp !== receipt.checked_at ||
+    status?.suspicious_count !== receipt.summary?.items_suspicious ||
+    report?.suspicious_count !== receipt.summary?.items_suspicious
+  ) {
     return undefined;
   }
   const label = status?.status ?? "UNKNOWN";
@@ -644,7 +695,13 @@ async function maybeRecoverWatchdogChatDeliveryFromProofSurfaces(params: {
   }
   const delivery = receipt.chat_delivery;
   if (delivery.status === "delivered") {
-    return { ok: true, status: "already-delivered" };
+    const verification = findTranscriptLineForMessageId({
+      transcriptPath: delivery.session_file ?? delivery.target?.session_file,
+      messageId: delivery.message_id,
+    });
+    return delivery.verified === true && verification.verified
+      ? { ok: true, status: "already-delivered" }
+      : { ok: false, error: "watchdog delivery lacks verified transcript evidence" };
   }
   if (delivery.status === "suppressed") {
     return { ok: true, status: "suppressed" };
@@ -679,9 +736,12 @@ async function maybeRecoverWatchdogChatDeliveryFromProofSurfaces(params: {
   }
 
   const verification = findTranscriptLineForMessageId({
-    transcriptPath: target.session_file,
+    transcriptPath: appended.sessionFile,
     messageId: appended.messageId,
   });
+  if (!verification.verified) {
+    return { ok: false, error: "watchdog recovery lacks verified transcript evidence" };
+  }
   const recoveredDelivery: WatchdogChatDeliveryRecord = {
     ...delivery,
     status: "delivered",
@@ -689,8 +749,8 @@ async function maybeRecoverWatchdogChatDeliveryFromProofSurfaces(params: {
     message_id: appended.messageId,
     session_entry_id: appended.messageId,
     proof_id: appended.messageId,
-    verified: verification.verified,
-    session_file: target.session_file,
+    verified: true,
+    session_file: appended.sessionFile,
     ...(verification.transcriptLine ? { transcript_line: verification.transcriptLine } : {}),
     state_path: WATCHDOG_CHAT_DELIVERY_STATE_JSON_PATH,
     recovery_by: "cron-runtime-transcript-recovery",
@@ -1257,6 +1317,7 @@ export async function onTimer(state: CronServiceState) {
     return;
   }
   state.running = true;
+  let reservedJobIds: string[] = [];
   // Keep a watchdog timer armed while a tick is executing. If execution hangs
   // (for example in a provider call), the scheduler still wakes to re-check.
   armRunningRecheckTimer(state);
@@ -1284,7 +1345,10 @@ export async function onTimer(state: CronServiceState) {
       for (const job of due) {
         job.state.runningAtMs = now;
         job.state.lastError = undefined;
+        // Reservation must hold replacements even while this job waits behind another worker.
+        markCronJobActive(job.id);
       }
+      reservedJobIds = due.map((job) => job.id);
       await persist(state);
 
       return due.map((j) => ({
@@ -1375,6 +1439,9 @@ export async function onTimer(state: CronServiceState) {
       });
     }
   } finally {
+    for (const jobId of reservedJobIds) {
+      clearCronJobActive(jobId);
+    }
     // Piggyback session reaper on timer tick (self-throttled to every 5 min).
     // Placed in `finally` so the reaper runs even when a long-running job keeps
     // `state.running` true across multiple timer ticks — the early return at the
@@ -1435,6 +1502,9 @@ function isRunnableJob(params: {
     return false;
   }
   if (typeof job.state.runningAtMs === "number") {
+    return false;
+  }
+  if (isCronJobActive(job.id)) {
     return false;
   }
   const lastRunStatus = resolveJobLastRunStatus(job);
@@ -1662,8 +1732,17 @@ async function planStartupCatchup(
     for (const job of startupCandidates) {
       job.state.runningAtMs = now;
       job.state.lastError = undefined;
+      // Reserve every catch-up candidate before persistence can yield to replacement reconciliation.
+      markCronJobActive(job.id);
     }
-    await persist(state);
+    try {
+      await persist(state);
+    } catch (error) {
+      for (const job of startupCandidates) {
+        clearCronJobActive(job.id);
+      }
+      throw error;
+    }
 
     return {
       candidates: startupCandidates.map((job) => ({ jobId: job.id, job })),
@@ -1688,18 +1767,25 @@ async function runStartupCatchupCandidate(
   candidate: StartupCatchupCandidate,
 ): Promise<TimedCronRunOutcome> {
   const startedAt = state.deps.nowMs();
-  const taskRunId = tryCreateCronTaskRun({
-    state,
-    job: candidate.job,
-    startedAt,
-  });
-  emit(state, {
-    jobId: candidate.job.id,
-    action: "started",
-    job: candidate.job,
-    runAtMs: startedAt,
-  });
+  // The proof marker must match the task row's actual start, not catch-up planning time.
+  let taskRunId: string | undefined;
   try {
+    await locked(state, async () => {
+      const stored = state.store?.jobs.find((entry) => entry.id === candidate.jobId);
+      if (!stored) {
+        throw new Error(`cron: startup catch-up job ${candidate.jobId} was removed`);
+      }
+      stored.state.runningAtMs = startedAt;
+      candidate.job.state.runningAtMs = startedAt;
+      await persist(state);
+    });
+    taskRunId = tryCreateCronTaskRun({ state, job: candidate.job, startedAt });
+    emit(state, {
+      jobId: candidate.job.id,
+      action: "started",
+      job: candidate.job,
+      runAtMs: startedAt,
+    });
     const result = await executeJobCoreWithTimeout(state, candidate.job);
     return {
       jobId: candidate.jobId,
@@ -1731,6 +1817,8 @@ async function runStartupCatchupCandidate(
       startedAt,
       endedAt: state.deps.nowMs(),
     };
+  } finally {
+    clearCronJobActive(candidate.job.id);
   }
 }
 
@@ -1832,7 +1920,14 @@ export async function executeJobCore(
     return await executeMainSessionCronJob(state, job, abortSignal, waitWithAbort);
   }
 
-  return await executeDetachedCronJob(state, job, abortSignal, resolveAbortError, options);
+  return await executeDetachedCronJob(
+    state,
+    job,
+    abortSignal,
+    resolveAbortError,
+    waitWithAbort,
+    options,
+  );
 }
 
 async function executeMainSessionCronJob(
@@ -1977,7 +2072,11 @@ async function executeMainSessionCronJob(
       }
       if (requiresWatchdogReceiptProof) {
         const proofAfter = captureWatchdogProofSurfaceSnapshot();
-        const proofSummary = resolveWatchdogCronProofSummary(proofAfter.receiptPath, cronRunId);
+        const proofSummary = resolveWatchdogCronProofSummary(
+          proofAfter.receiptPath,
+          undefined,
+          cronRunId,
+        );
         if (!proofSummary) {
           return {
             status: "error",
@@ -2045,6 +2144,7 @@ async function executeDetachedCronJob(
   job: CronJob,
   abortSignal: AbortSignal | undefined,
   resolveAbortError: () => { status: "error"; error: string },
+  waitWithAbort: (ms: number) => Promise<void>,
   options?: {
     onExecutionStarted?: (info?: CronAgentExecutionStarted) => void;
     onExecutionPhase?: (info: CronAgentExecutionPhaseUpdate) => void;
@@ -2078,9 +2178,25 @@ async function executeDetachedCronJob(
     };
   }
 
+  const requiresWatchdogReceiptProof = isWatchdogReceiptProofJob(job);
+  // Isolated delivery happens inside the runner, before this proof gate can run.
+  if (requiresWatchdogReceiptProof && job.delivery?.mode !== "none") {
+    return { status: "error", error: "cron: isolated watchdog proof requires delivery mode none" };
+  }
+  const cronStartedAt =
+    typeof job.state.runningAtMs === "number" ? job.state.runningAtMs : state.deps.nowMs();
+  const cronRunId = requiresWatchdogReceiptProof
+    ? `${createCronExecutionId(job.id, cronStartedAt)}:proof:${randomUUID()}`
+    : undefined;
+  const watchdogProofBefore = requiresWatchdogReceiptProof
+    ? captureWatchdogProofSurfaceSnapshot()
+    : undefined;
+  const message = cronRunId
+    ? `${job.payload.message}\n\nThis scheduled invocation must pass --reason cron_tick and --cron-run-id ${cronRunId} to the watchdog command.`
+    : job.payload.message;
   const res = await state.deps.runIsolatedAgentJob({
     job,
-    message: job.payload.message,
+    message,
     abortSignal,
     onExecutionStarted: options?.onExecutionStarted,
     onExecutionPhase: options?.onExecutionPhase,
@@ -2097,10 +2213,52 @@ async function executeDetachedCronJob(
     };
   }
 
+  let proofSummary: string | undefined;
+  if (res.status === "ok" && cronRunId && watchdogProofBefore) {
+    if (
+      !(await waitForWatchdogProofSurfaces({
+        before: watchdogProofBefore,
+        startedAtMs: cronStartedAt,
+        expectedJobId: job.id,
+        expectedCronRunId: cronRunId,
+        abortSignal,
+        waitWithAbort,
+      }))
+    ) {
+      return {
+        status: "error",
+        error: "cron: isolated watchdog did not write fresh receipt/status/report/latest proof",
+      };
+    }
+    if (abortSignal?.aborted) {
+      return resolveAbortError();
+    }
+    const proofAfter = captureWatchdogProofSurfaceSnapshot(cronRunId, cronStartedAt);
+    proofSummary = resolveWatchdogCronProofSummary(proofAfter.receiptPath, job.id, cronRunId);
+    if (!proofSummary) {
+      return {
+        status: "error",
+        error: "cron: isolated watchdog wrote no valid same-run proof summary",
+      };
+    }
+    if (abortSignal?.aborted) {
+      return resolveAbortError();
+    }
+    const recovery = await maybeRecoverWatchdogChatDeliveryFromProofSurfaces({
+      receiptPath: proofAfter.receiptPath,
+    });
+    if (!recovery.ok) {
+      return {
+        status: "error",
+        error: `cron: isolated watchdog transcript proof delivery failed: ${recovery.error}`,
+      };
+    }
+  }
+
   return {
     status: res.status,
     error: res.error,
-    summary: res.summary,
+    summary: proofSummary ?? res.summary,
     delivered: res.delivered,
     deliveryAttempted: res.deliveryAttempted,
     delivery: res.delivery,

@@ -10,6 +10,11 @@ import {
   setupCronRegressionFixtures,
 } from "../../../test/helpers/cron/service-regression-fixtures.js";
 import { HEARTBEAT_SKIP_LANES_BUSY, type HeartbeatRunResult } from "../../infra/heartbeat-wake.js";
+import {
+  clearCronJobCorePending,
+  isCronJobActive,
+  markCronJobCorePending,
+} from "../active-jobs.js";
 import * as schedule from "../schedule.js";
 import { loadCronStore, saveCronStore } from "../store.js";
 import type {
@@ -25,6 +30,7 @@ import {
   applyJobResult,
   executeJob,
   executeJobCore,
+  executeJobCoreWithTimeout,
   onTimer,
   runMissedJobs,
 } from "./timer.js";
@@ -844,6 +850,53 @@ describe("cron service timer regressions", () => {
     }
   });
 
+  it("holds a timed-out watchdog active until its underlying run settles", async () => {
+    vi.useFakeTimers();
+    try {
+      const started = createDeferred<void>();
+      const release = createDeferred<void>();
+      const job = {
+        ...createIsolatedRegressionJob({
+          id: "watchdog-timeout-drain",
+          name: "system-wide-active-work-watchdog-report-only",
+          scheduledAt: Date.parse("2026-02-15T13:00:00.000Z"),
+          schedule: { kind: "cron", expr: "*/5 * * * *", tz: "UTC" },
+          payload: {
+            kind: "agentTurn",
+            message:
+              "Run scripts/system_wide_active_work_watchdog.py --reason cron_tick --write-receipt",
+            timeoutSeconds: FAST_TIMEOUT_SECONDS,
+          },
+        }),
+        agentId: "orchestrator",
+        delivery: { mode: "none" as const },
+      } satisfies CronJob;
+      const state = createCronServiceState({
+        cronEnabled: true,
+        storePath: timerRegressionFixtures.makeStorePath().storePath,
+        log: noopLogger,
+        enqueueSystemEvent: vi.fn(),
+        requestHeartbeat: vi.fn(),
+        runIsolatedAgentJob: vi.fn(async ({ onExecutionStarted }) => {
+          onExecutionStarted?.();
+          started.resolve();
+          await release.promise;
+          return { status: "error" as const, error: "stopped" };
+        }),
+      });
+
+      const runPromise = executeJobCoreWithTimeout(state, job);
+      await started.promise;
+      await vi.advanceTimersByTimeAsync(Math.ceil(FAST_TIMEOUT_SECONDS * 1_000) + 10);
+      expect((await runPromise).status).toBe("error");
+      expect(isCronJobActive(job.id)).toBe(true);
+      release.resolve();
+      await vi.waitFor(() => expect(isCronJobActive(job.id)).toBe(false));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not spend isolated execution timeout while waiting for the runner lane (#41783)", async () => {
     vi.useFakeTimers();
     try {
@@ -977,6 +1030,7 @@ describe("cron service timer regressions", () => {
       await saveCronStore(store.storePath, { version: 1, jobs: [cronJob] });
 
       let now = scheduledAt;
+      let activeDuringRun = false;
       const abortAwareRunner = createAbortAwareIsolatedRunner();
       const state = createCronServiceState({
         cronEnabled: true,
@@ -986,6 +1040,7 @@ describe("cron service timer regressions", () => {
         enqueueSystemEvent: vi.fn(),
         requestHeartbeat: vi.fn(),
         runIsolatedAgentJob: vi.fn(async (params) => {
+          activeDuringRun = isCronJobActive("startup-timeout");
           const result = await abortAwareRunner.runIsolatedAgentJob(params);
           now += 5;
           return result;
@@ -998,6 +1053,8 @@ describe("cron service timer regressions", () => {
       await catchupPromise;
 
       expect(abortAwareRunner.getObservedAbortSignal()?.aborted).toBe(true);
+      expect(activeDuringRun).toBe(true);
+      expect(isCronJobActive("startup-timeout")).toBe(false);
       const job = state.store?.jobs.find((entry) => entry.id === "startup-timeout");
       expect(job?.state.lastStatus).toBe("error");
       expect(job?.state.lastError).toContain("timed out");
@@ -1175,6 +1232,78 @@ describe("cron service timer regressions", () => {
     expect(secondDone?.state.lastRunAtMs).toBe(dueAt + 50);
     expect(secondDone?.state.lastDurationMs).toBe(20);
     expect(startedAtEvents).toEqual([dueAt, dueAt + 50]);
+  });
+
+  it("marks queued timer jobs active until their reserved runs finish", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const dueAt = Date.parse("2026-02-06T10:05:01.000Z");
+    const first = createDueIsolatedJob({ id: "reserved-first", nowMs: dueAt, nextRunAtMs: dueAt });
+    const second = createDueIsolatedJob({
+      id: "reserved-second",
+      nowMs: dueAt,
+      nextRunAtMs: dueAt,
+    });
+    await saveCronStore(store.storePath, { version: 1, jobs: [first, second] });
+
+    const firstStarted = createDeferred<void>();
+    const releaseFirst = createDeferred<void>();
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      cronConfig: { maxConcurrentRuns: 1 },
+      log: noopLogger,
+      nowMs: () => dueAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob: vi.fn(async (params: { job: { id: string } }) => {
+        if (params.job.id === first.id) {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        return { status: "ok" as const, summary: "ok" };
+      }),
+    });
+
+    const timerPromise = onTimer(state);
+    try {
+      await firstStarted.promise;
+      expect(isCronJobActive(first.id)).toBe(true);
+      expect(isCronJobActive(second.id)).toBe(true);
+    } finally {
+      releaseFirst.resolve();
+      await timerPromise;
+    }
+    expect(isCronJobActive(first.id)).toBe(false);
+    expect(isCronJobActive(second.id)).toBe(false);
+  });
+
+  it("skips a due timer run while its timed-out core remains pending", async () => {
+    const store = timerRegressionFixtures.makeStorePath();
+    const dueAt = Date.parse("2026-02-06T10:05:01.000Z");
+    const job = createDueIsolatedJob({
+      id: "pending-core-timer",
+      nowMs: dueAt,
+      nextRunAtMs: dueAt,
+    });
+    await saveCronStore(store.storePath, { version: 1, jobs: [job] });
+    const runIsolatedAgentJob = vi.fn(createDefaultIsolatedRunner());
+    const state = createCronServiceState({
+      cronEnabled: true,
+      storePath: store.storePath,
+      log: noopLogger,
+      nowMs: () => dueAt,
+      enqueueSystemEvent: vi.fn(),
+      requestHeartbeat: vi.fn(),
+      runIsolatedAgentJob,
+    });
+
+    markCronJobCorePending(job.id);
+    try {
+      await onTimer(state);
+      expect(runIsolatedAgentJob).not.toHaveBeenCalled();
+    } finally {
+      clearCronJobCorePending(job.id);
+    }
   });
 
   it("honors cron maxConcurrentRuns for due jobs", async () => {
