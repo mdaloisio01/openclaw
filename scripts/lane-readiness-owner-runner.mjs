@@ -81,8 +81,11 @@ if (key === "watchdog.fixture_matrix") {
 }
 if (
   key === "cleanup_crew.clean_watchdog" ||
+  key === "cleanup_crew.stale_worker" ||
+  key === "cleanup_crew.repair_routing" ||
   key === "watchdog.cron_freshness" ||
   key === "watchdog.seven_dimensions" ||
+  key === "watchdog.repair_closure" ||
   key === "source_report_delivery.failure_notice" ||
   key === "source_report_delivery.final_delivered"
 ) {
@@ -118,6 +121,8 @@ if (
     Number.isSafeInteger(receipt.summary?.items_suspicious) &&
     receipt.summary?.by_category !== null &&
     typeof receipt.summary?.by_category === "object" &&
+    Array.isArray(receipt.decisions?.suspicious_items) &&
+    receipt.decisions.suspicious_items.length === Math.min(receipt.summary.items_suspicious, 200) &&
     Array.isArray(receipt.clean_dimensions_required);
   if (run.status !== 0 || !validReceipt) {
     respond(
@@ -130,13 +135,43 @@ if (
   const cron = receipt.watchdog_cron;
   const sourceFailed = receipt.summary.by_category.source_delivery_failed ?? 0;
   const sourceStale = receipt.summary.by_category.source_delivery_stale ?? 0;
+  const suspiciousItems = receipt.decisions.suspicious_items;
+  // The owner caps item detail at 200; a truncated list cannot prove worker health.
+  const completeItemList = suspicious <= 200;
+  const workerFindings = suspiciousItems.filter((item) =>
+    ["task_run", "flow_run", "subagent_run"].includes(item.entity_type),
+  ).length;
+  const intakeGaps = suspiciousItems.filter(
+    (item) => item.entity_type === "owner_request_intake",
+  ).length;
+  if (
+    key === "cleanup_crew.stale_worker" &&
+    completeItemList &&
+    workerFindings === 0 &&
+    receipt.coverage?.task_runs === true &&
+    receipt.coverage?.flow_runs === true &&
+    receipt.coverage?.subagent_runs === true
+  ) {
+    respond("PASS", undefined, {
+      ownerCommand: command,
+      ownerCheckedAt: receipt.checked_at,
+      workerFindings,
+      coverage: receipt.coverage,
+    });
+  }
   let detail;
   if (key === "cleanup_crew.clean_watchdog") {
     detail = `Owner watchdog scan found ${suspicious} suspicious items; clean watchdog proof unavailable`;
+  } else if (key === "cleanup_crew.stale_worker") {
+    detail = `Owner watchdog scan found ${completeItemList ? "" : "at least "}${workerFindings} suspicious worker records; clean worker proof unavailable`;
+  } else if (key === "cleanup_crew.repair_routing") {
+    detail = `Owner watchdog scan found ${completeItemList ? "" : "at least "}${intakeGaps} owner-request intake gaps; executed repair route proof unavailable`;
   } else if (key === "watchdog.cron_freshness") {
     detail = `Owner watchdog cron has enabled=${cron?.enabled}, lastRunStatus=${cron?.last_run_status}, lastRunAt=${cron?.last_run_at}; fresh scheduled proof unavailable`;
   } else if (key === "watchdog.seven_dimensions") {
     detail = `Owner scan declares ${receipt.clean_dimensions_required.length} clean dimensions and found ${suspicious} suspicious items; seven-dimension clean proof unavailable`;
+  } else if (key === "watchdog.repair_closure") {
+    detail = `Owner watchdog scan found ${suspicious} suspicious items; routed repair closure proof unavailable`;
   } else if (key === "source_report_delivery.failure_notice") {
     detail = `Owner watchdog found ${sourceFailed} failed source-delivery obligations; visible failure notice proof unavailable`;
   } else {
@@ -146,6 +181,8 @@ if (
     ownerCommand: command,
     ownerCheckedAt: receipt.checked_at,
     suspiciousItems: suspicious,
+    workerFindings,
+    ownerRequestIntakeGaps: intakeGaps,
     sourceDeliveryFailed: sourceFailed,
     sourceDeliveryStale: sourceStale,
     cleanDimensionsRequired: receipt.clean_dimensions_required,
