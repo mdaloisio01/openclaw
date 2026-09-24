@@ -5,6 +5,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import {
+  resolveVitestCliEntry,
+  resolveVitestNodeArgs,
+  resolveVitestSpawnEnv,
+} from "./run-vitest.mjs";
 
 const request = JSON.parse(fs.readFileSync(0, "utf8"));
 const key = `${request.laneId}.${request.checkId}`;
@@ -45,6 +50,65 @@ const commands = {
   "gateway_runtime.health": ["health", "--json", "--verbose", "--timeout", "10000"],
   "gateway_runtime.method_smoke": ["cron", "list", "--json", "--timeout", "10000"],
 };
+if (key === "engineering_delivery.focused_test") {
+  const repoRoot = path.resolve(import.meta.dirname, "..");
+  const testFile = path.join(repoRoot, "src/governance/lane-readiness-harness.test.ts");
+  function sourceSnapshot() {
+    const revision = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    });
+    const changes = spawnSync("git", ["status", "--porcelain"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    });
+    let testFileSha256;
+    try {
+      testFileSha256 = createHash("sha256").update(fs.readFileSync(testFile)).digest("hex");
+    } catch {
+      // A missing test file cannot certify the source revision.
+    }
+    return {
+      revision: revision.status === 0 ? revision.stdout.trim() : undefined,
+      clean: changes.status === 0 && changes.stdout.trim() === "",
+      testFileSha256,
+    };
+  }
+  const before = sourceSnapshot();
+  if (before.revision !== request.sourceRevision || !before.clean || !before.testFileSha256) {
+    respond("FAIL", "Focused test source does not match a clean reported revision", { before });
+  }
+  // The regular test wrapper detaches Vitest. Keep this CLI in the owner's
+  // process group so the harness deadline stops the full test tree.
+  const command = [...resolveVitestNodeArgs(), resolveVitestCliEntry(), "run", testFile];
+  const run = spawnSync(process.execPath, command, {
+    cwd: repoRoot,
+    env: resolveVitestSpawnEnv(),
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const result = /Tests\s+(\d+) passed \((\d+)\)/.exec(run.stdout ?? "");
+  const passed = Number(result?.[1]);
+  const total = Number(result?.[2]);
+  const after = sourceSnapshot();
+  const evidence = { command, before, after, passed, total, exitCode: run.status };
+  if (
+    run.status !== 0 ||
+    run.error ||
+    total <= 0 ||
+    passed !== total ||
+    after.revision !== before.revision ||
+    !after.clean ||
+    after.testFileSha256 !== before.testFileSha256
+  ) {
+    respond(
+      "FAIL",
+      `Lane readiness focused tests failed: exit=${run.status ?? "none"}, error=${run.error?.code ?? "none"}, passed=${passed}/${total}`,
+      evidence,
+    );
+  }
+  respond("PASS", undefined, evidence);
+}
 if (key === "watchdog.fixture_matrix") {
   const ownerTest =
     "/home/will/.openclaw/workspace-orchestrator/scripts/test_system_wide_active_work_watchdog.py";

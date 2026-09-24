@@ -34,7 +34,7 @@ fs.writeFileSync(
     sourceRevision,
     checkedAt,
     recurrenceMs: 7 * 24 * 60 * 60 * 1_000,
-    checkTimeoutMs: 20_000,
+    checkTimeoutMs: 90_000,
     runTimeoutMs: 180_000,
   }),
 );
