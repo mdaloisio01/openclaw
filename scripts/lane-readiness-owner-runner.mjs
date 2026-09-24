@@ -2,6 +2,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
@@ -17,7 +18,8 @@ const response = {
 };
 if (
   !/^[a-z][a-z0-9_]{0,63}$/.test(request.laneId) ||
-  !/^[a-z][a-z0-9_]{0,63}$/.test(request.checkId)
+  !/^[a-z][a-z0-9_]{0,63}$/.test(request.checkId) ||
+  !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(request.runLabel)
 ) {
   throw new Error("invalid lane readiness check identity");
 }
@@ -193,6 +195,141 @@ if (
       nextRunAt: cron?.next_run_at,
     },
   });
+}
+if (
+  request.laneId === "file_hub_export" &&
+  ["write_export", "dashboard_listing", "download_readback", "hash_match"].includes(request.checkId)
+) {
+  const exportDir = path.dirname(process.cwd());
+  const name = `${request.runLabel}-export-probe.json`;
+  const sourcePath = path.join(exportDir, name);
+  const dashboardReportPath = path.join(
+    os.homedir(),
+    ".openclaw",
+    "workspace",
+    "file_hub",
+    "exports",
+    name,
+  );
+  const probe = {
+    schema: "openclaw.lane_readiness_export_probe.v1",
+    runLabel: request.runLabel,
+    sourceRevision: request.sourceRevision,
+    checkedAt: request.checkedAt,
+  };
+  if (key === "file_hub_export.write_export") {
+    try {
+      fs.writeFileSync(sourcePath, JSON.stringify(probe) + "\n", { flag: "wx" });
+      fs.copyFileSync(sourcePath, dashboardReportPath, fs.constants.COPYFILE_EXCL);
+    } catch (error) {
+      respond(
+        "FAIL",
+        `Current readiness export probe could not be published: ${error?.code ?? "unknown"}`,
+      );
+    }
+  }
+  if (!fs.existsSync(sourcePath) || !fs.existsSync(dashboardReportPath)) {
+    respond("FAIL", "Current readiness export probe is absent from File Hub");
+  }
+  const sourceBytes = fs.readFileSync(sourcePath);
+  if (sourceBytes.toString("utf8") !== JSON.stringify(probe) + "\n") {
+    respond("FAIL", "Current readiness export probe has the wrong run identity");
+  }
+  const sourceHash = createHash("sha256").update(sourceBytes).digest("hex");
+  const evidence = {
+    sourcePath,
+    dashboardReportPath,
+    sourceHash,
+    probe,
+  };
+  if (key === "file_hub_export.write_export") {
+    const dashboardHash = createHash("sha256")
+      .update(fs.readFileSync(dashboardReportPath))
+      .digest("hex");
+    if (dashboardHash !== sourceHash) {
+      respond("FAIL", "Dashboard File Hub export differs from the current probe", {
+        ...evidence,
+        dashboardHash,
+      });
+    }
+    respond("PASS", undefined, { ...evidence, dashboardHash });
+  }
+  let token;
+  try {
+    token = fs
+      .readFileSync(
+        path.join(os.homedir(), ".openclaw", "workspace", ".dashboard_api_token"),
+        "utf8",
+      )
+      .trim();
+  } catch {
+    respond("FAIL", "Dashboard authentication token is unavailable", evidence);
+  }
+  if (!token) {
+    respond("FAIL", "Dashboard authentication token is empty", evidence);
+  }
+  const headers = { Authorization: `Bearer ${token}` };
+  const base = "http://127.0.0.1:18888";
+  try {
+    if (key === "file_hub_export.dashboard_listing") {
+      const url = `${base}/api/file-hub/browse?path=exports&query=${encodeURIComponent(name)}&limit=10`;
+      const result = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+      const listing = result.ok ? await result.json() : undefined;
+      const item = listing?.items?.find(
+        (entry) =>
+          entry.name === name && entry.relPath === `exports/${name}` && entry.type === "file",
+      );
+      if (!item) {
+        respond(
+          "FAIL",
+          `Dashboard File Hub listing omitted the export: HTTP ${result.status}`,
+          evidence,
+        );
+      }
+      respond("PASS", undefined, {
+        ...evidence,
+        httpStatus: result.status,
+        listedPath: item.relPath,
+      });
+    }
+    const url = `${base}/api/file-hub/download?path=${encodeURIComponent(`exports/${name}`)}`;
+    const result = await fetch(url, { headers, signal: AbortSignal.timeout(10_000) });
+    if (!result.ok) {
+      respond("FAIL", `Dashboard File Hub download failed: HTTP ${result.status}`, evidence);
+    }
+    const downloaded = Buffer.from(await result.arrayBuffer());
+    const downloadedHash = createHash("sha256").update(downloaded).digest("hex");
+    if (key === "file_hub_export.download_readback") {
+      let readback;
+      try {
+        readback = JSON.parse(downloaded.toString("utf8"));
+      } catch {
+        respond("FAIL", "Dashboard download is not a readable readiness export probe", evidence);
+      }
+      if (
+        readback.schema !== probe.schema ||
+        readback.runLabel !== probe.runLabel ||
+        readback.sourceRevision !== probe.sourceRevision ||
+        readback.checkedAt !== probe.checkedAt
+      ) {
+        respond(
+          "FAIL",
+          "Dashboard download does not match the current export probe identity",
+          evidence,
+        );
+      }
+      respond("PASS", undefined, { ...evidence, downloadedHash, httpStatus: result.status });
+    }
+    if (downloadedHash !== sourceHash) {
+      respond("FAIL", "Dashboard download hash differs from the current source export", {
+        ...evidence,
+        downloadedHash,
+      });
+    }
+    respond("PASS", undefined, { ...evidence, downloadedHash, httpStatus: result.status });
+  } catch (error) {
+    respond("FAIL", `Dashboard File Hub probe failed: ${error?.name ?? "unknown"}`, evidence);
+  }
 }
 const args = commands[key];
 if (!args) {
