@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createOwnerRequestIntakeRecord,
   listOwnerRequestIntakeRecords,
@@ -749,6 +749,64 @@ describe("foreground Cleanup Crew TaskFlow registration", () => {
       status: "hard_boundary",
       boundary: "runtime_restart_recovery",
     });
+  });
+
+  it("launches resumed foreground work only after the restart and a real execution callback", () => {
+    const first = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      now: 1000,
+    });
+    if (first.status !== "registered") {
+      throw new Error("expected registered result");
+    }
+    const stoppedAt = Date.now() - 5000;
+    const stopped = recordFlowLawfulStop({
+      flowId: first.flow.flowId,
+      expectedRevision: first.flow.revision,
+      reason: "restart_or_reload",
+      updatedAt: stoppedAt,
+    });
+    if (!stopped.applied) {
+      throw new Error("expected lawful stop");
+    }
+    const resumed = ensureForegroundCleanupCrewTaskFlow({
+      sessionKey: "webchat:direct:mark",
+      currentTurnText: "Cleanup Crew production repair build.",
+      now: stoppedAt + 1000,
+    });
+    if (resumed.status !== "attached") {
+      throw new Error("expected resumed flow");
+    }
+    const uptime = vi.spyOn(process, "uptime");
+    try {
+      uptime.mockReturnValue(10);
+      const sameProcess = recordForegroundCleanupCrewExecutionStarted({
+        flowId: first.flow.flowId,
+        sessionKey: "webchat:direct:mark",
+        proofRef: "run:before-restart:tool:start:read-1",
+      });
+      expect(getTaskFlowProductionContinuation(sameProcess!)).toMatchObject({
+        restartOrReloadRequired: true,
+        nextExecutableUnitLaunched: false,
+      });
+
+      uptime.mockReturnValue(1);
+      const recovered = recordForegroundCleanupCrewExecutionStarted({
+        flowId: first.flow.flowId,
+        sessionKey: "webchat:direct:mark",
+        proofRef: "run:after-restart:tool:start:read-2",
+      });
+      expect(getTaskFlowProductionContinuation(recovered!)).toMatchObject({
+        restartOrReloadRequired: false,
+        nextExecutableUnitLaunched: true,
+      });
+      expect(
+        getTaskFlowActiveProductionContinuation(recovered!)?.dispatchReceipts[0]?.proofRef,
+      ).toBe("run:after-restart:tool:start:read-2");
+    } finally {
+      uptime.mockRestore();
+    }
   });
 
   it("blocks checkpoint registration when the next executable action is missing", () => {

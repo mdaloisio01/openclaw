@@ -338,7 +338,19 @@ export function recordForegroundCleanupCrewExecutionStarted(params: {
     return undefined;
   }
   const activeProductionContinuation = getTaskFlowActiveProductionContinuation(flow);
-  if (activeProductionContinuation?.status !== "dispatch_required") {
+  const continuation = getTaskFlowProductionContinuation(flow);
+  const restartStop = continuation?.events.findLast(
+    (event) => event.type === "LAWFUL_STOP_ALLOWED",
+  );
+  // A restart stop stays a hard boundary until a later process handles real
+  // execution for an explicitly resumed flow. Prose or same-process callbacks cannot clear it.
+  const recoveredRestart =
+    flow.status === "running" &&
+    activeProductionContinuation?.boundary === "runtime_restart_recovery" &&
+    continuation?.lawfulStopReason === "restart_or_reload" &&
+    restartStop !== undefined &&
+    Date.now() - process.uptime() * 1000 > restartStop.at;
+  if (activeProductionContinuation?.status !== "dispatch_required" && !recoveredRestart) {
     return flow;
   }
   // A checkpoint identifies work. Only the executor's real activity callback
