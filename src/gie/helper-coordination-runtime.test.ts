@@ -129,7 +129,7 @@ describe("GIE helper coordination runtime", () => {
 
     expect(dispatched.state).toBe("running");
     expect(dispatched.taskId).toBe("task:helper-1");
-    expect(dispatched.policyDecision.triggeredRule).toBe("governed_dispatch_allowed");
+    expect(dispatched.policyDecision?.triggeredRule).toBe("governed_dispatch_allowed");
     expect(dispatched.auditLog.map((event) => event.to)).toContain("running");
   });
 

@@ -268,6 +268,9 @@ describe("GIE learning-by-doing runtime", () => {
     });
 
     expect(retest.retestResult).toBe("fail");
+    if (retest.retestResult !== "fail") {
+      throw new Error("expected failed learning retest");
+    }
     expect(retest.escalation.escalated).toBe(true);
     expect(retest.escalation.reason).toBe("unresolved_failure_after_retest");
     expect(retest.escalation.unresolvedFailureRef).toBe("failure-1");

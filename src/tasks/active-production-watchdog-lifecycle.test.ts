@@ -299,7 +299,9 @@ describe("active production watchdog lifecycle", () => {
       });
 
       for (const message of commands) {
-        cron.list = vi.fn(async () => [{ ...valid, payload: { kind: "agentTurn", message } }]);
+        cron.list = vi.fn(async () => [
+          { ...valid, payload: { kind: "agentTurn" as const, message } },
+        ]);
         const result = await reconcileProductionWatchdogCron({ cron });
         expect(result).toMatchObject({ ok: false, action: "update-failed" });
       }

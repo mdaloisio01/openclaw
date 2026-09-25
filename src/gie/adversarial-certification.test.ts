@@ -41,9 +41,8 @@ function adversarialRecords(): GieAdversarialValidationRecord[] {
     },
     memoryBeforeAction: evaluateGieMemoryBeforeAction({
       retrieval: retrieveGieMemory({ records: [], subjectKey: "dispatch-without-owner", now: NOW }),
-      liveAuthorityRefs: ["authority-proof"],
+      authorityRefs: ["authority-proof"],
       liveProofRefs: ["route-proof"],
-      now: NOW,
     }),
     now: NOW,
   });
