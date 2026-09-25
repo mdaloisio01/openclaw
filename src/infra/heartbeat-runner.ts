@@ -2281,7 +2281,8 @@ export async function runHeartbeatOnce(opts: {
                 if (info.kind !== "final") {
                   return;
                 }
-                const mirror = getReplyPayloadMetadata(payload)?.sourceReplyTranscriptMirror;
+                const sourceMetadata = getReplyPayloadMetadata(payload);
+                const mirror = sourceMetadata?.sourceReplyTranscriptMirror;
                 if (
                   mirror?.sessionKey !== sessionKey ||
                   !mirror.sessionId ||
@@ -2294,8 +2295,10 @@ export async function runHeartbeatOnce(opts: {
                     text: sendable.text,
                     mediaUrls: sendable.mediaUrls,
                     idempotencyKey: mirror.idempotencyKey,
-                    canonicalAssistantTranscript:
-                      getReplyPayloadMetadata(payload)?.canonicalAssistantTranscript,
+                    canonicalAssistantTranscript: sourceMetadata?.canonicalAssistantTranscript,
+                    nativeAssistantTranscript: sourceMetadata?.canonicalAssistantTranscript
+                      ? undefined
+                      : sourceMetadata?.nativeAssistantTranscript,
                     webchatContent: mirror.webchatContent,
                   },
                   mirror.sessionId,

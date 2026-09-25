@@ -280,6 +280,7 @@ export function buildEmbeddedRunPayloads(params: {
     channelData?: Record<string, unknown>;
     nonTerminalToolErrorWarning?: boolean;
     canonicalAssistantTranscript?: ReplyPayloadMetadata["canonicalAssistantTranscript"];
+    nativeAssistantTranscript?: ReplyPayloadMetadata["nativeAssistantTranscript"];
     sourceReplyMirror?: {
       idempotencyKey?: string;
     };
@@ -528,6 +529,11 @@ export function buildEmbeddedRunPayloads(params: {
       replyToId,
       replyToTag,
       replyToCurrent,
+      ...(!lastAssistantNeedsErrorSurface &&
+      answerTexts.length === 1 &&
+      params.canonicalAssistantTranscript
+        ? { nativeAssistantTranscript: params.canonicalAssistantTranscript }
+        : {}),
       // Identity comes from this attempt's persisted message, never a text search.
       // Directives or media transforms invalidate a plain-text publication reference.
       ...(!lastAssistantNeedsErrorSurface &&
@@ -613,6 +619,11 @@ export function buildEmbeddedRunPayloads(params: {
       ) {
         setReplyPayloadMetadata(payload, {
           canonicalAssistantTranscript: item.canonicalAssistantTranscript,
+        });
+      }
+      if (item.nativeAssistantTranscript) {
+        setReplyPayloadMetadata(payload, {
+          nativeAssistantTranscript: item.nativeAssistantTranscript,
         });
       }
       if (item.nonTerminalToolErrorWarning) {

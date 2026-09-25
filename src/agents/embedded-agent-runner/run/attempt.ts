@@ -19,6 +19,7 @@ import {
   bindOwnedSessionTranscriptWrites,
   withOwnedSessionTranscriptWrites,
 } from "../../../config/sessions/transcript-write-context.js";
+import type { CanonicalAssistantTranscript } from "../../../config/sessions/transcript.js";
 import {
   assertContextEngineHostSupport,
   OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
@@ -67,6 +68,7 @@ import {
 import { getPluginToolMeta } from "../../../plugins/tools.js";
 import { isSubagentSessionKey } from "../../../routing/session-key.js";
 import { annotateInterSessionPromptText } from "../../../sessions/input-provenance.js";
+import { extractAssistantVisibleText } from "../../../shared/chat-message-content.js";
 import { resolveSkillsPromptForRun } from "../../../skills/loading/workspace.js";
 import { resolveEmbeddedRunSkillEntries } from "../../../skills/runtime/embedded-run-entries.js";
 import {
@@ -2030,6 +2032,7 @@ export async function runEmbeddedAttempt(
     armExternalAbortSignal();
 
     let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
+    let nativeAssistantTranscript: CanonicalAssistantTranscript | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
     let removeToolResultContextGuard: (() => void) | undefined;
     let trajectoryRecorder: ReturnType<typeof createTrajectoryRuntimeRecorder> | null = null;
@@ -2081,8 +2084,29 @@ export async function runEmbeddedAttempt(
         // drops display-hidden rows, and content-observing hooks are bypassed.
         shouldHideMessageFromDisplay: (message) =>
           shouldSuppressGovernedMissionContent() && message.role !== "user",
-        onMessagePersisted: () => {
+        onMessagePersisted: (message) => {
           sessionLockController.refreshAfterOwnedSessionWrite();
+          const manager = sessionManager;
+          const entry = manager?.getLeafEntry();
+          if (
+            !manager ||
+            message.role !== "assistant" ||
+            entry?.type !== "message" ||
+            entry.message !== message ||
+            message.stopReason === "error" ||
+            message.stopReason === "aborted"
+          ) {
+            return;
+          }
+          const text = extractAssistantVisibleText(message)?.trim();
+          if (text && (message as { display?: boolean }).display !== false) {
+            nativeAssistantTranscript = {
+              sessionId: manager.getSessionId(),
+              sessionFile: manager.getSessionFile() ?? params.sessionFile,
+              messageId: entry.id,
+              text,
+            };
+          }
         },
         onUserMessagePersisted: (message) => {
           params.onUserMessagePersisted?.(message);
@@ -5260,6 +5284,16 @@ export async function runEmbeddedAttempt(
         finalPromptText,
         messagesSnapshot,
         assistantTexts,
+        canonicalAssistantTranscript:
+          nativeAssistantTranscript &&
+          sessionManager?.getEntry(nativeAssistantTranscript.messageId)?.type === "message"
+            ? {
+                ...nativeAssistantTranscript,
+                sessionId: sessionManager.getSessionId(),
+                sessionFile:
+                  sessionManager.getSessionFile() ?? sessionFileUsed ?? params.sessionFile,
+              }
+            : undefined,
         toolMetas: toolMetasNormalized,
         acceptedSessionSpawns,
         lastAssistant,

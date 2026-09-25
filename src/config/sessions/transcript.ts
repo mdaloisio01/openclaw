@@ -55,7 +55,7 @@ export type CanonicalAssistantTranscript = {
   sessionId: string;
   sessionFile: string;
   messageId: string;
-  idempotencyKey: string;
+  idempotencyKey?: string;
   text: string;
 };
 
@@ -105,14 +105,24 @@ function parseAssistantTranscriptText(
     message?: unknown;
   };
   const message = parsed.message as
-    | { role?: unknown; timestamp?: unknown; provider?: unknown; model?: unknown }
+    | {
+        role?: unknown;
+        timestamp?: unknown;
+        provider?: unknown;
+        model?: unknown;
+        display?: unknown;
+      }
     | undefined;
   if (!message || message.role !== "assistant") {
     return undefined;
   }
+  if (message.display === false) {
+    return undefined;
+  }
   if (
     options?.excludeTranscriptOnlyOpenClawAssistant &&
-    isTranscriptOnlyOpenClawAssistantMessage(message)
+    isTranscriptOnlyOpenClawAssistantMessage(message) &&
+    message.display !== true
   ) {
     return undefined;
   }
@@ -242,6 +252,7 @@ export async function appendAssistantMessageToSessionTranscript(params: {
   /** Pin recoverable publication to this session and its exact idempotency key. */
   expectedSessionId?: string;
   canonicalAssistantTranscript?: CanonicalAssistantTranscript;
+  nativeAssistantTranscript?: CanonicalAssistantTranscript;
   /** Optional override for store path (mostly for tests). */
   storePath?: string;
   updateMode?: SessionTranscriptUpdateMode;
@@ -267,6 +278,7 @@ export async function appendAssistantMessageToSessionTranscript(params: {
     idempotencyKey: params.idempotencyKey,
     expectedSessionId: params.expectedSessionId,
     canonicalAssistantTranscript: params.canonicalAssistantTranscript,
+    nativeAssistantTranscript: params.nativeAssistantTranscript,
     updateMode: params.updateMode,
     config: params.config,
     message: {
@@ -302,6 +314,7 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
   idempotencyKey?: string;
   expectedSessionId?: string;
   canonicalAssistantTranscript?: CanonicalAssistantTranscript;
+  nativeAssistantTranscript?: CanonicalAssistantTranscript;
   storePath?: string;
   updateMode?: SessionTranscriptUpdateMode;
   config?: OpenClawConfig;
@@ -354,7 +367,16 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
         params.idempotencyKey ??
         ((params.message as { idempotencyKey?: unknown }).idempotencyKey as string | undefined);
       const publishedAssistant = params.canonicalAssistantTranscript;
-      if (publishedAssistant) {
+      const nativeAssistant = params.nativeAssistantTranscript;
+      if (nativeAssistant) {
+        if (
+          params.expectedSessionId !== nativeAssistant.sessionId ||
+          path.resolve(sessionFile) !== path.resolve(nativeAssistant.sessionFile)
+        ) {
+          return { ok: false, reason: "native assistant source reference is unproven" };
+        }
+      }
+      if (publishedAssistant && !nativeAssistant) {
         if (
           params.expectedSessionId !== publishedAssistant.sessionId ||
           path.resolve(sessionFile) !== path.resolve(publishedAssistant.sessionFile) ||
@@ -382,34 +404,45 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
         ...(explicitIdempotencyKey ? { idempotencyKey: explicitIdempotencyKey } : {}),
         // The native answer is already visible. This exact-key receipt preserves
         // crash recovery without publishing that same answer a second time.
-        ...(publishedAssistant
+        ...(publishedAssistant && !nativeAssistant
           ? {
               display: false,
               sourceDelivery: { visibleMessageId: publishedAssistant.messageId },
             }
           : {}),
       } as Parameters<SessionManager["appendMessage"]>[0];
-      const {
-        messageId,
-        message: appendedMessage,
-        appended,
-      } = await runWithOwnedSessionTranscriptWritePublication(
-        { sessionFile, sessionKey: resolved.normalizedKey },
-        async () => {
-          await ensureSessionHeader({
-            sessionFile,
-            sessionId: entry.sessionId,
-            cwd: entry.spawnedCwd,
-          });
-          return await appendSessionTranscriptMessage({
-            transcriptPath: sessionFile,
-            message,
-            ...(explicitIdempotencyKey ? { idempotencyLookup: "scan" } : {}),
-            config: params.config,
-          });
-        },
-      );
+      let publication;
+      try {
+        publication = await runWithOwnedSessionTranscriptWritePublication(
+          { sessionFile, sessionKey: resolved.normalizedKey },
+          async () => {
+            await ensureSessionHeader({
+              sessionFile,
+              sessionId: entry.sessionId,
+              cwd: entry.spawnedCwd,
+            });
+            return await appendSessionTranscriptMessage({
+              transcriptPath: sessionFile,
+              message,
+              ...(explicitIdempotencyKey ? { idempotencyLookup: "scan" } : {}),
+              ...(nativeAssistant
+                ? {
+                    replaceTranscriptLineBeforeAppend: (line: string) =>
+                      hideNativeAssistantForPreparedSource(line, nativeAssistant),
+                  }
+                : {}),
+              config: params.config,
+            });
+          },
+        );
+      } catch (error) {
+        return { ok: false, reason: formatErrorMessage(error) };
+      }
+      const { messageId, message: appendedMessage, appended } = publication;
       if (!appended) {
+        if (nativeAssistant && params.updateMode !== "none") {
+          emitSessionTranscriptUpdate({ sessionFile, sessionKey });
+        }
         return { ok: true, sessionFile, messageId };
       }
 
@@ -433,9 +466,45 @@ export async function appendExactAssistantMessageToSessionTranscript(params: {
         case "none":
           break;
       }
+      if (nativeAssistant && (params.updateMode ?? "inline") === "inline") {
+        // Inline append cannot retract an older row from open history streams.
+        // A file refresh projects the native hide and source final together.
+        emitSessionTranscriptUpdate({
+          sessionFile,
+          sessionKey,
+          ...(params.agentId ? { agentId: params.agentId } : {}),
+        });
+      }
       return { ok: true, sessionFile, messageId };
     },
   );
+}
+
+function hideNativeAssistantForPreparedSource(
+  line: string,
+  reference: CanonicalAssistantTranscript,
+): string | undefined {
+  let record: {
+    id?: string;
+    message?: SessionTranscriptAssistantMessage & { display?: boolean; idempotencyKey?: string };
+  };
+  try {
+    record = JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+  if (record.id !== reference.messageId) {
+    return undefined;
+  }
+  const message = record.message;
+  if (
+    message?.role !== "assistant" ||
+    extractAssistantVisibleText(message)?.trim() !== reference.text ||
+    (reference.idempotencyKey !== undefined && message.idempotencyKey !== reference.idempotencyKey)
+  ) {
+    throw new Error("native assistant source reference is unproven");
+  }
+  return JSON.stringify({ ...record, message: { ...message, display: false } });
 }
 
 async function matchesPublishedAssistant(
@@ -465,8 +534,11 @@ async function matchesPublishedAssistant(
       return (
         record.message?.role === "assistant" &&
         record.message.display !== false &&
-        record.message.idempotencyKey === reference.idempotencyKey &&
-        extractAssistantMessageText(record.message) === expectedText
+        (reference.idempotencyKey === undefined ||
+          record.message.idempotencyKey === reference.idempotencyKey) &&
+        (reference.idempotencyKey === undefined
+          ? extractAssistantVisibleText(record.message)?.trim()
+          : extractAssistantMessageText(record.message)) === expectedText
       );
     } catch {
       continue;

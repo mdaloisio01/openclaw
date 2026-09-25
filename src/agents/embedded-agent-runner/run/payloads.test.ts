@@ -57,6 +57,10 @@ describe("buildEmbeddedRunPayloads canonical transcript reference", () => {
     expect(
       getReplyPayloadMetadata(payloads[0] as object)?.canonicalAssistantTranscript,
     ).toBeUndefined();
+    expect(getReplyPayloadMetadata(payloads[0] as object)?.nativeAssistantTranscript).toEqual({
+      ...canonicalAssistantTranscript,
+      text: saved,
+    });
   });
 
   it("does not give a same-text message-tool reply the ordinary native final's identity", () => {
@@ -76,6 +80,17 @@ describe("buildEmbeddedRunPayloads canonical transcript reference", () => {
     expect(
       getReplyPayloadMetadata(payloads[0] as object)?.canonicalAssistantTranscript,
     ).toBeUndefined();
+  });
+
+  it("does not assign one native entry to multiple source final parts", () => {
+    const payloads = buildPayloads({
+      assistantTexts: ["Earlier answer.", "Current answer."],
+      canonicalAssistantTranscript,
+    });
+    expect(payloads).toHaveLength(2);
+    for (const payload of payloads) {
+      expect(getReplyPayloadMetadata(payload as object)?.nativeAssistantTranscript).toBeUndefined();
+    }
   });
 });
 

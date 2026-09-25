@@ -918,53 +918,78 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
   });
 
-  it("prepares an ordinary WebChat final before its original source dispatch", async () => {
-    const registryPath = await useTempSourceTurnDeliveryRegistry();
-    hookMocks.runner.hasHooks.mockReturnValue(false);
-    sessionStoreMocks.currentEntry = {
-      sessionId: "source-session",
-      sessionKey: "agent:test:session",
-    };
-    sessionStoreMocks.readSessionEntry.mockImplementation(() => sessionStoreMocks.currentEntry);
-    let createdAt = 0;
-    const dispatcher = createReplyDispatcher({
-      deliver: async () => {
-        throw new Error("original source dispatch interrupted");
-      },
-    });
+  it.each([
+    { label: "transformed", nativeText: "Raw native answer.", unchanged: false },
+    { label: "unchanged", nativeText: "The final answer is 42.", unchanged: true },
+  ])(
+    "prepares a $label WebChat final before its original source dispatch",
+    async ({ nativeText, unchanged }) => {
+      const registryPath = await useTempSourceTurnDeliveryRegistry();
+      hookMocks.runner.hasHooks.mockReturnValue(false);
+      sessionStoreMocks.currentEntry = {
+        sessionId: "source-session",
+        sessionKey: "agent:test:session",
+      };
+      sessionStoreMocks.readSessionEntry.mockImplementation(() => sessionStoreMocks.currentEntry);
+      let createdAt = 0;
+      const nativeAssistantTranscript = {
+        sessionId: "source-session",
+        sessionFile: "/tmp/source-session.jsonl",
+        messageId: "native-final-entry",
+        text: nativeText,
+      };
+      const dispatcher = createReplyDispatcher({
+        deliver: async () => {
+          throw new Error("original source dispatch interrupted");
+        },
+      });
 
-    const result = await dispatchReplyFromConfig({
-      ctx: createSourceTurnCtx({
-        Provider: "webchat",
-        Surface: "webchat",
-        CommandTurn: { kind: "normal", source: "message", authorized: false, body: "hello" },
-      }),
-      cfg: emptyConfig,
-      dispatcher,
-      replyOptions: { runId: "ordinary-webchat-run" },
-      replyResolver: async () => {
-        createdAt = Date.now();
-        sessionStoreMocks.currentEntry = {
-          ...sessionStoreMocks.currentEntry,
-          pendingFinalDelivery: true,
+      const result = await dispatchReplyFromConfig({
+        ctx: createSourceTurnCtx({
+          Provider: "webchat",
+          Surface: "webchat",
+          CommandTurn: { kind: "normal", source: "message", authorized: false, body: "hello" },
+        }),
+        cfg: emptyConfig,
+        dispatcher,
+        replyOptions: { runId: "ordinary-webchat-run" },
+        replyResolver: async () => {
+          createdAt = Date.now();
+          sessionStoreMocks.currentEntry = {
+            ...sessionStoreMocks.currentEntry,
+            pendingFinalDelivery: true,
+            pendingFinalDeliveryCreatedAt: createdAt,
+          };
+          return setReplyPayloadMetadata(
+            { text: "The final answer is 42." },
+            {
+              nativeAssistantTranscript,
+              ...(unchanged ? { canonicalAssistantTranscript: nativeAssistantTranscript } : {}),
+            },
+          );
+        },
+      });
+
+      expect(result.queuedFinal).toBe(true);
+      expect((await readSourceTurnDeliveryRows(registryPath))[0]).toMatchObject({
+        currentStage: "final_dispatch_prepared_pending_delivery",
+        finalDeliveryDelivered: false,
+        sourceChannel: "webchat",
+        preparedSourceFinal: {
+          kind: "source_session_transcript",
           pendingFinalDeliveryCreatedAt: createdAt,
-        };
-        return { text: "The final answer is 42." };
-      },
-    });
-
-    expect(result.queuedFinal).toBe(true);
-    expect((await readSourceTurnDeliveryRows(registryPath))[0]).toMatchObject({
-      currentStage: "final_dispatch_prepared_pending_delivery",
-      finalDeliveryDelivered: false,
-      sourceChannel: "webchat",
-      preparedSourceFinal: {
-        kind: "source_session_transcript",
-        pendingFinalDeliveryCreatedAt: createdAt,
-        parts: [{ text: "The final answer is 42." }],
-      },
-    });
-  });
+          parts: [
+            {
+              text: "The final answer is 42.",
+              ...(unchanged
+                ? { canonicalAssistantTranscript: nativeAssistantTranscript }
+                : { nativeAssistantTranscript }),
+            },
+          ],
+        },
+      });
+    },
+  );
 
   it("leaves a WebChat reply without a model pending marker to its Gateway owner", async () => {
     const registryPath = await useTempSourceTurnDeliveryRegistry();

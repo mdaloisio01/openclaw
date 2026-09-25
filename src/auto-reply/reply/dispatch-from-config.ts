@@ -3214,6 +3214,7 @@ export async function dispatchReplyFromConfig(
           finals.map(async (payload) => {
             const sendable = resolveSendableOutboundReplyParts(payload);
             const reference = getReplyPayloadMetadata(payload)?.canonicalAssistantTranscript;
+            const nativeReference = getReplyPayloadMetadata(payload)?.nativeAssistantTranscript;
             const unchangedNativeFinal =
               transcriptSource &&
               reference &&
@@ -3225,6 +3226,11 @@ export async function dispatchReplyFromConfig(
               mediaUrls: sendable.mediaUrls,
               payload: structuredClone(payload),
               ...(unchangedNativeFinal ? { canonicalAssistantTranscript: reference } : {}),
+              ...(transcriptSource &&
+              !unchangedNativeFinal &&
+              nativeReference?.sessionId === sourceEntry.sessionId
+                ? { nativeAssistantTranscript: nativeReference }
+                : {}),
               ...(prepareWebchatSourceContent &&
               (sendable.mediaUrls.length > 0 || !sendable.text.trim())
                 ? {

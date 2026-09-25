@@ -157,6 +157,8 @@ export type ReplyPayloadMetadata = {
   assistantMessageIndex?: number;
   /** Actual current-attempt transcript publication; transport must revalidate its target and body. */
   canonicalAssistantTranscript?: CanonicalAssistantTranscript;
+  /** Native model entry from this attempt; source publication may replace its visibility after preparation. */
+  nativeAssistantTranscript?: CanonicalAssistantTranscript;
   /**
    * Internal OpenClaw notices generated after a runtime/provider failure are
    * not assistant source replies. Dispatch may deliver them even when normal

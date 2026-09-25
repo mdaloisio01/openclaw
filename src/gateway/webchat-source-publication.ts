@@ -131,6 +131,7 @@ export async function publishPreparedWebchatSourceReply(params: {
     mediaUrls?: string[];
     idempotencyKey: string;
     canonicalAssistantTranscript?: CanonicalAssistantTranscript;
+    nativeAssistantTranscript?: CanonicalAssistantTranscript;
     webchatContent?: PreparedWebchatSourceContent;
   };
   config: OpenClawConfig;
@@ -141,6 +142,9 @@ export async function publishPreparedWebchatSourceReply(params: {
   }
   const content = part.webchatContent?.content ?? [{ type: "text" as const, text: part.text }];
   const canonicalAssistantTranscript = part.canonicalAssistantTranscript;
+  const nativeAssistantTranscript = canonicalAssistantTranscript
+    ? undefined
+    : part.nativeAssistantTranscript;
   if (
     canonicalAssistantTranscript &&
     (part.webchatContent?.assets.length || part.mediaUrls?.length)
@@ -148,7 +152,7 @@ export async function publishPreparedWebchatSourceReply(params: {
     throw new Error("A native text reference cannot acknowledge a media final");
   }
   const expectedMessage = redactTranscriptMessage(
-    assistantMessage(content),
+    Object.assign(assistantMessage(content), { display: true }),
     params.config,
   ) as SessionTranscriptAssistantMessage;
   if (part.webchatContent) {
@@ -167,6 +171,7 @@ export async function publishPreparedWebchatSourceReply(params: {
     expectedSessionId: params.expectedSessionId,
     idempotencyKey: part.idempotencyKey,
     canonicalAssistantTranscript,
+    nativeAssistantTranscript,
     message: expectedMessage,
     config: params.config,
     updateMode: "inline",

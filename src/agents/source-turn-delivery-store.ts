@@ -106,6 +106,7 @@ type PreparedSourceFinalPart = {
   mediaUrls?: string[];
   payload?: ReplyPayload;
   canonicalAssistantTranscript?: CanonicalAssistantTranscript;
+  nativeAssistantTranscript?: CanonicalAssistantTranscript;
   webchatContent?: PreparedWebchatSourceContent;
 };
 
@@ -823,6 +824,9 @@ function resolvePreparedSourceFinal(params: {
       ...(part.payload ? { payload: structuredClone(part.payload) } : {}),
       ...(part.canonicalAssistantTranscript
         ? { canonicalAssistantTranscript: { ...part.canonicalAssistantTranscript } }
+        : {}),
+      ...(part.nativeAssistantTranscript
+        ? { nativeAssistantTranscript: { ...part.nativeAssistantTranscript } }
         : {}),
       ...(part.webchatContent ? { webchatContent: structuredClone(part.webchatContent) } : {}),
     };

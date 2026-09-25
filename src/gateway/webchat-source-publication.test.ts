@@ -12,9 +12,13 @@ import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
-import { appendAssistantMessageToSessionTranscript } from "../config/sessions/transcript.js";
+import {
+  appendAssistantMessageToSessionTranscript,
+  readLatestAssistantTextFromSessionTranscript,
+} from "../config/sessions/transcript.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { cleanOldMedia } from "../media/store.js";
+import { onSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import * as managedMedia from "./managed-image-attachments.js";
 import { readSessionMessageByIdAsync } from "./session-utils.fs.js";
 import {
@@ -113,6 +117,50 @@ async function recordFor(part: Awaited<ReturnType<typeof prepare>>) {
 }
 
 describe("required WebChat source publication", () => {
+  it("makes a replaced native answer private and keeps the source final as latest reply", async () => {
+    const native = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath,
+      expectedSessionId: sessionId,
+      idempotencyKey: "native-model-answer",
+      text: "Raw answer before source processing.",
+    });
+    if (!native.ok) {
+      throw new Error(native.reason);
+    }
+    const part = await prepare({ text: "Delivered source answer." });
+    part.nativeAssistantTranscript = {
+      sessionId,
+      sessionFile: native.sessionFile,
+      messageId: native.messageId,
+      idempotencyKey: "native-model-answer",
+      text: "Raw answer before source processing.",
+    };
+    const updates: Array<{ message?: unknown }> = [];
+    const unsubscribe = onSessionTranscriptUpdate((update) => updates.push(update));
+    let result;
+    try {
+      result = await publish(part);
+    } finally {
+      unsubscribe();
+    }
+    expect(updates).toHaveLength(2);
+    expect(updates[0].message).toBeDefined();
+    expect(updates[1].message).toBeUndefined();
+    expect((await readLatestAssistantTextFromSessionTranscript(result.sessionFile))?.text).toBe(
+      "Delivered source answer.",
+    );
+    const records = (await fs.readFile(result.sessionFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.message?.role === "assistant");
+    expect(records).toHaveLength(2);
+    expect(records[0].message.display).toBe(false);
+    expect(records[1].message.display).toBe(true);
+    expect((await publish(part)).messageId).toBe(result.messageId);
+  });
+
   it.each([
     {
       name: "portable presentation",

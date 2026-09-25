@@ -678,16 +678,18 @@ describe("parent delivery recovery", () => {
         if (!native.ok) {
           throw new Error(native.reason);
         }
+        const nativeReference = {
+          sessionId: "sid",
+          sessionFile: native.sessionFile,
+          messageId: native.messageId,
+          idempotencyKey: nativeKey,
+          text: finalText,
+        };
         return setReplyPayloadMetadata(
           { text: finalText },
           {
-            canonicalAssistantTranscript: {
-              sessionId: "sid",
-              sessionFile: native.sessionFile,
-              messageId: native.messageId,
-              idempotencyKey: nativeKey,
-              text: finalText,
-            },
+            canonicalAssistantTranscript: nativeReference,
+            nativeAssistantTranscript: nativeReference,
           },
         );
       });

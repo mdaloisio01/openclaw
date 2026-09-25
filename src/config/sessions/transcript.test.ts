@@ -449,6 +449,104 @@ describe("appendAssistantMessageToSessionTranscript", () => {
     ).toMatchObject({ ok: false });
   });
 
+  it("replaces a prepared native answer with one visible source final by exact entry ID", async () => {
+    writeTranscriptStore();
+    const native = await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({ text: "Raw native answer." }),
+    });
+    if (!native.ok) {
+      throw new Error(native.reason);
+    }
+    const nativeAssistantTranscript = {
+      sessionId,
+      sessionFile: native.sessionFile,
+      messageId: native.messageId,
+      text: "Raw native answer.",
+    };
+    const request = {
+      sessionKey,
+      storePath: fixture.storePath(),
+      expectedSessionId: sessionId,
+      idempotencyKey: "prepared-source-final",
+      text: "Delivered source answer.",
+      nativeAssistantTranscript,
+    };
+    const before = fs.readFileSync(native.sessionFile, "utf8");
+    expect(before).toContain("Raw native answer.");
+    expect(await appendAssistantMessageToSessionTranscript(request)).toMatchObject({ ok: true });
+    expect(await appendAssistantMessageToSessionTranscript(request)).toMatchObject({ ok: true });
+    const records = fs
+      .readFileSync(native.sessionFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.message?.role === "assistant");
+    expect(records).toHaveLength(2);
+    expect(records[0].id).toBe(native.messageId);
+    expect(records[0].message.display).toBe(false);
+    expect(records[1].message).toMatchObject({
+      idempotencyKey: request.idempotencyKey,
+      content: [{ type: "text", text: request.text }],
+    });
+    expect(
+      await appendAssistantMessageToSessionTranscript({
+        ...request,
+        idempotencyKey: "false-source-final",
+        nativeAssistantTranscript: { ...nativeAssistantTranscript, messageId: "other-message" },
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("acknowledges an unchanged phased native final without replacing its visible entry", async () => {
+    writeTranscriptStore();
+    const native = await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({
+        content: [
+          {
+            type: "text",
+            text: "Commentary.",
+            textSignature: JSON.stringify({ v: 1, id: "commentary", phase: "commentary" }),
+          },
+          {
+            type: "text",
+            text: "Final answer.",
+            textSignature: JSON.stringify({ v: 1, id: "final", phase: "final_answer" }),
+          },
+        ],
+      }),
+    });
+    if (!native.ok) {
+      throw new Error(native.reason);
+    }
+    expect(
+      await appendAssistantMessageToSessionTranscript({
+        sessionKey,
+        storePath: fixture.storePath(),
+        expectedSessionId: sessionId,
+        idempotencyKey: "unchanged-phased-final",
+        text: "Final answer.",
+        canonicalAssistantTranscript: {
+          sessionId,
+          sessionFile: native.sessionFile,
+          messageId: native.messageId,
+          text: "Final answer.",
+        },
+      }),
+    ).toMatchObject({ ok: true });
+    const records = fs
+      .readFileSync(native.sessionFile, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((entry) => entry.message?.role === "assistant");
+    expect(records[0].message.display).not.toBe(false);
+    expect(records[1].message.display).toBe(false);
+  });
+
   it("does not append a duplicate delivery mirror when the latest assistant message already matches", async () => {
     writeTranscriptStore();
 

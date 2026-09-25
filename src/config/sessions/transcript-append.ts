@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { createReadStream, createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { StringDecoder } from "node:string_decoder";
 import { resolveTimestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
 import type { AgentMessage } from "../../agents/runtime/index.js";
@@ -235,6 +238,8 @@ type AppendSessionTranscriptMessageParams<TMessage = unknown> = {
   useRawWhenLinear?: boolean;
   /** Opt into transcript idempotency lookup; default append stays O(1) for fresh keyed messages. */
   idempotencyLookup?: "scan" | "caller-checked";
+  /** Rewrites one line and appends the new entry in one rename under the session lock. */
+  replaceTranscriptLineBeforeAppend?: (line: string) => string | undefined;
   /** Runs under the transcript write lock after idempotency replay checks and before append. */
   prepareMessageAfterIdempotencyCheck?: (message: TMessage) => TMessage | undefined;
   config?: OpenClawConfig;
@@ -356,8 +361,71 @@ async function appendSessionTranscriptMessageLocked<TMessage>(
     timestamp: resolveTimestampMsToIsoString(now),
     message: finalMessage,
   };
-  await appendJsonlEntry(params.transcriptPath, entry);
+  if (params.replaceTranscriptLineBeforeAppend) {
+    await replaceTranscriptLineAndAppend({
+      transcriptPath: params.transcriptPath,
+      replaceLine: params.replaceTranscriptLineBeforeAppend,
+      appendedLine: serializeJsonlLine(entry),
+    });
+  } else {
+    await appendJsonlEntry(params.transcriptPath, entry);
+  }
   return { messageId, message: finalMessage, appended: true };
+}
+
+async function replaceTranscriptLineAndAppend(params: {
+  transcriptPath: string;
+  replaceLine: (line: string) => string | undefined;
+  appendedLine: string;
+}): Promise<void> {
+  const temporaryFile = `${params.transcriptPath}.${randomUUID()}.tmp`;
+  const decoder = new StringDecoder("utf8");
+  let carry = "";
+  let replaced = false;
+  const rewrite = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      try {
+        const lines = `${carry}${decoder.write(chunk)}`.split("\n");
+        carry = lines.pop() ?? "";
+        for (const line of lines) {
+          const next = params.replaceLine(line);
+          replaced ||= next !== undefined;
+          this.push(`${next ?? line}\n`);
+        }
+        callback();
+      } catch (error) {
+        callback(error as Error);
+      }
+    },
+    flush(callback) {
+      try {
+        const tail = `${carry}${decoder.end()}`;
+        if (tail) {
+          const next = params.replaceLine(tail);
+          replaced ||= next !== undefined;
+          this.push(`${next ?? tail}\n`);
+        }
+        this.push(`${params.appendedLine}\n`);
+        callback();
+      } catch (error) {
+        callback(error as Error);
+      }
+    },
+  });
+  try {
+    await pipeline(
+      createReadStream(params.transcriptPath),
+      rewrite,
+      createWriteStream(temporaryFile, { flags: "wx", mode: 0o600 }),
+    );
+    if (!replaced) {
+      throw new Error("native assistant source reference is unproven");
+    }
+    await fs.rename(temporaryFile, params.transcriptPath);
+  } catch (error) {
+    await fs.rm(temporaryFile, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function readMessageIdempotencyKey(message: unknown): string | undefined {
