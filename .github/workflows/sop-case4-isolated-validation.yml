@@ -1,0 +1,61 @@
+name: SOP Case4 isolated Gateway validation
+
+on:
+  push:
+    branches: [sop-validation-case4-handoff-20260925]
+
+permissions:
+  contents: read
+
+jobs:
+  case4:
+    if: github.repository == 'mdaloisio01/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 8
+          persist-credentials: false
+
+      - name: Verify product candidate and validation-only files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 5251550be0cdad79c00471bfba5eb06406986af3 HEAD
+          actual="$(git diff --name-only 5251550be0cdad79c00471bfba5eb06406986af3 HEAD | sort)"
+          expected="$(printf '%s\n' .github/workflows/sop-case4-isolated-validation.yml scripts/e2e/sop-case4-isolated.mjs | sort)"
+          test "$actual" = "$expected"
+
+      - name: Set up Node and frozen dependencies
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          install-deps: "true"
+          use-actions-cache: "true"
+
+      - name: Build isolated runtime
+        timeout-minutes: 20
+        env:
+          OPENCLAW_TSDOWN_SERIAL_BUILD: "1"
+          NODE_OPTIONS: --max-old-space-size=5120
+        run: pnpm build:release
+
+      - name: Interrupt and recover isolated main session
+        timeout-minutes: 15
+        env:
+          CASE4_PROOF_DIR: ${{ runner.temp }}/sop-case4-proof
+        run: node --import tsx scripts/e2e/sop-case4-isolated.mjs
+
+      - name: Preserve isolated proof
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sop-case4-isolated-proof
+          path: |
+            ${{ runner.temp }}/sop-case4-proof/*.json
+            ${{ runner.temp }}/sop-case4-proof/*.log
+            ${{ runner.temp }}/sop-case4-proof/*.jsonl
+          if-no-files-found: warn
