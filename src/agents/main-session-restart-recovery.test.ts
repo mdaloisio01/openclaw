@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { loadSessionStore, type SessionEntry } from "../config/sessions.js";
+import { appendAssistantMessageToSessionTranscript } from "../config/sessions/transcript.js";
 import { callGateway } from "../gateway/call.js";
 import { listActiveWorkCheckpoints, writeActiveWorkCheckpoint } from "./active-work-checkpoint.js";
 import {
@@ -12,10 +13,15 @@ import {
 import {
   markRestartAbortedMainSessions,
   markRestartAbortedMainSessionsFromLocks,
+  recoverPreparedWebchatSourceFinals,
   recoverRestartAbortedMainSessions,
   readMainSessionRestartRecoveryStatus,
 } from "./main-session-restart-recovery.js";
 import type { SessionLockInspection } from "./session-write-lock.js";
+import {
+  loadSourceTurnDeliveryRegistry,
+  persistSourceTurnDeliveryState,
+} from "./source-turn-delivery-store.js";
 
 vi.mock("../gateway/call.js", () => ({
   callGateway: vi.fn(async () => ({ runId: "run-resumed" })),
@@ -668,6 +674,181 @@ describe("main-session-restart-recovery", () => {
 
     expect(result).toEqual({ recovered: 0, failed: 0, skipped: 0 });
     expect(callGateway).not.toHaveBeenCalled();
+  });
+
+  it("continues unrelated restart recovery when the source registry is unavailable", async () => {
+    const sessionsDir = await makeSessionsDir();
+    await writeStore(sessionsDir, {
+      "agent:main:main": {
+        sessionId: "pending-session",
+        updatedAt: Date.now(),
+        status: "running",
+        abortedLastRun: true,
+        pendingFinalDelivery: true,
+        pendingFinalDeliveryText: "Already prepared answer",
+        pendingFinalDeliveryContext: { channel: "webchat" },
+      },
+      "agent:main:other": {
+        sessionId: "independent-session",
+        updatedAt: Date.now(),
+        status: "running",
+        abortedLastRun: true,
+      },
+      "agent:main:discord": {
+        sessionId: "discord-session",
+        updatedAt: Date.now(),
+        status: "running",
+        abortedLastRun: true,
+        pendingFinalDelivery: true,
+        pendingFinalDeliveryText: "Discord answer",
+        pendingFinalDeliveryContext: { channel: "discord", to: "discord:dm:recipient" },
+      },
+    });
+    await writeTranscript(sessionsDir, "pending-session", [
+      { role: "assistant", content: [{ type: "text", text: "Already prepared answer" }] },
+    ]);
+    await writeTranscript(sessionsDir, "independent-session", [
+      { role: "user", content: "finish independent work" },
+      { role: "toolResult", content: "ready" },
+    ]);
+    await writeTranscript(sessionsDir, "discord-session", [
+      { role: "user", content: "finish Discord work" },
+      { role: "toolResult", content: "ready" },
+    ]);
+
+    expect(
+      await recoverRestartAbortedMainSessions({
+        stateDir: tmpDir,
+        sourceRegistryUnavailable: true,
+      }),
+    ).toEqual({ recovered: 2, failed: 0, skipped: 1 });
+    expect(callGateway).toHaveBeenCalledTimes(2);
+  });
+
+  it("publishes a prepared WebChat final once after restart without resuming an assistant tail", async () => {
+    const sessionsDir = await makeSessionsDir();
+    const storePath = path.join(sessionsDir, "sessions.json");
+    const registryPath = path.join(tmpDir, "state", "openclaw.sqlite");
+    const sessionKey = "agent:main:main";
+    const createdAt = Date.now() - 5_000;
+    await writeStore(sessionsDir, {
+      [sessionKey]: {
+        sessionId: "main-session",
+        updatedAt: createdAt,
+        status: "running",
+        abortedLastRun: true,
+        pendingFinalDelivery: true,
+        pendingFinalDeliveryText: "The answer is 42.",
+        pendingFinalDeliveryCreatedAt: createdAt,
+      },
+    });
+    await writeTranscript(sessionsDir, "main-session", [
+      { role: "user", content: [{ type: "text", text: "calculate" }] },
+    ]);
+    const native = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath,
+      expectedSessionId: "main-session",
+      idempotencyKey: "native-answer",
+      text: "The answer is 42.",
+      config: {},
+    });
+    if (!native.ok) {
+      throw new Error(native.reason);
+    }
+    const row = await persistSourceTurnDeliveryState({
+      registryPath,
+      id: `source:${sessionKey}:message-1`,
+      sourceTurnId: `source:${sessionKey}:message-1`,
+      sourceSessionKey: sessionKey,
+      sourceMessageId: "message-1",
+      sourceChannel: "webchat",
+      deliveryContext: { channel: "webchat" },
+      runId: "run-original",
+      facts: { finalDeliveryRequired: true, evidenceKinds: ["internal_evidence_record"] },
+      currentStage: "final_dispatch_prepared_pending_delivery",
+      preparedSourceFinal: {
+        kind: "source_session_transcript",
+        sessionId: "main-session",
+        pendingFinalDeliveryCreatedAt: createdAt,
+        expectedPartCount: 1,
+        parts: [
+          {
+            text: "The answer is 42.",
+            canonicalAssistantTranscript: {
+              sessionId: "main-session",
+              sessionFile: native.sessionFile,
+              messageId: native.messageId,
+              idempotencyKey: "native-answer",
+              text: "The answer is 42.",
+            },
+          },
+        ],
+      },
+    });
+
+    const ownedSessionKeys = new Set<string>();
+    expect(
+      await recoverPreparedWebchatSourceFinals({
+        stateDir: tmpDir,
+        registryPath,
+        ownedSessionKeys,
+      }),
+    ).toEqual({
+      recovered: 1,
+      failed: 0,
+    });
+    expect(ownedSessionKeys).toEqual(new Set([sessionKey]));
+    expect(loadSessionStore(storePath)[sessionKey]?.abortedLastRun).toBe(false);
+    expect(
+      await recoverRestartAbortedMainSessions({
+        stateDir: tmpDir,
+        preparedSourceSessionKeys: ownedSessionKeys,
+      }),
+    ).toEqual({ recovered: 0, failed: 0, skipped: 1 });
+    // Simulate the durable row being settled while session cleanup was lost.
+    await writeStore(sessionsDir, {
+      [sessionKey]: {
+        sessionId: "main-session",
+        updatedAt: createdAt,
+        status: "running",
+        abortedLastRun: true,
+        pendingFinalDelivery: true,
+        pendingFinalDeliveryText: "The answer is 42.",
+        pendingFinalDeliveryCreatedAt: createdAt,
+      },
+    });
+    expect(await recoverPreparedWebchatSourceFinals({ stateDir: tmpDir, registryPath })).toEqual({
+      recovered: 1,
+      failed: 0,
+    });
+    expect(loadSessionStore(storePath)[sessionKey]?.abortedLastRun).toBe(false);
+    expect(await recoverPreparedWebchatSourceFinals({ stateDir: tmpDir, registryPath })).toEqual({
+      recovered: 0,
+      failed: 0,
+    });
+    expect(callGateway).not.toHaveBeenCalled();
+    const transcript = (await fs.readFile(path.join(sessionsDir, "main-session.jsonl"), "utf8"))
+      .trim()
+      .split("\n")
+      .map(
+        (line) => JSON.parse(line) as { message?: { idempotencyKey?: string; display?: boolean } },
+      );
+    expect(
+      transcript.filter(
+        (entry) =>
+          entry.message?.idempotencyKey === row.preparedSourceFinal?.parts[0].idempotencyKey,
+      ),
+    ).toHaveLength(1);
+    expect(
+      transcript.filter(
+        (entry) => entry.message?.display !== false && entry.message?.idempotencyKey,
+      ),
+    ).toHaveLength(1);
+    expect(loadSessionStore(storePath)[sessionKey]?.pendingFinalDelivery).toBeUndefined();
+    expect(
+      (await loadSourceTurnDeliveryRegistry(registryPath)).rows[0].finalDeliveryDelivered,
+    ).toBe(true);
   });
 
   it("accounts for scanned checkpoints when no session is recovery-eligible", async () => {

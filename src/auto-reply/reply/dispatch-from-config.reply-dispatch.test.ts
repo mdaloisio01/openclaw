@@ -918,6 +918,123 @@ describe("dispatchReplyFromConfig reply_dispatch hook", () => {
     });
   });
 
+  it("prepares an ordinary WebChat final before its original source dispatch", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    sessionStoreMocks.currentEntry = {
+      sessionId: "source-session",
+      sessionKey: "agent:test:session",
+    };
+    sessionStoreMocks.readSessionEntry.mockImplementation(() => sessionStoreMocks.currentEntry);
+    let createdAt = 0;
+    const dispatcher = createReplyDispatcher({
+      deliver: async () => {
+        throw new Error("original source dispatch interrupted");
+      },
+    });
+
+    const result = await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        CommandTurn: { kind: "normal", source: "message", authorized: false, body: "hello" },
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyOptions: { runId: "ordinary-webchat-run" },
+      replyResolver: async () => {
+        createdAt = Date.now();
+        sessionStoreMocks.currentEntry = {
+          ...sessionStoreMocks.currentEntry,
+          pendingFinalDelivery: true,
+          pendingFinalDeliveryCreatedAt: createdAt,
+        };
+        return { text: "The final answer is 42." };
+      },
+    });
+
+    expect(result.queuedFinal).toBe(true);
+    expect((await readSourceTurnDeliveryRows(registryPath))[0]).toMatchObject({
+      currentStage: "final_dispatch_prepared_pending_delivery",
+      finalDeliveryDelivered: false,
+      sourceChannel: "webchat",
+      preparedSourceFinal: {
+        kind: "source_session_transcript",
+        pendingFinalDeliveryCreatedAt: createdAt,
+        parts: [{ text: "The final answer is 42." }],
+      },
+    });
+  });
+
+  it("leaves a WebChat reply without a model pending marker to its Gateway owner", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    sessionStoreMocks.currentEntry = {
+      sessionId: "source-session",
+      sessionKey: "agent:test:session",
+    };
+    sessionStoreMocks.readSessionEntry.mockReturnValue(sessionStoreMocks.currentEntry);
+    const dispatcher = createDispatcher();
+
+    await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        CommandTurn: { kind: "normal", source: "message", authorized: false, body: "hello" },
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyOptions: { runId: "gateway-owned-run" },
+      replyResolver: async () => ({ text: "Gateway-owned final" }),
+    });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledOnce();
+    expect((await readSourceTurnDeliveryRows(registryPath))[0]).toMatchObject({
+      finalDeliveryDelivered: true,
+      currentStage: "final_dispatch_delivered",
+    });
+    expect((await readSourceTurnDeliveryRows(registryPath))[0]).not.toHaveProperty(
+      "preparedSourceFinal",
+    );
+  });
+
+  it("keeps an error final deliverable when a WebChat pending marker exists", async () => {
+    const registryPath = await useTempSourceTurnDeliveryRegistry();
+    hookMocks.runner.hasHooks.mockReturnValue(false);
+    sessionStoreMocks.currentEntry = {
+      sessionId: "source-session",
+      sessionKey: "agent:test:session",
+    };
+    sessionStoreMocks.readSessionEntry.mockImplementation(() => sessionStoreMocks.currentEntry);
+    const dispatcher = createDispatcher();
+
+    await dispatchReplyFromConfig({
+      ctx: createSourceTurnCtx({
+        Provider: "webchat",
+        Surface: "webchat",
+        CommandTurn: { kind: "normal", source: "message", authorized: false, body: "hello" },
+      }),
+      cfg: emptyConfig,
+      dispatcher,
+      replyOptions: { runId: "webchat-error-run" },
+      replyResolver: async () => {
+        sessionStoreMocks.currentEntry = {
+          ...sessionStoreMocks.currentEntry,
+          pendingFinalDelivery: true,
+          pendingFinalDeliveryCreatedAt: Date.now(),
+        };
+        return { text: "Model failed", isError: true };
+      },
+    });
+
+    expect(dispatcher.sendFinalReply).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "Model failed", isError: true }),
+    );
+    expect((await readSourceTurnDeliveryRows(registryPath))[0]).not.toHaveProperty(
+      "preparedSourceFinal",
+    );
+  });
+
   it.each([
     { name: "initial", tail: false },
     { name: "tail", tail: true },

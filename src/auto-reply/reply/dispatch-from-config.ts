@@ -40,8 +40,11 @@ import {
 } from "../../agents/report-delivery-guard.js";
 import type { SourceTurnDeliveryFacts } from "../../agents/source-turn-delivery-state.js";
 import {
+  createSourceTurnDeliveryQueueOwnerReference,
+  loadSourceTurnDeliveryRegistry,
   persistSourceTurnDeliveryState,
   resolveSourceTurnDeliveryRegistryPath,
+  settleSourceTurnDeliveryFinal,
   type PersistSourceTurnDeliveryParams,
   type SourceTurnDeliveryContext,
   type SourceTurnDeliveryRow,
@@ -586,6 +589,7 @@ async function persistDispatchSourceTurnDeliveryState(params: {
   parentYieldWaits?: ParentYieldWaitRef[];
   activationContinuation?: ActivationContinuationRef;
   preparedSourceFinal?: PersistSourceTurnDeliveryParams["preparedSourceFinal"];
+  requireDurableFinal?: boolean;
   facts: SourceTurnDeliveryFacts;
   currentStage: string;
 }): Promise<SourceTurnDeliveryRow | undefined> {
@@ -623,7 +627,11 @@ async function persistDispatchSourceTurnDeliveryState(params: {
     }
     return row;
   } catch (error) {
-    if (params.parentYieldWaits?.length || params.activationContinuation) {
+    if (
+      params.parentYieldWaits?.length ||
+      params.activationContinuation ||
+      params.requireDurableFinal
+    ) {
       throw error;
     }
     logVerbose(
@@ -2594,6 +2602,7 @@ export async function dispatchReplyFromConfig(
   const requiredSourceContinuation = Boolean(
     ctx.ParentYieldWaits?.length || ctx.ActivationContinuation,
   );
+  let durableWebchatFinal = false;
   const recordSourceTurnDeliveryState = (
     facts: SourceTurnDeliveryFacts,
     currentStage: string,
@@ -2607,9 +2616,11 @@ export async function dispatchReplyFromConfig(
       parentYieldWaits: ctx.ParentYieldWaits,
       activationContinuation: ctx.ActivationContinuation,
       preparedSourceFinal,
+      requireDurableFinal: durableWebchatFinal && preparedSourceFinal !== undefined,
       facts,
       currentStage,
     });
+  const sourceTurnAcceptedAt = Date.now();
   await recordSourceTurnDeliveryState({}, "accepted");
   const memoryFlushAdmissionBlock = resolvePreCompactionMemoryFlushWebchatAdmissionBlock(ctx);
   if (memoryFlushAdmissionBlock) {
@@ -3294,6 +3305,30 @@ export async function dispatchReplyFromConfig(
       await dispatcher.waitForIdle();
       const after = getDispatcherFinalOutcomeCounts(dispatcher);
       const delivered = after.failed === before.failed && after.cancelled === before.cancelled;
+      if (delivered && durableWebchatFinal && !requiredSourceContinuation) {
+        const registry = await loadSourceTurnDeliveryRegistry(sourceTurnDeliveryRegistryPath);
+        const owner = registry.rows.find((row) => row.id === sourceTurnDeliveryRecordId);
+        const prepared = owner?.preparedSourceFinal;
+        if (!owner || prepared?.kind !== "source_session_transcript") {
+          throw new Error("WebChat final delivery owner is missing after dispatch");
+        }
+        const { publishPreparedWebchatSourceReply } =
+          await import("../../gateway/webchat-source-publication.js");
+        for (const part of prepared.parts) {
+          await publishPreparedWebchatSourceReply({
+            sessionKey: owner.sourceSessionKey!,
+            agentId: sessionAgentId,
+            storePath: sessionStoreEntry.storePath,
+            expectedSessionId: prepared.sessionId,
+            part,
+            config: cfg,
+          });
+        }
+        await settleSourceTurnDeliveryFinal({
+          registryPath: sourceTurnDeliveryRegistryPath,
+          owner: createSourceTurnDeliveryQueueOwnerReference(owner),
+        });
+      }
       for (const payload of preparedPayloads) {
         recordCleanupCrewMissionSettlement(payload, delivered ? "proven" : "failed");
         if (delivered) {
@@ -4151,6 +4186,28 @@ export async function dispatchReplyFromConfig(
     }
 
     const replies = replyResult ? (Array.isArray(replyResult) ? replyResult : [replyResult]) : [];
+    if (
+      isInternalWebchatTurn &&
+      !shouldRouteToOriginating &&
+      sourceTurnDeliveryMetadata.sourceChannel === "webchat" &&
+      sourceTurnDeliveryRecordId &&
+      sourceTurnDeliveryMetadata.sourceSessionKey &&
+      params.replyOptions?.runId &&
+      ctx.CommandTurn?.kind === "normal" &&
+      sessionStoreEntry.storePath
+    ) {
+      const sourceEntry = readSessionEntry(
+        sessionStoreEntry.storePath,
+        sourceTurnDeliveryMetadata.sourceSessionKey,
+      );
+      // Only the model run writes this pending marker after acceptance. Gateway
+      // command replies have a separate transcript owner and must keep it.
+      durableWebchatFinal =
+        sourceEntry?.pendingFinalDelivery === true &&
+        typeof sourceEntry.pendingFinalDeliveryCreatedAt === "number" &&
+        sourceEntry.pendingFinalDeliveryCreatedAt >= sourceTurnAcceptedAt &&
+        !replies.some((reply) => reply.isError === true);
+    }
     const beforeAgentRunBlocked = replies.some(
       (reply) => getReplyPayloadMetadata(reply)?.beforeAgentRunBlocked === true,
     );
@@ -4213,7 +4270,7 @@ export async function dispatchReplyFromConfig(
         continue;
       }
       attemptedFinalDelivery = true;
-      if (requiredSourceContinuation) {
+      if (requiredSourceContinuation || durableWebchatFinal) {
         requiredFinalPayloads.push(reply);
         continue;
       }
@@ -4231,7 +4288,7 @@ export async function dispatchReplyFromConfig(
       finalDeliveryUnknown = finalBatch.finalDeliveryUnknown;
     }
 
-    if (attemptedFinalDelivery && !requiredSourceContinuation) {
+    if (attemptedFinalDelivery && !requiredSourceContinuation && !durableWebchatFinal) {
       await recordSourceTurnDeliveryState(
         finalDeliveryProven
           ? {

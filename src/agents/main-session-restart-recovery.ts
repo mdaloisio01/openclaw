@@ -23,8 +23,14 @@ import { readSessionMessagesAsync } from "../gateway/session-utils.fs.js";
 import { resolveGatewaySessionStoreTarget } from "../gateway/session-utils.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { CommandLane } from "../process/lanes.js";
-import { isAcpSessionKey, isCronSessionKey, isSubagentSessionKey } from "../routing/session-key.js";
+import {
+  isAcpSessionKey,
+  isCronSessionKey,
+  isSubagentSessionKey,
+  resolveAgentIdFromSessionKey,
+} from "../routing/session-key.js";
 import { resolveSendPolicy } from "../sessions/send-policy.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import {
   deliveryContextFromSession,
   normalizeDeliveryContext,
@@ -38,6 +44,11 @@ import {
 } from "./active-work-checkpoint.js";
 import { resolveAgentSessionDirs } from "./session-dirs.js";
 import type { SessionLockInspection } from "./session-write-lock.js";
+import {
+  createSourceTurnDeliveryQueueOwnerReference,
+  loadSourceTurnDeliveryRegistry,
+  settleSourceTurnDeliveryFinal,
+} from "./source-turn-delivery-store.js";
 
 const log = createSubsystemLogger("main-session-restart-recovery");
 
@@ -822,6 +833,8 @@ async function recoverStore(params: {
   resumedSessionKeys: Set<string>;
   checkpoints: ActiveWorkCheckpoint[];
   stateDir?: string;
+  preparedSourceSessionKeys?: Set<string>;
+  sourceRegistryUnavailable?: boolean;
 }): Promise<
   MainSessionRestartRecoveryResult & { accounting: MainSessionRestartRecoveryAccounting }
 > {
@@ -856,6 +869,23 @@ async function recoverStore(params: {
     if (entry.status !== "running") {
       accounting.ineligibleSessions++;
       accounting.ineligibleNonRunningSessions++;
+      continue;
+    }
+    const pendingChannel =
+      entry.pendingFinalDeliveryContext?.channel ??
+      entry.deliveryContext?.channel ??
+      entry.lastChannel;
+    if (
+      params.preparedSourceSessionKeys?.has(sessionKey) ||
+      (params.sourceRegistryUnavailable &&
+        (entry.pendingFinalDelivery === true || Boolean(entry.pendingFinalDeliveryText)) &&
+        (!pendingChannel || !isDeliverableMessageChannel(pendingChannel)))
+    ) {
+      // A durable source final owns this turn even when a stale lock also
+      // marked it aborted. If its registry is unreadable, a pending final
+      // cannot safely be distinguished from one already prepared.
+      result.skipped++;
+      accounting.skippedSessions++;
       continue;
     }
     if (entry.abortedLastRun !== true) {
@@ -1108,12 +1138,138 @@ async function resolveRestartRecoveryStorePaths(params: {
   return resolved;
 }
 
+/** Finish immutable WebChat finals that were prepared after model work released its lock. */
+export async function recoverPreparedWebchatSourceFinals(
+  params: {
+    cfg?: OpenClawConfig;
+    stateDir?: string;
+    registryPath?: string;
+    ownedSessionKeys?: Set<string>;
+  } = {},
+): Promise<{ recovered: number; failed: number }> {
+  const stateDir = params.stateDir ?? resolveStateDir(process.env);
+  const registryPath =
+    params.registryPath ??
+    process.env.OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH ??
+    resolveOpenClawStateSqlitePath({ ...process.env, OPENCLAW_STATE_DIR: stateDir });
+  const registry = await loadSourceTurnDeliveryRegistry(registryPath);
+  const storePaths = await resolveRestartRecoveryStorePaths(params);
+  const result = { recovered: 0, failed: 0 };
+  const clearRecoveredSession = async (
+    storePath: string,
+    sessionKey: string,
+    sessionId: string,
+    expectedCreatedAt: number,
+  ) => {
+    await updateSessionStore(
+      storePath,
+      (store) => {
+        const entry = store[sessionKey];
+        if (
+          entry?.sessionId !== sessionId ||
+          entry.pendingFinalDeliveryCreatedAt !== expectedCreatedAt ||
+          entry.pendingFinalDelivery !== true
+        ) {
+          return;
+        }
+        entry.pendingFinalDelivery = undefined;
+        entry.pendingFinalDeliveryText = undefined;
+        entry.pendingFinalDeliveryCreatedAt = undefined;
+        entry.pendingFinalDeliveryLastAttemptAt = undefined;
+        entry.pendingFinalDeliveryAttemptCount = undefined;
+        entry.pendingFinalDeliveryLastError = undefined;
+        entry.pendingFinalDeliveryContext = undefined;
+        entry.abortedLastRun = false;
+        entry.updatedAt = Date.now();
+      },
+      { skipMaintenance: true },
+    );
+  };
+  for (const row of registry.rows) {
+    const prepared = row.preparedSourceFinal;
+    if (
+      row.sourceChannel !== "webchat" ||
+      row.deliveryContext?.channel !== "webchat" ||
+      row.parentYieldWaits?.length ||
+      row.obligationIdentity.deliveryId ||
+      !row.obligationIdentity.runId ||
+      !row.sourceSessionKey ||
+      prepared?.kind !== "source_session_transcript" ||
+      !prepared.pendingFinalDeliveryCreatedAt ||
+      prepared.parts.length !== prepared.expectedPartCount
+    ) {
+      continue;
+    }
+    const storePath = storePaths.find((candidate) => {
+      try {
+        const entry = loadSessionStore(candidate, { skipCache: true })[row.sourceSessionKey!];
+        return (
+          entry?.sessionId === prepared.sessionId &&
+          entry.pendingFinalDelivery === true &&
+          entry.pendingFinalDeliveryCreatedAt === prepared.pendingFinalDeliveryCreatedAt
+        );
+      } catch {
+        return false;
+      }
+    });
+    if (!storePath) {
+      continue;
+    }
+    params.ownedSessionKeys?.add(row.sourceSessionKey);
+    try {
+      if (row.finalDeliveryDelivered) {
+        // A crash after source settlement but before session cleanup still
+        // owns this exact pending final; no publication should run again.
+        await clearRecoveredSession(
+          storePath,
+          row.sourceSessionKey,
+          prepared.sessionId,
+          prepared.pendingFinalDeliveryCreatedAt,
+        );
+        result.recovered++;
+        continue;
+      }
+      const { publishPreparedWebchatSourceReply } =
+        await import("../gateway/webchat-source-publication.js");
+      for (const part of prepared.parts) {
+        // The exact key acknowledges a pre-crash append; native transcript text
+        // alone never proves this source delivery or authorizes a model rerun.
+        await publishPreparedWebchatSourceReply({
+          sessionKey: row.sourceSessionKey,
+          agentId: resolveAgentIdFromSessionKey(row.sourceSessionKey),
+          storePath,
+          expectedSessionId: prepared.sessionId,
+          part,
+          config: params.cfg ?? {},
+        });
+      }
+      await settleSourceTurnDeliveryFinal({
+        registryPath,
+        owner: createSourceTurnDeliveryQueueOwnerReference(row),
+      });
+      await clearRecoveredSession(
+        storePath,
+        row.sourceSessionKey,
+        prepared.sessionId,
+        prepared.pendingFinalDeliveryCreatedAt,
+      );
+      result.recovered++;
+    } catch (error) {
+      result.failed++;
+      log.warn(`prepared WebChat source final recovery pending: ${String(error)}`);
+    }
+  }
+  return result;
+}
+
 export async function recoverRestartAbortedMainSessions(
   params: {
     cfg?: OpenClawConfig;
     includeAccounting?: boolean;
     stateDir?: string;
     resumedSessionKeys?: Set<string>;
+    preparedSourceSessionKeys?: Set<string>;
+    sourceRegistryUnavailable?: boolean;
   } = {},
 ): Promise<MainSessionRestartRecoveryResult> {
   const started = performance.now();
@@ -1131,6 +1287,8 @@ export async function recoverRestartAbortedMainSessions(
       resumedSessionKeys,
       checkpoints,
       stateDir: params.stateDir,
+      preparedSourceSessionKeys: params.preparedSourceSessionKeys,
+      sourceRegistryUnavailable: params.sourceRegistryUnavailable,
     });
     result.recovered += storeResult.recovered;
     result.failed += storeResult.failed;
@@ -1181,17 +1339,32 @@ export function scheduleRestartAbortedMainSessionRecovery(
   const attemptRecovery = (attempt: number, delay: number) => {
     setTimeout(() => {
       log.info(`starting interrupted main session restart recovery attempt=${attempt}`);
-      void recoverRestartAbortedMainSessions({
-        cfg: params.cfg,
-        stateDir: params.stateDir,
-        resumedSessionKeys,
-      })
-        .then((result) => {
-          if (result.failed > 0 && attempt < maxRetries) {
+      const preparedSourceSessionKeys = new Set<string>();
+      void (async () => {
+        const prepared = await recoverPreparedWebchatSourceFinals({
+          cfg: params.cfg,
+          stateDir: params.stateDir,
+          ownedSessionKeys: preparedSourceSessionKeys,
+        }).catch((error: unknown) => {
+          log.warn(`prepared source final registry unavailable: ${String(error)}`);
+          return undefined;
+        });
+        const resumed = await recoverRestartAbortedMainSessions({
+          cfg: params.cfg,
+          stateDir: params.stateDir,
+          resumedSessionKeys,
+          preparedSourceSessionKeys,
+          sourceRegistryUnavailable: prepared === undefined,
+        });
+        return { prepared, resumed };
+      })()
+        .then(({ prepared, resumed }) => {
+          const failed = (prepared?.failed ?? 1) + resumed.failed;
+          if (failed > 0 && attempt < maxRetries) {
             log.info(
               `main-session restart recovery retry scheduled attempt=${attempt + 1} delayMs=${
                 delay * RETRY_BACKOFF_MULTIPLIER
-              } failed=${result.failed}`,
+              } failed=${failed}`,
             );
             attemptRecovery(attempt + 1, delay * RETRY_BACKOFF_MULTIPLIER);
           }
