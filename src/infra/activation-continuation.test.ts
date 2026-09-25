@@ -7,6 +7,11 @@ import {
   persistSourceTurnDeliveryState,
   type PersistSourceTurnDeliveryParams,
 } from "../agents/source-turn-delivery-store.js";
+import type { DB as OpenClawStateDatabase } from "../state/openclaw-state-db.generated.js";
+import {
+  closeOpenClawStateDatabaseForTest,
+  openOpenClawStateDatabase,
+} from "../state/openclaw-state-db.js";
 import {
   persistActivationContinuationBeforeRestart,
   recoverPendingActivationContinuations,
@@ -20,6 +25,7 @@ import {
   type ActivationContinuationDeliveryResult,
 } from "./activation-continuation.js";
 import { resetHeartbeatWakeStateForTests } from "./heartbeat-wake.js";
+import { executeSqliteQuerySync, getNodeSqliteKysely } from "./kysely-sync.js";
 import {
   enqueueSystemEvent,
   peekSystemEventEntries,
@@ -35,7 +41,7 @@ beforeEach(async () => {
   tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-activation-continuation-"));
   stateDir = path.join(tempRoot, "state");
   exportsDir = path.join(tempRoot, "exports");
-  sourceDeliveryRegistryPath = path.join(tempRoot, "source-delivery.json");
+  sourceDeliveryRegistryPath = path.join(tempRoot, "source-delivery.sqlite");
   vi.stubEnv("OPENCLAW_SOURCE_TURN_DELIVERY_REGISTRY_PATH", sourceDeliveryRegistryPath);
 });
 
@@ -44,6 +50,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   resetHeartbeatWakeStateForTests();
   resetSystemEventsForTest();
+  closeOpenClawStateDatabaseForTest();
   await fs.rm(tempRoot, { recursive: true, force: true });
 });
 
@@ -265,7 +272,15 @@ describe("activation restart continuations", () => {
     if (field === "run") {
       row.obligationIdentity.runId = "";
     }
-    await fs.writeFile(sourceDeliveryRegistryPath, JSON.stringify({ rows: [row] }));
+    const db = openOpenClawStateDatabase({ path: sourceDeliveryRegistryPath }).db;
+    const stateDb = getNodeSqliteKysely<OpenClawStateDatabase>(db);
+    executeSqliteQuerySync(
+      db,
+      stateDb
+        .updateTable("source_turn_delivery_obligations")
+        .set({ row_json: JSON.stringify(row), updated_at_ms: Date.parse(row.updatedAt) })
+        .where("idempotency_key", "=", row.idempotencyKey),
+    );
     expect((await reconcile(pending)).status).not.toBe("settled");
     const current = (await testing.readStore(stateDir)).records[0];
     expect(current.status).toBe("pending_delivery");
