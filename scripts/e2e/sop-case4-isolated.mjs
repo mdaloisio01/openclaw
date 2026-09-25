@@ -114,12 +114,19 @@ async function inspector() {
   let nextId = 0;
   const pending = new Map();
   const target = { breakpointId: undefined };
+  let startupPaused;
+  const startupPausedPromise = new Promise((resolve) => {
+    startupPaused = resolve;
+  });
   let paused;
   const pausedPromise = new Promise((resolve) => {
     paused = resolve;
   });
   ws.on("message", (raw) => {
     const frame = JSON.parse(raw.toString());
+    if (frame.method === "Debugger.paused" && frame.params.reason === "Break on start") {
+      startupPaused(frame.params);
+    }
     if (
       frame.method === "Debugger.paused" &&
       frame.params.hitBreakpoints?.includes(target.breakpointId)
@@ -151,6 +158,15 @@ async function inspector() {
   });
   target.breakpointId = breakpoint.breakpointId;
   await request("Runtime.runIfWaitingForDebugger");
+  await Promise.race([
+    startupPausedPromise,
+    delay(15_000).then(() => {
+      throw new Error("Gateway did not report its inspector startup pause");
+    }),
+  ]);
+  // --inspect-brk pauses on the first script line after the attach gate.
+  // Release that pause while keeping the prepared-final breakpoint.
+  await request("Debugger.resume");
   return { ws, pausedPromise, location };
 }
 

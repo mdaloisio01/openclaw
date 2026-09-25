@@ -16,15 +16,15 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@v6
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
 
       - name: Verify product candidate and validation-only files
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = 7ec1d117f229fcf70af1262ee901a48672fc108c
-          actual="$(git diff-tree --no-commit-id --name-only -r HEAD | sort)"
+          git merge-base --is-ancestor 7ec1d117f229fcf70af1262ee901a48672fc108c HEAD
+          actual="$(git diff --name-only 7ec1d117f229fcf70af1262ee901a48672fc108c HEAD | sort)"
           expected="$(printf '%s\n' .github/workflows/sop-case4-isolated-validation.yml scripts/e2e/sop-case4-isolated.mjs | sort)"
           test "$actual" = "$expected"
 
