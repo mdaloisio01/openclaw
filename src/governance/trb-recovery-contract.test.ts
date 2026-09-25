@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { setReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
 import type { SessionEntry, TrbRecoveryRecordV1 } from "../config/sessions/types.js";
@@ -12,6 +15,7 @@ import {
   parseTrbRecoveryContractFromText,
   shouldDrainStaleTrbRecoveryState,
   validateTrbFinalReplyPayloads,
+  validateTrbRecoveryArtifact,
   validateTrbRecoveryContract,
   validateTrbRecoveryRecord,
   type TrbRecoveryContract,
@@ -201,6 +205,62 @@ describe("TRB recovery runtime contract", () => {
 
     expect(result.ok).toBe(false);
     expect(result.reasonCodes).toContain("TRB_ARTIFACT_MISSING");
+  });
+
+  it.each(["none", "not written", "no file created", "missing.md"])(
+    "rejects %s without a written artifact",
+    async (recoveryArtifactPath) => {
+      const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-trb-artifact-"));
+      try {
+        const state = createTrbRecoveryState({
+          ctx: { Body: "TRB", MessageSid: "msg-artifact" },
+          sessionKey: "agent:orchestrator:main",
+          sessionId: "session-artifact",
+          now: Date.now(),
+        });
+        state.recovery_record = { ...completeRecord, recoveryArtifactPath };
+
+        const result = await validateTrbRecoveryArtifact({ state, workspaceDir });
+        expect(result.ok).toBe(false);
+        expect(result.reasonCodes).toContain("TRB_ARTIFACT_MISSING");
+      } finally {
+        await fs.rm(workspaceDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("rejects malformed persisted artifact metadata without throwing", () => {
+    const result = validateTrbRecoveryRecord({
+      ...completeRecord,
+      recoveryArtifactPath: 42 as unknown as string,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reasonCodes).toContain("TRB_ARTIFACT_MISSING");
+  });
+
+  it("accepts a copied extensionless file and rejects stale or empty artifacts", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-trb-artifact-"));
+    try {
+      const state = createTrbRecoveryState({
+        ctx: { Body: "TRB", MessageSid: "msg-artifact" },
+        sessionKey: "agent:orchestrator:main",
+        sessionId: "session-artifact",
+        now: Date.now(),
+      });
+      const artifactPath = path.join(workspaceDir, "recovery");
+      state.recovery_record = { ...completeRecord, recoveryArtifactPath: "recovery" };
+      await fs.writeFile(artifactPath, "");
+      expect((await validateTrbRecoveryArtifact({ state, workspaceDir })).ok).toBe(false);
+      await fs.writeFile(artifactPath, "recovery proof\n");
+      const staleTime = new Date(state.trigger_timestamp - 1_000);
+      await fs.utimes(artifactPath, staleTime, staleTime);
+      expect((await validateTrbRecoveryArtifact({ state, workspaceDir })).ok).toBe(true);
+      state.trigger_timestamp = Date.now() + 2_000;
+      expect((await validateTrbRecoveryArtifact({ state, workspaceDir })).ok).toBe(false);
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
   });
 
   it("passes a complete TRB contract", () => {

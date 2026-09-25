@@ -24,6 +24,7 @@ import {
   markTrbGateResultOnSessionEntry,
   shouldDrainStaleTrbRecoveryState,
   validateTrbFinalReplyPayloads,
+  validateTrbRecoveryArtifact,
 } from "../../governance/trb-recovery-contract.js";
 import { measureDiagnosticsTimelineSpan } from "../../infra/diagnostics-timeline.js";
 import { formatErrorMessage } from "../../infra/errors.js";
@@ -580,10 +581,13 @@ export async function getReplyFromConfig(
       .filter((value): value is string => typeof value === "string")
       .join("\n");
     captureTrbRecoveryRecordFromFinalReplyPayloads({ sessionEntry, payloads: reply });
-    const result = validateTrbFinalReplyPayloads({
+    const contractResult = validateTrbFinalReplyPayloads({
       payloads: reply,
       state: sessionEntry.trbRecovery,
     });
+    const result = contractResult.ok
+      ? await validateTrbRecoveryArtifact({ state: sessionEntry.trbRecovery, workspaceDir })
+      : contractResult;
     markTrbGateResultOnSessionEntry({ sessionEntry, result, candidateReplyText });
     if (sessionKey && sessionStore) {
       sessionStore[sessionKey] = sessionEntry;

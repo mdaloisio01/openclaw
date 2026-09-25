@@ -222,6 +222,7 @@ describe("getReplyFromConfig fast test bootstrap", () => {
   it("persists structured TRB recovery metadata before final gate validation", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-trb-finalizer-"));
     const storePath = path.join(home, "sessions.json");
+    const artifactPath = path.join(home, "trb-finalizer.md");
     const sessionKey = "agent:main:telegram:123";
     const trbRecovery = createTrbRecoveryState({
       ctx: {
@@ -243,7 +244,7 @@ describe("getReplyFromConfig fast test bootstrap", () => {
       rootCause: "structured recovery metadata was not captured before validation",
       activeMissionImpact: "build remains open until recovery record persists",
       lawfulNoUpdateReason: "current blocker is handled in active recovery path",
-      recoveryArtifactPath: "/tmp/trb-finalizer.md",
+      recoveryArtifactPath: artifactPath,
       exactNextAction: "persist metadata-backed record before final gate settlement",
     };
     const sessionEntry = {
@@ -262,16 +263,17 @@ describe("getReplyFromConfig fast test bootstrap", () => {
         storePath,
       }),
     );
-    vi.mocked(runPreparedReplyMock).mockResolvedValue(
-      setReplyPayloadMetadata(
+    vi.mocked(runPreparedReplyMock).mockImplementation(async () => {
+      await fs.writeFile(artifactPath, "TRB recovery proof\n", "utf8");
+      return setReplyPayloadMetadata(
         {
           text: "Plain Mark-facing recovery report without visible machine fields.",
         },
         {
           trbRecoveryRecord: recoveryRecord,
         },
-      ),
-    );
+      );
+    });
 
     await expect(
       getReplyFromConfig(
@@ -300,7 +302,7 @@ describe("getReplyFromConfig fast test bootstrap", () => {
     const stored = JSON.parse(await fs.readFile(storePath, "utf8"))[sessionKey];
     expect(stored.trbRecovery.recovery_record).toMatchObject({
       recordId: "trb-record-finalizer-1",
-      recoveryArtifactPath: "/tmp/trb-finalizer.md",
+      recoveryArtifactPath: artifactPath,
     });
     expect(stored.trbRecovery.final_response_gate).toMatchObject({
       status: "passed",

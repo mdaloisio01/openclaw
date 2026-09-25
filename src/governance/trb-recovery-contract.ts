@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { getReplyPayloadMetadata, type ReplyPayload } from "../auto-reply/reply-payload.js";
 import type { MsgContext } from "../auto-reply/templating.js";
@@ -226,7 +228,12 @@ export function validateTrbRecoveryContract(
     errors.push("exact_next_action is required");
     reasonCodes.add("TRB_FINAL_MISSING_REQUIRED_FIELDS");
   }
-  if (!hasText(contract.recovery_artifact_path)) {
+  const artifactPath =
+    typeof contract.recovery_artifact_path === "string"
+      ? contract.recovery_artifact_path.trim()
+      : "";
+  // The finalizer verifies that this locator names a file written during the turn.
+  if (!artifactPath) {
     errors.push("recovery_artifact_path is required");
     reasonCodes.add("TRB_ARTIFACT_MISSING");
   }
@@ -739,6 +746,37 @@ export function validateTrbFinalReplyPayloads(params: {
   });
 }
 
+export async function validateTrbRecoveryArtifact(params: {
+  state: TrbRecoveryState;
+  workspaceDir: string;
+}): Promise<TrbRecoveryValidationResult> {
+  const artifactPath = params.state.recovery_record?.recoveryArtifactPath;
+  if (typeof artifactPath === "string" && artifactPath.trim()) {
+    try {
+      const file = await fs.stat(path.resolve(params.workspaceDir, artifactPath));
+      // Copies can preserve mtime; creation/change time still records this turn.
+      // Compare at one-second resolution for filesystems with coarse timestamps.
+      const triggerSecond = Math.floor(params.state.trigger_timestamp / 1_000) * 1_000;
+      const latestFileChange = Math.max(file.birthtimeMs, file.ctimeMs, file.mtimeMs);
+      if (
+        file.isFile() &&
+        file.size > 0 &&
+        Number.isFinite(params.state.trigger_timestamp) &&
+        latestFileChange >= triggerSecond
+      ) {
+        return { ok: true, reasonCodes: [], errors: [] };
+      }
+    } catch {
+      // Missing or unreadable artifacts cannot prove recovery.
+    }
+  }
+  return {
+    ok: false,
+    reasonCodes: ["TRB_ARTIFACT_MISSING"],
+    errors: ["recovery_artifact_path must name a nonempty file written during this TRB"],
+  };
+}
+
 function replyPayloadsToText(payloads: ReplyPayload | ReplyPayload[] | undefined): string {
   return (Array.isArray(payloads) ? payloads : payloads ? [payloads] : [])
     .map((payload) => payload.text)
@@ -857,7 +895,7 @@ export function buildTrbRecoverySystemPrompt(state?: TrbRecoveryState): string |
     "missing_proof: required when root_cause is unknown, likely, probably, not proven, unclear, or cannot be determined.",
     "active_mission_impact:",
     "issue_list_action: or lawful_no_update_reason:",
-    "recovery_artifact_path:",
+    "recovery_artifact_path: path to a nonempty file written during this TRB; absence markers are invalid",
     "exact_next_action:",
     state.requires_session_tool_log_proof
       ? "session_tool_log_proof: checked, with evidence. This TRB cannot close without session/tool-log proof."
