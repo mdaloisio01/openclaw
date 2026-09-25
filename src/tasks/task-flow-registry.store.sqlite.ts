@@ -34,7 +34,10 @@ import {
   parseTaskFlowRegistryRow,
   type TaskFlowRegistryRow,
 } from "./task-flow-registry.sqlite.shared.js";
-import type { TaskFlowRegistryStoreSnapshot } from "./task-flow-registry.store.types.js";
+import {
+  TaskFlowRevisionConflictError,
+  type TaskFlowRegistryStoreSnapshot,
+} from "./task-flow-registry.store.types.js";
 import type { JsonValue, TaskFlowRecord } from "./task-flow-registry.types.js";
 import { normalizeSqliteNumber } from "./task-registry.sqlite.shared.js";
 import {
@@ -368,8 +371,24 @@ export function saveTaskFlowRegistryStateToSqlite(snapshot: TaskFlowRegistryStor
   });
 }
 
-export function upsertTaskFlowRegistryRecordToSqlite(flow: TaskFlowRecord) {
+export function upsertTaskFlowRegistryRecordToSqlite(
+  flow: TaskFlowRecord,
+  expectedRevision?: number,
+) {
   withWriteTransaction(({ db }) => {
+    const row = executeSqliteQuerySync(
+      db,
+      getFlowRegistryKysely(db)
+        .selectFrom("flow_runs")
+        .select("revision")
+        .where("flow_id", "=", flow.flowId),
+    ).rows[0];
+    const currentRevision = row ? normalizeSqliteNumber(row.revision) : undefined;
+    // CLI and Gateway can own separate process snapshots of the same flow.
+    // Reject a stale writer before its upsert can roll back the durable revision.
+    if (currentRevision !== expectedRevision) {
+      throw new TaskFlowRevisionConflictError();
+    }
     upsertFlowRow(db, bindFlowRecord(flow));
   });
 }

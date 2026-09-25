@@ -19,6 +19,7 @@ import {
   type TaskFlowRegistryObserverEvent,
 } from "./task-flow-registry.store.js";
 import { hasGovernedMissionClaimForFlow } from "./task-flow-registry.store.sqlite.js";
+import { TaskFlowRevisionConflictError } from "./task-flow-registry.store.types.js";
 import type {
   ActiveProductionBoundary,
   ActiveProductionContinuationReceipt,
@@ -1123,10 +1124,10 @@ function persistFlowRegistry(): boolean {
   }
 }
 
-function persistFlowUpsert(flow: TaskFlowRecord) {
+function persistFlowUpsert(flow: TaskFlowRecord, expectedRevision?: number) {
   const store = getTaskFlowRegistryStore();
   if (store.upsertFlow) {
-    store.upsertFlow(cloneFlowRecord(flow));
+    store.upsertFlow(cloneFlowRecord(flow), expectedRevision);
     return;
   }
   store.saveSnapshot({
@@ -1134,11 +1135,19 @@ function persistFlowUpsert(flow: TaskFlowRecord) {
   });
 }
 
-function tryPersistFlowUpsert(flow: TaskFlowRecord, operation: string): boolean {
+function tryPersistFlowUpsert(
+  flow: TaskFlowRecord,
+  operation: string,
+  expectedRevision?: number,
+): boolean {
   try {
-    persistFlowUpsert(flow);
+    persistFlowUpsert(flow, expectedRevision);
     return true;
   } catch (error) {
+    if (error instanceof TaskFlowRevisionConflictError) {
+      restoreAttempted = false;
+      ensureFlowRegistryReady();
+    }
     log.warn("Failed to persist task-flow registry upsert", {
       operation,
       flowId: flow.flowId,
@@ -1245,7 +1254,7 @@ function applyFlowPatch(current: TaskFlowRecord, patch: FlowRecordPatch): TaskFl
 }
 
 function writeFlowRecord(next: TaskFlowRecord, previous?: TaskFlowRecord): TaskFlowRecord | null {
-  if (!tryPersistFlowUpsert(next, previous ? "update" : "create")) {
+  if (!tryPersistFlowUpsert(next, previous ? "update" : "create", previous?.revision)) {
     return null;
   }
   restoreFailureMessage = null;
@@ -1612,6 +1621,10 @@ export function updateFlowRecordByIdExpectedRevision(params: {
   }
   const flow = writeFlowRecord(applyFlowPatch(current, params.patch), current);
   if (!flow) {
+    const refreshed = flows.get(params.flowId);
+    if (refreshed && refreshed.revision !== current.revision) {
+      return { applied: false, reason: "revision_conflict", current: cloneFlowRecord(refreshed) };
+    }
     return {
       applied: false,
       reason: "persist_failed",
@@ -2105,8 +2118,12 @@ export function recordFlowNextExecutableLaunch(params: {
     );
   }
   const flow = writeFlowRecord(prepared.flow, current);
-  return flow
-    ? { applied: true, flow }
+  if (flow) {
+    return { applied: true, flow };
+  }
+  const refreshed = flows.get(params.flowId);
+  return refreshed && refreshed.revision !== current.revision
+    ? { applied: false, reason: "revision_conflict", current: cloneFlowRecord(refreshed) }
     : { applied: false, reason: "persist_failed", current: cloneFlowRecord(current) };
 }
 

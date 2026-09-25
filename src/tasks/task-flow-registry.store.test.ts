@@ -18,6 +18,7 @@ import {
   closeTaskFlowRegistryDatabase,
   loadTaskFlowRegistryStateFromSqlite,
   saveTaskFlowRegistryStateToSqlite,
+  upsertTaskFlowRegistryRecordToSqlite,
 } from "./task-flow-registry.store.sqlite.js";
 import {
   parseOptionalTaskFlowSyncMode,
@@ -258,6 +259,57 @@ describe("task-flow-registry store runtime", () => {
       expect(restored?.stateJson).toEqual({ phase: "ask_user" });
       expect(restored?.waitJson).toEqual({ kind: "external_event", topic: "forum" });
       expect(restored?.cancelRequestedAt).toBe(444);
+    });
+  });
+
+  it("preserves a newer flow revision written by another process", async () => {
+    await withFlowRegistryTempDir(async () => {
+      const created = createManagedTaskFlow({
+        ownerKey: "agent:main:main",
+        controllerId: "tests/external-writer",
+        goal: "Preserve current owner state",
+      });
+      upsertTaskFlowRegistryRecordToSqlite(
+        { ...created, revision: 1, currentStep: "external_pause" },
+        0,
+      );
+      upsertTaskFlowRegistryRecordToSqlite(
+        { ...created, revision: 2, currentStep: "external_resume" },
+        1,
+      );
+
+      const stale = setFlowWaiting({
+        flowId: created.flowId,
+        expectedRevision: created.revision,
+        currentStep: "stale_gateway_step",
+      });
+      expect(stale.applied).toBe(false);
+      expect(stale).toMatchObject({
+        reason: "revision_conflict",
+        current: { revision: 2, currentStep: "external_resume" },
+      });
+      expect(getTaskFlowById(created.flowId)).toMatchObject({
+        revision: 2,
+        currentStep: "external_resume",
+      });
+      const retried = setFlowWaiting({
+        flowId: created.flowId,
+        expectedRevision: 2,
+        currentStep: "retried_gateway_step",
+      });
+      expect(retried).toMatchObject({ applied: true, flow: { revision: 3 } });
+      const { db } = openOpenClawStateDatabase({
+        path: resolveOpenClawStateSqlitePath(process.env),
+        readOnly: true,
+      });
+      const row = executeSqliteQuerySync(
+        db,
+        getNodeSqliteKysely<TaskFlowRegistryTestDatabase>(db)
+          .selectFrom("flow_runs")
+          .select(["revision", "current_step"])
+          .where("flow_id", "=", created.flowId),
+      ).rows[0];
+      expect(row).toMatchObject({ revision: 3, current_step: "retried_gateway_step" });
     });
   });
 

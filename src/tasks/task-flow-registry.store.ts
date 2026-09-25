@@ -18,7 +18,7 @@ export type { TaskFlowRegistryStoreSnapshot } from "./task-flow-registry.store.t
 export type TaskFlowRegistryStore = {
   loadSnapshot: () => TaskFlowRegistryStoreSnapshot;
   saveSnapshot: (snapshot: TaskFlowRegistryStoreSnapshot) => void;
-  upsertFlow?: (flow: TaskFlowRecord) => void;
+  upsertFlow?: (flow: TaskFlowRecord, expectedRevision?: number) => void;
   deleteFlow?: (flowId: string) => void;
   commitGovernance?: (commit: GovernedMissionLedgerCommit) => GovernedMissionLedgerCommitResult;
   close?: () => void;
