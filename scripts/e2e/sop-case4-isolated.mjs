@@ -279,7 +279,7 @@ try {
   ]);
   assert.equal(pause.callFrames[0].location.lineNumber, debug.location.line);
   const before = sessionEntry();
-  assert.equal(before?.status, "running");
+  assert.equal(before?.status, "done");
   assert.equal(before?.pendingFinalDelivery, true);
   assert.equal(before?.pendingFinalDeliveryText, marker);
   const beforeMessages = transcript(before);

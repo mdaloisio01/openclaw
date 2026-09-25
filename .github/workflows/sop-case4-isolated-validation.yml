@@ -16,7 +16,7 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@v6
         with:
-          fetch-depth: 3
+          fetch-depth: 8
           persist-credentials: false
 
       - name: Verify product candidate and validation-only files
