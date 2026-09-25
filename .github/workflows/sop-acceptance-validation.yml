@@ -1,0 +1,52 @@
+name: SOP acceptance validation
+
+on:
+  push:
+    branches: [sop-validation-20260925]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sop-acceptance-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'mdaloisio01/openclaw'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Verify exact candidate parent
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = 44c85136ff02c3177cbbb6c6a2ec06ffb7face64
+          test "$(git diff-tree --no-commit-id --name-only -r HEAD)" = .github/workflows/sop-acceptance-validation.yml
+
+      - name: Set up Node and frozen dependencies
+        id: setup
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: "24.x"
+          install-bun: "false"
+          install-deps: "true"
+          use-actions-cache: "true"
+
+      - name: Check core test types
+        timeout-minutes: 20
+        run: pnpm tsgo:core:test
+
+      - name: Build release package
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 40
+        env:
+          OPENCLAW_TSDOWN_SERIAL_BUILD: "1"
+          NODE_OPTIONS: --max-old-space-size=5120
+        run: pnpm build:release
